@@ -375,7 +375,8 @@ shared automatically. `rnfs pin rm <cid>` stops sharing, and `rnfs gc` frees spa
 didn't pin. By default your node also shares what you download while it's cached, so others can see what you
 fetched; `provide_strategy = "pinned"` shares only what you pin. Every file and folder inside what you pin is also
 findable by its own CID (`provide_entries`), so a file you shared in a folder can be fetched without the folder's
-CID; on a slow radio node, only while there are few of them. That also lets anyone who has one of those files look
+CID; on a slow radio node, only while there are few of them. Content other nodes asked yours to keep (remote pins)
+and names you follow are shared only as a whole. That also lets anyone who has one of those files look
 up its CID and see that your node holds it, so pin only what may be known to be on your node, or set
 `provide_entries = false`. `add` refuses the rnfs dir (`~/.rnfs`) and any folder holding it, such as `~`: it holds
 your node's keys and API token.
@@ -440,7 +441,8 @@ quiet_hours = "22:00-06:00"
 | `slow` | `"auto"` | A slow node uses one provider at a time and fewer parallel queries; `auto` when every interface is under `slow_bitrate` (100 kbit/s) |
 | `announce_interval` | `21600` (6 h) | How often the node and its names announce; keep it ≥ 1 h |
 | `provide_strategy` | `"roots"` | `"roots"` shares pins and every complete download while it's cached (even a `cat` or `stat`), so **anyone can learn what you downloaded**; `"pinned"` shares only pins |
-| `provide_entries` | unset | Also share every file and folder inside your pins under its own CID (not inside downloads). Unset: on, for up to 100,000 of them, oldest pins first; on a slow node only while republishing them would take under 2% of the radio channel (about 40 keys in all on a large network: `rnfs status` says when they're off and why). `true` or `false` overrides it. Each one tells anyone who looks that your node has that file |
+| `provide_entries` | unset | Also share every file and folder inside your pins under its own CID (not inside downloads, remote pins or followed names). Unset: on, for up to `provide_entries_max` of them, oldest pins first; on a slow node only while republishing them would take under 2% of the radio channel (about 40 keys in all on a large network: `rnfs status` says when they're off and why). `true` or `false` overrides it. Each one tells anyone who looks that your node has that file |
+| `provide_entries_max` | `100000` | The most files and folders `provide_entries` shares; a pin that would pass it shares none of its own (`rnfs status`: `provide_entries_capped`). Raise it for a large mirror |
 | `max_storage` | 10 GiB | Cached downloads are evicted above this; pins never are. It counts disk use: each block rounded up to the filesystem's cluster, which on a FAT32 drive (16–32 KiB) makes small files take several times their size (`rnfs status`: `allocated_bytes`). The disk keeps max(256 MiB, 2%) free |
 | `max_download_size` | none | Refuse fetches larger than this |
 | `record_budget` | 1 GiB | Disk the provider records your node stores for others (as a DHT server) may take; when full, your node contacts and publishers seen for days keep their place, and strangers share a small part |

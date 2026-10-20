@@ -622,6 +622,26 @@ class LiveTest(SettingsBase):
         self.assertIn("provide_entries must be true or false, or unset",
                       self.set({"provide_entries": 1}, status=400)["error"])
 
+    def test_provide_entries_max(self):
+        """provide_entries_max applies at once: a pin past a lower cap has its entries withdrawn whole, and they come
+        back under a higher one; the schema knows it as a whole number of at least 0, 100,000 by default."""
+        entry = self.setting("provide_entries_max")
+        self.assertEqual((entry["type"], entry["nullable"], entry["default"], entry["live"], entry["minimum"]),
+                         ("int", False, 100_000, True, 0))
+        folder = os.path.join(self.tmp.name, "folder")
+        os.mkdir(folder)
+        for name in ("a", "b"):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(name.encode() * 10)
+        root = self.b.add_path(folder)["cid"]
+        self.assertEqual(self.b.status()["provided_entries"], 2)
+        self.assertEqual(self.set({"provide_entries_max": 1})["applied"], ["provide_entries_max"])
+        self.assertEqual({str(cid) for cid in self.b.publisher.provided()}, {root})
+        self.assertEqual(self.b.status()["provide_entries_capped"], 1)
+        self.set({"provide_entries_max": 2})
+        self.assertEqual(self.b.status()["provided_entries"], 2)
+        self.assertIn("provide_entries_max", self.set({"provide_entries_max": -1}, status=400)["error"])
+
     def test_plain_settings_reach_their_users(self):
         # Read from node.config at each use, which the node's parts share
         self.set({"max_output_entries": 7, "remote_pin_quota": 9})

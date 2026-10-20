@@ -218,10 +218,11 @@ class UpgradeTest(unittest.TestCase):
         expected = fixture("published.json")
         self.assertTrue(any(item.startswith("key:") for item in expected["published"]))
         publisher = node.publisher
-        self.assertEqual({str(item): [when, [n.hex() for n in nodes]]
-                          for item, (when, nodes) in publisher._published.items()}, expected["published"])
-        self.assertEqual({str(item): {n.hex(): when for n, when in nodes.items()}
-                          for item, nodes in publisher._earlier.items() if nodes}, expected["earlier"])
+        states = publisher.states()
+        self.assertEqual({str(item): [state["at"], [n.hex() for n in state["nodes"]]]
+                          for item, state in states.items() if state["at"] is not None}, expected["published"])
+        self.assertEqual({str(item): {n.hex(): when for n, when in state["earlier"].items()}
+                          for item, state in states.items() if state["earlier"]}, expected["earlier"])
         self.assertEqual({n.hex(): sorted(k.hex() for k in keys) for n, keys in publisher._withdrawals.items()
                           if keys}, expected["withdraw"])
         # What 0.1.4 provided is still provided: every published CID and key; and since 0.2.0 (provide_entries, on

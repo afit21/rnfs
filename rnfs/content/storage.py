@@ -130,6 +130,14 @@ def app_source(name: str, key: str | None = None) -> str:
     return f"{APP_PREFIX}{name}:{key}"
 
 
+def is_own_source(source) -> bool:
+    """True if source pins the user's own content: the user's pins (user), the shared folder's (folder), those of a
+    name this node publishes (name:<alias>) and an app's (app:<app>[:<key>]); not those another node asked for
+    (remote:<identity>), a followed name's (follow:<name>) or the deny lists' own blocks (deny)."""
+    return isinstance(source, str) and (source in (USER, FOLDER) or source.startswith(NAME_PREFIX)
+                                        or app_of(source) is not None)
+
+
 def app_of(source) -> str | None:
     """The app whose pin source this is (app:<app> or app:<app>:<key>), or None if it is no valid app source."""
     if not isinstance(source, str) or not source.startswith(APP_PREFIX):
@@ -357,6 +365,7 @@ class Storage:
         # has none
         self._added: dict[Cid, float] = {}
         self._pinned: frozenset[Cid] | None = None  # pinned_cids(), built when asked; None again once pins change
+        self._own_pinned: frozenset[Cid] | None = None  # own_pinned_cids(), the same way, once any source changes
         # Called as pin_listener(change, cids, source) once pins of source were added ("added") or released
         # ("removed") and saved, and as cache_listener(change, cids) with the targets of cache records added
         # ("added"), dropped ("removed") or retargeted (both), each with the lock held: the node's "pin" and "cache"
@@ -704,7 +713,7 @@ class Storage:
             if not added:
                 return
             self._changes += 1
-            self._pinned = None
+            self._pinned = self._own_pinned = None
             now = time.time()
             first = [cid for cid in added if self._pins[cid] == {source}]  # pinned by nothing else before
             try:
@@ -716,7 +725,7 @@ class Storage:
                     sources.discard(source)
                     if not sources:
                         del self._pins[cid]
-                self._pinned = None
+                self._pinned = self._own_pinned = None
                 raise
             for cid in first:  # a pin another source held already keeps its first time (or its lack of one)
                 self._added[cid] = now
@@ -730,6 +739,7 @@ class Storage:
                 return False
             sources.discard(source)
             self._changes += 1
+            self._own_pinned = None
             if not sources:
                 del self._pins[cid]
                 self._maybe_garbage = True
@@ -739,7 +749,7 @@ class Storage:
                 self._save_pins(source, removed=[cid], gone=gone)
             except BaseException:
                 self._pins.setdefault(cid, set()).add(source)  # still pinned, as the database says
-                self._pinned = None
+                self._pinned = self._own_pinned = None
                 raise
             if gone:
                 self._added.pop(cid, None)
@@ -780,6 +790,15 @@ class Storage:
             if self._pinned is None:
                 self._pinned = frozenset(self._pins)
             return self._pinned
+
+    def own_pinned_cids(self) -> frozenset[Cid]:
+        """Every CID pinned by a source of the user's own content (is_own_source), whatever else pins it: the same
+        frozenset until a pin's sources change."""
+        with self._lock:
+            if self._own_pinned is None:
+                self._own_pinned = frozenset(cid for cid, sources in self._pins.items()
+                                             if any(is_own_source(source) for source in sources))
+            return self._own_pinned
 
     def pinned_by(self, source: str) -> set[Cid]:
         """CIDs held by source."""

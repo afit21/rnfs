@@ -817,7 +817,7 @@ class BackendTest(NodeTest):
         self.assertEqual(self.a.records.providers(key), [B_ID])  # the lookup's
         for node_id in (young, silent, banned):
             self.assertEqual(self.net.nodes[node_id].records.providers(key), [])
-        self.assertEqual(set(self.b.publisher._published[Cid.parse(cid)][1]), {A_ID, senior})
+        self.assertEqual(set(self.b.publisher.states()[Cid.parse(cid)]["nodes"]), {A_ID, senior})
         self.b.pin_rm(cid)
         self.b.publisher.publish_due()
         self.assertEqual(self.net.nodes[senior].records.providers(key), [])

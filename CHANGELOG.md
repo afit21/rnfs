@@ -19,10 +19,11 @@ field. The upgrade of an `<rnfs dir>` is automatic and one-way.
 Upgrade notes:
 - **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
   `routing`, `peer_scores`, `announce_first_seen`, `provider_standing`, `remote_pins_asked`, `remote_pins_served`,
-  `name_syncs`, `name_sync_files`, `published_heal`, `name_announces`, `remote_pin_retries`, `range_support`); an
-  older rnfs can't open it afterwards. Pins made before the upgrade have no `added` time, name keys made before it
-  count as never exported (`rnfs status` lists them until `rnfs name export` is run), and remote pins asked before
-  it have no status entry.
+  `name_syncs`, `name_sync_files`, `published_heal`, `name_announces`, `remote_pin_retries`, `range_support`,
+  `publish_items`, `publish_stores`); an older rnfs can't open it afterwards. The publisher's `published` and
+  `published_earlier` rows move into `publish_items` (a row per provided item), leaving those tables empty. Pins
+  made before the upgrade have no `added` time, name keys made before it count as never exported (`rnfs status`
+  lists them until `rnfs name export` is run), and remote pins asked before it have no status entry.
 - **LXMF:** rnfs no longer sends or receives LXMF (Removed, below). Pins of links auto-fetched over LXMF change
   source from `lxmf:<address>` to `app:lxmf:<address>` (`pin ls` shows the new one), an app called `lxmf`'s, so
   they stay pinned for an LXMF app to take over; nothing is released by the change, and an older `pins.json`
@@ -51,8 +52,9 @@ Upgrade notes:
 - **Routing state:** the state database gains tables for the routing table (`routing`), which is now kept across
   restarts, for local scores (`peer_scores`) and for the announce first-seen log (`announce_first_seen`).
 - **Files and folders inside pins are provided** (`provide_entries`, below, on by default): after the upgrade a node
-  that isn't slow also publishes the CID of every file and folder inside its complete pins, up to 100,000, so its
-  first rounds publish more keys. Set `provide_entries = false` to keep 0.1.6's behaviour.
+  that isn't slow also publishes the CID of every file and folder inside its own complete pins (not remote pins or
+  followed names), up to `provide_entries_max` (100,000), so its first rounds publish more keys. Set
+  `provide_entries = false` to keep 0.1.6's behaviour.
 
 Security:
 - **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
@@ -360,16 +362,18 @@ Added:
   `GET /api/name/syncs`; `ApiConnection.name_sync`, `name_unsync`, `name_syncs`; `Node/Client.names.sync`,
   `unsync` and `syncs()` (`FolderSync`); capability `name_sync`. An app's token may start and stop a sync, as it
   may publish; the name's pin stays the name's.
-- **Files and folders inside pins are provided** (new setting `provide_entries`; an entry is an ordinary provider
-  record of its CID): every file and directory a directory entry names inside a complete pin, at every depth, can
-  be found by its own CID rather than only as `<root>/<path>`, and the same file in two folders from either. Not
-  chunks or other intermediate nodes, and never inside cached downloads, which provide only their root; serving is
-  unchanged (an entry's blocks are its pin's). Unset (the default), it is on up to 100,000 entry keys: pins
-  oldest first, each pin's entries all or none, a pin that would pass the cap left out (logged). On a slow node
+- **Files and folders inside pins are provided** (new settings `provide_entries` and `provide_entries_max`; an
+  entry is an ordinary provider record of its CID): every file and directory a directory entry names inside a
+  complete pin of the user's own content (the user's, the shared folder's, names' and apps' pins: not those other
+  nodes asked for or followed names'), at every depth, can be found by its own CID rather than only as
+  `<root>/<path>`, and the same file in two folders from either. Not chunks or other intermediate nodes, and never
+  inside cached downloads, which provide only their root; serving is unchanged (an entry's blocks are its pin's).
+  Unset (the default), it is on up to `provide_entries_max` entry keys (100,000): pins oldest first, each pin's
+  entries all or none, a pin that would pass the cap left out (logged). On a slow node
   it is on only while republishing every key is estimated to take at most 2% of the channel (from the slowest
   interface's bitrate, the keys, and the network size the publish rounds' regions show: about 1,300 keys at 100
   servers and 40 from 1,000 at 1 kbit/s), and none are provided past that; once on, they stay on up to 2.5%.
-  `true` or `false` overrides the default; it applies at once when changed through the API. Unpinning a folder
+  `true` or `false` overrides the default; both settings apply at once when changed through the API. Unpinning a folder
   withdraws its entries, except those still inside another pin. `rnfs status` (and `GET /api/status`,
   `Status`) gains `provided_entries`, `provide_entries_off` (why none are provided) and `provide_entries_capped`;
   `provided` counts entries too. Providing entries tells anyone looking up a file's CID that the node has it.
@@ -550,6 +554,12 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   costs two request timeouts a week.
 
 Changed:
+- **`provide_entries` covers the user's own content only** (a changed default): the files and folders inside pins of
+  the user, the shared folder, names and apps are provided by their own CIDs, but not those inside pins other nodes
+  asked for (`remote:`) or followed names (`follow:`), so a node doesn't publish the file CIDs of content others
+  asked it to keep; a pin the user holds too counts as the user's. Its cap of 100,000 entry keys is a new setting,
+  `provide_entries_max` (applied at once, like `provide_entries`), as a large mirror passes it: a pin whose entries
+  would pass the cap provides none of them.
 - A pacing wait no longer closes the link: after a response on a slow link the fetcher waits as long again before
   asking that provider again (the responder's upload pacing), and on LoRa a 64 KiB chunk takes about 9 minutes, so
   the wait outlasted `link_idle_timeout` (5 minutes) and the idle link was closed, taking its rate estimate with it:
@@ -689,6 +699,20 @@ Faster:
   layout, took 4.2 s and 74 s. A cold cache and a slow disk should gain more, as the table is one file read in
   order: Raspberry Pi SD-card numbers are still to be measured (`tests/bench_startup.py`, `--cold` for a cache
   dropped as after a reboot).
+- The publisher's state is on disk: where and when each provided key was last published lives in the state
+  database (`publish_items`, indexed by when each is next due) and is read per round, rather than held in memory
+  for every key. A wake asks the index when the next key is due, and a round reads the due keys only, at most
+  50,000 of them (the rest in the rounds that follow at once, in slices of the key space, so the rounds need no
+  more region lookups than one would), so neither looks at every provided key; while a round runs only the stores
+  servers answered are saved, in a small table written in order, and each key's row is written once at its end.
+  Measured with `tests/bench_publisher.py` (a 2,000-server fake network, desktop NVMe disk), before → after:
+  memory per provided key 632 B → 213 B after a round and 1,326 → 187 B after a restart at 100,000 keys, 582 →
+  161 B and 1,287 → 158 B at 1M (what is left is the provide set itself: a 4 GB Raspberry Pi held about 1.5–2M
+  keys; what bounds a node now is how many it can republish a day); a wake (`next_due`, a round
+  with nothing due) 80 → 0.1 ms at 100,000 keys and about 1,100 → 0.1 ms at 1M; disk 278 → 290 B a key (the due
+  index); bytes written per round 55–83 KB → 0.8–0.95 KB a key (SQLite's WAL and checkpoints: rows are written in
+  key order, and an item's row once a round instead of at each save). A first round of 1M keys took 20 rounds of
+  50,000 and 175 region lookups, against one round of 157. Raspberry Pi SD-card numbers are still to be measured.
 
 ## 0.1.6
 

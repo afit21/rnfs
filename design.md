@@ -80,7 +80,8 @@ all written as 32 hex characters.
   the schema steps of those labels (a memory-only `ProviderStore`).
 
 Persistent state lives in the state database. Each store but the provider store (which reads its records per key,
-`providers.py` below) keeps its state in memory, which is all reads use,
+`providers.py` below) and the publisher (which reads its items' rows per round, `publisher.py` below) keeps its state
+in memory, which is all reads use,
 loads it once at startup (checking every row as the JSON loaders checked every record: a malformed row is
 logged, skipped and deleted) and then writes only what changed: a pin is one row inserted or deleted, batched
 stores write the records changed since their last save. The shared parts are in statedb: `open_store(state_dir,
@@ -831,13 +832,18 @@ provide set, withdraw at once; skipped when the node's generation, the deny list
 strategy and `_entries_input()` are as at the last one), `publish_due()`, `serves(cid)`, `run()`. The node calls the
 first `refresh()` only after the features have registered their key sources, so a restart doesn't withdraw kept
 names' keys. **Entries** (`provide_entries`, `_choose_entries` inside `_compute`): the entries of the provided CIDs
-that are pins (`pinned_cids()`, read once per compute, among the complete undenied DAGs) are walked once per pin
+that are pins of the user's own content (`Storage.own_pinned_cids()`: CIDs one of whose sources passes
+`storage.is_own_source`, so `user`, `folder`, `name:` and `app:`, not `remote:`, `follow:` or `deny`; memoised like
+`pinned_cids()` until any pin's sources change; read once per compute, among the complete undenied DAGs) are walked
+once per pin
 (`_walk_entries`: directory and index nodes only, through `walker.directory_entries`, each directory CID once;
 memoised in `_entries_of` while the pin stays complete, as a CID's content never changes) and chosen by
 `_capped_entries`: pins in `Storage.pin_order` (first pinned oldest first, those of before 0.2.0 first, then by
-CID), each pin's entries whole or not at all while the union stays within `MAX_ENTRY_KEYS` (100,000), a pin that
-doesn't fit logged and skipped. The choice is reused while `pinned_cids()` is the same object and the complete pins
-are equal, so a refresh caused by a fetch or a block stored walks and chooses nothing. Entries are `Cid`s in
+CID), each pin's entries whole or not at all while the union stays within `provide_entries_max` (100,000 by
+default), a pin that doesn't fit logged and skipped. The choice is reused while `own_pinned_cids()` is the same
+object, the complete pins are equal and the cap is the same, so a refresh caused by a fetch or a block stored walks
+and chooses nothing; `_entries_input()` holds both settings, so changing either (live, through the settings feature,
+whose hook refreshes) makes the next refresh compute. Entries are `Cid`s in
 `_provided` like roots, so publishing, withdrawing (refresh's removed set) and persistence treat them alike;
 `_entries` holds those that aren't roots too (`provided_entries()`, `entries_status()` for the node's status).
 `_compute` asserts they are inside the served set, which doesn't change. On a slow node with the setting unset, the
@@ -882,12 +888,13 @@ disjoint path's K closest (`Region.path_closest`) and the ring servers of a wide
 keeps only the servers `allows` takes, the round's withdrawal snapshot leaves out the others (they stay queued), and
 `send` skips a server it no longer allows (as if refused, nothing recorded) without opening a link; each `/provide`
 of keys reports `answered` (keys possibly recorded) or `failed` (none: no link). At a round's end `_mark_heal` marks
-each item it published (`_heal`) whose accepted servers are all local, if partition mode was on at its start or end
-or its store set held an off-island server, and clears the mark of one that reached an off-island server;
-`heal()` (the node's `_partition_changed` on leaving partition mode) sets `_retry_at` to now for every marked item
-still provided, so it is due at once (and paced on slow nodes as any round); an item marked by a round that began in
-partition mode and ended out of it is made due again the same way. `_heal_rows` (items ever marked, so possibly with
-a row) bounds the `published_heal` deletes a save sends. `heal_marked()` counts them. `set_widening(flags, widen)` (the
+each item it published (its row's `heal`) whose accepted servers are all local, if partition mode was on at its
+start or end or its store set held an off-island server, and clears the mark of one that reached an off-island server;
+`heal()` (the node's `_partition_changed` on leaving partition mode) sets the retry time of every marked item to now
+(one `UPDATE` through the partial index on marked rows, and the same on the states memory holds), so it is due at
+once (and paced on slow nodes as any round); an item marked by a round that began in partition mode and ended out of
+it is made due again the same way. `heal_marked()` counts them (`COUNT(*)` over that index, memory's states over
+theirs). `set_widening(flags, widen)` (the
 node passes `Lookups.flags` and `Lookups.widen`) has each lookup thread, once its
 region is covered, check the keys it covered (`_widen`) and run the widened lookup of each flagged one within the
 round's limit (`Sweep.spend`; a key over it goes in `Region.deferred` and isn't published this round, so it stays
@@ -904,6 +911,45 @@ key's queued withdrawals (their nodes join its earlier nodes) and re-records the
 sends only withdrawals still queued when it reaches each node, so a withdrawal queued while the key was briefly
 unprovided never follows a store of it. `protocol.provide_batches` puts withdrawals before stores, and a key in both
 lists is only stored.
+
+**The publisher's state on disk.** What the publisher knows of each provided item is a `publish_items` row rather
+than memory (0.1.x and the 0.2.0 betas held every item's last publish and servers in memory: about 1.3 KB an item
+after a restart, so 1.5–2M items on a 4 GB Raspberry Pi): keyed by its DHT key, with the item itself (a binary CID, or
+`00` and a `DhtKey`'s key), `due` (when it is next published: its retry time if any, else its last publish plus its
+republish interval, 0 if never published; indexed, the index holding the key after it), `at`, `retry`, `nodes`,
+`earlier` (server and time, packed) and `heal` (a partial index over the marked rows). An item's state is an `_Item`;
+`_items` holds those changed since the last save (`None`: its row goes) and those the round in progress holds
+(`_round`), over the rows (`_read`, batched `IN` queries by key; `_peek` reads without keeping, `_get` keeps the state
+to change it). `next_due` asks the index for the earliest due row memory doesn't hold changed (`ORDER BY due LIMIT n
++ 1`, n being what memory holds) and takes memory's own; `publish_due` saves first if refresh added items, then
+`_take_due` reads the due rows in the index's order, at most `ROUND_KEYS` (50,000), memory's states over theirs,
+and sorts them as before (never published first, then the longest unpublished, then by key). Items published in one
+round share a due time, and never-published ones have 0, so the index hands them out in key order: a first round of
+more than `ROUND_KEYS` keys is cut into slices of the key space, which come due again as slices, and the rounds need
+no more region lookups than one would (100,000 keys on 2,000 servers: 78 + 80 lookups against 157). A round holds
+about 2 KB per item while it runs, then lets go (`_end_round`). The first refresh looks through every row (by key,
+`SCAN_BATCH` at a time) for items no longer provided (`_unprovided_rows`), deleting rows whose item doesn't parse;
+later refreshes compare the provide sets. Added items go in `_added` and get a never-published row (`INSERT OR
+IGNORE`, so a restart keeps those there) in the save refresh then makes. Saves stay at the old durability points
+(a refresh that changed the provide set, every `SAVE_EVERY_NODES` nodes or `SAVE_EVERY_SECONDS` of a round, the
+round's end, stop), through `_PublishState`, a `RowStore` whose snapshot is the changed items' rows, the added
+items, the round's stores, withdrawals and meta values; once written, the states it wrote that haven't changed since
+leave `_items` (`written`). Within a round, item rows aren't touched until its end, which writes each item once;
+the saves in between write only `publish_stores`, append-only: the round's item list once, then a row per server
+that answered with the 4-byte places of the items it recorded, emptied in the round's last save (`_ROUND_END`), and
+merged into the items' rows by the next start after a crash (`_merge_stores`; an item without a row has its stores
+queued for withdrawal). Every batch is written in key order: SQLite's cache (2 MB) spills pages of a large
+transaction to the WAL, and random order wrote each page many times (about 20× for a round's rows). Measured with
+`tests/bench_publisher.py` (a 2,000-server fake network, 10 servers a key), at 100,000 and 1M provided CIDs: memory
+213 and 161 B a key after a round, 187 and 158 after a restart (the provide set itself), against 632 and 582, 1,326
+and 1,287 before; a wake (`next_due`, and `publish_due` with nothing due) 0.1 ms either way, against 80 ms and
+1.1 s; 290 B a key on disk (`publish_items` 258, its due index 30); a round writes 820–950 B a key (the WAL and the
+checkpoint copy, SQLite's `secure_delete` on), against 55–83 KB before. Times: a clock gone back by more than `CLOCK_SLACK` (60 s) since the latest time seen or
+saved (meta `clock`) brings `at` and `retry` after it back to it, at once on disk (`_recompute`: one `UPDATE` and
+the due times computed again, writing only the rows that change) and in memory; earlier servers' times are brought
+back as rows are read, and expired ones left out. A republish interval other than the one the due times were
+computed with (meta `interval`) computes them again the same way. Withdrawals stay in memory, as before (they are
+sent at the next round on fast nodes).
 
 Errors (`errors.STATUSES`, the one table: `api.ERROR_STATUSES` is it, `apiclient.STATUS_ERRORS` and the gateway's
 `ERROR_MESSAGES` follow it): `ValueError` → 400 (with `BlockMismatch`, `SealError` and `NotRecipient`, which
@@ -1938,11 +1984,15 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   their checks, at most 10 000, saved after each ask and with the batched saves; the latest outcome of each remote
   pin served, at most 1 000, saved with the remote pins waiting; NORMAL, changed rows only; tables of their own, so
   `remote_pins` keeps its released meaning);
-- `published`, `published_earlier`, `withdrawals` (publisher: last rounds, earlier rounds' nodes, pending
-  withdrawals; NORMAL every 10 nodes or 30 s of a round and at stop, changed items only), with the meta values
-  `(publisher, region_bits)` and `(publisher, entries_on)` (0.2.0: the network size estimate and whether entries
-  were provided, saved with them), and `published_heal` (0.2.0: the published items marked for the heal republish,
-  written and deleted with their published rows; a mark without a published row is deleted at load);
+- `publish_items` (0.2.0: the publisher's items, a row each, read per round through its index on the due time;
+  `publisher.py`), `publish_stores` (0.2.0: a round's stores so far, appended at its saves and emptied at its end)
+  and `withdrawals` (pending withdrawals), NORMAL every 10 nodes or 30 s of a round, at its end, after a refresh that
+  changed the provide set and at stop, changed items only, with the meta values `(publisher, region_bits)` and
+  `(publisher, entries_on)` (0.2.0: the network size estimate and whether entries were provided), `(publisher,
+  interval)` and `(publisher, clock)` (0.2.0: the republish interval the due times were computed with, and the latest
+  time the rows may hold). The step `publisher_on_disk` (`statedb.move_published`) moved 0.1.x's `published` and
+  `published_earlier` rows, and 0.2.0's `published_heal` marks, into `publish_items`, leaving those tables empty
+  (an import of published.json goes through them the same way);
 - `provider_records` (read per key; indexed by publisher and last-stored time for eviction and expiry; `pooled` is
   always 0 since 0.2.0), `provider_publishers` (first-seen times) and `provider_standing` (0.2.0: each publisher's
   record count, tier, refresh days and last refresh day; indexed by tier and count), NORMAL every 30 s, when 20 000
@@ -2107,10 +2157,10 @@ Everything in the specification is implemented, with these simplifications and a
   lookup: a lookup that misses one of x's closest servers misses it for the region's keys near x too.
 - Withdrawals are sent once, with any provides due for the same node. One that fails isn't retried, since the
   record expires after `PROVIDER_TTL`. A CID is withdrawn from the nodes of its last round and from nodes of
-  earlier rounds, or of a round cut short, that may still hold its record (`Publisher._earlier`, persisted in
-  `published_earlier`, forgotten after `PROVIDER_TTL`). Each node that accepts a key is added there as its
-  `/provide` returns, and the publish state is saved every 10 nodes or 30 s of a round
-  (`SAVE_EVERY_NODES`, `SAVE_EVERY_SECONDS`), so a crash loses at most that much of where a round stored.
+  earlier rounds, or of a round cut short, that may still hold its record (its row's `earlier`, forgotten after
+  `PROVIDER_TTL`). Each node that accepts a key is added there as its `/provide` returns, and the round's stores are
+  saved every 10 nodes or 30 s of a round (`SAVE_EVERY_NODES`, `SAVE_EVERY_SECONDS`, in `publish_stores`), so a
+  crash loses at most that much of where a round stored.
   A round stopped before every node was sent its keys leaves its CIDs due, and persisted times later than now
   are clamped to now.
 - A CID whose lookup found no nodes to publish to is retried after 30 s rather than at the next republish.

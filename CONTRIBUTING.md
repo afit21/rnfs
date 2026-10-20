@@ -49,7 +49,9 @@ variables:
 
 `tests/bench_block_writes.py` is a benchmark, not a test: run it by hand on the disks that matter (its docstring
 says how, including on a Raspberry Pi SD card). So is `tests/bench_startup.py`, which times opening a large block
-store at startup (after a clean stop, after a crash, and the first start on 0.1.6's layout). Performance changes
+store at startup (after a clean stop, after a crash, and the first start on 0.1.6's layout), and
+`tests/bench_publisher.py`, which measures what each provided key costs the publisher (memory, disk, writes per
+round) and how long a wake takes. Performance changes
 record their before and after numbers in CHANGELOG.md.
 
 `tests/interop.py` is a manual cross-version check, not a test either: it runs this tree's daemons against daemons

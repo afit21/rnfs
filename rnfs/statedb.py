@@ -27,8 +27,10 @@ SQLite's signed 64-bit integers, as decimal text.
 """
 import importlib
 import json
+import math
 import os
 import stat
+import struct
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -36,6 +38,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 from rnfs import fsutil
+from rnfs.constants import ID_LENGTH
+from rnfs.content.cid import Cid
 from rnfs.errors import RnfsError
 from rnfs.log import LOG_ERROR, LOG_NOTICE, log, plural
 
@@ -65,6 +69,65 @@ PROVIDER_STANDING = (
     " AND MAX(r.pooled = 0 AND r.last_stored - r.first_stored >= 86400)) AS earned,"
     " CAST(MAX(r.last_stored) / 86400 AS INTEGER) AS last_day"
     " FROM provider_records r JOIN provider_publishers p ON p.publisher = r.publisher GROUP BY r.publisher)")
+
+# publish_items' item for a DhtKey: this byte and the key (a binary CID starts with its version, 01)
+KEY_ITEM_PREFIX = b"\x00"
+ITEM_TIME = struct.Struct(">d")  # an earlier server's time in publish_items' earlier
+
+
+def _published_item(text) -> tuple[bytes, bytes] | None:
+    """(publish_items' item, its key) of an item as the published tables wrote it (str() of a Cid, or "key:" and a key's
+    hex digits), or None if it isn't one."""
+    if isinstance(text, str) and text.startswith("key:"):
+        try:
+            key = bytes.fromhex(text[len("key:"):])
+        except ValueError:
+            return None
+        return (KEY_ITEM_PREFIX + key, key) if len(key) == ID_LENGTH else None
+    try:
+        cid = Cid.parse(text)
+    except ValueError:
+        return None
+    return cid.binary, cid.key
+
+
+def _saved_time(value) -> bool:
+    """True if value is a time the published tables could hold: a finite int or float, not a bool."""
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def move_published(tx):
+    """Move the rows of the published, published_earlier and published_heal tables (rnfs 0.1.x's, and those an import
+    of published.json writes) into publish_items, inside transaction tx: an item's row, its earlier servers and its
+    mark become one row, due 0 until the publisher computes when (it does whenever the meta value (publisher,
+    interval) isn't its republish interval: deleted here). Rows the publisher would have skipped as malformed (an item
+    that doesn't parse, a time that isn't a number, node IDs not 16 bytes) are dropped, as are marks of items without
+    a published row. Times are kept as written: the publisher clamps those in the future when it loads. Never change
+    this: a schema step runs it."""
+    items: dict[bytes, list] = {}  # key -> [item, at, nodes, earlier {node: at}, heal]
+    for text, at, nodes in tx.execute("SELECT item, at, nodes FROM published").fetchall():
+        parsed = _published_item(text)
+        if parsed is None or not _saved_time(at) or not isinstance(nodes, bytes) or len(nodes) % ID_LENGTH:
+            continue
+        items.setdefault(parsed[1], [parsed[0], None, b"", {}, 0])[1:3] = [float(at), nodes]
+    for text, node, at in tx.execute("SELECT item, node, at FROM published_earlier").fetchall():
+        parsed = _published_item(text)
+        if parsed is None or not isinstance(node, bytes) or len(node) != ID_LENGTH or not _saved_time(at):
+            continue
+        items.setdefault(parsed[1], [parsed[0], None, b"", {}, 0])[3][node] = float(at)
+    for (text,) in tx.execute("SELECT item FROM published_heal").fetchall():
+        parsed = _published_item(text)
+        if parsed is not None and parsed[1] in items and items[parsed[1]][1] is not None:
+            items[parsed[1]][4] = 1
+    tx.executemany("INSERT OR REPLACE INTO publish_items (key, item, due, at, retry, nodes, earlier, heal)"
+                   " VALUES (?, ?, 0, ?, NULL, ?, ?, ?)",
+                   sorted((key, item, at, nodes, b"".join(node + ITEM_TIME.pack(when)
+                                                          for node, when in earlier.items()), heal)
+                          for key, (item, at, nodes, earlier, heal) in items.items()))
+    for table in ("published", "published_earlier", "published_heal"):
+        tx.execute(f"DELETE FROM {table}")
+    tx.execute("DELETE FROM meta WHERE store = 'publisher' AND key = 'interval'")
+
 
 SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
     ("statedb", (
@@ -272,6 +335,27 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         # time). The silences are forgotten 7 days after the last, so the node is asked afresh; at most 10,000 rows
         "CREATE TABLE range_support (node BLOB PRIMARY KEY, answers INTEGER NOT NULL, silences INTEGER NOT NULL,"
         " at REAL NOT NULL) WITHOUT ROWID",
+    )),
+    ("publisher_on_disk", (
+        # rnfs 0.2.0: the publisher reads its state per round rather than holding it in memory (rnfs.publisher). One
+        # row per provided item, by its DHT key (key: rows in key order, as rounds write them); item is a binary CID,
+        # or 00 and a DhtKey's key; due when it is next published (Unix time; 0: never published); at when it last
+        # was (NULL: never, or that round was cut short),
+        # retry when it is tried again sooner (NULL: not), nodes the servers that recorded it then (their IDs
+        # concatenated), earlier other servers that may still hold a record of it (ID and big-endian double time,
+        # concatenated), heal 1 if its last round reached no server beyond the island
+        "CREATE TABLE publish_items (key BLOB PRIMARY KEY, item BLOB NOT NULL, due REAL NOT NULL, at REAL, retry REAL,"
+        " nodes BLOB NOT NULL, earlier BLOB NOT NULL, heal INTEGER NOT NULL) WITHOUT ROWID",
+        "CREATE INDEX publish_items_due ON publish_items (due)",
+        "CREATE INDEX publish_items_heal ON publish_items (heal) WHERE heal != 0",
+        # The stores of a round in progress, saved as it goes so a crash in a round still leaves where it stored,
+        # and emptied when the round ends (its items' rows have them then). Rows are only appended, which writes few
+        # pages: first, with node x'', the round's items (each as publish_items' item, after a byte giving its
+        # length); then a row per server that answered, when, and the items it recorded (their places in that
+        # list, 4-byte big-endian)
+        "CREATE TABLE publish_stores (node BLOB NOT NULL, at REAL NOT NULL, items BLOB NOT NULL)",
+        # published, published_earlier and published_heal's rows become publish_items rows
+        move_published,
     )),
 )
 

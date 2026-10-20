@@ -601,7 +601,7 @@ class WideningPublisherTest(unittest.TestCase):
         stored = {node_id: set(stored) for node_id, stored, _ in client.calls}
         self.assertEqual(stored[ring], {keys[0]})
         self.assertEqual(len(result["published"]), 2)
-        published = publisher._published[next(item for item in result["published"] if item.key == keys[0])][1]
+        published = publisher.states()[next(item for item in result["published"] if item.key == keys[0])]["nodes"]
         self.assertIn(ring, published)  # withdrawn from too, when it stops being provided
 
     def test_slow_node_counts_widened_lookups_and_defers_the_rest(self):
