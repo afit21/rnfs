@@ -365,7 +365,8 @@ changed through a SNAPSHOT `RowStore` taking the table's lock; it imports the st
 which lookups import, needn't.
 
 `providers.py` — `ProviderStore(state_dir, record_budget=1 GiB, *, ttl=PROVIDER_TTL, clock=time.time, rng=random,
-max_per_key=1000, own_id=None, known=lambda id: False, free_space=None, record_bytes=None)` (`state_dir` holds the
+max_per_key=1000, own_id=None, known=lambda id: False, free_space=None, record_bytes=None, monotonic=time.monotonic,
+write_budget=WRITE_BUDGET)` (`state_dir` holds the
 state database; None: a private in-memory one, `statedb.connect_memory`, so tests run the same code):
 `store(key, publisher) -> bool`, `withdraw(key, publisher)`, `provide(publisher, keys, withdrawn) -> int`,
 `retain(keep) -> int` (drops every record and the standing of publishers `keep` rejects: private mode's
@@ -383,8 +384,20 @@ Records live on disk and are read per key. Nothing in memory grows with the reco
 - `save()` writes all of it in one transaction (NORMAL), then measures (`_measure`): the node's `maintain()`
   call, every 30 s (`RECORDS_INTERVAL`), expires and saves; a store saves itself once `FLUSH_CHANGES` (20 000)
   changes wait, and past `MAX_CHANGES` (saves failing) refuses others' new records rather than hold more. A refresh
-  writes nothing unless it moves the last-stored time by more than an hour (`REFRESH_WRITE`), or its day is a new
+  writes nothing unless it moves the last-stored time by more than 6 hours (`REFRESH_WRITE`), or its day is a new
   refresh day; a refusal writes nothing.
+- The write budget (`_WriteBudget`, REV2), full or not: new records and withdrawals spend rows from pools refilled
+  on `monotonic` per `WRITE_WINDOW` (30 s, the node's save interval), `WRITE_BUDGET` = (60, 30, 30): the first
+  open to every tier, the others kept for Earned and Known, who spend their own first; each pool starts full and
+  carries at most `WRITE_CARRY` (720) windows, 6 hours. `_store` refuses a new record of another publisher when its
+  pools are empty, as `_FULL` (so `provide` stops looking for the rest of the batch), and spends a row once it is
+  added; `_withdraw` spends one if any is left, never refusing. Every record inserted is deleted at most once, so
+  the rows written stay within twice the budget. A withdrawn record is kept in `_withdrawn` until the save (each is
+  a deleted row in `_dirty`, so bounded with it): stored again before then, `_store` adds it back with its
+  first-stored time (its last-stored time moved only past `REFRESH_WRITE`) as a refresh, spending nothing.
+  Measured on a 1M-record database, a new record costs about 12 kB of writes (WAL and checkpoint) for one publisher's
+  and 36 kB for a fresh identity's (its standing rows too), so a Newcomer flood writes at most about 150 kB/s;
+  without the budget one identity's store-and-withdraw loop wrote 10-20 MB/s.
 
 Each publisher's standing (`_Standing`: first seen, records held, tier, refresh days and the last of them) keeps
 the counts the budget and tiers need: `_tier_records` (records per tier, this node's in a tier of its own, `OWN`)

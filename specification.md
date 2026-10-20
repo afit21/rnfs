@@ -985,6 +985,16 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
     expired: one more way a full store makes room. The longest honest gap between republishes is just under
     3.5 days (kept names, below), so a record republished on time never lapses this way. A store that isn't
     full keeps every record `PROVIDER_TTL`, so a record survives one missed republish.
+  - **Write budget.** Full or not, the rows a node writes for others' records are budgeted, so no publisher can
+    make it write without bound (one identity storing and withdrawing records in a loop could make a store write
+    megabytes a second). In rnfs, new records and withdrawals spend a budget of 60 rows every 30 s open to every
+    publisher, plus 30 kept for Earned and 30 for Known publishers (the tiers above, by the same tests, though the
+    store needn't be full), who spend their own first; unused budget is carried over for up to 6 hours. Past it,
+    new records are refused; withdrawals spend what is left but are never refused, and refreshes cost nothing:
+    one is written only once it moves the record's last-stored time by more than 6 hours. A withdrawal followed by
+    a store of the same key by the same publisher before the node next writes its changes (every 30 s) is a
+    refresh, keeping its first-stored time. A 0.1.x publisher stores at most a few new keys a second, so the
+    budget carried over covers its first round to a server; republishing every day or every 3 days is refreshes.
   - A publisher's refresh days are persisted with its first-seen time, and kept `PROVIDER_TTL` after the last
     of them once its last record is gone, so one that was away for a while is still Earned; a publisher that
     never refreshed a record leaves nothing behind, so a flood of fresh identities grows no state.

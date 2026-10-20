@@ -13,6 +13,14 @@ record's last-stored time by more than REFRESH_WRITE, and a refused store writes
 is kept the same way: provider_standing (records held, tier, the UTC days it refreshed a record on) and
 provider_publishers (when it was first seen).
 
+Writes are budgeted, full or not (_WriteBudget): new records and withdrawals spend a budget of rows per WRITE_WINDOW
+(the node's save interval), WRITE_BUDGET, part of it open to every tier and parts kept for Earned and for Known
+publishers, unused budget carried over for WRITE_CARRY windows. Past it, others' new records are refused (as by a
+full store); withdrawals spend what is left but are never refused, and refreshes cost nothing. Every record inserted
+is deleted at most once, so the rows written stay within twice the budget, whatever a publisher sends. A withdrawal
+followed by a store of the same key and publisher before the next save is a refresh: the record comes back with its
+first-stored time (_withdrawn), spending nothing.
+
 Room is local policy (spec section 6). Records may take record_budget bytes of the state database, measured as its
 pages in use over the records held (so it counts their indexes, B-tree overhead and the database's other state), and
 never the free disk the blocks' reserve needs (free_space). While there is room anyone stores freely. Once the store
@@ -63,9 +71,20 @@ FLOORS = (0.10, 0.60, 0.30)  # by tier: the share of the budget a full store kee
 EARNED_DAYS = 3  # distinct UTC days a publisher must refresh a record it holds on to be Earned
 MAX_DAYS = 1000  # refresh days counted at most (only whether there are EARNED_DAYS matters)
 NEWCOMER_TTL_FULL = 4.5 * DAY  # while full, a Newcomer's record last stored this long ago counts as expired
-REFRESH_WRITE = HOUR  # a refresh moving a record's last-stored time by less is not written
+REFRESH_WRITE = 6 * HOUR  # a refresh moving a record's last-stored time by less is not written (TTL: 7 days)
 DEFAULT_RECORD_BUDGET = GIB  # bytes (Config.record_budget's default)
 MAX_PUBLISHERS_PER_KEY = 1000  # publishers recorded per key, besides this node
+# The write budget: new records and withdrawals a WRITE_WINDOW (the node's save interval, RECORDS_INTERVAL) by pool:
+# WRITE_BUDGET[NEWCOMER] is open to every tier, the others are kept for Earned and for Known publishers, who spend
+# their own first. Unused budget is carried over for up to WRITE_CARRY windows (6 h). So new records are written at
+# most 2 + 1 + 1 a second, each deleted again at most once: on a 1M-record database about 12 kB is written per new
+# record of one publisher and 36 kB per record of a fresh identity (its standing too), so a Newcomer flood writes
+# at most about 150 kB/s, against the 10-20 MB/s one identity's store-and-withdraw loop wrote without it. A 0.1.x
+# publisher stores at most about 3.3 new keys a second (a lookup each), so the 43,200 carried over for all covers
+# a first round of over 100,000 keys to one server; republishing is refreshes, which cost nothing
+WRITE_WINDOW = 30.0
+WRITE_BUDGET = (60, 30, 30)
+WRITE_CARRY = 720
 FLUSH_CHANGES = 20_000  # rows changed and not yet written past which a store writes them itself
 MAX_CHANGES = 2 * FLUSH_CHANGES  # past this (writes failing), others' new records are refused: memory stays bounded
 CACHE_ROWS = 50_000  # records of the keys used most recently kept in memory, at most ...
@@ -198,6 +217,48 @@ def import_records(value: dict, tx) -> int:
     return len(kept)
 
 
+class _WriteBudget:
+    """The rows (new records, withdrawals) the store may still write, by pool (WRITE_BUDGET), refilled as monotonic
+    time passes and starting full."""
+
+    __slots__ = ("per_window", "left", "at", "clock")
+
+    def __init__(self, per_window: tuple[int, ...], clock: Callable[[], float]):
+        """A budget of per_window rows a WRITE_WINDOW by pool, on clock (monotonic seconds)."""
+        self.per_window = per_window
+        self.clock = clock
+        self.left = [float(WRITE_CARRY * rows) for rows in per_window]
+        self.at = clock()
+
+    @staticmethod
+    def _pools(tier: int) -> tuple[int, ...]:
+        """The pools a publisher of tier spends from, its own first."""
+        return (tier, NEWCOMER) if tier in (EARNED, KNOWN) else (NEWCOMER,)
+
+    def _refill(self):
+        """Add what the time since the last refill earns, up to WRITE_CARRY windows' worth."""
+        now = self.clock()
+        if now > self.at:
+            windows = (now - self.at) / WRITE_WINDOW
+            self.left = [min(WRITE_CARRY * rows, left + windows * rows)
+                         for left, rows in zip(self.left, self.per_window, strict=True)]
+        self.at = now
+
+    def allows(self, tier: int) -> bool:
+        """Whether a publisher of tier may write a row now."""
+        self._refill()
+        return any(self.left[pool] >= 1 for pool in self._pools(tier))
+
+    def spend(self, tier: int) -> bool:
+        """Spend a row from tier's pools, if one is left; False if none is."""
+        self._refill()
+        for pool in self._pools(tier):
+            if self.left[pool] >= 1:
+                self.left[pool] -= 1
+                return True
+        return False
+
+
 class _Standing:
     """A publisher's standing here: when first seen, how many records it holds, its tier as last worked out, and the
     UTC days on which it refreshed a record it held (days, the last of them last_day)."""
@@ -225,14 +286,16 @@ class ProviderStore:
     seconds, since times are persisted. `rng` picks the random half of /find replies and the publisher a full key
     evicts. `known(publisher)` tells the Known tier; `free_space()` gives the bytes free on the state database's disk
     beyond the blocks' reserve (None: not checked); `record_bytes` fixes the bytes a record takes (None: measured).
-    `monotonic` is the clock of the recent refusals and evictions usage() reports.
+    `monotonic` is the clock of the recent refusals and evictions usage() reports, and of the write budget;
+    `write_budget` is its rows a WRITE_WINDOW by pool (WRITE_BUDGET; None: no budget).
     """
 
     def __init__(self, state_dir: str | None, record_budget: int = DEFAULT_RECORD_BUDGET, *,
                  ttl: float = PROVIDER_TTL, clock: Callable[[], float] = time.time, rng: random.Random = random,
                  max_per_key: int = MAX_PUBLISHERS_PER_KEY, own_id: bytes | None = None,
                  known: Callable[[bytes], bool] = _never, free_space: Callable[[], int] | None = None,
-                 record_bytes: float | None = None, monotonic: Callable[[], float] = time.monotonic):
+                 record_bytes: float | None = None, monotonic: Callable[[], float] = time.monotonic,
+                 write_budget: tuple[int, int, int] | None = WRITE_BUDGET):
         """A store of records taking up to record_budget bytes, on the state database in state_dir if given."""
         self.record_budget = record_budget
         self.ttl = ttl
@@ -247,6 +310,10 @@ class ProviderStore:
         self._dirty: dict[bytes, dict[bytes, tuple[float, float] | None]] = {}
         self._dirty_count = 0
         self._dirty_by_publisher: dict[bytes, set[bytes]] = {}  # the keys of each publisher's changed records
+        # Records withdrawn since the last save, (key, publisher) -> (first stored, last stored): one stored again
+        # before then is a refresh. Each is a deleted row in _dirty, so they are bounded with it
+        self._withdrawn: dict[tuple[bytes, bytes], tuple[float, float]] = {}
+        self._writes = None if write_budget is None else _WriteBudget(write_budget, monotonic)
         # Records of the keys used most recently, as the database has them with _dirty's changes: key -> publisher ->
         # (first stored, last stored), least recently used first, at most CACHE_ROWS rows of CACHE_KEYS keys
         self._cache: OrderedDict[bytes, dict[bytes, tuple[float, float]]] = OrderedDict()
@@ -304,7 +371,10 @@ class ProviderStore:
         check_id(key)
         check_id(publisher)
         with self._lock:
-            return self._remove(key, publisher)
+            withdrawn = self._withdraw(key, publisher)
+            if self._save_due():
+                self._try_save()
+            return withdrawn
 
     def provide(self, publisher: bytes, keys: Iterable[bytes], withdrawn: Iterable[bytes] = ()) -> int:
         """Apply one /provide batch from publisher: withdraw `withdrawn`, then store `keys`.
@@ -320,7 +390,7 @@ class ProviderStore:
         with self._lock:
             now = self._now()
             for key in withdrawn:
-                self._remove(key, publisher)
+                self._withdraw(key, publisher)
             stored = 0
             room = True
             for key in keys:
@@ -328,6 +398,20 @@ class ProviderStore:
                 stored += result == _STORED
                 room = room and result != _FULL
             return stored
+
+    def _withdraw(self, key: bytes, publisher: bytes) -> bool:
+        """Remove publisher's record for key at its request, kept in _withdrawn until the next save, spending the
+        write budget if any is left (a withdrawal is never refused). True if there was one. Lock held."""
+        record = self._key_records(key).get(publisher)
+        if record is None:
+            return False
+        tier = self._tier_of(publisher, self._get_standing(publisher))
+        self._remove(key, publisher)
+        if publisher != self.own_id:
+            self._withdrawn[(key, publisher)] = record
+            if self._writes is not None:
+                self._writes.spend(tier)
+        return True
 
     def _refuse(self, publisher: bytes, result: str) -> str:
         """Count a refused new record of publisher (not this node's) in its tier's refusals; result. Lock held."""
@@ -371,12 +455,19 @@ class ProviderStore:
             return _STORED
         if not room:
             return self._refuse(publisher, _FULL)
+        # Withdrawn since the last save: a refresh of that record rather than a new one
+        restored = self._withdrawn.pop((key, publisher), None) if record is None else None
+        if restored is not None and now - restored[1] >= self.ttl:
+            restored = None
         victim = None
+        tier = OWN
         if publisher != self.own_id:
             if self._changes() >= MAX_CHANGES and not (self._save_due() and self._try_save()):
                 return self._refuse(publisher, _REFUSED)
             standing = self._get_standing(publisher)
             tier = self._tier_of(publisher, standing)
+            if restored is None and self._writes is not None and not self._writes.allows(tier):
+                return self._refuse(publisher, _FULL)  # the write budget is spent: as when full, for the whole batch
             allowed, victim = self._key_room(records, tier, now)
             if not allowed:
                 return self._refuse(publisher, _REFUSED)
@@ -388,7 +479,14 @@ class ProviderStore:
         if victim is not None:
             self._count_eviction(victim)
             self._remove(key, victim)
-        self._add(key, publisher, now)
+        if restored is None:
+            self._add(key, publisher, now)
+            if tier != OWN and self._writes is not None:
+                self._writes.spend(tier)
+        else:
+            first, last = restored
+            self._add(key, publisher, now, (first, last if abs(now - last) <= REFRESH_WRITE else now))
+            self._refreshed_on(publisher, now)
         if self._save_due():
             self._try_save()
         return _STORED
@@ -399,6 +497,10 @@ class ProviderStore:
         first, last = record
         if abs(now - last) > REFRESH_WRITE:
             self._set_record(key, publisher, (min(first, now), now))
+        self._refreshed_on(publisher, now)
+
+    def _refreshed_on(self, publisher: bytes, now: float):
+        """publisher refreshed a record now: the day counts toward Earned if it is a new one. Lock held."""
         standing = self._get_standing(publisher)
         if standing is None:
             return
@@ -573,9 +675,10 @@ class ProviderStore:
             self._dirty_by_publisher.setdefault(publisher, set()).add(key)
         changed[publisher] = record
 
-    def _add(self, key: bytes, publisher: bytes, now: float):
-        """Add a new record of publisher for key, first and last stored now, and count it. Lock held."""
-        self._set_record(key, publisher, (now, now))
+    def _add(self, key: bytes, publisher: bytes, now: float, record: tuple[float, float] | None = None):
+        """Add a record of publisher for key, first and last stored now unless record gives them, and count it. Lock
+        held."""
+        self._set_record(key, publisher, (now, now) if record is None else record)
         standing = self._get_standing(publisher)
         if standing is None:
             # The day of a first store doesn't count toward Earned: only refreshes on later days do
@@ -1120,6 +1223,7 @@ class ProviderStore:
         self._dirty.clear()
         self._dirty_count = 0
         self._dirty_by_publisher.clear()
+        self._withdrawn.clear()
         self._dirty_standing.clear()
         self._dirty_seen.clear()
         # The changed standings are what the database has now: cached as any other, the most recently used
@@ -1206,6 +1310,8 @@ class ProviderStore:
             check(len(self._cache) <= CACHE_KEYS, "the key cache is over its size")
             check(self._dirty_count == sum(map(len, self._dirty.values())), "_dirty_count")
             check(self._dirty_by_publisher == _by_publisher(self._dirty), "_dirty_by_publisher")
+            check(all(self._dirty.get(key, {}).get(publisher, ()) is None for key, publisher in self._withdrawn),
+                  "a record in _withdrawn isn't a deleted row in _dirty")
             check(self._dirty_standing | self._dirty_seen == set(self._pinned_standings),
                   "the standings kept until saved aren't those changed")
             for publisher, standing in self._standings.items():

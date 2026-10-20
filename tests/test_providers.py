@@ -213,15 +213,15 @@ class RecordTest(StoreTestCase):
         self.clock.now += PROVIDER_TTL - 1
         self.assertEqual(self.store.providers(KEY), [ident(1)])
 
-    def test_a_refresh_within_an_hour_moves_nothing(self):
-        """A refresh is recorded only once it moves the last-stored time by more than REFRESH_WRITE (an hour)."""
+    def test_a_refresh_within_six_hours_moves_nothing(self):
+        """A refresh is recorded only once it moves the last-stored time by more than REFRESH_WRITE (6 h)."""
         self.store.store(KEY, ident(1))
-        self.clock.now += HOUR
+        self.clock.now += 6 * HOUR
         self.store.store(KEY, ident(1))
         self.assertEqual(self.store.record(KEY, ident(1)), (T0, T0))
         self.clock.now += 1
         self.store.store(KEY, ident(1))
-        self.assertEqual(self.store.record(KEY, ident(1)), (T0, T0 + HOUR + 1))
+        self.assertEqual(self.store.record(KEY, ident(1)), (T0, T0 + 6 * HOUR + 1))
 
     def test_expired_record_stored_again_is_new(self):
         self.store.store(KEY, ident(1))
@@ -790,6 +790,62 @@ class BudgetTest(StoreTestCase):
         self.assertFalse(store.is_full())
 
 
+class WriteBudgetTest(StoreTestCase):
+    """The write budget (tests/security/test_rev2_provider_write_budget.py has the attack): rows a window by pool,
+    here (2, 1, 1), so WRITE_CARRY windows carry 1440 for all and 720 each kept for Earned and Known."""
+
+    def setUp(self):
+        """A store with a small budget, on the test's clock for monotonic time too."""
+        super().setUp()
+        self.store = self.new_store(own_id=OWN, monotonic=self.clock, write_budget=(2, 1, 1))
+        self.carried = providers.WRITE_CARRY * 2
+
+    def spend(self, publisher: bytes = ident(0xA)) -> int:
+        """publisher stores new keys until one is refused; how many it stored."""
+        stored = 0
+        while self.store.store(ident((1 << 100) + self.store.record_count()), publisher):
+            stored += 1
+        return stored
+
+    def test_budget_refills_per_window_up_to_its_carry(self):
+        self.assertEqual(self.spend(), self.carried)
+        self.clock.now += providers.WRITE_WINDOW
+        self.assertEqual(self.spend(), 2)
+        self.clock.now += 10 * DAY
+        self.assertEqual(self.spend(), self.carried)
+        self.assertEqual(self.store.usage()["tiers"]["newcomer"]["refused_hour"], 1)
+
+    def test_own_records_and_refreshes_are_never_refused(self):
+        self.spend()
+        self.assertTrue(self.store.store(KEY, OWN))
+        self.store.withdraw(KEY, OWN)
+        self.assertTrue(self.store.store(KEY, OWN))
+        self.assertTrue(self.store.store(ident(1 << 100), ident(0xA)))  # its first record, refreshed
+
+    def test_withdrawals_spend_but_are_never_refused(self):
+        stored = keys(1 << 100, 100)
+        for key in stored:
+            self.assertTrue(self.store.store(key, ident(0xB)))
+        self.assertEqual(sum(self.store.withdraw(key, ident(0xB)) for key in stored), 100)
+        self.assertEqual(self.spend(), self.carried - 200)
+        self.store.save()  # stored again after a save, they are new records: refused
+        for key in stored:
+            self.assertFalse(self.store.store(key, ident(0xB)))
+        self.assertTrue(self.store.withdraw(ident(1 << 100), ident(0xA)))
+
+    def test_earned_and_known_spend_their_own_first(self):
+        earned = ident(0xE)
+        self.earn(self.store, earned, 1, 5000)
+        self.known.add(ident(0xC))
+        self.assertEqual(self.spend(earned), self.carried + providers.WRITE_CARRY)
+        self.assertEqual(self.spend(ident(0xC)), providers.WRITE_CARRY)
+        self.assertEqual(self.spend(), 0)
+
+    def test_no_budget(self):
+        store = self.new_store(monotonic=self.clock, write_budget=None)
+        self.assertEqual(sum(store.store(ident((1 << 100) + n), ident(0xA)) for n in range(3000)), 3000)
+
+
 class CacheTest(StoreTestCase):
     """Memory doesn't grow with the records or publishers: the caches are bounded, the rest is read per key."""
 
@@ -863,13 +919,13 @@ class PersistenceTest(StoreTestCase):
         self.assertEqual(rows_written(transactions), 10 + 2 + 2)
         self.assertEqual(saved(self.state), held(store))
 
-    def test_refreshes_are_written_only_past_an_hour(self):
+    def test_refreshes_are_written_only_past_six_hours(self):
         store = self.open()
         for n in range(100):
             store.store(ident(100 + n), ident(1))
         store.save()
         with recorded_writes(store._db) as transactions:
-            self.clock.now += HOUR
+            self.clock.now += 6 * HOUR
             for n in range(100):
                 store.store(ident(100 + n), ident(1))
             store.save()
