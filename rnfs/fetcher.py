@@ -32,9 +32,9 @@ in a fetch that found none either, is remembered for UNFOUND_FOR (MAX_UNFOUND ro
 nodes, but doesn't search again within it and fails with NotFound. An explicit fetch (the user's get, cat, pin add and
 the rest of the CLI and API, a remote pin's) always searches. Only this node's own lookups set it, keyed on the root.
 
-A provider fails, and isn't used again during the fetch, when its link fails (no path, closed by the provider, a
-malformed answer), it answers None for a block of the root it advertised, it is busy max_failures times in a row (each
-retried after BUSY_DELAY), its requests go unanswered max_failures times in a row the way a lossy link loses them
+A provider fails, and isn't used again during the fetch, when its link fails (no path, a malformed answer), it answers
+None for a block of the root it advertised, it is busy (refuses, or closes the link: peer_client.BUSY) max_failures
+times in a row (each retried after BUSY_DELAY), its requests go unanswered max_failures times in a row the way a lossy link loses them
 (peer_client.LOST: each has its link closed and is retried on a new one after BUSY_DELAY), or it stalls twice. When no
 providers are left, the lookup runs again for a fresh random half of providers, within the same lookup_timeout. A block
 not matching its CID bans the provider; a correctly hashed block that isn't a valid DAG node marks the root invalid
@@ -1700,9 +1700,10 @@ class Fetch:
                 self._fail(provider, f"doesn't have {plural(len(result.missing), 'block')} of the root it advertised")
             elif result.blocks:
                 self._pace(provider, sent_at, rate)
-        elif result.status == peer_client.BUSY and result.reason != "cancelled" and now < provider.pacing_until:
+        elif result.status == peer_client.BUSY and result.reason not in ("cancelled", "closed") \
+                and now < provider.pacing_until:
             # Refused soon after it served us: most likely its upload pacing, which isn't a failure (a response
-            # it cancelled, displaced or past its deadline, counts as busy as usual)
+            # it cancelled, displaced or past its deadline, or a link it closed, counts as busy as usual)
             provider.busy_until = now + provider.pacing_retry
         elif result.status == peer_client.BUSY:
             provider.busy += 1

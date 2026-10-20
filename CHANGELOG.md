@@ -142,6 +142,12 @@ Security:
   from the closest up to the first that isn't (its distance scaled to the 10th), so a node that knows few identities,
   on a LoRa island, doesn't underestimate the network instead. Over 300 servers with such a server in every lookup:
   288 -> 743 before, 288 -> 318 now.
+- **RNS's identity blackhole is honoured** (specification section 10, "Blackholed identities"): RNS drops a
+  blackholed identity's announces and paths, but rnfs kept using what it held, so the node stayed in the routing
+  table, was asked in lookups, and its provider records were handed out and fetched from. The node now reads the
+  list (`rnpath -B`, blackhole sources; through rnsd too) every 5 minutes and treats a listed identity's node ID as
+  banned while it is listed (nothing of it is saved: it ends when the identity leaves the list), and answers `False`
+  to every request on a link identified as a listed identity.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
@@ -624,6 +630,24 @@ Changed:
   peers count as one interface), so a gateway's lookups no longer send requests for internet nodes over its radio.
   A node named over a slow interface, joins, names, providers and links to known nodes ask on every interface, and
   nothing changes through a shared instance.
+- Shorter path waits for lookup candidates on nodes that aren't slow: a node measures how long its path requests take
+  to be answered, and once 20 are measured a lookup's path check waits their 95th percentile, at least RNS's own 15 s,
+  instead of `path_timeout` (30 s): a candidate whose path doesn't come costs half as long, as the lookup has others
+  to ask. Names, nodes the user names, stores, fetches, joins and slow nodes still wait `path_timeout`.
+- A server closing a link (RNS's `DESTINATION_CLOSED`: no room for another incoming link, or going away) is a
+  refusal, not a failure: a lookup's `/find` on such a link no longer counts against the server in the routing table,
+  its score or partition mode (a partition probe it ends counts as reaching the outside), and a `/blocks` provider
+  that closes the link is busy, asked again on a new link after the busy delay and failed after `max_failures` in a
+  row, instead of failing at once. A link that timed out, or that this node closed, counts as before.
+- A slow node paces by its radio's measured load: RNodes report their own airtime and the channel's load (over 15 s
+  and an hour, through rnsd too), which a slow node reads at most every 15 s while it has paced work. While the
+  channel's load is above 25% its path requests and publishing rounds (the heal republish's too) are spaced further
+  apart in proportion (twice as far at 50%, at most 4 times), never so far that a record would go unrepublished for
+  half its 7-day lifetime; while its own airtime over the last hour is above 50% it refuses `/blocks` (a new airtime
+  refusal, `blocks_refused_airtime` in `rnfs status`, `airtime` in `GET /api/stats`'s `refused`); and while its own
+  transmissions took over 2% of the channel in the last hour, `provide_entries`' default doesn't turn entries on. A
+  figure of 0.0 counts as unknown (RNodes report it before their first measurement); other nodes and interfaces
+  without the figures keep the estimates they had.
 
 Faster:
 - Fetching something again doesn't look it up again. Nothing was kept between fetches, so once its links had closed

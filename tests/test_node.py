@@ -1484,8 +1484,11 @@ class LookupStartTest(NodeTest):
         self.b.slow_paths.hops = self.b.paths.hops
         paths = {bytes([1]) * 16: 5, bytes([2]) * 16: 1}
 
-        def await_path(node_id: bytes) -> bool:
+        waits = []
+
+        def await_path(node_id: bytes, timeout: float | None = None) -> bool:
             """The path request's answer: a path for the nodes in paths."""
+            waits.append(timeout)
             if node_id in paths:
                 hops[node_id] = paths[node_id]
             return node_id in paths
@@ -1496,6 +1499,11 @@ class LookupStartTest(NodeTest):
             self.assertTrue(self.b._path_check(bytes([1]) * 16))  # 5 hops: ranked again
             self.assertIsNone(self.b._path_check(bytes([2]) * 16))
             self.assertIs(self.b._path_check(bytes([3]) * 16), False)  # no path: a failed query
+            self.assertEqual(waits, [self.b.config.path_timeout] * 3)  # no path-response times measured
+            # Once they are, the measured wait (PathRequests.candidate_wait)
+            self.b.links = mock.Mock(paths=mock.Mock(candidate_wait=lambda path_timeout: 15.0))
+            self.b._path_check(bytes([4]) * 16)
+            self.assertEqual(waits[-1], 15.0)
 
 
 class JoinTest(NodeTest):

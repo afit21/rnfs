@@ -6337,12 +6337,17 @@
               },
               "quiet_hours": {
                 "type": "integer"
+              },
+              "airtime": {
+                "type": "integer",
+                "description": "A slow node's radio measured its own airtime over budget."
               }
             },
             "required": [
               "budget",
               "interface",
-              "quiet_hours"
+              "quiet_hours",
+              "airtime"
             ],
             "description": "/blocks requests refused, by cause."
           },
@@ -6710,6 +6715,10 @@
             "type": "integer",
             "description": "/blocks requests refused: quiet hours."
           },
+          "blocks_refused_airtime": {
+            "type": "integer",
+            "description": "/blocks requests refused: a slow node's radio measured its own airtime over the last hour above its budget (spec section 3, \"Measured airtime\")."
+          },
           "upload_budget_left": {
             "type": "integer",
             "description": "Bytes of `upload_budget` left; absent when no budget is set."
@@ -6720,7 +6729,8 @@
           "bytes_received",
           "blocks_refused_budget",
           "blocks_refused_interface",
-          "blocks_refused_quiet_hours"
+          "blocks_refused_quiet_hours",
+          "blocks_refused_airtime"
         ],
         "description": "The peers feature's status fields."
       },

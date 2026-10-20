@@ -132,7 +132,8 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
 - A node SHOULD pace its own path requests, so RNS's estimate for it at the next hop's interface stays well under a
   new interface's 3 a second. rnfs keeps one budget per node for every path request it sends (link opens, so lookups,
   stores, fetches and keeper queries; a lookup's path check; name resolves; NomadNet adds): each takes a turn at least
-  1 s after the last, and requests 1 s apart peak at an estimate of 1.5 a second. A request waiting for its turn
+  1 s after the last, and requests 1 s apart peak at an estimate of 1.5 a second. On a slow node the spacing grows
+  while its radio measures the channel busy (up to 4 s; "Measured airtime", below). A request waiting for its turn
   hasn't failed, and the wait isn't part of `path_timeout`, which starts once it is sent. A turn is also put off while
   the busiest interface's outgoing estimate (RNS's `outgoing_pr_frequency` from `get_interface_stats`, through a
   shared instance too, which counts other applications' requests; a hub's server interface, which counts a copy for
@@ -143,6 +144,12 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   destination runs at a time (RNS's `Transport.await_path` doesn't join concurrent callers; later callers wait for
   it), and nothing is sent again for a destination within `PATH_REQUEST_MI` of its last request, RNS's own included: a
   caller then waits `path_timeout` for the answer still on its way.
+- A lookup has other candidates, so a node that isn't slow MAY wait less than `path_timeout` for a candidate's path.
+  rnfs measures how long its path requests take to be answered (from the request sent to the path, or the identity
+  its answer carries; the last 100 answered, of waits as long as `path_timeout`), and once 20 are measured a lookup's
+  path check waits their 95th percentile, at least RNS's own `PATH_REQUEST_TIMEOUT` (15 s) and at most `path_timeout`;
+  those shorter waits aren't measured, so they can't pull the figure down to their own length. Everything else waits
+  `path_timeout`: names, a node the user or a remote pin names, stores, fetches, joins, and every wait on a slow node.
 - In the topology simulation (docs/simulations/topology, section 11; 1,000 and 3,000 servers) the pacing keeps a fast
   node that starts for the first time from tripping its hub's interface (peak estimate 1.5 a second): none of its
   ~45 requests is dropped (7–10 were at a hub taking 2–10 ms a packet), and no such node has 3 failed queries in a
@@ -392,6 +399,26 @@ refused by them SHOULD be answered at once, before a response slot is reserved o
     7) is cut to what the bucket holds less what is committed, less 1 KiB.
   - A request arriving while the bucket is empty or in debt is refused before its response is built.
   - Responses of only `None` entries are not charged.
+- **Measured airtime** (no setting; a slow node only, below): `/blocks` is refused while the node's radio measured its
+  own airtime over the last hour (`airtime_long`) above 50%. A single paced transfer stays under it, as a slow link's
+  upload cap is half its rate estimate (above), so the node refuses only while it serves several at once or is busy
+  with other traffic. `rnfs status` counts these refusals as `blocks_refused_airtime`.
+
+**Measured airtime.** RNodes measure their own airtime and the load of the channel they are on, over 15 s and over an
+hour, and RNS reports them with each interface's stats (`Reticulum.get_interface_stats`: `airtime_short`,
+`airtime_long`, `channel_load_short`, `channel_load_long`, in percent; through a shared instance too, by RPC). An RNode
+reports 0.0 until its first measurement, so 0.0 counts as unknown, as does an interface without the figures. A slow
+node (section 2) MAY pace by them; rnfs:
+- reads them at most every 15 s, and only while it has paced work asking (a path request taking its turn, a publishing
+  round, a `/blocks` request, a refresh choosing entries), taking each figure from the busiest online radio (a shared
+  instance's local interfaces left out) and the channel's load from the 15 s figure while known, else the hour's;
+- while the channel's load is above 25%, spaces its path requests (below) and its publishing rounds' lookups (the heal
+  republish's included, section 6) further apart, in proportion to the load (twice as far at 50%, at most 4 times),
+  never so far that a record a round doesn't republish would go unrepublished past `PROVIDER_TTL / 2`;
+- refuses `/blocks` while its own airtime is over budget (the airtime control above);
+- doesn't turn `provide_entries` on by default while its own airtime over the last hour is above the estimate's 2%
+  (section 6): the estimate covers republishing alone, the radio everything the node sent.
+Other nodes, and nodes whose interfaces don't report the figures, keep the estimates they use without them.
 
 **Private mode.** RNS Interface Access Codes keep outsiders off an interface. To restrict rnfs itself
 across shared interfaces and transport nodes, a node MAY run in private mode:
@@ -669,6 +696,10 @@ announced once a day, would take all of it).
 - A node is dropped after `max_failures` queries in a row go unanswered; hearing from it resets the count.
   Lossy links can drop a live server this way, so a dropped node's first-seen time is kept for
   `2 × announce_interval`, and it regains its seniority if it comes back within that time.
+- A query whose link the server closed (RNS's `teardown_reason`, `DESTINATION_CLOSED` at the end that opened it: a
+  server with no room for another incoming link closes it, or one going away) is a refusal, not a failure: it counts
+  neither here, nor against the node's local score, nor towards partition mode ("LoRa islands"), and a partition
+  probe it ends has reached the island's outside. Such a node is up; one going away fails its next query.
 - **Saved across restarts.** A node SHOULD save its routing table: each entry's first-seen and last-heard times
   and whether it failed a query since, the first-seen times of dropped nodes until they expire, and bans until
   they end. Times are saved as wall clock; one later than the current time when loaded (a clock since corrected
@@ -815,9 +846,9 @@ and repeat.
   answer for a node's next-hop interface for up to 15 seconds (each answer is an RPC to it); hops, and whether
   there is a path at all, are read fresh.
 
-  A provider *fails* when its link fails (there is no path to it, or the link is closed under a request by either end),
-  its answer is malformed, it answers `None` for a block of the root it advertised, it answers `False` (busy or refused)
-  `max_failures` times in a row, its requests go unanswered `max_failures` times in a row, or it stalls twice (section
+  A provider *fails* when its link fails (there is no path to it, or this node closed the link under a request), its
+  answer is malformed, it answers `None` for a block of the root it advertised, it answers `False` (busy or refused)
+  or closes the link (`DESTINATION_CLOSED`, a refusal: above; asked again on a new link) `max_failures` times in a row, its requests go unanswered `max_failures` times in a row, or it stalls twice (section
   7). A `False` is retried after a short delay. A request goes *unanswered* when RNS times it out with the link up (on a
   lossy path its packet or its answer's was lost: RNS resends neither), the link times out under it, or a new link to a
   node RNS has a path to isn't established (its link request or proof lost); the requester closes that link (which
@@ -1097,7 +1128,9 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
 - A slow node SHOULD pace its closest-nodes lookups, since each is several `/find` exchanges at radio rates
   (rnfs: at most 10 region and widened lookups per publish round, each region lookup publishing every due key of
   its region, and after a round of n lookups the next waits 30 × n s, as does a search's fallback; items never
-  published go first, then those unpublished longest).
+  published go first, then those unpublished longest). rnfs stretches that wait while its radio measures the channel
+  busy (section 3, "Measured airtime"), never past where a record the round didn't republish would go unrepublished
+  for `PROVIDER_TTL / 2`.
   It SHOULD pace withdrawals too: each server they alone reach costs an identified link and a request, and
   unpinning many keys reaches many servers (1,000 keys at 1,000 servers: about 2.9 h of airtime at 1 kbit/s).
   rnfs sends a slow node's withdrawals along with the round's stores to the same servers, and counts each server
@@ -1214,6 +1247,10 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
     table's size and the density check's estimate (below), and taken as 1,000 or more until a region has been found (past about 500 servers the answer no
     longer changes). One mid-size folder already exceeds what a 1 kbit/s node can republish: past that, remote
     pinning on a fast node (the existing `/pin`) shares it instead.
+  - The estimate is checked against what the radio measures (section 3, "Measured airtime"): while the node's own
+    transmissions took over 2% of the channel in the last hour, a slow node doesn't turn entries on by default, though
+    the estimate allows it; once on, a busy hour doesn't withdraw them (the estimate alone does). Unknown (no radio
+    reporting it): the estimate decides.
   - `provide_entries = true` provides entries whatever the estimate (still up to the cap); `false` provides none.
     When none are provided, the node's status says why.
   - Privacy: each entry provided tells anyone looking up its CID that this node has that file or folder, without
@@ -1826,6 +1863,17 @@ as is cheap. Rules live in the sections referenced.
   make the root invalid.
 
 RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
+
+**Blackholed identities.** RNS (1.5.6) keeps a list of blackholed identities, filled by the instance's operator
+(`rnpath -B`) and by the blackhole lists it subscribes to (`blackhole_sources`), and returns it from
+`Reticulum.get_blackholed_identities` (through a shared instance too, by RPC). RNS itself drops their announces,
+removes the paths to their destinations and tears down an incoming link that identifies as one. A node SHOULD also
+honour it: rnfs reads the list every 5 minutes (an entry whose `until` has passed counts as lifted) and, while an
+identity is listed, treats its node ID (the `rnfs.dht` destination of that identity) as banned (dropped from the
+routing table and kept out of it, left out of lookups, its provider records not handed out or used, never asked by a
+fetch), and answers `False` to every request on a link identified as it (one identified before it was listed, which
+RNS lets be). Unlike a ban, nothing of this is kept: it ends when the identity leaves the list. An unidentified link
+(lookups, downloads) carries no identity, so it is served as any other.
 
 **Privacy** (outside private mode, where every link identifies).
 - Lookups and downloads use unidentified links, so the nodes asked learn only that *some* node wants a key.
@@ -2470,7 +2518,7 @@ Reticulum, the DHT mode and private mode never apply before a restart.
 | `stall_timeout` | 120 s | A response with no progress for this long is cancelled and refunded |
 | `blocks_cooldown` | 300 s | A link (and its identity) whose response made no progress is refused `/blocks` this long |
 | `lookup_timeout` | 10 min | |
-| `path_timeout` | 30 s | Waiting for an RNS path, from when the path request is sent (a wait for its turn, section 3, isn't counted) |
+| `path_timeout` | 30 s | Waiting for an RNS path, from when the path request is sent (a wait for its turn, section 3, isn't counted); a lookup's path check on a node that isn't slow waits less once path-response times are measured (section 3) |
 | `max_failures` | 3 | Unanswered queries in a row before a node is dropped; busy refusals in a row before a provider fails |
 | `link_idle_timeout` | 5 min | |
 | `max_incoming_links` | 128 | |

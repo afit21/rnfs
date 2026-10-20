@@ -273,6 +273,69 @@ INTERNALS = [
                                "spawned_interfaces", "bitrate"),
                       _has(RNS.Interfaces.Interface.Interface, "OUT"))),
 
+    Internal("network/channel.py", "Reticulum.get_interface_stats() entries {airtime_short, airtime_long, "
+             "channel_load_short, channel_load_long} from an interface's r_airtime_* and r_channel_load_*, which "
+             "RNodeInterface starts at 0.0 and sets in percent; a shared instance's RPC answering interface_stats with "
+             "its own get_interface_stats()",
+             lambda: (_source(RNS.Reticulum.get_interface_stats,
+                              "if hasattr(interface, 'r_airtime_short'): ifstats['airtime_short'] = "
+                              "interface.r_airtime_short",
+                              "if hasattr(interface, 'r_airtime_long'): ifstats['airtime_long'] = interface.r_airtime_long",
+                              "if hasattr(interface, 'r_channel_load_short'): ifstats['channel_load_short'] = "
+                              "interface.r_channel_load_short",
+                              "if hasattr(interface, 'r_channel_load_long'): ifstats['channel_load_long'] = "
+                              "interface.r_channel_load_long",
+                              "rpc_connection.send_bytes(mp.packb({'get': 'interface_stats'}))"),
+                      _source(RNS.Reticulum.rpc_loop,
+                              "if path == 'interface_stats': self.rpc_return(conn, self.get_interface_stats())"),
+                      _assigns(_rnode().__init__, r_airtime_short="0.0", r_airtime_long="0.0",
+                               r_channel_load_short="0.0", r_channel_load_long="0.0"),
+                      _source(_rnode(), "self.r_airtime_short = ats/100.0", "self.r_airtime_long = atl/100.0",
+                              "self.r_channel_load_short = cus/100.0", "self.r_channel_load_long = cul/100.0"))),
+
+    Internal("network/paths.py", "Transport.PATH_REQUEST_TIMEOUT, RNS's own wait for a path (the shortest "
+             "candidate_wait), and await_path blocking until the path is there or the timeout passes",
+             lambda: (_true(RNS.Transport.PATH_REQUEST_TIMEOUT == paths.PATH_REQUEST_TIMEOUT,
+                            "PATH_REQUEST_TIMEOUT changed"),
+                      _source(RNS.Transport.await_path, "while not Transport.has_path(destination_hash) and time.time() "
+                              "< timeout: time.sleep(0.05)", "return Transport.has_path(destination_hash)"))),
+
+    # Why a link closed
+    Internal("network/links.py, network/client.py", "Link.teardown_reason naming the end that closed a link by its "
+             "role: teardown() sets INITIATOR_CLOSED at the opener (DESTINATION_CLOSED at the other end), a LINKCLOSE "
+             "received sets DESTINATION_CLOSED at the opener, the watchdog sets TIMEOUT",
+             lambda: (_true((RNS.Link.TIMEOUT, RNS.Link.INITIATOR_CLOSED, RNS.Link.DESTINATION_CLOSED) == (1, 2, 3),
+                            "teardown reasons changed"),
+                      _source(RNS.Link.teardown, "if self.initiator: self.teardown_reason = Link.INITIATOR_CLOSED",
+                              "else: self.teardown_reason = Link.DESTINATION_CLOSED"),
+                      _source(RNS.Link.teardown_packet, "if self.initiator: self.teardown_reason = "
+                              "Link.DESTINATION_CLOSED", "else: self.teardown_reason = Link.INITIATOR_CLOSED"),
+                      _source(RNS.Link._Link__watchdog_job, "self.teardown_reason = Link.TIMEOUT"))),
+
+    # Blackholed identities
+    Internal("network/blackhole.py", "Reticulum.get_blackholed_identities() returning Transport.blackholed_identities "
+             "({identity hash: {source, until, reason}}), through a shared instance by the blackholed_identities RPC; "
+             "Destination.hash(identity hash, app, aspects) taking a 16-byte identity hash",
+             lambda: (_source(RNS.Reticulum.get_blackholed_identities,
+                              "rpc_connection.send_bytes(mp.packb({'get': 'blackholed_identities'}))",
+                              "else: return RNS.Transport.blackholed_identities"),
+                      _source(RNS.Reticulum.rpc_loop, "if path == 'blackholed_identities': "
+                              "self.rpc_return(conn, self.get_blackholed_identities())"),
+                      _source(RNS.Transport.blackhole_identity,
+                              "entry = {'source': Transport.identity.hash, 'until': until, 'reason': reason}",
+                              "Transport.blackholed_identities[identity_hash] = entry"),
+                      _true(isinstance(RNS.Transport.blackholed_identities, dict), "not a dict"),
+                      _true(RNS.Destination.hash(bytes(16), "rnfs", "dht")
+                            == RNS.Destination.hash(_identity_with_hash(bytes(16)), "rnfs", "dht"),
+                            "Destination.hash of an identity hash differs from the identity's"))),
+    Internal("network/blackhole.py, network/server.py", "RNS itself tearing down an incoming link that identifies as a "
+             "blackholed identity (Link LINKIDENTIFY, before remote_identified), and dropping its announces "
+             "(Identity.validate_announce)",
+             lambda: (_source(RNS.Link._Link__receive, "if RNS.Reticulum.get_instance().is_blackholed(identity.hash):",
+                              "self.teardown()"),
+                      _source(RNS.Identity.validate_announce,
+                              "if announced_identity.hash in RNS.Transport.blackholed_identities:"))),
+
     # Sealed files
     Internal("content/seal.py", "RNS.Cryptography.hkdf(length, derive_from, salt, context), "
              "AES.AES_256_CBC.encrypt/decrypt(data, key, iv), and Identity.encrypt of a content key being "
@@ -364,6 +427,19 @@ def _destination(app: str, *aspects: str, identity=None, direction=RNS.Destinati
     """A Destination that isn't registered with Transport."""
     with mock.patch.object(RNS.Transport, "register_destination"):
         return RNS.Destination(identity or RNS.Identity(), direction, RNS.Destination.SINGLE, app, *aspects)
+
+
+def _identity_with_hash(identity_hash: bytes):
+    """An object Destination.hash takes as an RNS.Identity whose hash is identity_hash."""
+    identity = RNS.Identity(create_keys=False)
+    identity.hash = identity_hash
+    return identity
+
+
+def _rnode():
+    """RNS's RNodeInterface class (imported here: other tests needn't load the serial interfaces)."""
+    from RNS.Interfaces.RNodeInterface import RNodeInterface
+    return RNodeInterface
 
 
 def _incoming_link():

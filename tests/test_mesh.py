@@ -19,6 +19,7 @@ from rnfs.constants import BLOCKS_PATH, FIND_PATH, KIB, MAX_RESPONSE_SIZE
 from rnfs.features import peers as peers_feature
 from rnfs.network import protocol, server
 from rnfs.network.announces import DhtAnnounceHandler, encode_mode
+from rnfs.network.channel import ChannelLoad
 from rnfs.network.client import BUSY, FAILED, OK, BlocksResult, PeerClient
 from rnfs.node import RnfsNode
 from tests.support import FakeClock, wait_for
@@ -683,6 +684,23 @@ class ServerAirtimeTest(unittest.TestCase):
         srv.airtime.minute_of_day = lambda: 12 * 60
         self.assertIsNot(self.blocks(link), False)
 
+    def test_measured_airtime_refuses_blocks(self):
+        """A slow node whose radio measured its own airtime over the last hour above the budget refuses /blocks
+        (counted as an airtime refusal), at once and before any slot; /find is still answered."""
+        srv = self.make_server()
+        figures = {"airtime_long": 60.0}
+        reticulum = types.SimpleNamespace(get_interface_stats=lambda: {"interfaces": [
+            {"type": "RNodeInterface", "status": True, **figures}]})
+        srv.airtime.over_airtime = ChannelLoad(lambda: reticulum, clock=self.clock).over_budget
+        link = self.connect("RNode LoRa")
+        self.assertIs(self.blocks(link), False)
+        self.assertIsNot(self.ask(FIND_PATH, protocol.encode_find(bytes(16)), link), False)
+        self.assertEqual(srv.traffic.snapshot()["refused"][mesh.REFUSED_AIRTIME], 1)
+        self.assertEqual(srv.incoming.in_progress(link.link_id), (0, 0))
+        figures["airtime_long"] = 30.0
+        self.clock.now += 15  # the next reading
+        self.assertIsNot(self.blocks(link), False)
+
     def test_upload_budget(self):
         srv = self.make_server(upload_budget=150 * KIB)
         self.assertIsNot(self.blocks(self.connect(), 0), False)  # full bucket
@@ -1060,7 +1078,7 @@ class PeersFeatureTest(unittest.TestCase):
     def test_status_and_stats(self):
         status = self.node.status()
         for key in ("bytes_sent", "bytes_received", "blocks_refused_budget", "blocks_refused_interface",
-                    "blocks_refused_quiet_hours"):
+                    "blocks_refused_quiet_hours", "blocks_refused_airtime"):
             self.assertEqual(status[key], 0, key)
         stats = self.feature.stats()
         self.assertEqual(stats["upload_budget"], 1000)

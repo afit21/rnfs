@@ -19,7 +19,8 @@
   Link.identify() is unacknowledged.
 - A shared link that has a path and identity but isn't established is remembered (LinkPool.unestablished): on a
   lossy path its link request or proof may have been lost, so the fetcher tries again rather than give up on the
-  node (specification section 6, unanswered requests).
+  node (specification section 6, unanswered requests). One the node closes (closed_by_other: RNS's teardown_reason) is
+  a refusal (LinkPool.refused), not a failure.
 - A request that wouldn't fit one packet on its link isn't sent: RNS would send it as a Resource, which nodes
   refuse (network/guards.py) and RNS may compress.
 - Every path request goes through the node's budget (LinkPool.paths, network/paths.py), whose wait doesn't count
@@ -63,12 +64,19 @@ def close_reason(link) -> str:
     reason = getattr(link, "teardown_reason", None)
     if reason == LINK_TIMEOUT:
         return "timed out"
-    ours = INITIATOR_CLOSED if getattr(link, "initiator", True) else DESTINATION_CLOSED
-    if reason == ours:
-        return "closed by this node"
-    if reason in (INITIATOR_CLOSED, DESTINATION_CLOSED):
+    if closed_by_other(link):
         return "closed by the other node"
+    if reason in (INITIATOR_CLOSED, DESTINATION_CLOSED):
+        return "closed by this node"
     return "closed"
+
+
+def closed_by_other(link) -> bool:
+    """True if the other node closed link (RNS's teardown_reason, which names the end by its role): for a link this
+    node opened, a server refusing it (no room for another incoming link) or going away. A refusal, not a failure
+    (specification section 6): the node is up."""
+    theirs = DESTINATION_CLOSED if getattr(link, "initiator", True) else INITIATOR_CLOSED
+    return getattr(link, "teardown_reason", None) == theirs
 
 
 def idle_limit(link_idle_timeout: float, keepalive, rtt, rated: bool) -> float:
@@ -195,6 +203,7 @@ class PeerLink:
         # The node had a path and its identity, but the link wasn't established: its request or proof may have been
         # lost on the way (LinkPool._open), rather than the node being out of reach
         self.unestablished = False
+        self.refused = False  # the node closed the link before it was established at this end (closed_by_other)
         self.handed_out: float | None = None  # when LinkPool.get() last returned it (the pool's clock)
         self.held_until: float | None = None  # LinkPool.hold: in use until then, as if handed out then
         self.cond = threading.Condition()
@@ -296,6 +305,8 @@ class LinkPool:
         self.connecting: dict[bytes, threading.Event] = {}  # one thread opens a node's shared link at a time
         # Nodes whose last shared link get() tried to open had a path and identity but wasn't established
         self.not_established: set[bytes] = set()
+        # Nodes that closed the last shared link get() tried to open before it was established here (refused)
+        self.closed_by: set[bytes] = set()
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.sweeper: threading.Thread | None = None
@@ -348,12 +359,13 @@ class LinkPool:
                 if opened and peer.is_active():
                     peer.handed_out = self.clock()
                     self.shared[node_id] = peer
-                if peer.unestablished:
-                    if len(self.not_established) >= MAX_NOT_ESTABLISHED:
-                        self.not_established.clear()  # only the latest attempts matter; keeps it bounded
-                    self.not_established.add(node_id)
-                else:
-                    self.not_established.discard(node_id)
+                for marked, flag in ((self.not_established, peer.unestablished), (self.closed_by, peer.refused)):
+                    if flag:
+                        if len(marked) >= MAX_NOT_ESTABLISHED:
+                            marked.clear()  # only the latest attempts matter; keeps it bounded
+                        marked.add(node_id)
+                    else:
+                        marked.discard(node_id)
                 self.connecting.pop(node_id, None)
             event.set()
         if not (opened and peer.is_active()):
@@ -369,17 +381,25 @@ class LinkPool:
         with self.lock:
             return node_id in self.not_established
 
-    def await_path(self, node_id: bytes) -> bool:
-        """Wait up to path_timeout for a path to node_id, requesting one in its turn if RNS has none (as opening a link
-        would): True once there is one. A lookup asks it before a query, to see how many hops the path takes
-        (rnfs.mesh.SlowPaths).
+    def refused(self, node_id: bytes) -> bool:
+        """True if the last time get() tried to open a shared link to node_id (and returned None), the node closed it:
+        a refusal (closed_by_other), not a failure."""
+        with self.lock:
+            return node_id in self.closed_by
+
+    def await_path(self, node_id: bytes, timeout: float | None = None) -> bool:
+        """Wait up to timeout (path_timeout if None) for a path to node_id, requesting one in its turn if RNS has none
+        (as opening a link would): True once there is one. A lookup asks it before a query, to see how many hops the
+        path takes (rnfs.mesh.SlowPaths), on a node that isn't slow for PathRequests.candidate_wait. A wait shorter
+        than path_timeout isn't measured for it.
         """
         if RNS.Transport.has_path(node_id):
             return True
+        wait = self.config.path_timeout if timeout is None else timeout
         log(f"requesting a path to {node_name(node_id)}", LOG_VERBOSE)
-        if self.paths.await_path(node_id, self.config.path_timeout, cancel=self.stop_event):
+        if self.paths.await_path(node_id, wait, cancel=self.stop_event, measure=wait >= self.config.path_timeout):
             return True
-        log(f"no path to {node_name(node_id)} after {self.config.path_timeout:g}s")
+        log(f"no path to {node_name(node_id)} after {wait:g}s")
         return False
 
     def open_identified(self, node_id: bytes) -> PeerLink | None:
@@ -439,6 +459,13 @@ class LinkPool:
         peer.link = link
         timeout = getattr(link, "establishment_timeout", None) or self.config.path_timeout
         settled.wait(timeout + ESTABLISH_GRACE)
+        if link.status == RNS.Link.CLOSED and closed_by_other(link):
+            # The node refused it (no room for another incoming link, say): it is up, and RNS doesn't request the path
+            # again for a link that was established at its end
+            log(f"{name} closed the link as it was established", LOG_VERBOSE)
+            peer.mark_closed()
+            peer.refused = True
+            return False
         if link.status != RNS.Link.ACTIVE:
             route = path_description(node_id)
             why = (close_reason(link) if link.status == RNS.Link.CLOSED

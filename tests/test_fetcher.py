@@ -647,6 +647,16 @@ class PacingTest(FetcherTest):
             self.result(BUSY, "cancelled")
         self.assertTrue(self.provider.failed)
 
+    def test_closed_links_count_even_after_serving(self):
+        # A provider closing the link (no room for another incoming link) is busy, not pacing: counted, and failed only
+        # after max_failures in a row, each retried after the busy delay
+        self.result(OK, sent_at=self.now - 40, rate=50_000)
+        self.result(BUSY, "closed")
+        self.assertEqual((self.provider.busy, self.provider.failed), (1, False))
+        for _ in range(self.config.max_failures - 1):
+            self.result(BUSY, "closed")
+        self.assertTrue(self.provider.failed)
+
     def test_paced_provider_isnt_dropped_meanwhile(self):
         # Only provider, waiting out the pacing: the fetch neither gives up nor reruns the lookup
         self.result(OK, sent_at=self.now - 40, rate=50_000)

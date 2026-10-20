@@ -403,6 +403,29 @@ class EntriesTest(PublisherCase):
         publisher.refresh()
         self.assertEqual(publisher.provided(), {folder.cid} | files)
 
+    def test_slow_node_measured_airtime_keeps_entries_off(self):
+        """The estimate is checked against what the radio measured: while this node's own transmissions took over 2%
+        of the channel in the last hour, a slow node's default doesn't turn entries on; once they are on, a busy hour
+        doesn't withdraw them (the estimate alone does). Unknown (None): the estimate decides."""
+        folder, files = self.flat(10)
+        self.pin(folder)
+        measured = [0.03]
+        publisher = self.slow_publisher(servers=100, generation=True)
+        publisher.measured_airtime = lambda: measured[0]
+        publisher.refresh()
+        self.assertEqual(publisher.provided(), {folder.cid})
+        self.assertIn("measured", publisher.entries_status()["provide_entries_off"])
+        measured[0] = 0.01  # a quiet hour: the refresh computes again, and entries go on
+        publisher.refresh()
+        self.assertEqual(publisher.provided(), {folder.cid} | files)
+        measured[0] = 0.5
+        publisher.refresh()
+        self.assertEqual(publisher.provided(), {folder.cid} | files)
+        for unknown in (self.slow_publisher(servers=100), self.make_publisher()):
+            unknown.measured_airtime = lambda: None
+            unknown.refresh()
+            self.assertEqual(unknown.provided(), {folder.cid} | files)
+
     def test_slow_node_off_is_logged_once(self):
         folder, _ = self.flat(keys_within(1000))
         self.pin(folder)

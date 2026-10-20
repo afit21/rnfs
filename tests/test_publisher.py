@@ -3,6 +3,7 @@ import os
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -14,6 +15,7 @@ from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER, Storage
 from rnfs.denylist import DenyList
 from rnfs.dht.providers import ProviderStore
+from rnfs.network.channel import ChannelLoad
 from rnfs.publisher import (MAX_WAIT, PROVIDE_PARALLEL, PUBLISH_LOOKUPS, SAVE_EVERY_NODES, SLOW_LOOKUP_PACE,
                             SLOW_ROUND_LOOKUPS, DhtKey, Publisher)
 import tests.test_links as fake_links  # a module, so its test cases don't run twice
@@ -761,6 +763,34 @@ class PublisherTest(PublisherCase):
         self.assertEqual(publisher.publish_due()["published"], [])
         self.clock.now += SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS
         self.assertEqual(len(publisher.publish_due()["published"]), SLOW_ROUND_LOOKUPS)
+
+    def test_a_busy_channel_stretches_slow_rounds(self):
+        """A slow node's radio measuring a busy channel spaces its rounds further apart, in proportion to the load
+        (rnfs.network.channel), but never so far that a record this round doesn't republish would slip past
+        PROVIDER_TTL / 2."""
+        publisher = self.make_publisher(slow=True)
+        stats = {"interfaces": [{"type": "RNodeInterface", "status": True, "channel_load_short": 50.0}]}
+        reticulum = types.SimpleNamespace(get_interface_stats=lambda: stats)
+        publisher.stretch = ChannelLoad(lambda: reticulum, clock=self.clock).stretch_wait
+        self.due_keys(20)
+        publisher.refresh()
+        self.nodes_of = lambda key: near(key) + [N1, N2]  # each key a region of its own
+        self.assertEqual(len(publisher.publish_due()["published"]), SLOW_ROUND_LOOKUPS)
+        self.assertEqual(publisher.next_due(), 2 * SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)  # 50% load: twice as long
+        # A record the next round won't reach (10 keys never published go first) is 400 s from PROVIDER_TTL / 2 old:
+        # the stretch stops there
+        self.clock.now += 2 * SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS
+        old = sorted(publisher._published, key=str)[0]
+        long_ago = self.clock.now - PROVIDER_TTL / 2 + 400
+        with publisher._lock:
+            publisher._published[old] = (long_ago, [N1])
+        self.assertEqual(len(publisher.publish_due()["published"]), SLOW_ROUND_LOOKUPS)
+        self.assertEqual(publisher._published[old][0], long_ago)  # not reached this round
+        self.assertEqual(publisher.next_due(), 400)
+        # A quiet channel: as ever
+        stats["interfaces"][0]["channel_load_short"] = 10.0
+        self.clock.now += 15  # the next reading of the radio's figures
+        self.assertEqual(publisher.stretch(300.0, 10**6), 300.0)
 
     def queue_withdrawals(self, publisher: Publisher, servers: list[bytes], keys: int = 1):
         """Queue withdrawals of keys keys at each of servers, as if their CIDs had been unpinned, and saved."""
