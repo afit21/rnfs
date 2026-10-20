@@ -380,10 +380,9 @@ class _Backend:
         return self.api.name_resolve(name)
 
     def submit_job(self, kind: str, target: str | None, output: str | None, from_node: str | None, **flags) -> dict:
-        """POST /api/jobs (only the flags set, as the CLI sends them, and retry when it is False; an add's or
-        import's path and options too)."""
-        return self.api.submit_job(kind, target, output, from_node,
-                                   **{k: v for k, v in flags.items() if v or (k == "retry" and v is False)})
+        """POST /api/jobs (only the flags set, as the CLI sends them; an add's or import's path and options
+        too)."""
+        return self.api.submit_job(kind, target, output, from_node, **{k: v for k, v in flags.items() if v})
 
     def job(self, job_id: str, wait: float) -> dict:
         """GET /api/jobs/get, waiting up to wait seconds (whole ones, within the timeout this thread's request has)

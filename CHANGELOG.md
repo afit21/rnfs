@@ -636,11 +636,12 @@ Changed:
   hours, for up to 3 days, instead of being dropped at once; `pin remote ls --served` shows it waiting
   (`not_found`) with when it is tried again (`retry_at`, a new field of `GET /api/pin/remote/served`). Pins
   accepted after it aren't held up, and a release ends the wait at once.
-- A `get`, `pin` or `export` job whose content can't be found is queued again the same way, keeping its blocks,
-  rather than failed: `retry_at` (and `retry_since` while it waits) are new fields of a job, and `rnfs jobs` shows
-  it waiting. Not for a path its directory shows doesn't exist, nor for a job submitted with the new `retry: false`
-  (`POST /api/jobs`; `retry=False` in the library's `jobs.get`, `pin` and `export`), which fails as in 0.1.6. A
-  foreground `rnfs get`, `pin add` or `export` submits so, and still fails at once; `--background` jobs wait.
+- A `get`, `pin` or `export` job submitted with the new `retry: true` (`POST /api/jobs`; `retry=True` in the
+  library's `jobs.get`, `pin` and `export`) whose content can't be found is queued again the same way, keeping its
+  blocks, rather than failed: `retry_at` (and `retry_since` while it waits) are new fields of a job, and `rnfs jobs`
+  shows it waiting. Not for a path its directory shows doesn't exist. Retrying is opt-in: the API's default is
+  0.1.6's, failing at once, so an app polling its job still sees it fail rather than stay queued for days. `rnfs
+  get`, `pin add` and `export` with `--background` opt in; in the foreground they still fail at once.
 - Path requests are paced node-wide: since RNS 1.2.5 every interface limits the path requests arriving on it (3 a
   second while it is under 2 hours old, as a hub's interface for a newly connected client is), and a fresh node's
   join and first publish round sent dozens at once, so its hub dropped some and the queries failed after

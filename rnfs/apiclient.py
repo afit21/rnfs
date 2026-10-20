@@ -1119,9 +1119,10 @@ class ApiConnection:
                    **flags) -> dict:
         """Start a job: kind "get" (output needed), "pin" or "export" (output needed) of a target, or "add" or
         "import" of a path on this machine. Its record, with its "id". flags: get's sealed_name, fallback_dht and
-        no_extract, and retry (False: a get, pin or export whose content isn't found fails rather than waiting to be
-        tried again; a daemon before rnfs 0.2.0 ignores it, and never waits); options: an add's, as add_path takes them in the API's form (wrap, only_hash, pin, to, to_self,
-        seal_name, chunker; only those set)."""
+        no_extract, and retry (True: a get, pin or export whose content isn't found is queued again to be tried
+        later, for up to 3 days, rather than failing at once as by default; a daemon before rnfs 0.2.0 ignores it,
+        and never waits); options: an add's, as add_path takes them in the API's form (wrap, only_hash, pin, to,
+        to_self, seal_name, chunker; only those set)."""
         output = os.path.abspath(os.path.expanduser(output)) if output is not None else None
         path = os.path.abspath(os.path.expanduser(path)) if path is not None else None
         return self._post("/api/jobs", kind=kind, target=target, output=output, path=path, **{"from": from_node},

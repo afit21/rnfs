@@ -2394,13 +2394,14 @@ at such a path) — and a state: `queued`, `running`, `done`, `failed` or `cance
 MUST be what the equivalent API call returns (`POST /api/get`, `/api/pin/add`, `/api/export`, `/api/add`, `/api/import`), and its error, when failed, the
 message that call would have reported.
 - At most `max_jobs` jobs run at once; queued jobs MUST be started oldest first.
-- A `get`, `pin` or `export` job that fails because no provider could supply its content (`404`, but not for a path
-  that the target's stored directories show doesn't exist) MAY be queued again rather than failed (rnfs 0.2.0),
-  keeping its blocks as a queued job does, with its `error` and `retry_at`, the time before which it isn't started.
-  rnfs tries it again after 10 minutes, the wait doubling up to 6 hours, until 3 days after it first wasn't found
-  (`retry_since`), then fails it. A job submitted with `retry` false (`POST /api/jobs`, kept with the job) fails at
-  once instead, as before 0.2.0; the CLI's foreground transfers (without `--background`) are, so a command never
-  waits hours.
+- A `get`, `pin` or `export` job that fails because no provider could supply its content (`404`) MUST fail at once,
+  as in 0.1.6, unless it was submitted with `retry` true (`POST /api/jobs`, rnfs 0.2.0, kept with the job). Such a
+  job MAY then be queued again rather than failed (but not for a path that the target's stored directories show
+  doesn't exist), keeping its blocks as a queued job does, with its `error` and `retry_at`, the time before which it
+  isn't started. rnfs tries it again after 10 minutes, the wait doubling up to 6 hours, until 3 days after it first
+  wasn't found (`retry_since`), then fails it. The default stays 0.1.6's so that an app polling its job sees it
+  fail rather than stay queued for days; the CLI's `--background` transfers opt in, as they run unattended, and its
+  foreground ones don't, so a command never waits hours.
 - Jobs MUST be persisted in the state directory, each change saved atomically and durably. When the node starts, jobs that were
   queued or running MUST be queued again. A resumed job MUST NOT fetch again blocks that are still stored.
 - While a job is queued or running, the blocks stored below its root MUST be kept as if pinned, including

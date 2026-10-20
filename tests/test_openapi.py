@@ -210,6 +210,12 @@ class DocumentTest(unittest.TestCase):
         items = self.document["components"]["schemas"]["Capabilities"]["properties"]["capabilities"]["items"]
         self.assertSameSet(items["enum"], api.CAPABILITIES, "capabilities")
 
+    def test_job_retry_is_opt_in(self):
+        """POST /api/jobs' retry defaults to false (0.1.6's behaviour), and a job's retry is there only when true."""
+        request = self.operations[("POST", "/api/jobs")]["requestBody"]["content"]["application/json"]["schema"]
+        self.assertIs(resolve(self.document, request)["properties"]["retry"]["default"], False)
+        self.assertIs(self.document["components"]["schemas"]["Job"]["properties"]["retry"]["const"], True)
+
     def test_every_reference_resolves(self):
         """Every $ref names something in the document."""
         def walk(node, where):
@@ -311,6 +317,17 @@ class LiveTest(unittest.TestCase):
         self.check("GET", "/api/pin/remote", asked := self.call("GET", "/api/pin/remote"))
         self.assertEqual(len(asked["pins"]), 1)
         self.check("GET", "/api/pin/remote/served", self.call("GET", "/api/pin/remote/served"))
+
+    def test_jobs(self):
+        """POST /api/jobs with and without retry, and GET /api/jobs: retry is in a job only when submitted true."""
+        cid = self.call("POST", "/api/add", {"path": os.path.abspath(__file__)})["cid"]
+        job = self.call("POST", "/api/jobs", {"kind": "pin", "target": cid})
+        self.check("POST", "/api/jobs", job)
+        self.assertNotIn("retry", job)
+        job = self.call("POST", "/api/jobs", {"kind": "pin", "target": cid, "retry": True})
+        self.check("POST", "/api/jobs", job)
+        self.assertIs(job["retry"], True)
+        self.check("GET", "/api/jobs", self.call("GET", "/api/jobs"))
 
     def test_peers(self):
         """GET /api/peers with a peer in it, and GET /api/stats."""

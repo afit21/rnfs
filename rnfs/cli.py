@@ -29,6 +29,10 @@ from rnfs.config import DEFAULT_API_PORT, LOCK_FILE, Config
 
 DEFAULT_DIR = apiclient.DEFAULT_DIR
 COPY_SIZE = apiclient.COPY_SIZE
+# --background of get, pin add and export: the job runs unattended, so it waits for content not found yet
+# (rnfs.features.jobs.run_transfer submits it with retry); in the foreground it fails at once
+BACKGROUND_TRANSFER_HELP = ("start a job, print its ID and return (rnfs jobs); content not found yet is tried "
+                            "again for up to 3 days")
 
 
 # text with control characters escaped, so names from other people's DAGs can't drive the terminal
@@ -1172,7 +1176,7 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument("target", metavar="CID[/PATH]")
     get.add_argument("-o", "--output", help="where to write (default: the last path name or the CID, here)")
     get.add_argument("--from", dest="from_node", metavar="NODE_ID", help="fetch from this node, bypassing the DHT")
-    get.add_argument("--background", action="store_true", help="start a job, print its ID and return (rnfs jobs)")
+    get.add_argument("--background", action="store_true", help=BACKGROUND_TRANSFER_HELP)
     get.add_argument("--raw", action="store_true", help="a sealed file as stored (its ciphertext), not decrypted")
     get.add_argument("--no-extract", action="store_true",
                      help="write a sealed folder as its .tar instead of unpacking it")
@@ -1206,7 +1210,7 @@ def build_parser() -> argparse.ArgumentParser:
                                                                         metavar="command")
     pin_add = command(pin, "add", run_pin_add, "fetch and pin")
     pin_add.add_argument("target", metavar="CID[/PATH]")
-    pin_add.add_argument("--background", action="store_true", help="start a job, print its ID and return (rnfs jobs)")
+    pin_add.add_argument("--background", action="store_true", help=BACKGROUND_TRANSFER_HELP)
     pin_rm = command(pin, "rm", run_pin_rm, "remove the user pin")
     pin_rm.add_argument("cid")
     pin_ls = command(pin, "ls", run_pin_ls, "list pins, their sources and where each came from")
@@ -1272,7 +1276,7 @@ def build_parser() -> argparse.ArgumentParser:
     export = command(commands, "export", run_export, "write an archive of a target")
     export.add_argument("target", metavar="CID[/PATH]")
     export.add_argument("-o", "--output", required=True, help="archive file to write")
-    export.add_argument("--background", action="store_true", help="start a job, print its ID and return (rnfs jobs)")
+    export.add_argument("--background", action="store_true", help=BACKGROUND_TRANSFER_HELP)
     import_ = command(commands, "import", run_import, "import an archive, pinning its roots")
     import_.add_argument("file")
     import_.add_argument("--background", action="store_true",
