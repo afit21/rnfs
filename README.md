@@ -332,6 +332,16 @@ talks to it. Your node needs Reticulum interfaces that reach other nodes:
   [reticulum.network/connect.html](https://reticulum.network/connect.html) for the public backbone.
 - **Radio:** add an `RNodeInterface` for LoRa ([Reticulum manual](https://reticulum.network/manual/interfaces.html)).
 
+**Running a LoRa island's gateway.** A node on the radio finds other nodes with path requests, and Reticulum never
+repeats a path request on the interface it came in on: a request reaches only the nodes in radio range, and those
+with transport enabled answer from the paths they already know. So the gateway (the node with the radio and an
+internet interface) should forward requests for paths it doesn't know to the internet side: run it with
+`enable_transport = Yes`, and give its radio interface `mode = gateway` (or `recursive_prs = yes`). A relay
+bridging two radios needs the same on both. That serves the nodes in the gateway's (or the relay's) radio range;
+nodes farther out find only the servers whose announces their neighbours heard, however many path requests they
+send, as a relay with one radio can't pass a request on. (In Reticulum 1.5.6 write `mode = gateway`:
+`interface_mode = gateway` isn't read correctly.)
+
 Your node then joins the DHT through the project's built-in bootstrap nodes and the rnfs nodes it hears
 announcing. `rnfs status` shows your node ID and `known_nodes`, and once a few lookups have completed, about how
 many DHT servers the whole network has (`network_size`); `rnfs peers` lists the nodes it knows. To also

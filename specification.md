@@ -94,12 +94,12 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   - A client (section 6) MAY skip the periodic announces while nothing needs other nodes to reach it, but MUST
     announce while it provides anything (section 6), owns names (it answers `/name` for them, section 9),
     accepts remote pins (section 8) or is in private mode, and SHOULD announce at once when that starts. A
-    transport node forwards a path request only for a destination it has a path to, unless the request arrived
-    on an access-point, gateway, roaming or boundary interface, or one with `recursive_prs` (RNS 1.5.6
-    `Transport.path_request`); interfaces default to `full` mode, so a destination that never announces is
-    usually reachable from one hop away only. And private-mode servers of rnfs 0.1.4 to 0.1.6 drop at start the
-    records of publishers whose identity RNS doesn't recall. (rnfs: checked every minute; servers always
-    announce.)
+    transport node answers a path request only for a destination it has a path to, and forwards one for a path it
+    lacks only if the request arrived on an access-point, gateway, roaming or boundary interface, or one with
+    `recursive_prs` (RNS 1.5.6 `Transport.path_request`); interfaces default to `full` mode, so a destination that
+    never announces is usually reachable from one hop away only. And private-mode servers of rnfs 0.1.4 to 0.1.6
+    drop at start the records of publishers whose identity RNS doesn't recall. (rnfs: checked every minute; servers
+    always announce.)
 - The announce's `app_data` is the node's DHT mode as a msgpack integer: `1` server, `0` client (section 6).
   - Anything other than msgpack `1` means client. A node re-announces when its mode changes.
   - It is set with `Destination.set_default_app_data()`, so path responses carry it too.
@@ -126,7 +126,8 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   expires the path and requests it again on every interface, at most once per destination every `PATH_REQUEST_MI`
   (20 s) (RNS 1.5.6 `Transport.jobs`; `rnsd` does the same for its local clients' links).
 - A transport node answers a request for a destination it has a path to; it forwards one for a path it lacks only as
-  above (an access-point, gateway, roaming or boundary interface, or `recursive_prs`). A node that isn't a transport
+  above (an access-point, gateway, roaming or boundary interface, or `recursive_prs`), and then only on its other
+  interfaces: RNS never sends a path request out again on the interface it arrived on. A node that isn't a transport
   node answers only for its own destinations.
 - A node SHOULD pace its own path requests, so RNS's estimate for it at the next hop's interface stays well under a
   new interface's 3 a second. rnfs keeps one budget per node for every path request it sends (link opens, so lookups,
@@ -848,6 +849,15 @@ or protocol constant changes.
   radius, which misses some of the island), one at a time on a slow node, before any other server, until one of
   their replies lists a provider; their replies seed the rest of the lookup as any answer does (its start nodes),
   and the lookup's bounds and checks are unchanged. Its fallback over disjoint paths doesn't ask them first again.
+- **Path requests on an island.** RNS never sends a path request out again on the interface it arrived on (section 3),
+  so on an island whose relays have one radio a request reaches only the nodes in radio range of its sender, each
+  transport node among them answering from its own path table; nothing floods it across the island. A slow node's
+  larger budgets of unknown IDs (Lookups, above) therefore find paths beyond its neighbours' path tables only one
+  hop from the gateway, and only if the gateway forwards requests for paths it lacks to its internet side: its radio
+  interface in `gateway` (or `access_point`, `roaming`) mode or with `recursive_prs`, transport enabled. A relay
+  bridging two radios forwards from one to the other likewise. The topology simulation's island rows (section 11 of
+  its results) assumed requests flood the island; with relays that can't forward, its `-full` rows are closer.
+  Island operators SHOULD run gateways (and relays with more than one interface) so; rnfs's README says how.
 - **Partition mode.** Servers that aren't local are *off-island*. A node with local servers SHOULD notice when it is
   cut off from them and then use its local servers only. rnfs enters partition mode when a probe of an off-island
   server (below) goes unanswered:
