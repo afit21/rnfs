@@ -547,6 +547,17 @@ class OtherCommandTest(CliTestCase):
         self.assertEqual(raised.exception.code, "rnfs: the rnfs dir isn't private")
         self.assert_unlocked()
 
+    def test_daemon_writes_its_log_a_line_at_a_time(self):
+        """Under systemd stdout is a pipe, which Python buffers in blocks: the daemon's log lines would reach the
+        journal hours late. The daemon makes stdout line-buffered before anything else."""
+        from rnfs.errors import RnfsError
+        stdout = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+        self.assertFalse(stdout.line_buffering)
+        with mock.patch("sys.stdout", stdout), mock.patch("rnfs.node.RnfsNode", side_effect=RnfsError("test")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.main(["--dir", self.tmp, "daemon"])
+        self.assertTrue(stdout.line_buffering)
+
     def test_debug_log_that_cant_open_fails_cleanly(self):
         """A debug log that can't be written is a message, and the daemon.lock taken before it is let go."""
         with mock.patch("rnfs.debuglog.start", side_effect=OSError("disk full")), \

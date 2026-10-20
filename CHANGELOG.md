@@ -732,6 +732,13 @@ Faster:
   is registered, on `rnfs.dht` links and on the link of a NomadNet add, where a page small enough for one packet
   (NomadNet's "Request Not Allowed" among them) could be lost the same way and the add fail.
 
+Fixed:
+- **The daemon's log reaches the journal as it is written.** Under systemd (and launchd, or the Windows logon task)
+  stdout is a pipe or a file, which Python fills in 8 KiB blocks, so `journalctl --user -u rnfs -f` showed nothing for
+  hours on a quiet node, and lines turned up in bursts stamped hours earlier, all of them at a stop. Seen upgrading a
+  cloud node with 857k blocks: its first start moved them for minutes with nothing in the journal. The daemon now
+  writes stdout a line at a time.
+
 ## 0.1.6
 
 Security fixes, maintainability work and performance work. No wire-format or CID changes: these nodes, 0.1.5,

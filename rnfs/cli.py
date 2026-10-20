@@ -244,6 +244,12 @@ def run_daemon(args):
     from rnfs.log import LOG_ERROR, LOG_NOTICE
     from rnfs.node import DirInUse, RnfsNode, lock_rnfs_dir, make_private_root
 
+    # The daemon's output is its log, written a line at a time (RNS.log prints): under systemd, launchd or a logon
+    # task stdout is a pipe or a file, which Python fills in 8 KiB blocks, so `journalctl -u rnfs -f` showed nothing
+    # for hours on a quiet node, nor any of a long first start's progress, until a block filled or the daemon stopped
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
     # The rnfs dir is made private first, then the settings in it are checked and read, then its subdirectories
     # are made private and it is locked (lock_rnfs_dir): nobody else can change what each step relies on
     root = os.path.expanduser(args.dir)
