@@ -521,8 +521,8 @@ you can open, and unpacks a sealed folder to its directory (`--no-extract` keeps
 stored bytes, which is what scripts that show content to others should use.
 
 **Gateway** (`http://127.0.0.1:8789`): `/rnfs/<cid>[/path]` and `/name/<name>[/path]` serve files and
-directories; `?filename=` sets the type and download name; `?format=raw` and `?format=archive` return data you
-can check against the CID. Pages are sandboxed and can't read the gateway's responses, and sealed files are
+directories; `?filename=` sets the type and download name (on a site, below, only the download name);
+`?format=raw` and `?format=archive` return data you can check against the CID. Pages are sandboxed and can't read the gateway's responses, and sealed files are
 never decrypted there. Each CID and name also has a site of its own, `http://<k-cid>.rnfs.localhost:8789/[path]`
 (`rnfs url <cid>` prints it) and `http://<name>.name.localhost:8789/[path]`, whose pages can read their own
 files; browsers resolve `*.localhost` themselves, other tools should use the paths above.

@@ -60,6 +60,13 @@ Security:
   assembled may not outgrow the advertised total; a file's metadata must be a small flat map, checked before RNS
   decodes it; a page must be one flat byte string, checked from its msgpack headers before RNS decodes it. The
   daemon's process-wide decompression limit stays 0, and `rnfs.dht` links keep every rule they have.
+- **Gateway sites don't render uploads as pages** (specification section 11, Sites). A site's pages run script in
+  its own origin, so a file someone else got into a site's DAG could be made to run script there: on site hosts
+  `?filename=` now only names a download (`Content-Disposition: attachment`; the type comes from the path's own
+  name), and a file inside the site's DAG whose name gives no type is sniffed only to an image, audio, video, font,
+  wasm or plain text, else served as `application/octet-stream`, never as HTML, SVG or PDF. A site's `index.html`,
+  the files its DAG names `.html` or `.svg`, and a site whose root is itself a file render as before; the path
+  gateway is unchanged.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
