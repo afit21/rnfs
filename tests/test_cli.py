@@ -371,6 +371,37 @@ class OtherCommandTest(CliTestCase):
         with mock.patch.object(self.node, "status", return_value=older):
             self.assertEqual(self.ok("status").splitlines(), [f"{key}: {value}" for key, value in older.items()])
 
+    def test_status_clock(self):
+        """status prints clock_offset and announces_held as fields, and warns on stderr of a clock estimated over 5
+        minutes off and of names whose announces are held; not within 5 minutes, nor from a daemon before 0.2.0."""
+        status = {"node_id": "ab" * 16, "announces_held": ["site", "blog"], "clock_offset": 3720}
+        with mock.patch.object(self.node, "status", return_value=status):
+            code, out, err = self.run_cli("status")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.decode().splitlines(), [f"node_id: {'ab' * 16}", "announces_held: site, blog",
+                                                     "clock_offset: 3720"])
+        self.assertEqual(err.splitlines(), [
+            "rnfs: warning: this node's clock seems to be 1 h 2 min behind, going by the announces it hears; set it "
+            "right",
+            "rnfs: warning: the announces of site, blog are held until the clock passes their last announce (RNS would "
+            "drop them)"])
+        for quiet in ({"node_id": "ab" * 16, "announces_held": [], "clock_offset": -300},
+                      {"node_id": "ab" * 16, "announces_held": [], "clock_offset": None}, {"node_id": "ab" * 16}):
+            with mock.patch.object(self.node, "status", return_value=quiet):
+                self.assertEqual(self.run_cli("status")[2], "")
+
+    def test_publish_held(self):
+        """name publish warns, on stderr, of an announce held for the clock, after saying it published."""
+        cid = self.node.put_file(b"abc")
+        name = self.ok("name", "create", "site").strip()
+        original = self.node.name_publish
+        reason = "announce held: this node's clock is 10 min behind the name's last announce"
+        with mock.patch.object(self.node, "name_publish",
+                               lambda alias, target: {**original(alias, target), "announce_held": reason}):
+            code, out, err = self.run_cli("name", "publish", "site", cid)
+        self.assertEqual((code, out.decode()), (0, f"published {cid} as {name} (sequence 1)\n"))
+        self.assertEqual(err, f"rnfs: warning: {reason}\n")
+
     def test_names(self):
         cid = self.node.put_file(b"abc")
         name = self.ok("name", "create", "site").strip()

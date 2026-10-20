@@ -5811,6 +5811,10 @@
           "warning": {
             "type": "string",
             "description": "Private mode only: the name's announce reaches outsiders."
+          },
+          "announce_held": {
+            "type": "string",
+            "description": "Present while the node's clock is behind the name's last announce: why its announce is held (RNS drops an announce emitted no later than the one a node took its path from). The record is published (saved, pinned, kept); its announce goes out once the clock passes the last one, or after a week held in all (rnfs 0.2.0)."
           }
         },
         "required": [
@@ -6472,6 +6476,20 @@
             },
             "description": "Aliases of name keys never exported (or imported): losing one loses the name."
           },
+          "announces_held": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Aliases of names whose announces are held: the clock is behind their last announce, which RNS would take them as replays of (rnfs 0.2.0)."
+          },
+          "clock_offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "The network's clock less this node's, in seconds (positive: this node's is behind), estimated from the emission times of the announces it hears: the median over the nodes and names heard in the last 2 x announce_interval, one value each; null until 5 were. Only reported, and logged past 5 minutes (rnfs 0.2.0)."
+          },
           "local_servers": {
             "type": "integer",
             "description": "The DHT servers on this node's own island it knows of (spec section 6, \"LoRa islands\"); 0 on a node without a slow interface or local_interfaces."
@@ -6513,6 +6531,8 @@
           "max_storage",
           "names",
           "unexported_names",
+          "announces_held",
+          "clock_offset",
           "local_servers",
           "partition",
           "partition_since",

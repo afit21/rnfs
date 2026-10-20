@@ -1197,9 +1197,11 @@ class RnfsNode:
         then the newest may be an earlier announce's, which counts only if no later one was). An in-memory read: no
         disk, unlike the
         announce cache, which a shared instance's client doesn't write and whose packet hash a path answer passed on
-        as an announce doesn't match."""
+        as an announce doesn't match. It is a sample of the clock's offset too (NameManager.clock_skew)."""
+        emitted = RnsNetwork().emitted_time(node_id)
+        self.names.clock_skew.node_announced(node_id, emitted)
         traffic = getattr(self.client, "traffic", None)
-        if traffic is not None and traffic.announced(node_id, RnsNetwork().emitted_time(node_id)):
+        if traffic is not None and traffic.announced(node_id, emitted):
             self._fresh_announce(node_id)
 
     def _fresh_announce(self, node_id: bytes):
@@ -2843,6 +2845,7 @@ class RnfsNode:
                 "blocks": self.storage.block_count(),
                 "used_bytes": self.storage.used_bytes(), "max_storage": self.config.max_storage,
                 "names": len(self.names.list()), "unexported_names": self.names.unexported(),
+                **self.names.announce_status(),
                 "local_servers": len(self.local), **self.partition.state(),
                 "network": self._network_status(), "record_store": self.records.usage(),
                 **{key: value for feature in self.features.values() for key, value in feature.status().items()}}

@@ -157,7 +157,10 @@ rnfs/
     announces.py      rnfs.dht announces carrying the DHT mode, and the announce handler (section 3)
     identity.py       node identity file, node ID helpers
   mesh.py             provider ranking (PathInfo, provider_rank, RnsPaths), airtime policy, Traffic (3, 6)
-  names.py            NameManager: name keys, records, publish, resolve, sequences, keeper hook (section 9)
+  names.py            NameManager: name keys, records, publish, resolve, sequences, keeper hook, announces
+                      held while the clock is behind a name's last announce (section 9)
+  clockskew.py        ClockSkew: the clock's offset from heard announces' emission times, for a warning; no
+                      RNS (section 9)
   name_sync.py        NameSync: names kept pointing at a folder's content, settle time, hourly limit (section 9)
   denylist.py         DenyList: denied CIDs and file hashes, local entries, accepted lists (section 8)
   fetcher.py          fetching a target from providers; observing() for job progress (sections 6, 7)
@@ -709,7 +712,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `export(target, output)` / `import_archive(path, progress=None)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}`; `import_archive` opens `path` with `O_NONBLOCK` and refuses (ValueError) anything but a regular file, so a FIFO can't hold it (or an import job) |
 | `import_stream(stream, label="(archive upload)", progress=None)` | as `import_archive`, of an archive read from `stream` to its end (`POST /api/import/stream`; `import_archive` opens the file and calls it). `progress` here and in `add_path` is told each read's length (`builder.BuildOptions.progress`, `builder.counted`) and may raise to stop: an add or import job's `Job.read` |
 | `app_add(name)`, `app_ls()`, `app_rm(name)` | `{"name", "created", "token"}` / `[{"name", "created"}]` / `{"released"}`: `AppRegistry` (rnfs/apps.py); `app_rm` revokes the token, calls every feature's `app_removed(name)`, releases every `app:<name>[:<key>]` pin, then deletes the row |
-| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "names", "unexported_names", "local_servers", "partition", "partition_since", "network", "record_store"}` plus every feature's `status()` fields (traffic, jobs); `identity_hash` is the RNS identity hash (None on offline test nodes); `network` is `_network_status()` (`sizes.estimate()` rounded, `len(sizes)`, `lookups.checks.status()`), `record_store` `records.usage()`: counts in memory, no read of the state database (specification section 11, "Network status") |
+| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "names", "unexported_names", "announces_held", "clock_offset", "local_servers", "partition", "partition_since", "network", "record_store"}` plus every feature's `status()` fields (traffic, jobs); `identity_hash` is the RNS identity hash (None on offline test nodes); `network` is `_network_status()` (`sizes.estimate()` rounded, `len(sizes)`, `lookups.checks.status()`), `record_store` `records.usage()`: counts in memory, no read of the state database (specification section 11, "Network status") |
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
 threads, for tests (tests/test_node.py). The request server's backend is `node.backend` (`NodeBackend`).
@@ -1133,7 +1136,7 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `Setting` | `rnfs.config.settings_schema()`'s `name`, `group`, `type`, `choices`, `nullable`, `default`, `unit`, `minimum`, `maximum`, `exclusive_minimum`, `description`, `live`, and `value`, `file`, `overridden`, `pending` (lists as tuples) | the name |
 | `Settings` / `SettingsChange` | `path`, `settings: tuple[Setting]` (`settings["max_jobs"]`, iteration), `file_error`, `warnings` / `path`, `applied`, `restart_required`, `overridden`, `warnings` | — |
 | `Record` | `name: bytes`, `cid`, `sequence`, `age` (seconds since heard, or None) | — |
-| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `names`, `unexported_names`, `local_servers`, `partition`, `partition_since`, `features: dict` (every other field) | — |
+| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `names`, `unexported_names`, `announces_held`, `clock_offset`, `local_servers`, `partition`, `partition_since`, `features: dict` (every other field) | — |
 | `Collected` / `Verified` | `removed_blocks`, `freed_bytes` / `checked`, `bad: tuple[Cid]` | — |
 | `Exported` / `Imported` | `roots: tuple[Cid]`, `blocks` / and `incomplete` | — |
 | `DenyState` | `entries: tuple[str]`, `lists: tuple[dict]` | — |
@@ -1834,6 +1837,9 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   raising it, at most every 5 s, and by the re-announce loop when changed); `name_exports` (keys known to exist
   outside this node: exported by `name export` (`NameManager.mark_exported`, called by the node's
   `name_export`, not by `export_key`, which keepers also use) or imported, and when; FULL, at each);
+  `name_announces` (0.2.0: each local name's last announce from here, its emission in whole seconds, and the
+  seconds its announces have been held since; kept when the name is removed; FULL when an emission changes, after
+  the announce, NORMAL for held time grown 15 minutes and at stop; a malformed row is dropped);
 - `shared_folder` (FULL) and `shared_folder_files` (the shared folder's per-file cache, `FolderFiles`: one row per
   file per top-level entry, the `dump()`ed entry name and `[device, inode, size, mtime_ns, execute bit]` as text,
   the CID, its height and the content SHA-256 if one was computed; a `RowStore` in SNAPSHOT mode, NORMAL with the
@@ -2220,6 +2226,24 @@ Everything in the specification is implemented, with these simplifications and a
   unsettled with batches left, `resume` runs `find_providers` again, but only if the last search was stopped
   early (`cut_short`) and some of its candidates were asked, so resumes stay within the batch bound and the
   lookup's deadline.
+- **Announces and the clock.** `NameManager._announce` asks `_announce_held` first: the name's last announce is the
+  later of its `name_announces` emission (written after each announce, from the clock read after
+  `Destination.announce()` returns, so never earlier than what RNS signed) and `RnsNetwork.emitted_time(name)` (a
+  path RNS took from the key's announces elsewhere, before it was registered here). While the wall clock is
+  before it, nothing is announced, the name is in `_holding` (alias: `_Hold`, whose reason a publish returns as
+  `announce_held`), and `_next_announce` rechecks it in `HOLD_RECHECK` (60 s), so an NTP step is seen within a
+  minute. The hold is counted in monotonic time into `_Announced.held` (`_count_hold`, at each recheck, removal
+  and stop), saved across restarts, and ends at `HOLD_LIMIT` (7 days, RNS's `DESTINATION_TIMEOUT`): a Pi whose
+  clock resets to the same old time at every boot would otherwise hold for ever, while RNS's paths have lapsed by
+  then. The same second as the last announce isn't held (RNS drops that one too: an announce must be strictly
+  later), so a frozen test clock and quick publishes behave as before. `NameManager.clock_skew` (`ClockSkew`)
+  takes samples from `_heard` (live announces of names no resolve is waiting for: through a shared instance a
+  path answer arrives as an announce) and from `RnfsNode._announced` (rnfs.dht announces, not path responses),
+  both reading the path's newest emission, which is the announce's own since RNS calls handlers only for one that
+  takes the path. Each sample is kept as emission less monotonic arrival, per sender its largest in a window of
+  2 × `announce_interval`, at most 128 nodes and 128 names; the estimate is the median over the nodes and as many
+  names as make up 5 senders, otherwise fewer than the nodes. It is reported (`report`, logged by names) past
+  300 s, and again once back within 240 s.
 - **Names.** A key imported, or found without a `names_published` row, is marked `imported`: its first publish
   offers kept records, makes a path request and queries keepers before choosing a sequence. `publish()` pins the new
   target, saves its row (the commit point; a failed commit rolls the record back and releases the new pin) and only

@@ -887,6 +887,8 @@ def run_name_publish(args):
     print(printable(f"published {result['cid']} as {result['name']} (sequence {result['sequence']})"))
     if result.get("warning"):  # private mode: the name's announce still reaches outsiders
         warn(result["warning"])
+    if result.get("announce_held"):  # the clock is behind the name's last announce, which RNS would drop it for
+        warn(result["announce_held"])
 
 
 def run_name_sync(args):
@@ -1080,6 +1082,25 @@ def run_status(args):
     print_fields({name: value for name, value in status.items() if name not in ("network", "record_store")})
     for line in network_lines(status):
         print(line)
+    for warning in clock_warnings(status):
+        warn(warning)
+
+
+def clock_warnings(status: dict) -> list[str]:
+    """`rnfs status`'s warnings of the clock: an estimated offset beyond WARN_OFFSET, and names whose announces are
+    held because the clock is behind their last announce; none from a daemon before 0.2.0."""
+    from rnfs.clockskew import WARN_OFFSET, offset_text  # no RNS
+
+    warnings = []
+    offset = status.get("clock_offset")
+    if type(offset) in (int, float) and abs(offset) > WARN_OFFSET:
+        warnings.append(f"this node's clock seems to be {offset_text(offset)}, going by the announces it hears; "
+                        "set it right")
+    held = status.get("announces_held")
+    if held:
+        warnings.append(printable(f"the announces of {', '.join(held)} are held until the clock passes their last "
+                                  "announce (RNS would drop them)"))
+    return warnings
 
 
 # Parser

@@ -1115,11 +1115,13 @@ class Name:
         """Point the name at target (a path in it resolved locally) and announce it; the new record. Raises
         NotFound (a path not stored here), ValueError, RnfsError (the highest sequence reached). In private mode
         the node's warning that the announce is visible outside the private network is raised as a
-        RuntimeWarning (warnings.warn), as the CLI prints it."""
+        RuntimeWarning (warnings.warn), as the CLI prints it; so is the reason the announce is held, if the
+        node's clock is behind the name's last announce (the record is published, and announced once it passes)."""
         self._owner._check()
         result = self._owner._backend.name_publish(self.alias, self._owner._target(target)[0])
-        if result.get("warning"):
-            warnings.warn(result["warning"], RuntimeWarning, stacklevel=2)
+        for key in ("warning", "announce_held"):
+            if result.get(key):
+                warnings.warn(result[key], RuntimeWarning, stacklevel=2)
         return Record.from_dict({**result, "age": 0.0})
 
     def export_key(self) -> bytes:
