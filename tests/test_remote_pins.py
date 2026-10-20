@@ -12,8 +12,8 @@ from unittest import mock
 
 import RNS
 
-from rnfs import remote_pins, statedb
-from rnfs.constants import CHUNK_SIZE
+from rnfs import remote_pins, retry, statedb
+from rnfs.constants import APP_NAME, CHUNK_SIZE, DHT_ASPECT
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import remote_source
 from rnfs.remote_pins import (DONE, DROPPED, FETCHING, MISSING, PINNED, REFUSED, RELEASED, WAITING, AskedPins,
@@ -376,6 +376,29 @@ class ServedPinsTest(unittest.TestCase):
                          [DROPPED, WAITING])
 
 
+class RetryScheduleTest(unittest.TestCase):
+    """rnfs.retry: content not found yet is tried again after 10 minutes, doubling up to 6 hours, for 3 days."""
+
+    def test_waits_double_up_to_six_hours_for_three_days(self):
+        """Each try taking no time, the waits are 10, 20, 40 ... minutes, then 6 hours, the last at 3 days."""
+        since = now = 1_000_000.0
+        waits = []
+        while (at := retry.next_retry(since, now)) is not None:
+            waits.append(at - now)
+            now = at
+        self.assertEqual(waits[:6], [600.0, 1200.0, 2400.0, 4800.0, 9600.0, 19200.0])
+        self.assertEqual(set(waits[6:-1]), {6 * HOUR})
+        self.assertLessEqual(waits[-1], 6 * HOUR)
+        self.assertEqual(now, since + retry.RETRY_FOR)
+        self.assertEqual(len(waits), 17)
+
+    def test_a_long_try_or_a_stop_counts(self):
+        """The time a try took, or the node spent stopped, counts towards the wait and the 3 days."""
+        self.assertEqual(retry.next_retry(0.0, 2 * HOUR), 2 * HOUR + 600 + 2 * HOUR)
+        self.assertEqual(retry.next_retry(0.0, 10 * HOUR), 16 * HOUR)
+        self.assertIsNone(retry.next_retry(0.0, retry.RETRY_FOR))
+
+
 class AskedThroughTheNodeTest(NodeTest):
     """B asks A to pin; B's checks look A up among the CID's providers."""
 
@@ -438,12 +461,29 @@ class ServedByTheNodeTest(NodeTest):
         return cid
 
     def settled(self):
-        """Wait until A's remote-pin workers have nothing left."""
-        self.assertTrue(wait_for(lambda: not any(self.a._remote_reserved.values()), what="the remote pins"))
+        """Wait until A's remote-pin workers have nothing left but pins waiting to be tried again."""
+
+        def idle() -> bool:
+            """Nothing left to fetch now, and no worker."""
+            with self.a._lock:
+                return not self.a._remote_workers and all(
+                    (source, cid) in self.a._remote_retry
+                    for source, cids in self.a._remote_reserved.items() for cid in cids)
+
+        self.assertTrue(wait_for(idle, what="the remote pins"))
 
     def served(self) -> dict:
         """A's served pins by CID: (state, reason)."""
         return {pin["cid"]: (pin["state"], pin["reason"]) for pin in self.a.pin_remote_served()["pins"]}
+
+    def due_now(self, cid: Cid, since: float | None = None):
+        """Make IDENTITY's pin of cid, waiting to be tried again, due now (first not found at since, if given), and
+        run the maintenance pass that starts its fetch."""
+        key = (remote_source(IDENTITY), cid)
+        with self.a._lock:
+            retry_at, first = self.a._remote_retry[key]
+            self.a._remote_retry[key] = (time.time(), first if since is None else since)
+        self.a._retry_remote_pins()
 
     def test_pinned_and_released(self):
         """A pin fetched is pinned; released, it shows released; usage counts it while pinned."""
@@ -475,12 +515,69 @@ class ServedByTheNodeTest(NodeTest):
         self.assertIn("quota", pin["detail"])
         self.assertIsInstance(pin["at"], float)
 
-    def test_drop_for_not_found_is_recorded_with_its_reason(self):
-        """A CID nobody provides is dropped "not_found"."""
-        missing = Cid.for_block(RAW, b"nobody has this")
+    def test_not_found_waits_and_is_tried_again(self):
+        """A CID nobody provides yet waits ("not_found", with when it is tried again: 10 minutes on), saved; tried
+        again once due, it is pinned when it can be found by then."""
+        data = b"nobody has this yet"
+        missing = Cid.for_block(RAW, data)
         self.a.backend.remote_pin(IDENTITY, missing, True)
         self.settled()
+        self.assertEqual(self.served(), {str(missing): (WAITING, "not_found")})
+        pin, = self.a.pin_remote_served()["pins"]
+        self.assertAlmostEqual(pin["retry_at"], time.time() + retry.RETRY_FIRST, delta=30)
+        self.assertEqual(self.a.pin_remote_served()["usage"][0]["waiting"], 1)
+        self.a.maintain(time.monotonic(), {})
+        self.assertEqual(state_rows(self.a.config.state_dir, "SELECT cid FROM remote_pin_retries"), [(missing.binary,)])
+        self.assertEqual(self.a._remote_workers, {})  # nothing due: no thread waits hours for it
+        self.assertEqual(self.shared(data), missing)
+        self.due_now(missing)
+        self.settled()
+        self.assertEqual(self.served(), {str(missing): (PINNED, None)})
+        self.assertEqual(self.a._remote_retry, {})
+        self.a.maintain(time.monotonic(), {})
+        self.assertEqual(state_rows(self.a.config.state_dir, "SELECT cid FROM remote_pin_retries"), [])
+
+    def test_not_found_for_three_days_is_dropped(self):
+        """A pin whose content still isn't found 3 days after it first wasn't is dropped "not_found"."""
+        missing = Cid.for_block(RAW, b"never anywhere")
+        self.a.backend.remote_pin(IDENTITY, missing, True)
+        self.settled()
+        self.due_now(missing, since=time.time() - retry.RETRY_FOR)
+        self.assertTrue(wait_for(lambda: not self.a._remote_reserved.get(remote_source(IDENTITY)),
+                                 what="the pin dropped"))
         self.assertEqual(self.served(), {str(missing): (DROPPED, "not_found")})
+        self.assertIn("3 days", self.a.pin_remote_served()["pins"][0]["detail"])
+
+    def test_a_pin_waiting_to_be_tried_again_is_released_at_once(self):
+        """Released while waiting to be tried again, a pin is given up at once, not when it is next due."""
+        missing = Cid.for_block(RAW, b"released while waiting")
+        self.a.backend.remote_pin(IDENTITY, missing, True)
+        self.settled()
+        self.assertTrue(self.a.backend.remote_pin(IDENTITY, missing, False))
+        self.assertEqual(self.a._remote_reserved.get(remote_source(IDENTITY)), {})
+        self.assertEqual(self.a._remote_retry, {})
+        self.assertEqual(self.served(), {str(missing): (RELEASED, None)})
+
+    def test_later_pins_are_fetched_while_one_waits(self):
+        """A pin waiting to be tried again doesn't hold up the source's pins accepted after it."""
+        missing = Cid.for_block(RAW, b"not yet")
+        self.a.backend.remote_pin(IDENTITY, missing, True)
+        self.settled()
+        cid = self.shared(b"there already")
+        self.a.backend.remote_pin(IDENTITY, cid, True)
+        self.settled()
+        self.assertEqual(self.served(), {str(missing): (WAITING, "not_found"), str(cid): (PINNED, None)})
+
+    def test_the_asking_node_is_asked_first(self):
+        """The node that asked serves what it added before any provider record of it is out: the pin is fetched
+        from it, found through its identified link's identity rather than the DHT."""
+        asker_id = RNS.Destination.hash(IDENTITY, APP_NAME, DHT_ASPECT)
+        asker = self.make_node("asker", asker_id)
+        cid = Cid.parse(asker.add_stream(io.BytesIO(os.urandom(2 * CHUNK_SIZE)))["cid"])
+        self.assertFalse(self.a.records.providers(cid.key))
+        self.assertTrue(self.a.backend.remote_pin(IDENTITY, cid, True))
+        self.settled()
+        self.assertEqual(self.served(), {str(cid): (PINNED, None)})
 
     def test_refusals_are_recorded(self):
         """A denied CID, and a pin past the queue, are refused with their reason."""
@@ -516,19 +613,25 @@ class ServedByTheNodeTest(NodeTest):
         missing = Cid.for_block(RAW, b"never found")
         self.a.backend.remote_pin(IDENTITY, missing, True)
         self.settled()
+        retry_at = self.a._remote_retry[(remote_source(IDENTITY), missing)]
         before = self.served()
+        self.assertEqual(before[str(missing)], (WAITING, "not_found"))
         self.a.maintain(time.monotonic(), {})  # saves the outcomes, as maintenance does every second
         self.a.served_pins.record(IDENTITY, Cid.for_block(RAW, b"crash"), WAITING)  # as if lost in a crash
         self.a.served_pins.save()
         self.a.stop()
-        self.a = self.make_node("a", A_ID)
+        self.a = self.make_node("a", A_ID, remote_pin_identities=[IDENTITY.hex()])
+        self.a._resume_remote_pins()  # as the start does
         after = self.served()
         self.assertEqual({cid: after[cid] for cid in before}, before)
+        # Still waiting to be tried again when it was due to be, with no thread waiting for it
+        self.assertEqual(self.a._remote_retry, {(remote_source(IDENTITY), missing): retry_at})
+        self.assertEqual(self.a._remote_workers, {})
         self.assertEqual(after[str(Cid.for_block(RAW, b"crash"))], (DROPPED, "lost"))
-        # Waiting at a stop, from an identity removed from the list before the next start (none is listed now)
+        # Waiting at a stop, from an identity removed from the list before the next start (only IDENTITY is now)
         source = remote_source(OTHER_IDENTITY)
         with self.a._db.transaction() as tx:
-            tx.execute("INSERT INTO remote_pins (position, source, cid) VALUES (0, ?, ?)", (source, pinned.binary))
+            tx.execute("INSERT INTO remote_pins (position, source, cid) VALUES (100, ?, ?)", (source, pinned.binary))
         self.a._resume_remote_pins()
         self.assertEqual(self.served()[str(pinned)], (PINNED, None))  # still IDENTITY's pin
         pins = [pin for pin in self.a.pin_remote_served()["pins"] if pin["identity"] == OTHER_IDENTITY.hex()]

@@ -8,7 +8,8 @@ CID is fetched once however often it appears.
 
 Providers, in the order they are tried:
 1. up to max_parallel_providers nodes with an open outgoing link (on a node that isn't slow, none over a slow
-   link, below), asked for the first missing block;
+   link, below), asked for the first missing block; a fetch's hint first, link or not and whatever its link's
+   speed (the node that asked for a remote pin, which may not have published its records yet);
 2. if none has it, providers found by a Lookup running in the background, so downloading starts with
    the first one found; the search ends once max_parallel_providers providers are known and the root
    block has arrived, when the lookup is complete, or at lookup_timeout. Providers in the routing table
@@ -550,8 +551,11 @@ class Fetcher:
         return max(1, self.config.effective_max_parallel_providers(self.slow_node))
 
     def open(self, root: Cid, names: list[str] | tuple[str, ...] = (), from_node: bytes | None = None,
-             pinned: bool = False) -> "Fetch":
+             pinned: bool = False, hint: bytes | None = None) -> "Fetch":
         """A fetch of <root>/<names>, to use as `with fetcher.open(...) as fetch:`.
+
+        hint is a node likely to hold it (a remote pin's asker), asked first along with the nodes with an open
+        link, as they are: one that hasn't it isn't penalised, and the lookup follows. Ignored with from_node.
 
         Raises InvalidDag if root was found invalid before. Its traversals raise StorageFull if what they
         would store doesn't fit on the disk (never because of max_storage).
@@ -563,7 +567,7 @@ class Fetcher:
             error.root = root
             raise error
         self.check_denied(root)
-        return Fetch(self, root, list(names), from_node, pinned)
+        return Fetch(self, root, list(names), from_node, pinned, hint)
 
     def check_denied(self, cid: Cid):
         """Raise Denied if the deny list (the storage's) denies cid."""
@@ -615,7 +619,8 @@ class Fetcher:
 class Fetch:
     """One fetch of a target: its protection session, providers, lookup and the blocks it has stored."""
 
-    def __init__(self, fetcher: Fetcher, root: Cid, names: list[str], from_node: bytes | None, pinned: bool):
+    def __init__(self, fetcher: Fetcher, root: Cid, names: list[str], from_node: bytes | None, pinned: bool,
+                 hint: bytes | None = None):
         """Use Fetcher.open."""
         self.fetcher = fetcher
         self.storage = fetcher.storage
@@ -625,6 +630,7 @@ class Fetch:
         self.names = names
         self.from_node = from_node
         self.pinned = pinned
+        self.hint = hint  # asked first, with the open links (_discover)
         self.target: Expect | None = None  # set by resolve()
         self.observer: Observer | None = getattr(_observers, "current", None)  # progress and cancel hook
         self.downloaded_blocks = 0
@@ -1418,7 +1424,9 @@ class Fetch:
         if not self._probed:
             self._probed = True
             banned = self.fetcher.routing.is_banned
-            linked = [n for n in self.client.open_links() if n != self.fetcher.own_id and not banned(n)]
+            hinted = [n for n in [self.hint] if n is not None and n != self.fetcher.own_id and not banned(n)]
+            linked = [n for n in self.client.open_links() if n != self.fetcher.own_id and not banned(n)
+                      and n not in hinted]
             # Ranked like providers; most recently used breaks ties. Their paths in one go: attached to a shared
             # instance, that is one RPC rather than one per link before the first request (plan C1). A node that
             # isn't slow probes none over a slow link: each would hold the lookup up by a radio round trip, and
@@ -1427,8 +1435,10 @@ class Fetch:
             paths = self._paths(linked)
             if not self.fetcher.slow_node:
                 linked = [node_id for node_id in linked if not self._slow(node_id, paths[node_id])]
+            # The hint goes first, taking one of the probe slots, over any link: one request that saves a lookup,
+            # to the one node known to hold the content before its records are out (a remote pin's asker)
             ranked = sorted(enumerate(linked), key=lambda item: self._rank(item[1], paths[item[1]], item[0]))
-            candidates = [node_id for _, node_id in ranked][:self.fetcher.max_parallel]
+            candidates = (hinted + [node_id for _, node_id in ranked])[:self.fetcher.max_parallel]
             if candidates and pending:
                 # Each is asked for just the first block missing, which is the root at the start
                 first = pending[0]

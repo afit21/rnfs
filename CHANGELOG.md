@@ -19,6 +19,8 @@ Upgrade notes:
 - **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
   `routing`, `peer_scores`, `announce_first_seen`, `provider_standing`, `remote_pins_asked`, `remote_pins_served`,
   `name_syncs`, `name_sync_files`, `published_heal`, `name_announces`); an older rnfs can't open it afterwards. Pins made before the
+  `name_syncs`, `name_sync_files`, `published_heal`, `remote_pin_retries`); an older rnfs can't open it
+  afterwards. Pins made before the
   upgrade have no `added` time, name keys made before it count as never exported (`rnfs status` lists them until
   `rnfs name export` is run), and remote pins asked before it have no status entry.
 - **LXMF:** rnfs no longer sends or receives LXMF (Removed, below). Pins of links auto-fetched over LXMF change
@@ -531,6 +533,22 @@ Changed:
 - `Config.validate` refuses `api_port` equal to a non-zero `gateway_port`.
 - A request that times out raises `ConnectionFailed` saying the daemon "didn't answer within its timeout".
 - `Config.load` reports invalid TOML as "<path> isn't valid TOML: …" (still a `ValueError`).
+- A fetch to pin that fails keeps what it got: `pin add`, `dir set` and `dir rm`, remote pins, followed names and
+  deny lists record it as a cached fetch, as `get` and `cat` already did, so trying again resumes rather than
+  starting over (a 4 MiB pin over LoRa failing at 90% fetched all of it again). Not when it failed on denied
+  content, an invalid DAG or a size bound or quota (`TooLarge`), which a retry can't get past. The record is cache
+  like any other (evictable, removed by `gc`), and never provided as a download of the user's.
+- Remote pins don't give up on content not yet published. The node asked to pin asks the node that asked first
+  (its node ID follows from the identity of the `/pin`'s link), which serves what it added before its provider
+  records are out. A pin whose content can't be found waits and is tried again after 10 minutes, doubling up to 6
+  hours, for up to 3 days, instead of being dropped at once; `pin remote ls --served` shows it waiting
+  (`not_found`) with when it is tried again (`retry_at`, a new field of `GET /api/pin/remote/served`). Pins
+  accepted after it aren't held up, and a release ends the wait at once.
+- A `get`, `pin` or `export` job whose content can't be found is queued again the same way, keeping its blocks,
+  rather than failed: `retry_at` (and `retry_since` while it waits) are new fields of a job, and `rnfs jobs` shows
+  it waiting. Not for a path its directory shows doesn't exist, nor for a job submitted with the new `retry: false`
+  (`POST /api/jobs`; `retry=False` in the library's `jobs.get`, `pin` and `export`), which fails as in 0.1.6. A
+  foreground `rnfs get`, `pin add` or `export` submits so, and still fails at once; `--background` jobs wait.
 
 Faster:
 - Range reads (`cat`, the gateway, sealed reads) size their window by the providers' links: they fetched 32 chunks

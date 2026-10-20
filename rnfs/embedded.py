@@ -325,7 +325,7 @@ class _Backend:
 
     def submit_job(self, kind: str, target: str | None, output: str | None, from_node: str | None, **flags) -> dict:
         """JobsFeature.submit (flags: get's sealed_name, fallback_dht and no_extract, or an add's or import's path and
-        options)."""
+        options; retry for a get, pin or export)."""
         return self.node.feature("jobs").submit(kind, target, output, from_node, **flags)
 
     def job(self, job_id: str, wait: float) -> dict:

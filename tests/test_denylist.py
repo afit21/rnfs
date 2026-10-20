@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 
-from rnfs import cli, denylist
+from rnfs import cli, denylist, fetcher
 from rnfs.api import ApiServer
 from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE
@@ -25,7 +25,7 @@ from rnfs.network import protocol
 from rnfs.network.server import select_blocks
 from tests.support import failing_commits, state_execute, state_rows
 from tests.test_api import raw_request
-from tests.test_node import A_ID, B_ID, NodeTest, setUpModule, tearDownModule  # noqa: F401 - RNS's loglevel
+from tests.test_node import A_ID, B_ID, NodeTest, _CancelAfter, setUpModule, tearDownModule  # noqa: F401 - RNS's loglevel
 from tests.test_providers import recorded_writes, rows_written
 
 IDENTITY = bytes(range(16))
@@ -647,6 +647,19 @@ class SourceTest(DenyNodeTest):
         self.assertEqual(c.deny.accepted()[source], good)
         self.assertEqual(c.deny.entry_count(source), 1)
         self.assertEqual(c.storage.pinned_by(DENY), {good})
+
+    def test_a_fetch_cut_short_keeps_its_progress(self):
+        """A list whose fetch fails (here cut short) keeps what it got as a cached fetch; the next check resumes."""
+        version = self.publish_list(*[Cid.for_block(RAW, i.to_bytes(4, "big")) for i in range(2500)])
+        c = self.node_with(str(version))
+        with fetcher.observing(_CancelAfter(2)):
+            self.assertFalse(self.check(c, str(version)))
+        self.assertEqual(c.storage.cached_fetches(), [(version, (), version)])
+        kept = c.storage.stat(version)["local_blocks"]
+        self.assertGreaterEqual(kept, 2)
+        self.assertLess(kept, c.storage.stat(version)["blocks"])
+        self.assertTrue(self.check(c, str(version)))
+        self.assertEqual(c.storage.pins()[version], {DENY})
 
     def test_removed_source_is_forgotten(self):
         """A source no longer in deny_lists at start stops applying, and its pin is released."""

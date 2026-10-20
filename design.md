@@ -111,6 +111,7 @@ rnfs/
   constants.py config.py ids.py errors.py log.py   shared foundation
   debuglog.py         the debug log file, <rnfs dir>/debug.log (debug_log)
   fsutil.py           cross-platform file operations: replace/remove retried on Windows, O_BINARY, IS_WINDOWS
+  retry.py            when content not found yet is tried again (remote pins, jobs): next_retry, no imports
   statedb.py          the state database, <rnfs dir>/state/rnfs.db: schema, transactions, JSON state migration
   content/            no networking; uses RNS's bundled msgpack and RNS logging, so importing it loads RNS
     cid.py            CIDs (section 4)
@@ -702,7 +703,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "sealed": bool \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names; for a sealed add, the local path or the name given, kept for the local user), its shared-folder entry, or a directory's single entry or entry count; `sealed` from the file's first bytes (`seal.MAGIC`), False for directories, None if the root or first chunk isn't stored. A complete pin's `type`, name from inside and `sealed` are read from its blocks once, then remembered while it stays complete (`_pin_details`, `PIN_MEMO` 16 384, forgotten when released). Callers that show pins to others must skip `sealed` entries' names and content |
 | `pin_remote(node_id, cid, pin)` | `bool` accepted; recorded (`AskedPins.record`) |
 | `pin_remote_ls(node_id=None, cid=None, check=False)` | `[{"node", "cid", "pin", "accepted", "asked", "state", "done", "checked", "seen"}]`, most recently asked first; `check` runs `AskedPins.check_now` first (Remote pin status, below) |
-| `pin_remote_served()` | `{"pins": [{"identity", "cid", "state", "reason", "at", "detail"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}` |
+| `pin_remote_served()` | `{"pins": [{"identity", "cid", "state", "reason", "at", "detail", "retry_at"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}` |
 | `gc()` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}` |
 | `providers(cid)` | `[node_id bytes]` |
 | `ping(node_id)` | round-trip seconds, or None |
@@ -718,7 +719,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
 threads, for tests (tests/test_node.py). The request server's backend is `node.backend` (`NodeBackend`).
-`fetcher.py`: `Fetcher.open(root, names, from_node, pinned)` gives a `Fetch` context (a protection session) with
+`fetcher.py`: `Fetcher.open(root, names, from_node, pinned, hint)` gives a `Fetch` context (a protection session) with
 `resolve()`, `fetch_dag()`, `fetch_listing()`, `read_range()`; `publisher.py`: `Publisher.refresh()` (recompute the
 provide set, withdraw at once; skipped when the node's generation, the deny list, the key sources' keys, the
 strategy and `_entries_input()` are as at the last one), `publish_due()`, `serves(cid)`, `run()`. The node calls the
@@ -1198,9 +1199,9 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 | `names.watch(name, callback) -> Watch` | `ValueError`; a Client: `NotFound` from a daemon without the endpoint | below / `GET /api/name/watch` |
 | `names.sync(alias, path) -> FolderSync` (a relative path made absolute where the program runs), `names.unsync(alias)`, `names.syncs() -> list[FolderSync]` | `sync`: `NotFound` (no such name or folder), `ValueError` (not a folder, one in the rnfs dir); a `RuntimeWarning` in private mode; `unsync`: `NotFound` (not synced) | `name_sync`, `name_unsync`, `name_syncs` / `POST /api/name/sync`, `/api/name/unsync`, `GET /api/name/syncs` |
 | `Name`: `alias`, `name: bytes`, `cid`, `sequence`, `str()` hex; `publish(target) -> Record`, `export_key() -> bytes`, `remove()`, `refresh() -> Name` | `publish`: `NotFound` (path not stored), `ValueError`, `RnfsError` (highest sequence) | `name_publish`, `name_export`, `name_rm` / `POST /api/name/publish`, `/api/name/export`, `/api/name/rm` |
-| `jobs.get(target, output, *, from_node=None, sealed_name=False, fallback_dht=False, on_progress=None, no_extract=False) -> Job`, `jobs.pin(target, *, on_progress=None) -> Job`, `jobs.export(target, output, *, on_progress=None) -> Job`, `jobs.add(path, *, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, on_progress=None) -> Job`, `jobs.add_nomadnet(link, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, identify=False, on_progress=None) -> Job`, `jobs.import_archive(path, *, on_progress=None) -> Job` | `ValueError` (output exists or in use, an option), `NotFound` (add, import: no such path), `Busy` (1000 active) | `JobsFeature.submit` / `POST /api/jobs` |
+| `jobs.get(target, output, *, from_node=None, sealed_name=False, fallback_dht=False, on_progress=None, no_extract=False, retry=True) -> Job`, `jobs.pin(target, *, on_progress=None, retry=True) -> Job`, `jobs.export(target, output, *, on_progress=None, retry=True) -> Job`, `jobs.add(path, *, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, on_progress=None) -> Job`, `jobs.add_nomadnet(link, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, identify=False, on_progress=None) -> Job`, `jobs.import_archive(path, *, on_progress=None) -> Job` | `ValueError` (output exists or in use, an option), `NotFound` (add, import: no such path), `Busy` (1000 active) | `JobsFeature.submit` / `POST /api/jobs` |
 | `jobs.job(job_id) -> Job`, `jobs.list() -> list[Job]`, `jobs.clear(job_id=None) -> int` | `NotFound`, `ValueError` (not finished) | `JobsFeature.get`, `list`, `clear` / `GET /api/jobs/get`, `GET /api/jobs`, `POST /api/jobs/clear` |
-| `Job`: `id`, `kind`, `target` (None for add and import), `output`, `from_node`, `sealed_name`, `fallback_dht`, `no_extract`, `path`, `options` (add and import), `source` (pin, add and import), `nomadnet` (an add of a NomadNet link), `state`, `error`, `result: dict`, `total_bytes`, `done_bytes`, `downloaded_bytes`, `blocks`, `blocks_total`, `rate`, `eta`, `created`, `started`, `finished`, `runs`, `done` (finished); `refresh() -> Job`, `wait(timeout=None) -> Job`, `cancel() -> Job`, `watch(callback) -> Watch` | `wait`: `TimeoutError`; `NotFound` once cleared | `JobsFeature.get(wait=)`, `cancel` / `GET /api/jobs/get?wait=`, `POST /api/jobs/cancel` |
+| `Job`: `id`, `kind`, `target` (None for add and import), `output`, `from_node`, `sealed_name`, `fallback_dht`, `no_extract`, `path`, `options` (add and import), `source` (pin, add and import), `nomadnet` (an add of a NomadNet link), `state`, `error`, `result: dict`, `total_bytes`, `done_bytes`, `downloaded_bytes`, `blocks`, `blocks_total`, `rate`, `eta`, `created`, `started`, `finished`, `runs`, `retry_at`, `retry_since` (queued again as its content wasn't found), `retry` (False: submitted not to be), `done` (finished); `refresh() -> Job`, `wait(timeout=None) -> Job`, `cancel() -> Job`, `watch(callback) -> Watch` | `wait`: `TimeoutError`; `NotFound` once cleared | `JobsFeature.get(wait=)`, `cancel` / `GET /api/jobs/get?wait=`, `POST /api/jobs/cancel` |
 | `deny.list() -> DenyState`, `deny.add(entries) -> list[str]`, `deny.remove(entries) -> list[str]` | `ValueError` (malformed entry, too many), `NotFound` (remove: not on it) | `node.deny.entries`/`add`/`remove`, `DenyFeature.lists` / `GET /api/deny`, `POST /api/deny/add`, `/api/deny/rm` |
 | `timeout(seconds) -> context manager` | `ValueError` (not None or a positive number) | a Client: `ApiConnection.using_timeout`; a Node: nothing (above) |
 | `peers() -> list[Peer]`, `stats() -> Stats` | `NotFound` (no peers feature) | `PeersFeature.peers`, `stats` / `GET /api/peers`, `/api/stats` |
@@ -1665,9 +1666,9 @@ its `start()` raising is logged and the others still start (`RnfsNode._start_fea
 | Feature | Module | What it does | Hooks in shared code |
 |---|---|---|---|
 | `peers` | `peers.py` | `rnfs peers`, `rnfs stats`; client-mode nodes' mode and last-heard time come from the node's `rnfs.dht` announce handler, which counts every announce in `Traffic`; `first_heard`, `rtt`, `online` and `peer` events (Mesh) | reads `Traffic`, the routing table, links, paths |
-| `jobs` | `jobs.py` | `JobsFeature` (the job manager), `Job` (a pin, add or import job keeps its `source`, saved in its record only when it isn't `user`, so other records are as 0.1.6 wrote them; `app_removed` cancels an app's), CLI progress formatting | `fetcher.observing(observer)`: a thread-local observer every `Fetch` picks up (`total`, `block`, `cancelled` checked at each step, raising `fetcher.Cancelled`) |
+| `jobs` | `jobs.py` | `JobsFeature` (the job manager), `Job` (a pin, add or import job keeps its `source`, saved in its record only when it isn't `user`, so other records are as 0.1.6 wrote them; `app_removed` cancels an app's; a get, pin or export failing with `NotFound` is queued again, keeping its protection, with `retry_at` and `retry_since` in its record while it waits (`_retries`, `rnfs.retry`; not when `_absent_path` finds its path missing from stored directories), started by `_schedule` once due, which the `rnfs-job-retry` thread runs every 30 s; a job submitted with `retry` false, kept in its record only then, fails instead: the CLI's foreground `run_transfer` submits so), CLI progress formatting | `fetcher.observing(observer)`: a thread-local observer every `Fetch` picks up (`total`, `block`, `cancelled` checked at each step, raising `fetcher.Cancelled`) |
 | `keepers` | `keepers.py` | signed records (`SignedRecord`, `parse_signed`, `sign_record`, `from_announce_data`), `/name`, `KeeperClient`, `KeeperStore` | `Feature.requests`; `publisher.DhtKey` and `Publisher.add_key_source` (non-CID keys published like CIDs); `NameManager.keepers` (`published`, `heard`, `query`, `always_ask`, `local_record`), `NameManager.offer()`/`record()`; the 5-argument announce handler (packet hash) |
-| `follow` | `follow.py` | followed names: each check and fetch one at a time, `fetcher.open(pinned=True)`, pin inside the fetch's protection, old pin released after | keepers' `FOLLOW` reason |
+| `follow` | `follow.py` | followed names: each check and fetch one at a time, `node.pinned_fetch` (a pinned fetch whose progress a failure keeps as cache), pin inside the fetch's protection, old pin released after | keepers' `FOLLOW` reason |
 | `contacts` | `contacts.py` | address book; `expand_target`, `lookup(nick, kind)`, `resolve_id(text, kind)`, `node_arg` | `RnfsNode._parse_target` (never for the gateway), `JobsFeature.submit` |
 | `deny` | `deny.py` | `deny_lists` sources (`parse_source`, `validate_settings` from `Config.validate`): `check(source)` resolves a name (persisted), fetches the target pinned, checks it is a file within `MAX_LIST_BYTES`, parses it, pins it `deny` and `accept`s it, then releases unused `deny` pins; `run_due` on `rnfs-deny`, after the join (`CHECK_INTERVAL` for names, `retry_delay` backoff); sources no longer configured are forgotten at start | `node.deny` (core); `DENY` in `storage.check_source` |
 | `settings` | `settings.py` | `rnfs config`, `GET /api/config`, `POST /api/config/set`: rnfs.toml read and rewritten, `LIVE` settings applied to the running node | `config.settings_schema`, `Config.combine`, `config.edit_settings`; `Config.overrides`/`given_defaults` (set by `Config.load`); the live hooks below |
@@ -1810,7 +1811,9 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   pin, and an add costs one durable commit, not two) and `pin_labels` (0.2.0: the label its user gave a pin,
   apart from where it came from; FULL, each change written at once; pruned with the names);
 - node: `fetched` (targets fetched for the user, for `roots`; with the cache records) and `remote_pins` (remote
-  pins accepted and not yet fetched, in order; about once a second and at stop, rewritten whole); fetcher:
+  pins accepted and not yet fetched, in order; about once a second and at stop, rewritten whole), with
+  `remote_pin_retries` (0.2.0: those whose content wasn't found, when each is tried again and was first not found;
+  rewritten in the same transaction); fetcher:
   `invalid` (invalid roots, oldest first; with the cache records);
 - `remote_pins_asked` and `remote_pins_served` (0.2.0, rnfs/remote_pins.py: the remote pins this node asked for and
   their checks, at most 10 000, saved after each ask and with the batched saves; the latest outcome of each remote
@@ -2053,6 +2056,13 @@ Everything in the specification is implemented, with these simplifications and a
   children by `_range_leaves`, never kept on the fetch, since another read of the same fetch may run between a
   generator's steps; `reserve` counts a file node not yet received as `MAX_BLOCK_SIZE` against it, so a
   small honest range ending inside two nodes of a level asks for them in two requests instead of one.
+- A failed fetch keeps what it stored as a cached fetch: `RnfsNode._fetching` (get, cat, ls, stat, the gateway)
+  records every fetch when it ends, and `RnfsNode.pinned_fetch` (`pin add`, `dir set`/`dir rm`, remote pins, and
+  the follow and deny features' fetches, all with `pinned=True`) records one that raised, except for `Denied`,
+  `InvalidDag` and `TooLarge` (a quota or bound: a retry fails the same way), inside the fetch's protection
+  session, then enforces `max_storage`. Its record is made as a gateway fetch's is (`_record_fetch(for_gateway=True)`:
+  not a target `roots` provides), since it was fetched to be pinned; a remote pin's quota check that drops the pin
+  returns inside the fetch rather than raising, so it records nothing either.
 - `max_storage` is soft. An unpinned fetch evicts other cached fetches (LRU) to make room for each response
   and goes above `max_storage` when nothing is evictable; when its session ends the node evicts again, which
   may evict what it fetched if pins alone fill `max_storage`. Any fetch is refused with `StorageFull` ("not
@@ -2076,6 +2086,19 @@ Everything in the specification is implemented, with these simplifications and a
   wait for the first join before fetching, and a fetch cut short by stopping stays queued. Stop cancels their
   fetches (an observer bound to `stop_event`, so a fetch ends at its next step) and waits for the workers
   (`_remote_workers` maps each source to its thread) within its budget.
+- A remote pin's fetch asks the node that asked first (0.2.0): `Fetcher.open`'s `hint`, its node ID
+  `Destination.hash(identity, "rnfs", "dht")` from the `/pin`'s identity hash (no wire change), probed for the
+  first missing block along with the open links (`Fetch._discover`, taking one of the `max_parallel` probe slots;
+  one that hasn't it isn't penalised, and the lookup follows). The asker serves what it provides before its records
+  are out. A fetch failing with `NotFound` keeps the pin queued (`_not_found`): `_remote_retry[(source, cid)]` holds
+  `(retry_at, since)` (Unix times, `rnfs.retry.next_retry`: `RETRY_FIRST` 10 min plus the time since it was first
+  not found, at most `RETRY_MAX` 6 h, until `RETRY_FOR` 3 days after `since`, then dropped `not_found`), its outcome
+  `waiting` with reason `not_found`, and `pin_remote_served` gives its `retry_at`. A worker takes its source's oldest
+  pin that is due (`_next_remote_pin`), marking it `_remote_current`, and ends when none is due; maintenance
+  (`_retry_remote_pins`, every second) starts the worker of a source with a pin due again. Later pins aren't held
+  up. A release of a pin waiting to be retried (not `_remote_current`) removes it at once. The waits are saved with
+  the pins waiting, in `remote_pin_retries` (a table of its own, so `remote_pins` keeps its released layout), and
+  restored by `_resume_remote_pins`, which starts no worker for a source whose pins all wait.
 - **Remote pin status** (0.2.0, `rnfs/remote_pins.py`; local only, `/pin` unchanged). `AskedPins` records each
   `/pin` this node sends (`RnfsNode.pin_remote`): one entry per (node, CID), replaced by a later ask, with pin or
   release, whether accepted, when, and its checks (`tried`, the last attempt, for pacing; `checked` and `found`,

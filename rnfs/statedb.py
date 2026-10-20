@@ -260,6 +260,12 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         # the name's announces have been held since, the clock being behind it. Kept when the name is removed
         "CREATE TABLE name_announces (name BLOB PRIMARY KEY, emitted INTEGER, held REAL NOT NULL) WITHOUT ROWID",
     )),
+    ("remote_pin_retry", (
+        # The remote pins waiting (remote_pins) whose content wasn't found (rnfs 0.2.0; rnfs.retry): when each is
+        # tried again and when it was first not found (Unix times). Saved with remote_pins, in the same transaction
+        "CREATE TABLE remote_pin_retries (source TEXT NOT NULL, cid BLOB NOT NULL, retry_at REAL NOT NULL,"
+        " since REAL NOT NULL, PRIMARY KEY (source, cid)) WITHOUT ROWID",
+    )),
 )
 
 
