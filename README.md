@@ -160,8 +160,9 @@ rnfs daemon
 
 ## Debian and Ubuntu
 
-Pick `amd64` or `arm64` to match `dpkg --print-architecture`. Ubuntu 22.04 has Python 3.10, which is too old;
-use the [install script](#install-script) there.
+Pick `amd64` or `arm64` to match `dpkg --print-architecture`. Ubuntu 22.04's Python is 3.10, which is too old:
+there, run `sudo apt install python3.11 python3.11-venv` and then the [install script](#install-script), which finds
+`python3.11`.
 
 ```sh
 curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.6/rnfs_0.1.6_amd64.deb
