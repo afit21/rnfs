@@ -1638,7 +1638,7 @@ class RnfsNode:
             self.deny.remember_hash(expect.cid, digest)
         if self.deny.denies_hash(digest):
             # A hash entry stops the file being assembled, not its blocks being served one by one (spec section 8)
-            if expect.cid not in self._hash_noticed:
+            if not expect.cid.is_raw and expect.cid not in self._hash_noticed:
                 if len(self._hash_noticed) >= HASH_NOTICES:
                     self._hash_noticed.clear()
                 self._hash_noticed.add(expect.cid)

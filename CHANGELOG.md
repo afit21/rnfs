@@ -748,6 +748,10 @@ Faster:
   (NomadNet's "Request Not Allowed" among them) could be lost the same way and the add fail.
 
 Fixed:
+- **A file-hash deny entry stops a one-block file everywhere** (spec section 8): a file of one block has its content's
+  hash as its CID's digest, and the specification says either entry stops it, but a `sha256:` entry was only checked
+  where content is assembled. A cloud node with such an entry refused the file to its own `cat` and gateway, yet
+  served it to `get --from` from another node and kept providing it. The raw CID a hash names is now denied with it.
 - **The daemon's log reaches the journal as it is written.** Under systemd (and launchd, or the Windows logon task)
   stdout is a pipe or a file, which Python fills in 8 KiB blocks, so `journalctl --user -u rnfs -f` showed nothing for
   hours on a quiet node, and lines turned up in bursts stamped hours earlier, all of them at a stop. Seen upgrading a

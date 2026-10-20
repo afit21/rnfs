@@ -82,6 +82,14 @@ class Cid:
         return cls(_PREFIXES[codec] + hashlib.sha256(block).digest())
 
     @classmethod
+    def raw_of_digest(cls, digest: bytes) -> "Cid":
+        """The raw CID of the block whose SHA-256 is digest: a file of one block has its content's hash as its CID's
+        digest."""
+        if len(digest) != _DIGEST_LENGTH:
+            raise ValueError(f"a SHA-256 digest is {_DIGEST_LENGTH} bytes, not {len(digest)}")
+        return cls(_PREFIXES[RAW] + digest)
+
+    @classmethod
     def parse(cls, text) -> "Cid":
         """The CID written as text ("b" + base32). Raises ValueError unless text is its one canonical form."""
         if not isinstance(text, str) or not text.startswith("b") or not text.isascii():

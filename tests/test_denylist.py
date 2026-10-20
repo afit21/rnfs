@@ -376,6 +376,26 @@ class ServeAndProvideTest(DenyNodeTest):
         with self.assertRaises(NotFound):
             b"".join(self.b.read(str(cid)))  # B finds A as the provider, which answers "not held"
 
+    def test_a_hash_entry_stops_a_one_block_file_as_its_cid_does(self):
+        """A file of one block has its content's hash as its CID's digest, so a hash entry stops it everywhere a CID
+        entry does: it was refused when read, yet still served whole by /blocks and provided (a cloud node's deny list
+        by hash: a 0.1.6 node fetched it from it with get --from)."""
+        data = b"one block, denied by its hash"
+        cid = self.shared(data)
+        self.a.publisher.publish_due()
+        self.assertIn(cid, self.a.publisher.provided())
+        self.deny(self.a, "sha256:" + hashlib.sha256(data).hexdigest())
+        self.assertTrue(self.a.deny.denies(cid))
+        self.assertIsNone(self.a.backend.served_block(cid))
+        self.assertNotIn(cid, self.a.publisher.provided())
+        with self.assertRaises(NotFound):
+            b"".join(self.b.read(str(cid)))
+        # A file of several chunks is still served chunk by chunk (only reading it whole is refused): deny its CID
+        big = os.urandom(3 * CHUNK_SIZE)
+        root = self.shared(big)
+        self.deny(self.a, "sha256:" + hashlib.sha256(big).hexdigest())
+        self.assertFalse(self.a.deny.denies(root))
+
     def test_not_provided_and_withdrawn(self):
         """A pin that is, or holds, a denied block stops being provided, and its record is withdrawn."""
         root = Cid.parse(self.a.add_path(self.tree())["cid"])
