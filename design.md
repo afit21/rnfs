@@ -2249,7 +2249,9 @@ Everything in the specification is implemented, with these simplifications and a
   added from a path.
 - **Sealed files.** `get` of a *directory* containing sealed files writes them as stored (get each with
   `get <cid>/<path>`). Sealing hides content and name but not size, recipients or wrapper names, and gives no
-  sender authentication. A sealed file's 65600-byte segments don't align with 64 KiB chunks, so a
+  sender authentication. A recipient opens it with its node identity's private key, which the node holds
+  while it runs and keeps unencrypted in `storage/identity`: sealing protects against the network, not
+  against someone who can read the recipient's rnfs dir. A sealed file's 65600-byte segments don't align with 64 KiB chunks, so a
   one-segment range read may fetch two chunks. Jobs (`get` without `--raw`) decrypt as plain `get` does.
 - **Mesh.** Attached to a shared `rnsd` instance, every incoming link arrives on the local shared-instance
   interface, so `serve_interfaces`/`no_serve_interfaces` can't tell radios apart (a warning is logged); run

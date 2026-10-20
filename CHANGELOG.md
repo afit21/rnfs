@@ -71,6 +71,10 @@ Security:
   stay in the block store, unpinned, until a gc or an eviction. An unpack now marks the state database while it
   runs, and a start that finds the mark deletes every block nothing reaches before serving anything (the
   unrecorded blocks of a fetch the same crash interrupted too: a retry fetches them again).
+- **Documented: a sealed file is only as safe as the recipient's node identity** (REV12), which is online while
+  the node runs and stored unencrypted in the rnfs dir (`storage/identity`): sealing protects against the
+  network, not against someone who can read the recipient's disk (README, Known limitations; specification
+  section 5).
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves

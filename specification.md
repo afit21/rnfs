@@ -496,7 +496,10 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
 - **What it protects.** The confidentiality of the content and, if sealed, of the file name. It does not hide
   the recipients' identity hashes, the approximate size, or (with `--wrap`) the wrapper's entry name, and it
   says nothing about who sealed it: anyone with a recipient's public key can seal a file for them, and any
-  recipient can seal different content for the others.
+  recipient can seal different content for the others. A sealed file is readable by whoever holds a
+  recipient's identity: rnfs's recipient is its node identity, which a running node keeps in memory and
+  stores unencrypted in the rnfs dir (`storage/identity`), so sealing protects the content against the network
+  and other nodes, not against someone who can read a recipient's rnfs dir or disk.
 - **Folders.** `add --to` of a folder seals it as one sealed file, never file by file (which would leave its
   names and tree visible): the folder is packed as one plain tar (POSIX pax) and that tar is sealed with the
   sealed name `<folder>.tar`. The format above is unchanged, so a reader that only decrypts (rnfs 0.1.x) gets a
