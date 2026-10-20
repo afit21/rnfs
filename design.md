@@ -699,6 +699,10 @@ once it has had no data, and hasn't been handed out by `LinkPool.get()`, for its
 not within `link_idle_timeout` of the end of a `hold`. The `rnfs-link-sweeper` thread sweeps when the next link kept
 is due (`LinkPool.next_sweep`, at least `MIN_SWEEP_WAIT`, 0.25 s, at most a quarter of `link_idle_timeout` within 1 to
 30 s), and is woken (`LinkPool.wake`) by each request on a shared link ending and each link `get()` hands out.
+A request on a shared link that RNS fails (`RECEIPT_FAILED`, nothing of an answer started) while the link, still
+active, received nothing since it was sent (`Link.no_inbound_for()` longer than the request took: `_went_dead`) closes
+the link, unless another thread uses it (`close_unless_used`, 0.2.0): the far end lost it, which RNS would notice
+only at its keepalive.
 Every link `LinkPool` opens gets an `EarlyResponses` (`PeerLink.early`, 0.2.0) in place of its `handle_response`
 (RNS looks it up on the link): a response no `Link.pending_requests` entry matches is kept (at most
 `MAX_EARLY_RESPONSES`, 16, for `EARLY_RESPONSE_LIFE`, 30 s), and `LinkPool._request`, once `Link.request` has

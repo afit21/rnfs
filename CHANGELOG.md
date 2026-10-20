@@ -740,6 +740,13 @@ Fixed:
   hours on a quiet node, and lines turned up in bursts stamped hours earlier, all of them at a stop. Seen upgrading a
   cloud node with 857k blocks: its first start moved them for minutes with nothing in the journal. The daemon now
   writes stdout a line at a time.
+- **A link the other end lost is closed after one unanswered request** (spec section 3, Links). When the `rnsd` of a
+  node, or of a transport node on the way, restarted, the links through it were gone at the far end but still up at
+  this one until RNS's keepalive noticed, 12 minutes on a radio path; every request on them waited out its timeout.
+  Over LoRa, after the gateway's `rnsd` restarted, a slow node's every `/find` to the gateway took 21–23 s and failed,
+  so a search during the partition that followed found nothing in 3.5 minutes. A link that received nothing at all
+  while a request on it went unanswered is now closed, unless another request is using it, and the next request
+  opens a new one.
 
 ## 0.1.6
 

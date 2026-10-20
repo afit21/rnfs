@@ -55,6 +55,7 @@ class FakeLink:
         self.identities = []
         self.requests = []
         self.idle = 0.0
+        self.silence = 0.0
         self.expected_rate = None
         FakeLink.created.append(self)
 
@@ -85,6 +86,10 @@ class FakeLink:
         """Seconds without data, set by tests."""
         return self.idle
 
+    def no_inbound_for(self):
+        """Seconds since anything arrived on the link, set by tests (by default just now)."""
+        return self.silence
+
     def get_mdu(self):
         """Default MDU."""
         return 431 if self.status == FakeLink.ACTIVE else None
@@ -110,6 +115,7 @@ class FakeLink:
             if response is SILENT:
                 return
             if response is FAIL:
+                receipt.status = links.RECEIPT_FAILED  # as RNS marks a request it timed out
                 failed_callback(receipt)
                 return
             if isinstance(response, Stall):
@@ -515,6 +521,35 @@ class LinkPoolTest(unittest.TestCase):
         FakeLink.responder = staticmethod(lambda link, path, data: FAIL)
         peer = run(self, lambda: self.pool.get(NODE))
         self.assertFalse(run(self, lambda: self.pool.request(peer, "/find", b"k")).answered)
+
+    def test_a_link_silent_through_an_unanswered_request_is_closed(self):
+        """Nothing came back on the link while a request waited out RNS's timeout: the other end lost the link (its
+        rnsd restarted), which RNS would notice only at its keepalive. Closed, so the next request opens a new one."""
+        FakeLink.responder = staticmethod(lambda link, path, data: FAIL)
+        peer = run(self, lambda: self.pool.get(NODE))
+        peer.link.silence = 10_000.0
+        self.assertFalse(run(self, lambda: self.pool.request(peer, "/find", b"k")).answered)
+        self.assertEqual(peer.link.status, FakeLink.CLOSED)
+        FakeLink.responder = staticmethod(lambda link, path, data: True)
+        fresh = run(self, lambda: self.pool.get(NODE))
+        self.assertIsNot(fresh, peer)
+        self.assertTrue(run(self, lambda: self.pool.request(fresh, "/find", b"k")).answered)
+
+    def test_a_link_heard_from_meanwhile_is_kept_after_an_unanswered_request(self):
+        # The request or its answer was lost on the way (RNS resends neither); the link itself works
+        FakeLink.responder = staticmethod(lambda link, path, data: FAIL)
+        peer = run(self, lambda: self.pool.get(NODE))
+        self.assertFalse(run(self, lambda: self.pool.request(peer, "/find", b"k")).answered)
+        self.assertEqual(peer.link.status, FakeLink.ACTIVE)
+        self.assertIs(run(self, lambda: self.pool.get(NODE)), peer)
+
+    def test_a_silent_link_another_request_uses_is_left_to_it(self):
+        FakeLink.responder = staticmethod(lambda link, path, data: FAIL)
+        peer = run(self, lambda: self.pool.get(NODE))
+        peer.link.silence = 10_000.0
+        peer.users[-1] = 1  # another thread's request in progress on it
+        self.assertFalse(run(self, lambda: self.pool.request(peer, "/find", b"k")).answered)
+        self.assertEqual(peer.link.status, FakeLink.ACTIVE)
 
     def test_request_outcomes_are_logged_with_the_reason(self):
         FakeLink.responder = staticmethod(lambda link, path, data: [path, data])

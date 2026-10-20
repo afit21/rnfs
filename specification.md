@@ -191,6 +191,13 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   in and out). A link with a rate estimate, which carried `/blocks`, keeps `link_idle_timeout`: closing it would
   reset the responder's rate estimate (its next response held to one chunk) and RNS's Resource window. These
   links don't identify, so lookups and downloads don't reveal who is asking.
+- A requester SHOULD close a shared link once a request on it goes unanswered (RNS times it out, nothing of an answer
+  started) with nothing at all received on the link since the request was sent, unless another request is in
+  progress on it (rnfs 0.2.0). The other end has most likely lost the link: its `rnsd`, or a transport node on the
+  path, restarted. RNS notices that only when a keepalive goes unanswered, 12 minutes on a radio path, and meanwhile
+  every request on the link waits out its timeout (measured over LoRa after a gateway's `rnsd` restarted: every
+  `/find` to it, 21–23 s each, for minutes, so a search during a partition found nothing). A new link either works
+  or fails fast. A link that received anything meanwhile is kept: the request or its answer was lost on the way.
 - A node identifies (`Link.identify()`) only:
   - on a separate link opened to publish (section 6) or to send `/pin` (section 8), closed when done; or
   - on every link, in private mode.

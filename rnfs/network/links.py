@@ -793,6 +793,14 @@ class LinkPool:
                 self._wait(peer, path, exchange, receipt, deadline, watchdog, on_progress)
             finally:
                 self._log_outcome(peer, path, exchange)
+            if self._went_dead(peer, exchange):
+                # Nothing at all came back on the link while the request waited out RNS's timeout: the other end
+                # most likely lost it (its rnsd or a transport node on the way restarted), which RNS notices only at
+                # its keepalive, about 10 minutes on LoRa; meanwhile every request on it waited out its timeout too.
+                # Closed, unless another request is using it, so the next one opens a link that works or fails fast
+                if self.close_unless_used(peer.node_id, {threading.get_ident()}):
+                    log(f"closed the link to {node_name(peer.node_id)}: nothing came back on it while {path} waited",
+                        LOG_VERBOSE)
             return exchange
         finally:
             peer.release(blocks)
@@ -834,6 +842,20 @@ class LinkPool:
                 break
         if exchange.answered and on_progress is not None and reported < 1.0:
             on_progress(1.0)
+
+    def _went_dead(self, peer: PeerLink, exchange: Exchange) -> bool:
+        """True if exchange went unanswered on peer's shared link (RNS gave up on it, nothing of an answer started)
+        while the link, still up at this end, received nothing at all from the other end since it was sent, not even a
+        keepalive: a link lost at the other end, rather than a request or answer lost on the way."""
+        if not peer.shared or exchange.answered or exchange.response_started is not None or exchange.sent_at is None:
+            return False
+        if getattr(exchange.receipt, "status", None) != RECEIPT_FAILED or not peer.is_active():
+            return False
+        try:
+            silent = peer.link.no_inbound_for()
+        except Exception:  # noqa: BLE001 - RNS internals: not known to be dead if they fail
+            return False
+        return silent > self.clock() - exchange.sent_at
 
     def _log_outcome(self, peer: PeerLink, path: str, exchange: Exchange):
         """Log, at LOG_DEBUG, how a request sent ended: answered (in what time, how large) or why not."""
