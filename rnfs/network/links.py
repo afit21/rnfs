@@ -170,7 +170,8 @@ class Exchange:
             self.expected_rate = receipt.link.get_expected_rate()
         except Exception:  # noqa: BLE001 - RNS internals: no rate if they fail
             self.expected_rate = None
-        self.response_size = receipt.response_size
+        # RNS sizes a one-packet response as its msgpack length less 2, so one of a byte ([], False) is -1
+        self.response_size = None if receipt.response_size is None else max(0, receipt.response_size)
         self.response = receipt.get_response()
         self.progress = 1.0
         self.answered = True
