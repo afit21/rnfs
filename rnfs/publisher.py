@@ -15,7 +15,8 @@
   pin's, so the served set doesn't change.
 - **Publishing.** A CID is due when it has never been published or its republish_interval has passed. The due
   CIDs' K closest nodes are found by sweep providing (rnfs.dht.sweep): one lookup per region of due keys,
-  PUBLISH_LOOKUPS at once (one at a time on slow nodes). Each key is stored on its store set: its K closest (and
+  PUBLISH_LOOKUPS at once (one at a time on slow nodes), regions sized by the network size estimate too
+  (set_network_size). Each key is stored on its store set: its K closest (and
   each disjoint path's, when the region's lookup ran as disjoint paths), the ring servers of its widened lookup when
   the density check flags it on its region's servers (set_widening; the widened lookup counts as one of the round's
   lookups), and the servers of the parts add_store_part added. Keys are grouped by node, and each node gets its
@@ -411,7 +412,8 @@ class Publisher:
                  make_lookup: Callable[[bytes], object], slow_node: bool = False, state_dir: str | None = None,
                  cached_eligible: Callable[[], set[Cid]] = set, clock: Callable[[], float] = time.time,
                  retry_interval: float = RETRY_INTERVAL, generation: Callable[[], object] | None = None,
-                 bitrate: float | None = None, known_servers: Callable[[], int] = lambda: 0):
+                 bitrate: float | None = None, known_servers: Callable[[], int] = lambda: 0,
+                 lookups_at_once: int | None = None):
         """Publisher for own_id. providers is the ProviderStore (to record ourselves), client the PeerClient.
 
         make_lookup(key) returns a dht.lookup.Lookup; cached_eligible() returns the cached targets the
@@ -420,6 +422,8 @@ class Publisher:
         list and the key sources' keys are as at the last one (without it, every refresh recomputes). bitrate (the
         slowest interface's, bits/s; None if unknown) and known_servers() (the routing table's size, a lower bound
         of the network's) decide whether a slow node provides entries by default (republish_airtime).
+        lookups_at_once is how many region lookups a round runs at once on a node that isn't slow (PUBLISH_LOOKUPS if
+        None; 1 makes a round's outcome independent of thread timing, for tests that measure placement).
         """
         self.own_id = own_id
         self.config = config
@@ -434,6 +438,7 @@ class Publisher:
         self.generation = generation
         self.bitrate = bitrate
         self.known_servers = known_servers
+        self.lookups_at_once = PUBLISH_LOOKUPS if lookups_at_once is None else max(1, lookups_at_once)
         self._lock = threading.RLock()
         self._wake = threading.Event()
         self._provided: frozenset[ProvidedItem] = frozenset()
@@ -470,6 +475,7 @@ class Publisher:
         self._region_bits: int | None = None  # the prefix length of a recent region (sweep providing), or None
         self._store_parts: list[StorePart] = []  # add_store_part
         self._widening: tuple[Flags, Widen] | None = None  # set_widening
+        self._sizes: Callable[[bytes], float | None] | None = None  # set_network_size
         self._islands = None  # set_islands: the node's partition mode (rnfs.dht.local.PartitionMode), if any
         self._heal: set[ProvidedItem] = set()  # items whose last round reached no off-island server (persisted)
         self._heal_rows: set[ProvidedItem] = set()  # items that may have a published_heal row (ever marked)
@@ -1169,8 +1175,8 @@ class Publisher:
         """Fold the prefix lengths of regions a round found (those that found a server) into the running mean the
         network size is estimated from (network_size), saved with the publish state. Lock held."""
         for region in regions:
-            if not region.closest:
-                continue
+            if not region.closest or region.single:
+                continue  # a single region's prefix isn't a region's size (sweep.find_region)
             mean = self._region_bits_mean
             self._region_bits_mean = (float(region.bits) if mean is None
                                       else mean + (region.bits - mean) / REGION_SMOOTHING)
@@ -1195,6 +1201,12 @@ class Publisher:
         key on too. Called by the lookup threads once a region is found, without the lock."""
         with self._lock:
             self._widening = (flags, widen)
+
+    def set_network_size(self, estimate: Callable[[bytes], float | None]):
+        """Size regions by the network size estimate too: estimate(key) is it (rnfs.dht.density.SizeEstimate, leaving
+        out key's own sample), None while there is none (sweep.find_region)."""
+        with self._lock:
+            self._sizes = estimate
 
     def _widen(self, sweep: Sweep, region: Region, keys: list[bytes], limit: int | None):
         """Run the widened lookups of region's keys (those its lookup covered) that the density check flags, within
@@ -1244,7 +1256,7 @@ class Publisher:
         lookups, widened ones included (None: no limit). Called without the lock: refresh() may run meanwhile.
 
         should_stop() is checked before each lookup starts; one running isn't interrupted. Slow nodes (and a
-        single item) look up one at a time; other nodes run up to PUBLISH_LOOKUPS at once on
+        single item) look up one at a time; other nodes run up to lookups_at_once at once on
         rnfs-publish-lookup threads. A lookup that raises starts no more; the exception is raised once those
         running have finished, ending the round as it would one at a time.
         """
@@ -1252,24 +1264,26 @@ class Publisher:
 
         def look_up(key: bytes):
             """Run the lookup for key, cover its region and widen the lookups of the keys the density check flags."""
-            region = find_region(self.make_lookup(key), key, self.own_id, lambda bits: sweep.members(key, bits))
+            sizes = self._sizes
+            region = find_region(self.make_lookup(key), key, self.own_id, lambda bits: sweep.members(key, bits),
+                                 None if sizes is None else lambda: sizes(key))
             self._widen(sweep, region, sweep.cover(region), limit)
 
-        if self.slow_node or len(due) < 2 or PUBLISH_LOOKUPS < 2:
+        if self.slow_node or len(due) < 2 or self.lookups_at_once < 2:
             while (limit is None or sweep.lookups < limit) and not should_stop():
                 key = sweep.take()
                 if key is None:
                     break
                 look_up(key)
         else:
-            self._sweep_at_once(sweep, look_up, should_stop)
+            self._sweep_at_once(sweep, look_up, should_stop, self.lookups_at_once)
         if sweep.regions:
             self._region_bits = sweep.estimate
         return sweep
 
     @staticmethod
-    def _sweep_at_once(sweep: Sweep, look_up: Callable[[bytes], None], should_stop: Callable[[], bool]):
-        """Run sweep's lookups PUBLISH_LOOKUPS at once (_sweep), raising the first exception one raised."""
+    def _sweep_at_once(sweep: Sweep, look_up: Callable[[bytes], None], should_stop: Callable[[], bool], count: int):
+        """Run sweep's lookups count at once (_sweep), raising the first exception one raised."""
         ended: list[BaseException | None] = []  # None once stopped, else the exception a lookup raised
 
         def work():
@@ -1294,7 +1308,7 @@ class Publisher:
                     return
 
         threads = [threading.Thread(target=work, name="rnfs-publish-lookup", daemon=True)
-                   for _ in range(PUBLISH_LOOKUPS)]
+                   for _ in range(count)]
         for thread in threads:
             thread.start()
         for thread in threads:

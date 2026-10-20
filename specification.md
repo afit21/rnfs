@@ -1069,6 +1069,17 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   never published first, then those unpublished longest, and on nodes that aren't slow runs up to 4 lookups at
   once, each claiming the keys sharing one bit fewer than the last region's p so that lookups running together
   seldom find the same region.
+  A node that knows few identities (on a LoRa island, or just started) finds x's `K` closest among them, padded
+  with servers it knows far from x: p comes out short and the region holds many keys the lookup learned little
+  about. rnfs therefore also sizes regions by the network size estimate N (above, "Identities placed next to a
+  key"): the region's prefix is never shorter than ⌊log2(N ÷ `K`) − 1⌋ (the far half asked about stays the one p as found
+  gives), and a key of the region is covered only if the `K`-th closest server learned lies within 1.5 times
+  (`K` − 1/3) × 2^128 ÷ N of it (the median distance of a `K`-th closest among N servers); the region's other keys
+  are looked up in turn like any key not yet covered. While there is no estimate yet (a node's first lookups after
+  its first start), a region is x alone. In a simulated world of 1,000 servers, 21% of them on LoRa islands that
+  hear 16% of the rest, an island node's records reached 6.6 of their 10 closest instead of 3.8 (a lookup per key:
+  7.9), and a node's first round after its first start 6.3 instead of 0.3; a backbone node needs 15–45% more
+  lookups for the keys a region knows too sparsely by chance (1,000 servers, 3,000 keys: 114 instead of 80).
 - `/provide` is answered `True` if the keys were recorded, or `False` if the request was refused (the link
   isn't identified, or a section 3 limit applied). Apart from the one re-identify retry of section 3, a
   refused or failed store isn't retried until the next republish. A responder may have recorded some keys of
