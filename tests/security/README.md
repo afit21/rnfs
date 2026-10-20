@@ -70,7 +70,7 @@ and a fake CLI), and `_h1_real_helpers.py` and `_m1_real_helpers.py` (the real-R
 | DHT-4 | `test_dht4_private_name_announces.py`; also `tests/test_public.py` | `rnfs/names.py` (`NameManager.publish`), `rnfs/cli.py` | `509c056` |
 | DHT-5 | `test_dht5_own_provider_record.py`; also `tests/test_providers.py` | `rnfs/dht/providers.py` (`_key_room`, `_reclaim`, the own tier) | `4b72ea7` |
 | DHT-6 | none: documented only (the cost of grinding node IDs, specification section 10) | none | `4441878` (docs) |
-| none (RNS blackhole) | `test_rns_blackhole.py`; also `tests/test_blackhole.py`, `tests/test_rns_compat.py` | `rnfs/network/blackhole.py` (`Blackhole`, `listed`), `rnfs/dht/routing.py` (`RoutingTable.blackholed`), `rnfs/node.py` (`maintain`), `rnfs/network/server.py` (`RequestServer.blackholed`) | built with honouring RNS's identity blackhole (0.2.0) |
+| none (RNS blackhole) | `test_rns_blackhole.py`; also `tests/test_blackhole.py`, `tests/test_rns_compat.py` | `rnfs/network/blackhole.py` (`Blackhole`, `listed`), `rnfs/dht/routing.py` (`RoutingTable.blackholed`), `rnfs/node.py` (`maintain`), `rnfs/network/server.py` (`RequestServer.blackholed`) | `963205e` |
 
 ## Network and the `/blocks` server
 
