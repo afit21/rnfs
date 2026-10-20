@@ -767,6 +767,8 @@ def run_pin_remote_ls(args):
         for pin in served["pins"]:
             state = pin["state"] + (f" ({pin['reason']})" if pin.get("reason") else "")
             when = f"  {human_age(now - pin['at'])} ago" if pin.get("at") is not None else ""
+            if pin.get("retry_at") is not None:  # waiting to be tried again (rnfs 0.2.0)
+                when += f", tried again in {human_age(max(0.0, pin['retry_at'] - now))}"
             detail = f": {pin['detail']}" if pin.get("detail") else ""  # may name what others' DAGs hold: escaped
             print(printable(f"{pin['identity']}  {pin['cid']}  {state}{when}{detail}"))
         return

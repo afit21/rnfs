@@ -278,7 +278,9 @@ pass a `max_response_size` just above their largest honest answer.
     have to wait longer.
   - So a requester on a slow link SHOULD, after a response, wait as long again as that request took before
     sending its next `/blocks` to that node (at the default cap, half the rate estimate, the next response may
-    start twice its transfer time after the last one started).
+    start twice its transfer time after the last one started). The link counts as in use while it waits, so it
+    isn't closed as idle (`link_idle_timeout`): a 64 KiB chunk takes about 9 minutes at 1 kbit/s, and so does the
+    wait, and a new link would have no rate estimate for the next response's size and pacing.
 
 **Airtime controls.** A node MAY limit the airtime it spends answering `/blocks` with the settings below.
 Each limit answers `/blocks` with `False`, which the requester treats as busy (section 6), moving on to
@@ -738,13 +740,19 @@ and repeat.
   answer for a node's next-hop interface for up to 15 seconds (each answer is an RPC to it); hops, and whether
   there is a path at all, are read fresh.
 
-  A provider *fails* when its link fails, it answers `None` for a block of the root it advertised, it answers
-  `False` (busy or refused) `max_failures` times in a row, or it stalls twice (section 7). A `False` is retried
-  after a short delay. A `False` soon after the provider served a response (within 4 × that request's round
-  trip, counted from when it was sent) is taken as upload pacing (section 3) and not counted; it is retried
-  after an eighth of that round trip, or the usual delay if longer. Failed providers are removed and not
-  retried during that fetch. When no providers are left, `/find` runs again for a fresh random half, within the
-  same `lookup_timeout`.
+  A provider *fails* when its link fails (there is no path to it, or the link is closed under a request by either end),
+  its answer is malformed, it answers `None` for a block of the root it advertised, it answers `False` (busy or refused)
+  `max_failures` times in a row, its requests go unanswered `max_failures` times in a row, or it stalls twice (section
+  7). A `False` is retried after a short delay. A request goes *unanswered* when RNS times it out with the link up (on a
+  lossy path its packet or its answer's was lost: RNS resends neither), the link times out under it, or a new link to a
+  node RNS has a path to isn't established (its link request or proof lost); the requester closes that link (which
+  starts no cooldown, section 3) and asks again on a new one after the same short delay. (Failing the provider at once,
+  rnfs before 0.2.0 failed most 1 MiB fetches from one provider at 5% packet loss.) A response RNS rejects at its
+  advertisement as too large fails its request the same way, so it is asked again too, `max_failures` times at most, as
+  a `False` is. A `False` soon after the provider served a response (within 4 × that request's round trip, counted from
+  when it was sent) is taken as upload pacing (section 3) and not counted; it is retried after an eighth of that round
+  trip, or the usual delay if longer. Failed providers are removed and not retried during that fetch. When no providers
+  are left, `/find` runs again for a fresh random half, within the same `lookup_timeout`.
 
 **LoRa islands.** A LoRa mesh joined to the internet through a gateway (an *island*) is part of one DHT with the
 rest, so its own content's records sit on servers anywhere: while the gateway is down (a *partition*) a node there
@@ -779,30 +787,38 @@ or protocol constant changes.
   their replies lists a provider; their replies seed the rest of the lookup as any answer does (its start nodes),
   and the lookup's bounds and checks are unchanged. Its fallback over disjoint paths doesn't ask them first again.
 - **Partition mode.** Servers that aren't local are *off-island*. A node with local servers SHOULD notice when it is
-  cut off from them and then use its local servers only. rnfs enters partition mode:
-  - after 3 failures in a row reaching off-island servers (a `/find` unanswered, or a `/provide` for which no
-    identified link could be opened; any off-island answer between resets the count; local ones don't count), or
+  cut off from them and then use its local servers only. rnfs enters partition mode when a probe of an off-island
+  server (below) goes unanswered:
+  - after 3 failures in a row reaching off-island servers it knows (a `/find` unanswered, or a `/provide` for which
+    no identified link could be opened; any off-island answer between resets the count; local ones don't count).
+    A server it knows is one in its routing table or announce first-seen log, or whose identity or path RNS knows:
+    a `/find` reply can name made-up IDs, which always fail, and they don't count. The probe goes at once, to a
+    server that answered or announced itself recently (with none, nothing beyond the island having been heard since
+    the start, the failures enter partition mode without one); or
   - after off-island silence (no off-island answer nor fresh announce) longer than 4 times the usual gap between the
     off-island announces it heard (their mean over the last 32 gaps, counted once it has 8, and none that spanned
-    partition mode), and at least 10 minutes, if a probe (below) then goes unanswered. Silence alone doesn't enter
-    it: with servers announcing every 6 hours, an island hearing 20 of them hears one about every 18 minutes, and
-    such gaps vary, so a fixed silence would flap on a small connected network. A fresh announce is one RNS didn't
-    mark as a path response, emitted within the last 15 minutes (allowing 5 minutes of clock difference, as a peer's
-    online state is judged, section 11): an island node's cached answer for an off-island server says nothing about
-    the way off the island.
+    partition mode), and at least 10 minutes. Silence alone doesn't enter it: with servers announcing every 6 hours,
+    an island hearing 20 of them hears one about every 18 minutes, and such gaps vary, so a fixed silence would flap
+    on a small connected network. A fresh announce is one RNS didn't mark as a path response, emitted within the last
+    15 minutes (allowing 5 minutes of clock difference, as a peer's online state is judged, section 11): an island
+    node's cached answer for an off-island server says nothing about the way off the island.
+
+  Failures alone don't enter it either, as a server beyond the island can name in its replies servers it controls
+  and lets fail.
 
   In partition mode, lookups (searches and their fallback, publishing's region and widened lookups) query local
   servers only, starting from the local servers closest to the key, and a lookup running when it begins drops its
   off-island nodes as their turn comes; a publish round stores to and withdraws from local servers only (the
   withdrawals for others stay queued, and a store set's off-island servers are left out). So a search on the island
   ends in about the time its local servers take instead of minutes of link timeouts. Any off-island answer or fresh
-  off-island announce ends it. While in it the node probes one off-island server (a `/find` for its own ID, to those
-  that failed and those heard most recently in turn; a failed probe isn't counted against the server in the routing
-  table) every 5 minutes, or on a slow node after 15 minutes, doubling after each unanswered probe up to 2 hours: a
-  probe costs a path request and a link's airtime on radio, and every node of a cut-off island probes. The node's
-  status says whether it is in partition mode and since when. With a hop radius, island servers beyond `local_hops`
-  count as off-island: their announces and answers keep a node out of partition mode or end it, so on wide islands
-  set `local_interfaces`.
+  off-island announce ends it. While in it the node probes one off-island server (a `/find` for its own ID, to the
+  servers that answered or announced themselves most recently in turn, those that failed since after the rest, never
+  an ID that only ever failed; a failed probe isn't counted against the server in the routing table) every 5
+  minutes, or on a slow node after 15 minutes, doubling after each unanswered probe up to 2 hours: a probe costs a
+  path request and a link's airtime on radio, and every node of a cut-off island probes. The node's status says
+  whether it is in partition mode and since when. With a hop radius, island servers beyond `local_hops` count as
+  off-island: their announces and answers keep a node out of partition mode or end it, so on wide islands set
+  `local_interfaces`.
 - **The heal republish.** Records stored during a partition sit on island servers only, so after it the rest of the
   network finds them only once the publisher republishes (rnfs: every 3 days on a slow node): 1–14% of the time in
   the simulation. A node SHOULD mark each key whose last round reached no off-island server (rnfs: in partition mode,
@@ -819,8 +835,8 @@ or protocol constant changes.
   content published before a partition was found 78% of the time (55% with none). Over the fake network of
   `tests/test_topology.py` (1,000 servers, 21% on 8 islands; a `/find` over LoRa taking 8 s, one to a server out of
   reach 40 s), with partition mode and the heal republish (below): a neighbour found what an island node published
-  before a partition 100% of the time instead of 67%, and what it published during it 100% instead of 91%, with 0.15
-  timeouts and 31 s per search instead of 11.7 and 490 s; the backbone found what was published during the partition
+  before a partition 100% of the time instead of 67%, and what it published during it 100% instead of 91%, with 0.2
+  timeouts and 33 s per search instead of 11.7 and 490 s; the backbone found what was published during the partition
   0% of the time until the heal republish, 99.5% after it.
 
 **Local scores.** A node MAY keep a private score for each peer it deals with, earned by work it checked itself.
@@ -848,10 +864,15 @@ mode, whether or not the server enters its routing table, and keep the record ac
 in the future when loaded counts as now). Identities generated next to a key can't be old ones, so among the servers
 near a key, those first heard at least `provider_seniority` ago were there before any such identity was made for it;
 the log gives the `K` closest of them to a key, which publishers also store to and searchers ask (below). It is
-local state: nothing about it is sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536
-servers, forgetting the least recently heard first (about 12 MB of memory when full), so a flood of new identities
-pushes out only servers silent longer than every one of them; announces are recorded in memory and written together
-every 30 s.
+local state: nothing about it is sent. A server that announces client mode is forgotten. A full log SHOULD NOT let
+new identities push out its senior servers: forgetting the least recently heard first would let about 3 fresh
+identities a second push out every server announcing every 6 hours between its announces, so that none ever became
+senior. rnfs keeps at most 65,536 servers (about 12 MB of memory when full) and, when full, forgets first a server
+silent for 2 × `announce_interval` (as `/find` replies leave such servers out; counted from the later of its last
+announce and the node's start, so a restart doesn't make every server silent), then the server not yet senior that
+it first heard most recently (in a flood, the newcomer itself), and only if every server is senior and heard lately
+the least recently heard. A flood can then keep new servers out while it lasts, but never takes the place of the
+servers that were already there. Announces are recorded in memory and written together every 30 s.
 
 **Identities placed next to a key.** RNS identities are free, and one closer to a key than every honest server costs
 about as many key generations as there are servers (about 4 s of one core among 10,000). `K` of them that answer
@@ -863,8 +884,17 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   d_K, is about K × 2^128 / N. A node estimates N as (K − 1/3) × 2^128 over the median d_K of its last 16 complete
   lookups for other keys (the latest lookup for each key; the key checked is always left out, so identities next to
   it can't shrink its own yardstick). Pooled over many keys it is 2 to 4 times less noisy than the node's own
-  neighbourhood. rnfs keeps the samples in the state database (written with the periodic saves), so a restart has
-  the estimate at once, and runs no density check until it has 8.
+  neighbourhood. A lookup's sample SHOULD count only servers it verified, those that answered or whose identity
+  is known: a `/find` reply can name made-up IDs just beyond the closest that answered,
+  which a lookup completes without querying, and they shrank d_K and inflated the estimate about 3 times. rnfs takes
+  the run of verified servers closest to the key, up to the first that isn't verified and at most `K` long, and
+  scales its last distance d_j to rank `K` (d_j × (K − 1/3) / (j − 1/3), the medians of Gamma(j) and Gamma(K)); a
+  run shorter than 3 gives no sample. Counting every verified server instead would skip the servers a node doesn't
+  know the identity of too: a node on a LoRa island, hearing few announces, underestimated the network about 4 times
+  and flagged 93% of its searches in the topology simulation. An attacker that knows the true distances and is asked
+  in every lookup can still end the runs where they bias the estimate most, by about 1.3 times (1.6 for 1 estimate in
+  20). rnfs keeps the samples in the state database (written with the periodic saves), so a restart has the
+  estimate at once, and runs no density check until it has 8.
 - **Density check** (T = 2). The servers known near a key are anomalously dense when some rank j ≥ `K` (1-based,
   by distance) lies closer than j × 2^128 / (T × N); the *dense core* ends at the last such rank. Ranks below `K`
   never fire: a few close servers happen by chance, and fewer than `K` identities can't take every place anyway.
@@ -1121,7 +1151,11 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
 
 **Fetching a target** (`get`, `cat`, `pin add`, `export`):
 1. Ask up to `max_parallel_providers` nodes with an open outgoing link for the root with `/blocks`; if none
-   has it, find providers (section 6).
+   has it, find providers (section 6). A node that isn't slow asks none over a slow link (item 7): on a radio each
+   would hold the search up a round trip, and several would each send the root. A slow node, whose links are all
+   slow, asks its one (`max_parallel_providers` is 1 there): a hit saves a whole lookup over the radio for one
+   request on a link already open. For a remote pin, the node that asked is asked first, link or not and over any
+   link (rnfs 0.2.0): it is the one node known to hold the content before its provider records are out.
 2. Fetch the root block and decode it. Fetch the blocks not already stored: those along the requested path,
    then every block of the target's DAG — or, for a byte range (`cat --offset`, gateway Range requests), only
    the chunks covering it and the nodes above them. Each block is fetched once, even if it appears several
@@ -1156,22 +1190,31 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
    chunks of 4 KiB or more (one level up to 1 MiB, seven for any size): a range ends inside at most two nodes
    of a level. Otherwise it fails ("too large"); a requester counts a file node not yet received as
    `MAX_BLOCK_SIZE`, as in item 5, so a small range ending in two nodes of a level asks for them one at a
-   time. The chunks are fetched a window (32 chunks) at a time, and the next window's are asked for before the
+   time. The chunks are fetched a window at a time, and the next window's are asked for before the
    reader is handed the current one's bytes, so the providers don't wait for the reader; a reader that stops
-   early has had at most one window fetched that it didn't read.
-7. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers only
-   contend for the same channel). A response *stalls* if it makes no progress for `stall_timeout`, or misses the
-   same deadline the responder uses (section 3). A stalled provider's link is closed, which cancels the transfer,
-   and its blocks are requested again from another provider; providers that keep failing are handled as in
-   section 6. A fetch that fails or is cancelled, or whose reader stops early (item 6), closes the links of its
-   requests still in flight, so their responses don't keep using the link and hold up the next `/blocks` to those
-   nodes, unless another fetch has a request on the same link: closing it would fail that one, so the request is
-   left to finish. It never cancels their Resources (section 3, Cooldown). When nothing is left to ask for and a
-   provider is idle, a requester MAY ask it too for a batch that has been in flight for longer than
-   `deadline_slack` (end-game duplication), so a response that keeps making just enough progress not to stall
-   doesn't hold up the fetch. The first verified copy wins; the request still sending blocks that have arrived
-   then has its link closed (left to finish, under the same rule), which doesn't count as a stall of its
-   provider. rnfs duplicates each request at most once, and not on slow nodes, which use one provider at a time.
+   early has had at most one window fetched that it didn't read. rnfs sizes each window by the providers' links
+   (item 7): 32 chunks while a provider is reached over a fast link, else one (one chunk, the next asked for
+   ahead), also while no provider is known yet; 32 chunks (2 MiB) would hold the first byte back for about 5 hours
+   at 1 kbit/s.
+7. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers only contend
+   for the same channel). Whether a link is slow is judged per provider, not per node, so a node with a fast and a slow
+   interface (a gateway) isn't slow but doesn't run parallel transfers over its radio either: a provider is reached over
+   a *slow link* when the link's rate estimate is below `slow_bitrate`, or, without one, when the next-hop interface of
+   the path to it runs below `slow_bitrate` or it is behind a slow path (section 6); the providers over slow links whose
+   paths leave through the same next-hop interface (an unknown one counts as one) have one request in flight between
+   them. A response *stalls* if it makes no progress for `stall_timeout`, or misses the same deadline the responder uses
+   (section 3). A stalled provider's link is closed, which cancels the transfer, and its blocks are requested again from
+   another provider; providers that keep failing are handled as in section 6. A fetch that fails or is cancelled, or
+   whose reader stops early (item 6), closes the links of its requests still in flight, so their responses don't keep
+   using the link and hold up the next `/blocks` to those nodes, unless another fetch has a request on the same link:
+   closing it would fail that one, so the request is left to finish. It never cancels their Resources (section 3,
+   Cooldown). When nothing is left to ask for and a provider is idle, a requester MAY ask it too for a batch that has
+   been in flight for longer than `deadline_slack` (end-game duplication), so a response that keeps making just enough
+   progress not to stall doesn't hold up the fetch; rnfs waits, on a link with a rate estimate, also for 1.5 times the
+   transfer time of the batch's blocks at it, and duplicates only onto a provider that isn't over a slow link. The first
+   verified copy wins; the request still sending blocks that have arrived then has its link closed (left to finish,
+   under the same rule), which doesn't count as a stall of its provider. rnfs duplicates each request at most once, and
+   never over a slow link (so never on slow nodes), where it would spend the channel's airtime twice.
 8. Blocks are stored as they arrive, so an interrupted fetch resumes where it stopped. An RNS Resource is only
    delivered when complete, so a response lost mid-transfer yields nothing and its blocks are requested again.
 9. When the target is complete, the node provides it if its strategy says so (section 6).
@@ -1231,6 +1274,11 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
 **Cache** is everything else.
 - Each cached fetch is recorded as the `<root>/<path>` it fetched, which keeps the path's nodes as well as the
   target's DAG.
+- A fetch that fails is recorded too, so trying again resumes from what it stored (section 7). That includes a
+  fetch to pin (`pin add`, `dir set` and `dir rm`, a remote pin, a followed name's target, a deny list; rnfs 0.2.0),
+  unless it failed because the content is denied, is an invalid DAG, or exceeds a size bound or quota ("too
+  large"), which trying again can't change. Such a record never counts as a download of the user's: under `roots`
+  it isn't provided (the pin is, once complete).
 - When storage exceeds `max_storage`, cached fetches are evicted least recently used first; `gc` evicts them
   all, and `cache rm <cid>` those leading to one CID (a pin of the same content keeps its blocks).
 - `add --no-pin` stores what it adds as a cached fetch of its CID instead of pinning it: evicted least recently
@@ -1293,6 +1341,13 @@ changed by other users, who could replace the folder with another.
 - `/pin` is best effort: an accepted pin may still be dropped (quota, or the CID can't be found). rnfs saves the
   pins waiting (in its state database, about once a second and at stop) and resumes them after a restart,
   unless their identity has left `remote_pin_identities`; a crash may lose those accepted in the last second.
+- The node asked to pin asks the node that asked first (rnfs 0.2.0): its identity, from the identified link, gives
+  its node ID, and it serves what it provides even before its provider records are out. One that hasn't it isn't
+  held against it, and the providers are looked up as usual.
+- A pin whose content can't be found (no provider could supply it) isn't dropped at once (rnfs 0.2.0): it waits and
+  is tried again after 10 minutes, the wait doubling up to 6 hours, until 3 days after it was first not found;
+  then it is dropped (`not_found`). What a try fetched is kept as a cached fetch (above). Pins accepted after it
+  are fetched meanwhile, a release ends the wait at once, and the waits are kept across a restart.
 - `rnfs pin remote add|rm <node ID> <cid>` sends these requests over an identified link; `rnfs pin remote ls`
   shows their status (below, and section 11).
 - **Status** (rnfs 0.2.0; local only: `/pin` and every other message are unchanged).
@@ -1311,7 +1366,8 @@ changed by other users, who could replace the folder with another.
     checked first, skipping pins checked in the last minute (10 minutes on a slow node), its lookups sharing the
     same limit at once. rnfs keeps at most 10 000 entries: past that the oldest released or refused go first,
     then the oldest done, then the oldest of the rest.
-  - A node serving remote pins records what became of each pin an identity asked of it: *waiting*, *fetching*,
+  - A node serving remote pins records what became of each pin an identity asked of it: *waiting* (with reason
+    `not_found` and when it is tried again while it waits for its content to be found), *fetching*,
     *pinned*, *dropped* (`quota`; the fetch failing: `not_found`, `denied`, `invalid_dag`, `too_large`,
     `storage_full`, `failed`; released by the deny list, `denied`; waiting at a start from an identity no longer
     on `remote_pin_identities`, `identity_removed`; recorded as current but lost in a crash, `lost`), *refused*
@@ -2061,6 +2117,13 @@ at such a path) — and a state: `queued`, `running`, `done`, `failed` or `cance
 MUST be what the equivalent API call returns (`POST /api/get`, `/api/pin/add`, `/api/export`, `/api/add`, `/api/import`), and its error, when failed, the
 message that call would have reported.
 - At most `max_jobs` jobs run at once; queued jobs MUST be started oldest first.
+- A `get`, `pin` or `export` job that fails because no provider could supply its content (`404`, but not for a path
+  that the target's stored directories show doesn't exist) MAY be queued again rather than failed (rnfs 0.2.0),
+  keeping its blocks as a queued job does, with its `error` and `retry_at`, the time before which it isn't started.
+  rnfs tries it again after 10 minutes, the wait doubling up to 6 hours, until 3 days after it first wasn't found
+  (`retry_since`), then fails it. A job submitted with `retry` false (`POST /api/jobs`, kept with the job) fails at
+  once instead, as before 0.2.0; the CLI's foreground transfers (without `--background`) are, so a command never
+  waits hours.
 - Jobs MUST be persisted in the state directory, each change saved atomically and durably. When the node starts, jobs that were
   queued or running MUST be queued again. A resumed job MUST NOT fetch again blocks that are still stored.
 - While a job is queued or running, the blocks stored below its root MUST be kept as if pinned, including

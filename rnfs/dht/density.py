@@ -7,6 +7,8 @@ then looks further out. All local: nothing about it is sent, and nothing on the 
   and estimates N as (K − 1/3) × 2^128 over their median (the median of a Gamma(K) is about K − 1/3), leaving out the
   key being checked, so identities placed next to it can't shrink its own yardstick. Pooled over many keys it is 2 to
   4 times less noisy than a node's own neighbourhood (eclipse simulation: 4% false positives at T = 2 against 12%).
+  A lookup's sample counts only nodes it verified (verified_sample: the closest that answered or whose identity is
+  known, up to the first that isn't, its d_j scaled to rank K), so made-up IDs in a reply can't inflate the estimate.
   It needs MIN_SIZE_SAMPLES lookups before the check runs, and is kept in the state database's meta table, written
   with the node's batched saves, so a restart has it at once.
 - **The check.** With N the estimate, rank j (1-based) of the servers known near a key should lie at about
@@ -40,6 +42,7 @@ SPACE = 1 << (ID_LENGTH * 8)  # the ID space: distances are below it
 DENSITY_THRESHOLD = 2.0  # T: denser than this many times what the size estimate allows fires the check
 SIZE_SAMPLES = 16  # lookups (distinct keys) the size estimate pools, the latest kept
 MIN_SIZE_SAMPLES = 8  # samples needed before the check runs (it doesn't before)
+MIN_VERIFIED = 3  # a lookup's sample needs at least this many verified nodes closest to its key (beta, by default)
 RING_ANSWERS = 5  # servers of each ring a searcher waits for (eclipse simulation: 3 lost 3 points, 8 gained 0.8)
 META_STORE = "size_estimate"  # the meta table's store name for the samples
 _SAMPLE = 2 * ID_LENGTH  # bytes per saved sample: the key, then d_K
@@ -154,11 +157,25 @@ class CheckCounts:
                 "density_checked_day": checked_day, "density_flagged_day": flagged_day}
 
 
-def kth_distance(distances: Sequence[int]) -> int | None:
-    """d_K of a lookup's nodes' distances to its key (sorted or not), or None if fewer than K."""
-    if len(distances) < K:
+def verified_sample(distances: dict[bytes, int], verified: Callable[[bytes], bool]) -> int | None:
+    """A complete lookup's size-estimate sample, from distances (node -> distance to the key: every node it knew of
+    and hadn't seen fail) and verified(node) (it answered, or its identity is known): over the longest run of
+    verified nodes from the closest, at most K long, d_j of its last scaled to rank K, d_j × (K − 1/3) / (j − 1/3)
+    (the medians of Gamma(j) and Gamma(K)); None if the run is shorter than MIN_VERIFIED.
+
+    Not d_K over every node known: a /find reply can name made-up IDs just beyond the closest that answered, which
+    the lookup completes without querying, and they would shrink d_K, inflating the estimate about 3 times. Not d_K
+    over the verified nodes either: a node that knows few identities (on a LoRa island, say) would skip most real
+    nodes too, and underestimate about 4 times. Ending the run at the first unverified node keeps the sample's rank
+    honest either way; it is noisier only when unverified nodes come early."""
+    run: list[int] = []
+    for node_id in sorted(distances, key=distances.__getitem__):
+        if len(run) == K or not verified(node_id):
+            break
+        run.append(distances[node_id])
+    if len(run) < MIN_VERIFIED:
         return None
-    return sorted(distances)[K - 1]
+    return max(1, round(run[-1] * (K - 1 / 3) / (len(run) - 1 / 3)))
 
 
 def dense_core(distances: Sequence[int], size: float, threshold: float = DENSITY_THRESHOLD) -> int:

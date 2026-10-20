@@ -173,8 +173,16 @@ A read-only review of 0.2.0 against remote and local attackers, fixed before 0.2
 | REV1 | `test_rev1_add_rnfs_dir.py` | `rnfs/node.py` (`add_path`), `rnfs/content/shared_folder.py` (`add_refused_reason`, `private_dirs`, the scan), `rnfs/content/builder.py` (`BuildOptions.skip_dirs`, `_build_tree`, `build_path`), `rnfs/content/tarstream.py` (`folder_chunks`), `rnfs/node_content.py` (`add_sealed_path`), `rnfs/name_sync.py`, `rnfs/features/jobs.py` (`submit`) | `5195153` |
 | REV2 | `test_rev2_provider_write_budget.py`; also `tests/test_providers.py` (`WriteBudgetTest`) | `rnfs/dht/providers.py` (`_WriteBudget`, `ProviderStore._store`, `_withdraw`, `REFRESH_WRITE`) | `63201f5` |
 | REV3 | `test_rev3_full_key_takeover.py`; also `tests/test_providers.py` (`KeyCapTest`) | `rnfs/dht/providers.py` (`ProviderStore._key_room`, `KEY_NEWCOMER_SHARE`) | `18897a5` |
+| REV4 | `test_rev4_forced_partition.py` | `rnfs/dht/local.py` (`PartitionMode.failed`, `probe_target`), `rnfs/node.py` (`_knows_server`, `_run_local`) | `53ed603` |
 | REV5 | `test_rev5_nomadnet_page_memory.py` | `rnfs/network/nomadnet.py` (`MAX_PAGE_SIZE`, `Transfer.resource_started`, `_outcome`) | `ac38138` |
 | REV6 | `test_rev6_site_upload_render.py` | `rnfs/gateway.py` (`serve_target`, `serve_file`, `file_type`, `SITE_SNIFFED_TYPES`) | `abf8ab0` |
+| REV7 | `test_rev7_firstseen_seniors.py` | `rnfs/dht/firstseen.py` (`FirstSeenLog._evict`, `_victim`), `rnfs/node.py` (the log's settings) | `1109f77` |
+| REV8 | `test_rev8_size_estimate_inflation.py` | `rnfs/dht/density.py` (`verified_sample`), `rnfs/dht/lookup.py` (`Lookup._sample`, `verified`), `rnfs/dht/disjoint.py` (`DisjointLookup._sample`) | `c6746e2` |
+A read-only review of 0.2.0 against remote and local attackers, fixed before 0.2.0 was released; the findings are
+the roadmap's "Security fixes from the 0.2.0 review".
+
+| ID | Test modules | Code guarded | Fix commits |
+|---|---|---|---|
 | REV9 | `test_rev9_app_name_oracle.py`; also `tests/test_api.py` (`test_proof_for_an_app`) | `rnfs/apps.py` (`AppRegistry.proof_key`), `rnfs/api.py` (`ApiHandler.proof_key`, `send_common_headers`) | `284268e` |
 | REV10 | `test_rev10_sealed_unpack.py`; also `tests/test_tar_stream.py` (`test_scan_counts_allocation_units`, scan_tar agreeing with build_tar), `tests/test_fsutil.py` (`AllocationUnitTest`) | `rnfs/node_content.py` (`unpack_sealed`, `_check_unpack_space`, `_unpacking`, `collect_unpack_leftovers`), `rnfs/content/tarstream.py` (`scan_tar`, `Extent`), `rnfs/fsutil.py` (`allocation_unit`), `rnfs/node.py` (`_setup`) | `76b5af4` |
 | REV11 | `test_rev11_standings_cap.py`; also `tests/test_providers.py` (`test_departed_standings_are_capped_on_disk`) | `rnfs/dht/providers.py` (`ProviderStore._cap_departed`, `maintain`, `MAX_DEPARTED`) | `f5dd6e8` |

@@ -23,6 +23,7 @@ program's Reticulum running when it stops. Neither ever stops Reticulum: the dae
 """
 import errno
 import hashlib
+import math
 import os
 import random
 import secrets
@@ -73,6 +74,7 @@ from rnfs.network.links import LinkPool
 from rnfs.network.server import RequestServer
 from rnfs.publisher import Publisher
 from rnfs.remote_pins import DROPPED, FETCHING, PINNED, REFUSED, RELEASED, WAITING
+from rnfs.retry import RETRY_FOR, next_retry
 
 RECORDS_INTERVAL = 30.0  # seconds between passes over the provider records (expiry), each saving their changes
 STATE_SAVE_INTERVAL = 30.0  # seconds between saves of cache records, fetched targets and invalid roots, when changed
@@ -125,6 +127,11 @@ def import_fetched(value: list, tx) -> int:
 # Why a remote pin's fetch failed, by the error's class (rnfs.remote_pins.REASONS); any other is "failed"
 _FAILURE_REASONS = {NotFound: "not_found", Denied: "denied", InvalidDag: "invalid_dag", TooLarge: "too_large",
                     StorageFull: "storage_full"}
+
+
+def _finite(value) -> bool:
+    """True if value is an int or float, finite (a time read back from the state database)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _remote_identity(source: str) -> bytes | None:
@@ -658,8 +665,10 @@ class RnfsNode:
         # Local scores (section 6): bootstrap nodes seeded; saved with the batched stores
         self.scores = self._add_store(Scores(config.state_dir, seeded=self._bootstrap_set()))
         # When each server's announce was first heard (section 6; for publishing and searching); saved with the
-        # batched stores
-        self.first_seen = self._add_store(FirstSeenLog(config.state_dir))
+        # batched stores. When full it keeps its senior servers (provider_seniority) until silent as long as /find
+        # replies allow (2 × announce_interval), so a flood of fresh identities can't push them out
+        self.first_seen = self._add_store(FirstSeenLog(config.state_dir, seniority=config.provider_seniority,
+                                                       silence=2 * config.announce_interval))
         # The network size estimate of the density check (section 6), from recent complete lookups; saved with the
         # batched stores, so a restart has it at once
         self.sizes = self._add_store(SizeEstimate(config.state_dir))
@@ -672,8 +681,11 @@ class RnfsNode:
         self._path_hops: Callable[[bytes], int | None] = lambda node_id: None
         self._scan_paths: Callable[[int | None], dict[bytes, PathInfo]] = lambda max_hops: {}
         self._scanned_at: float | None = None  # monotonic time of the last scan
-        # Partition mode: fed only on a node with local servers (local_on), so never entered on another
-        self.partition = PartitionMode(self.local.is_local, slow, on_change=self._partition_changed)
+        # Partition mode: fed only on a node with local servers (local_on), so never entered on another. Failures of
+        # servers it knows ask for a probe, which wakes the local-servers thread to send it (_run_local)
+        self._local_wake = threading.Event()
+        self.partition = PartitionMode(self.local.is_local, slow, on_change=self._partition_changed,
+                                       known=self._knows_server, on_probe=self._local_wake.set)
         # Keys marked for the heal republish before a restart are republished at the first off-island contact after
         # it (the partition may have ended while the node was down, and then no partition mode ends to start it)
         self._heal_at_contact = local
@@ -733,6 +745,8 @@ class RnfsNode:
         self.fetcher = self._add_store(Fetcher(self.storage, client, config, node_id, self.routing, self._lookup,
                                                slow, config.state_dir, after_store=self._enforce_storage,
                                                make_room=self._make_room, scores=self.scores))
+        # A provider behind a slow path gets one request at a time per interface, and no probes or duplicates
+        self.fetcher.slow_path = self.slow_paths
         # Saved by its own refreshes and publish loop
         self.publisher = self._add_store(Publisher(node_id, config, self.storage, self.records, client,
                                                    self.lookups.publish, slow, config.state_dir,
@@ -774,6 +788,9 @@ class RnfsNode:
         # Remote source -> CIDs waiting or being fetched for it, in the order accepted (fetched one at a time)
         self._remote_reserved: dict[str, dict[Cid, None]] = {}
         self._remote_released: set[tuple[str, Cid]] = set()  # remote pins released while still being fetched
+        # Remote pins whose content wasn't found, waiting to be tried again (rnfs.retry): (retry_at, since), Unix times
+        self._remote_retry: dict[tuple[str, Cid], tuple[float, float]] = {}
+        self._remote_current: dict[str, Cid] = {}  # remote source -> the pin its worker is fetching now
         # Remote source -> the thread fetching its pins (one at most); stop waits for them
         self._remote_workers: dict[str, threading.Thread] = {}
         self._remote_pins_dirty = False  # changed since last saved (by maintenance, and at stop)
@@ -884,7 +901,7 @@ class RnfsNode:
             (f"stopping feature {feature.name}", partial(features.stop_feature, feature, deadline))
             for feature in reversed(list(self.features.values()))]
         steps += [("signalling the threads to stop", self.stop_event.set),
-                  ("waking the publisher", self.publisher.wake)]
+                  ("waking the publisher", self.publisher.wake), ("waking the local servers", self._local_wake.set)]
         if getattr(self, "folder_syncs", None) is not None:
             steps.append(("waking the name sync", self.folder_syncs.wake))
         if self.announcer is not None:
@@ -1045,6 +1062,12 @@ class RnfsNode:
         """True if node_id is a DHT server this node knows of (in its routing table or announce first-seen log)."""
         return self.routing.contains(node_id) or self.first_seen.first_heard(node_id) is not None
 
+    def _knows_server(self, node_id: bytes) -> bool:
+        """Partition mode's known (section 6): True if node_id's failure says something about the way off the island,
+        as a server this node knows of (_is_server) or one whose identity or path RNS knows. A /find reply can name
+        made-up IDs, which always fail."""
+        return self._is_server(node_id) or self._is_known(node_id) or self._path_hops(node_id) is not None
+
     def scan_local(self):
         """Judge every server known with a path from one read of the path table (RnsPaths.scan: through a shared
         instance one RPC, within local_hops unless local_interfaces names the interfaces): the local servers are then
@@ -1102,7 +1125,9 @@ class RnfsNode:
                 self.check_local()
             except Exception as e:  # noqa: BLE001 - the loop keeps running; logged
                 log(f"checking the local servers failed: {e!r}", LOG_ERROR)
-            self.stop_event.wait(LOCAL_CHECK)
+            # Woken early when failures ask for a probe (PartitionMode's on_probe), and at stop
+            self._local_wake.wait(LOCAL_CHECK)
+            self._local_wake.clear()
 
     def _new_lookup(self, key: bytes, start: list[bytes], exclude: Callable[[bytes], bool], **options) -> Lookup:
         """A Lookup for key from start, wired to the routing table (answers, failures, unreliable nodes and
@@ -1126,7 +1151,7 @@ class RnfsNode:
 
     def _query_failed(self, node_id: bytes):
         """A /find to node_id went unanswered: counted in the routing table, and lowering its score (and towards
-        partition mode, if it is off-island)."""
+        partition mode's probe, if it is an off-island server this node knows: PartitionMode's known)."""
         self.routing.failed(node_id)
         self.scores.failed(node_id)
         if self.local_on:
@@ -1477,6 +1502,7 @@ class RnfsNode:
             self.publisher.refresh()
         if self.deny.cids is not self._deny_applied and time.monotonic() >= self._deny_retry_at:
             self._apply_deny()
+        self._retry_remote_pins()
         self._save_remote_pins()
         try:
             self.served_pins.save()
@@ -1689,6 +1715,41 @@ class RnfsNode:
                 self._enforce_storage()
             except Exception as e:  # noqa: BLE001 - never hide the fetch's own outcome
                 log(f"enforcing max_storage after a fetch failed: {e!r}", LOG_ERROR)
+
+    @contextmanager
+    def pinned_fetch(self, root: Cid, names: list[str] | tuple[str, ...] = (),
+                     hint: bytes | None = None) -> Iterator[Fetch]:
+        """A fetch to pin what it fetches (pin add, dir set and rm, remote pins, followed names, deny lists): its
+        caller pins inside it, so nothing it fetched is unprotected. hint is a node to ask first (Fetcher.open: a
+        remote pin's asker).
+
+        A fetch that fails keeps what it got as a cached fetch of <root>/<names>, as get's and cat's do, so trying
+        again resumes from there rather than from nothing (a 4 MiB pin over LoRa failing at 90%), unless it failed
+        because the content is denied (Denied), is an invalid DAG (InvalidDag), or is more than a quota or bound
+        allows (TooLarge): trying again fails the same way, so its blocks are left for the next collection. The
+        record is never provided as a download of the user's (it was fetched to be pinned): once complete, the
+        pin is. Like a cached fetch, it may be evicted before the next try.
+        """
+        recorded = False
+        try:
+            with self.fetcher.open(root, names, pinned=True, hint=hint) as fetch:
+                try:
+                    yield fetch
+                except (Denied, InvalidDag, TooLarge):
+                    raise
+                except BaseException:
+                    recorded = fetch.downloaded_blocks > 0
+                    try:
+                        self._record_fetch(fetch, True)  # never provided as the user's download
+                    except Exception as e:  # noqa: BLE001 - never hide the fetch's own outcome
+                        log(f"recording what a failed fetch of {root} got failed: {e!r}", LOG_ERROR)
+                    raise
+        finally:
+            if recorded:
+                try:
+                    self._enforce_storage()
+                except Exception as e:  # noqa: BLE001 - never hide the fetch's own outcome
+                    log(f"enforcing max_storage after a fetch failed: {e!r}", LOG_ERROR)
 
     def _record_fetch(self, fetch: Fetch, for_gateway: bool):
         """Record a cached fetch (or mark an existing one used), then update what is provided."""
@@ -2062,7 +2123,7 @@ class RnfsNode:
         _caller_source(source)
         root, names = self._parse_target(target)
         child = Cid.parse(child_cid)
-        with self.fetcher.open(root, pinned=True) as fetch, self.fetcher.open(child, pinned=True) as child_fetch:
+        with self.pinned_fetch(root) as fetch, self.pinned_fetch(child) as child_fetch:
             fetch.fetch_dag(fetch.resolve())
             child_fetch.fetch_dag(child_fetch.resolve())
             new_root = edit.dir_set(root, names, name, child, executable, fetch.get, fetch.session.put)
@@ -2078,7 +2139,7 @@ class RnfsNode:
         _caller_source(source)
         edit.check_entry_target(target)
         root, names = self._parse_target(target)
-        with self.fetcher.open(root, pinned=True) as fetch:
+        with self.pinned_fetch(root) as fetch:
             fetch.fetch_dag(fetch.resolve())
             new_root = edit.dir_rm(root, names, fetch.get, fetch.session.put)
             self.storage.pin(new_root, source)
@@ -2126,7 +2187,7 @@ class RnfsNode:
         """Fetch the target completely and pin it with source ("user", or the caller's app's)."""
         _caller_source(source)
         root, names = self._parse_target(target)
-        with self.fetcher.open(root, names, pinned=True) as fetch:
+        with self.pinned_fetch(root, names) as fetch:
             expect = fetch.resolve()
             fetch.fetch_dag(expect)
             self.storage.pin(expect.cid, source)
@@ -2337,11 +2398,12 @@ class RnfsNode:
 
     def pin_remote_served(self) -> dict:
         """The remote pins other identities asked of this node: {"pins": [{"identity", "cid", "state", "reason",
-        "at", "detail"}], most recent first, "usage": [{"identity", "used", "quota", "pinned", "waiting",
+        "at", "detail", "retry_at"}], most recent first, "usage": [{"identity", "used", "quota", "pinned", "waiting",
         "allowed"}], "quota"}. Current pins (storage's remote:<identity> sources) are "pinned" and those queued
         "waiting" or "fetching", whatever their recorded outcome says; the rest are the outcomes kept
         (rnfs.remote_pins.ServedPins). An outcome saying a pin is current that no longer is was lost to a crash
-        ("dropped", reason "lost")."""
+        ("dropped", reason "lost"). retry_at is when a pin waiting because its content wasn't found is tried again
+        (None for the rest)."""
         outcomes = self.served_pins.outcomes()
         current: dict[tuple[bytes, Cid], str] = {}
         counts: dict[bytes, list[int]] = {}  # identity -> [pinned, waiting]
@@ -2354,6 +2416,8 @@ class RnfsNode:
         with self._lock:
             queued = [(source, cid) for source, cids in self._remote_reserved.items() for cid in cids
                       if (source, cid) not in self._remote_released]
+            retry_at = {(_remote_identity(source), cid): retry[0] for (source, cid), retry in self._remote_retry.items()
+                        if self._remote_current.get(source) != cid}
         for source, cid in queued:
             identity = _remote_identity(source)
             if identity is None or (identity, cid) in current:
@@ -2375,7 +2439,8 @@ class RnfsNode:
                 at = self.storage.pin_added(key[1])  # pinned before 0.2.0, or its outcome forgotten
             pins.append({"identity": key[0].hex(), "cid": str(key[1]), "state": state,
                          "reason": recorded.reason if recorded is not None else None, "at": at,
-                         "detail": recorded.detail if recorded is not None else None})
+                         "detail": recorded.detail if recorded is not None else None,
+                         "retry_at": retry_at.get(key) if state == WAITING else None})
         pins.sort(key=lambda pin: pin["at"] if pin["at"] is not None else float("-inf"), reverse=True)
         allowed = {bytes.fromhex(text) for text in self.config.remote_pin_set}
         quota = self.config.remote_pin_quota
@@ -2404,7 +2469,14 @@ class RnfsNode:
         if not pin:
             released = False
             with self._lock:
-                if cid in self._remote_reserved.get(source, {}):
+                if (source, cid) in self._remote_retry and self._remote_current.get(source) != cid:
+                    # Waiting to be tried again, which may be hours away: given up at once
+                    self._remote_retry.pop((source, cid))
+                    self._remote_reserved[source].pop(cid, None)
+                    self._remote_pins_dirty = True
+                    released = True
+                    log(f"released remote pin of {cid} for {source}, which was waiting to be tried again", LOG_NOTICE)
+                elif cid in self._remote_reserved.get(source, {}):
                     # Still being fetched: it mustn't be pinned when the fetch ends
                     self._remote_released.add((source, cid))
                     self._remote_pins_dirty = True
@@ -2451,29 +2523,61 @@ class RnfsNode:
         A worker leaves _remote_workers in the same critical section in which it finds nothing waiting, so a
         pin reserved after that starts a new one, and one reserved before it is fetched by the old one.
         """
-        if source in self._remote_workers:
-            return True
-        thread = threading.Thread(target=self._remote_pin_worker, args=(source,), name="rnfs-remote-pin",
-                                  daemon=True)
         try:
-            thread.start()
+            self._start_remote_worker(source)
         except RuntimeError as e:  # can't start new thread: out of threads or memory
             reserved = self._remote_reserved.get(source, {})
             reserved.pop(cid, None)
+            self._remote_retry.pop((source, cid), None)
             if not reserved:
                 self._remote_reserved.pop(source, None)
             self._remote_pins_dirty = True
             log(f"refused remote pin of {cid} for {source}: couldn't start its fetch: {e}", LOG_ERROR)
             return False
+        return True
+
+    def _start_remote_worker(self, source: str):
+        """Start source's fetch thread unless it has one. Raises RuntimeError if it can't be started. Caller holds
+        the lock."""
+        if source in self._remote_workers:
+            return
+        thread = threading.Thread(target=self._remote_pin_worker, args=(source,), name="rnfs-remote-pin",
+                                  daemon=True)
+        thread.start()
         # Registered after start() succeeds, still under the lock, so the worker can't look before it is
         self._remote_workers[source] = thread
-        return True
+
+    def _next_remote_pin(self, source: str, now: float) -> Cid | None:
+        """source's oldest pin waiting that is due: not waiting to be tried again, or due to be by now (Unix time).
+        Caller holds the lock."""
+        for cid in self._remote_reserved.get(source, {}):
+            retry = self._remote_retry.get((source, cid))
+            if retry is None or retry[0] <= now:
+                return cid
+        return None
+
+    def _retry_remote_pins(self):
+        """Start the fetch thread of each source with a pin due to be tried again and no thread (maintenance, about
+        every second); one that can't be started is tried again at the next pass."""
+        now = time.time()
+        with self._lock:
+            if self.stop_event.is_set() or not self._remote_retry:
+                return
+            due = {source for (source, _), (retry_at, _) in self._remote_retry.items()
+                   if retry_at <= now and source not in self._remote_workers}
+            for source in due:
+                try:
+                    self._start_remote_worker(source)
+                except RuntimeError as e:  # out of threads or memory: the next pass tries again
+                    log(f"couldn't start the fetch of the remote pins of {source}: {e}", LOG_ERROR)
 
     def _remote_pin_worker(self, source: str):
         """Fetch source's remote pins one at a time, oldest first, until none is waiting or the node stops.
 
         Concurrent fetches would each be checked against the quota without the others' blocks, so together
-        they could store several times it. Pins waiting when the node stops stay saved for the next start.
+        they could store several times it. Pins waiting when the node stops stay saved for the next start. Pins
+        waiting to be tried again are skipped until they are due; once none is due the worker ends, and maintenance
+        starts one again when the next is (_retry_remote_pins).
         """
         # Resumed and early pins wait for the join: a lookup before it would find no provider and drop them
         while not self.joined.is_set():
@@ -2481,12 +2585,13 @@ class RnfsNode:
                 break
         while True:
             with self._lock:
-                cid = None if self.stop_event.is_set() else next(iter(self._remote_reserved.get(source, {})), None)
+                cid = None if self.stop_event.is_set() else self._next_remote_pin(source, time.time())
                 if cid is None:
-                    # Deregistered in the same critical section that saw nothing waiting: a /pin arriving after
-                    # it starts a new worker instead of relying on this one, which is about to return
+                    # Deregistered in the same critical section that saw nothing due: a /pin arriving after it
+                    # starts a new worker instead of relying on this one, which is about to return
                     self._remote_workers.pop(source, None)
                     return
+                self._remote_current[source] = cid
             try:
                 self._remote_pin_fetch(cid, source)  # removes cid from _remote_reserved when done
             except BaseException:
@@ -2504,12 +2609,18 @@ class RnfsNode:
                     return
                 waiting = [(source, cid) for source, cids in self._remote_reserved.items() for cid in cids
                            if (source, cid) not in self._remote_released]
+                retries = [(source, cid.binary, retry_at, since)
+                           for (source, cid), (retry_at, since) in self._remote_retry.items()
+                           if (source, cid) not in self._remote_released]
                 self._remote_pins_dirty = False
             try:
                 with self._db.transaction() as tx:  # a few rows (at most REMOTE_PIN_QUEUE per source): rewritten
                     tx.execute("DELETE FROM remote_pins")
                     tx.executemany("INSERT INTO remote_pins (position, source, cid) VALUES (?, ?, ?)",
                                    [(position, source, cid.binary) for position, (source, cid) in enumerate(waiting)])
+                    tx.execute("DELETE FROM remote_pin_retries")
+                    tx.executemany("INSERT INTO remote_pin_retries (source, cid, retry_at, since) VALUES (?, ?, ?, ?)",
+                                   retries)
             except OSError as e:
                 with self._lock:
                     self._remote_pins_dirty = True  # try again next time
@@ -2547,20 +2658,43 @@ class RnfsNode:
                 LOG_WARNING)
         return list(pins)
 
+    def _load_remote_retries(self) -> dict[tuple[str, Cid], tuple[float, float]]:
+        """When each remote pin saved as waiting for its content to be found is tried again and was first not found
+        ((retry_at, since), Unix times), by (source, CID); a malformed row is left out (its pin is tried at once).
+        Caller holds no lock (it reads the database)."""
+        try:
+            saved = self._db.query("SELECT source, cid, retry_at, since FROM remote_pin_retries")
+        except OSError as e:
+            log(f"reading the remote pins waiting to be tried again failed: {e!r}", LOG_ERROR)
+            return {}
+        retries = {}
+        for source, binary, retry_at, since in saved:
+            try:
+                cid = Cid.from_bytes(binary)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(source, str) and _finite(retry_at) and _finite(since):
+                retries[(source, cid)] = (float(retry_at), float(since))
+        return retries
+
     def _resume_remote_pins(self):
         """Queue the remote pins saved as waiting when the node last stopped (called once at start)."""
         pins = self._load_remote_pins()
+        retries = self._load_remote_retries()
         resumed = 0
         with self._lock:
             pinned = self.storage.pins()
             for source, cid in pins:
                 if source not in pinned.get(cid, set()):
                     self._remote_reserved.setdefault(source, {})[cid] = None
+                    if (source, cid) in retries:
+                        self._remote_retry[(source, cid)] = retries[(source, cid)]
                     resumed += 1
             self._remote_pins_dirty = True
             for source, cids in list(self._remote_reserved.items()):
-                # A thread that can't be started gives its pin back, so this ends
-                while cids:
+                # A thread that can't be started gives its pin back, so this ends. One whose pins all wait to be tried
+                # again is started by maintenance once the first is due
+                while cids and self._next_remote_pin(source, time.time()) is not None:
                     first = next(iter(cids))
                     if self._ensure_remote_worker(source, first):
                         break
@@ -2570,8 +2704,17 @@ class RnfsNode:
 
     def _remote_pin_fetch(self, cid: Cid, source: str):
         """Fetch cid for a remote pin, dropping it as soon as its verified size, or the bytes of its DAG's
-        blocks met so far, would exceed the quota. The fetch ends at its next step once the node stops."""
+        blocks met so far, would exceed the quota. The fetch ends at its next step once the node stops.
+
+        The node that asked is asked first (the fetch's hint: its node ID follows from its identity), as it serves
+        what it provides before its provider records are out. A pin whose content isn't found (NotFound) waits and
+        is tried again later (rnfs.retry: 10 minutes, doubling up to 6 hours, for up to 3 days), keeping what its
+        fetch got as a cached fetch (pinned_fetch); then it is dropped as not found.
+        """
         quota = self.config.remote_pin_quota
+        identity = _remote_identity(source)
+        hint = RNS.Destination.hash(identity, APP_NAME, DHT_ASPECT) if identity is not None else None
+        waits = False
         observer = Observer()
         observer.cancelled = self.stop_event.is_set
         try:
@@ -2579,7 +2722,7 @@ class RnfsNode:
                 if (source, cid) in self._remote_released:
                     return  # released while it waited
             self._served(source, cid, FETCHING)
-            with observing(observer), self.fetcher.open(cid, pinned=True) as fetch:
+            with observing(observer), self.pinned_fetch(cid, hint=hint) as fetch:
                 expect = fetch.resolve()
                 content = fetch.size_of(expect)
                 # Nothing else is being fetched for source (_remote_pin_worker), so its pins are all it uses
@@ -2613,6 +2756,8 @@ class RnfsNode:
             log(f"remote pin of {cid} for {source} stopped with the node: it is fetched after the next start",
                 LOG_VERBOSE)
             self._served(source, cid, WAITING)
+        except NotFound as e:
+            waits = self._not_found(source, cid, e)
         except RnfsError as e:
             log(f"remote pin of {cid} for {source} failed: {e}", LOG_WARNING)
             self._fetch_failed(source, cid, _FAILURE_REASONS.get(type(e), "failed"), str(e))
@@ -2621,12 +2766,36 @@ class RnfsNode:
             self._fetch_failed(source, cid, "failed", repr(e))
         finally:
             with self._lock:
+                self._remote_current.pop(source, None)
                 # Once the node is stopping, a fetch cut short stays waiting, so it is saved for the next start
-                # (a pin that completed meanwhile is skipped then)
-                if not self.stop_event.is_set():
+                # (a pin that completed meanwhile is skipped then); so does one waiting to be tried again
+                if not self.stop_event.is_set() and not waits:
                     self._remote_reserved.get(source, {}).pop(cid, None)
+                    self._remote_retry.pop((source, cid), None)
                     self._remote_released.discard((source, cid))
-                    self._remote_pins_dirty = True
+                self._remote_pins_dirty = True
+
+    def _not_found(self, source: str, cid: Cid, error: NotFound) -> bool:
+        """A remote pin's content wasn't found: wait to try again (True), or drop it once rnfs.retry.RETRY_FOR has
+        passed since it was first not found (False), or if it was released while it was fetched (False, its release
+        recorded already). Waiting when the node is stopping too, as any pin cut short."""
+        now = time.time()
+        with self._lock:
+            if (source, cid) in self._remote_released:
+                return False
+            since = self._remote_retry.get((source, cid), (None, now))[1]
+            retry_at = next_retry(since, now)
+            if retry_at is not None:
+                self._remote_retry[(source, cid)] = (retry_at, since)
+        if retry_at is None:
+            log(f"remote pin of {cid} for {source} failed: {error}; not found for "
+                f"{RETRY_FOR / 86400:g} days", LOG_WARNING)
+            self._fetch_failed(source, cid, "not_found", f"{error}; not found for {RETRY_FOR / 86400:g} days")
+            return False
+        log(f"remote pin of {cid} for {source}: {error}; trying again in {(retry_at - now) / 60:.0f} minutes",
+            LOG_NOTICE)
+        self._served(source, cid, WAITING, "not_found", str(error))
+        return True
 
     def _fetch_failed(self, source: str, cid: Cid, reason: str, detail: str):
         """Record a remote pin's fetch that failed: dropped, unless the node is stopping, which keeps it waiting

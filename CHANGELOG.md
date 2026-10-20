@@ -19,6 +19,8 @@ Upgrade notes:
 - **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
   `routing`, `peer_scores`, `announce_first_seen`, `provider_standing`, `remote_pins_asked`, `remote_pins_served`,
   `name_syncs`, `name_sync_files`, `published_heal`, `name_announces`); an older rnfs can't open it afterwards. Pins made before the
+  `name_syncs`, `name_sync_files`, `published_heal`, `remote_pin_retries`); an older rnfs can't open it
+  afterwards. Pins made before the
   upgrade have no `added` time, name keys made before it count as never exported (`rnfs status` lists them until
   `rnfs name export` is run), and remote pins asked before it have no status entry.
 - **LXMF:** rnfs no longer sends or receives LXMF (Removed, below). Pins of links auto-fetched over LXMF change
@@ -120,6 +122,26 @@ Security:
   record a day later and withdrew it grew the state database (and took room from the record budget, which measures
   it). At most 50,000 are kept (about 5 MB); past that the hourly pass forgets those with the fewest refresh days
   first, so Earned publishers that left outlast such a flood.
+- **Partition mode can't be forced from outside** (spec section 6, "LoRa islands"; REV4): a server beyond the island
+  could answer a slow node's `/find` with 3 made-up IDs, whose failures entered partition mode at once. Only failures
+  of servers the node knows (its routing table or first-seen log, or an identity or path RNS knows) count, and 3 in a
+  row ask for a probe of an off-island server that answered or announced itself recently, as silence does: partition
+  mode starts only if that probe fails (or nothing beyond the island was heard to probe). An ID that only ever failed
+  is never a probe target.
+- **The announce first-seen log keeps its senior servers** (spec section 6, "Announce first-seen log"; REV7): it
+  forgot the least recently heard server first, so about 3 announces a second of fresh identities pushed every honest
+  server out between its 6-hourly announces, and none ever became senior (`provider_seniority`), which publishing and
+  searching's senior rule needs. When full it now forgets first a server silent for 2 × `announce_interval` (counted
+  from the start at the earliest), then the server not yet senior that it first heard most recently (in a flood, the
+  newcomer itself), and a senior server heard lately only when nothing else can go. At a tenth of the scale (6,553
+  rows, 200 honest servers, a fresh identity every 3.3 s for 2 days) every honest server became senior, against none.
+- **Made-up IDs can't inflate the network size estimate** (spec section 6, "Identities placed next to a key"; REV8):
+  a lookup took its sample, the distance to the 10th-closest server, over every ID replies named, so a server naming
+  made-up IDs just beyond the 3 closest (which a lookup completes without asking) inflated the estimate about 3
+  times, weakening the density check. A sample now counts only servers that answered or whose identity is known,
+  from the closest up to the first that isn't (its distance scaled to the 10th), so a node that knows few identities,
+  on a LoRa island, doesn't underestimate the network instead. Over 300 servers with such a server in every lookup:
+  288 -> 743 before, 288 -> 318 now.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
@@ -373,7 +395,8 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
 - Choosing providers: within each seniority group (seniority stays first), providers with a better local score
   are tried first, before fewer hops: a provider whose blocks verified before is preferred to an unknown one.
 - The announce first-seen log: each node records when it first heard each server's announce (at most 65,536
-  servers, the least recently heard forgotten first; about 12 MB when full), kept across restarts, and can give
+  servers, about 12 MB when full: servers silent for 2 × `announce_interval` forgotten first, then the newest not
+  yet senior, Security above), kept across restarts, and can give
   the closest servers to a key among those heard for at least `provider_seniority`, which identities generated
   next to a key can't be. Publishing and searching use it (below).
 - **Sweep providing:** republishing many keys takes far fewer lookups. One closest-nodes lookup now serves every
@@ -394,8 +417,8 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   nodes and 90.8% on slow ones across every attack of the eclipse simulation). Four local mechanisms, nothing on
   the wire changed:
   - a network size estimate: the median distance to the 10th-closest server over the node's last 16 complete
-    lookups for other keys, kept in the state database's `meta` table so a restart has it at once (the density
-    check waits for 8);
+    lookups for other keys, counting only servers the lookup verified (Security above), kept in the state
+    database's `meta` table so a restart has it at once (the density check waits for 8);
   - the density check: when the servers found near a key are packed more than twice as densely as the estimate
     allows (from the 10th on), a search waits until 5 servers of each of two rings beyond them have answered (those
     ranked after the dense core, and those beyond where 10 honest servers would be expected), and a publisher gives
@@ -443,12 +466,12 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   nodes with no slow interface and no `local_interfaces` are unchanged. New settings `local_interfaces`,
   `local_hops`, `local_replicas`; `rnfs status` gains `local_servers`.
 - **Partition mode** (spec section 6, "LoRa islands"): a node with local servers that fails 3 times in a row to reach
-  off-island servers, or hears no off-island announce or answer for over 4 times the usual gap between off-island
-  announces (at least 10 minutes) and then gets no answer from one it probes, uses its local servers only for
-  lookups and publishing, so a search during a gateway outage ends in the time its island takes instead of minutes
-  of link timeouts. Any off-island answer or fresh announce ends it, and a probe of one off-island server every 5
-  minutes (on slow nodes after 15 minutes, doubling up to 2 hours) keeps it from sticking. Silence alone never enters
-  it, so a small connected network with sparse announces doesn't flap. `rnfs status` gains `partition` and
+  off-island servers it knows, or hears no off-island announce or answer for over 4 times the usual gap between
+  off-island announces (at least 10 minutes), and then gets no answer from one it probes, uses its local servers
+  only for lookups and publishing, so a search during a gateway outage ends in the time its island takes instead of
+  minutes of link timeouts. Any off-island answer or fresh announce ends it, and a probe of one off-island server
+  every 5 minutes (on slow nodes after 15 minutes, doubling up to 2 hours) keeps it from sticking. Silence alone never
+  enters it, so a small connected network with sparse announces doesn't flap. `rnfs status` gains `partition` and
   `partition_since`.
 - **The heal republish:** keys whose last publish round reached no server beyond the island (during a partition) are
   marked, and republished as soon as partition mode ends, paced as a slow node's rounds are, so the rest of the
@@ -457,7 +480,7 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
 
   Together, over the fake network of `tests/test_topology.py` (1,000 servers, 21% on 8 islands, an island's gateway
   down): a neighbour found what an island node published before the partition 100% of the time instead of 67%, and
-  what it published during it 100% instead of 91%, with 0.15 timeouts and 31 s of simulated time per search instead
+  what it published during it 100% instead of 91%, with 0.2 timeouts and 33 s of simulated time per search instead
   of 11.7 and 490 s; the backbone found what was published during the partition 0% of the time until the heal
   republish, 99.5% after it. Over a simulated week with 5 or 20 servers beyond the island announcing every 6 hours,
   partition mode was entered only while the gateway was down, and left within 49 minutes of its coming back.
@@ -492,6 +515,28 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   share kept for Newcomers (Security, above).
 
 Changed:
+- A pacing wait no longer closes the link: after a response on a slow link the fetcher waits as long again before
+  asking that provider again (the responder's upload pacing), and on LoRa a 64 KiB chunk takes about 9 minutes, so
+  the wait outlasted `link_idle_timeout` (5 minutes) and the idle link was closed, taking its rate estimate with it:
+  the next response was sized and paced as on a new link. The link now counts as in use while its provider is
+  waited for.
+- Slow links are judged per provider, not per node: a gateway with a TCP and a LoRa interface isn't a slow node,
+  so it ran 3 parallel `/blocks`, probed open links for the root and duplicated any batch out for 30 s, all over
+  the radio. Now a provider is reached over a slow link when the link's rate estimate is below `slow_bitrate` (or,
+  without one, the next-hop interface is, or the provider is behind a slow path); providers over slow links
+  behind one next-hop interface share one request at a time, a node that isn't slow probes no open link over a
+  slow link (a slow node still probes one, as before: a hit saves a lookup over the radio), nothing is duplicated
+  onto a slow link, and on fast links a batch is duplicated only once it has taken 1.5 times its blocks' transfer
+  time at the rate estimate (and `deadline_slack`, as before).
+- A lost packet no longer drops a provider: a `/blocks` request RNS times out (its packet or its answer's lost,
+  which RNS doesn't resend), whose link times out under it, or whose new link isn't established, failed its
+  provider for the rest of the fetch at once, so at 5% packet loss most 1 MiB fetches from one provider failed.
+  Now its link is closed (which starts no cooldown at the provider) and the request asked again on a new link
+  after the busy delay; the provider fails after `max_failures` such requests in a row. A link closed by either
+  end, no path, or a malformed answer still fails it at once. Measured over the fake link of
+  `tests/test_fetcher.py`'s `LossyLinkTest` (one provider, each request lost with probability 5%), 1 MiB fetches
+  succeeded 39% of the time before and 99.7% after (300 fetches each), or 97.6% when each new link's request and
+  proof are lost at 5% too.
 - A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private
   mode) announces `rnfs.dht` only at startup, no longer every `announce_interval`; nothing needs to reach it. It
   announces again at once when it starts to provide. Servers, and clients that provide, announce as before.
@@ -509,8 +554,28 @@ Changed:
 - `Config.validate` refuses `api_port` equal to a non-zero `gateway_port`.
 - A request that times out raises `ConnectionFailed` saying the daemon "didn't answer within its timeout".
 - `Config.load` reports invalid TOML as "<path> isn't valid TOML: …" (still a `ValueError`).
+- A fetch to pin that fails keeps what it got: `pin add`, `dir set` and `dir rm`, remote pins, followed names and
+  deny lists record it as a cached fetch, as `get` and `cat` already did, so trying again resumes rather than
+  starting over (a 4 MiB pin over LoRa failing at 90% fetched all of it again). Not when it failed on denied
+  content, an invalid DAG or a size bound or quota (`TooLarge`), which a retry can't get past. The record is cache
+  like any other (evictable, removed by `gc`), and never provided as a download of the user's.
+- Remote pins don't give up on content not yet published. The node asked to pin asks the node that asked first
+  (its node ID follows from the identity of the `/pin`'s link), which serves what it added before its provider
+  records are out. A pin whose content can't be found waits and is tried again after 10 minutes, doubling up to 6
+  hours, for up to 3 days, instead of being dropped at once; `pin remote ls --served` shows it waiting
+  (`not_found`) with when it is tried again (`retry_at`, a new field of `GET /api/pin/remote/served`). Pins
+  accepted after it aren't held up, and a release ends the wait at once.
+- A `get`, `pin` or `export` job whose content can't be found is queued again the same way, keeping its blocks,
+  rather than failed: `retry_at` (and `retry_since` while it waits) are new fields of a job, and `rnfs jobs` shows
+  it waiting. Not for a path its directory shows doesn't exist, nor for a job submitted with the new `retry: false`
+  (`POST /api/jobs`; `retry=False` in the library's `jobs.get`, `pin` and `export`), which fails as in 0.1.6. A
+  foreground `rnfs get`, `pin add` or `export` submits so, and still fails at once; `--background` jobs wait.
 
 Faster:
+- Range reads (`cat`, the gateway, sealed reads) size their window by the providers' links: they fetched 32 chunks
+  (2 MiB) before handing over the first byte, about 5 hours at LoRa's 1 kbit/s. While no provider known is reached
+  over a fast link (or none is known yet), the window is one chunk with the next asked for ahead, so the first
+  byte comes after one chunk (about 9 minutes at 1 kbit/s); over fast links it stays 32.
 - A start no longer lists every stored block before the API answers: their sizes are kept in the state database
   (`block_sizes`) and read from there after a clean stop. After a crash or power loss the start lists them all,
   as before, and corrects the table. Opening storage on a desktop NVMe disk (warm cache), small blocks: 100 000

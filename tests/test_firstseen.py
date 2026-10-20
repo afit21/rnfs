@@ -101,16 +101,51 @@ class LogTest(unittest.TestCase):
                 with self.subTest(size=size, min_age=min_age, count=count):
                     self.assertEqual(log.closest(key, count=count, min_age=min_age), expected)
 
-    def test_least_recently_heard_is_forgotten_first(self):
-        log = FirstSeenLog(clock=self.clock, max_rows=3)
-        a, b, c, d = (node_id(n) for n in (1, 2, 3, 4))
+    def test_the_newest_not_yet_senior_is_forgotten_first(self):
+        """Full, and none silent: the server first heard most recently goes, if not yet senior (a newcomer itself),
+        never a senior one."""
+        log = FirstSeenLog(clock=self.clock, max_rows=3, seniority=DAY, silence=12 * 3600)
+        a, b, c, d, e = (node_id(n) for n in (1, 2, 3, 4, 5))
+        log.heard(a)
+        self.clock.now += 1
+        for n in (b, c):
+            log.heard(n)
+        log.heard(a)  # heard again: b is now the least recently heard, but that doesn't matter while it isn't silent
+        log.heard(d)
+        self.assertIsNone(log.first_heard(d))  # the newcomer
+        self.assertEqual(sorted(log.closest(node_id(0), count=10)), [a, b, c])
+        self.clock.now += DAY - 1  # a is senior, b and c not
         for n in (a, b, c):
             log.heard(n)
-        log.heard(a)  # heard again: b is now the least recently heard
-        log.heard(d)
-        self.assertIsNone(log.first_heard(b))
-        self.assertEqual(sorted(log.closest(node_id(0), count=10)), [a, c, d])
+        self.clock.now += 1  # b and c senior too: only newcomers go
+        log.heard(e)
+        self.assertIsNone(log.first_heard(e))
         self.assertEqual(log.first_heard(a), WALL)  # kept its first-heard time
+
+    def test_a_silent_server_is_forgotten_first(self):
+        log = FirstSeenLog(clock=self.clock, max_rows=2, seniority=DAY, silence=12 * 3600)
+        a, b, c = (node_id(n) for n in (1, 2, 3))
+        log.heard(a)
+        log.heard(b)
+        self.clock.now += 2 * DAY  # both senior
+        log.heard(a)
+        log.heard(b)
+        self.clock.now += 6 * 3600
+        log.heard(b)
+        self.clock.now += 6 * 3600
+        log.heard(c)  # a was silent for exactly 12 h: not yet forgotten
+        self.assertIsNone(log.first_heard(c))
+        self.clock.now += 1
+        log.heard(c)
+        self.assertIsNone(log.first_heard(a))  # silent too long, senior or not
+        self.assertEqual(sorted(log.closest(node_id(0), count=10)), [b, c])
+
+    def test_with_no_seniority_the_least_recently_heard_goes(self):
+        log = FirstSeenLog(clock=self.clock, max_rows=2, seniority=0)
+        a, b, c = (node_id(n) for n in (1, 2, 3))
+        for n in (a, b, a, c):
+            log.heard(n)
+        self.assertEqual(sorted(log.closest(node_id(0), count=10)), [a, c])
 
 
 class SavedTest(unittest.TestCase):
@@ -170,7 +205,11 @@ class SavedTest(unittest.TestCase):
         self.assertEqual(log.closest(node_id(0), count=5, min_age=5 * DAY), [a, b])
         # Last heard as of the save that wrote each row: b's, 60 s after a's
         self.assertEqual(log.closest(node_id(0), count=5, heard_within=5 * DAY), [b])
-        log.heard(c)  # a was heard least recently before the restart
+        log.heard(c)  # a and b are senior, and silence counts from the restart: the newcomer goes
+        self.assertIsNone(log.first_heard(c))
+        self.clock.now += 12 * 3600 + 1
+        log.heard(b)
+        log.heard(c)  # a, heard least recently, has now been silent too long since the restart
         self.assertIsNone(log.first_heard(a))
         log.save()
         self.assertEqual([row[0] for row in self.rows()], [b, c])
@@ -198,7 +237,8 @@ class SavedTest(unittest.TestCase):
         log = self.open(max_rows=2)
         self.assertEqual(len(log), 2)
         log.save()
-        self.assertEqual([row[0] for row in self.rows()], [node_id(4), node_id(5)])
+        # None is senior or silent: those first heard most recently go
+        self.assertEqual([row[0] for row in self.rows()], [node_id(1), node_id(2)])
 
 
 if __name__ == "__main__":

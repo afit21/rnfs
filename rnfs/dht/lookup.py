@@ -617,7 +617,7 @@ class Lookup:
                     + (f", {len(extras)} for the senior rule and the density check" if extras else "")
                     + ("; dense near the key" if self.dense else "")
                     + (f"; {len(found)} new providers" if on_provider is not None else ""))
-        kth = density.kth_distance(list(known.values())) if why == "complete" else None
+        kth = density.verified_sample(dict(known), self.verified()) if why == "complete" else None
         if kth is not None:
             try:
                 self.on_complete(self.key, kth)
@@ -625,6 +625,19 @@ class Lookup:
                 from rnfs.log import LOG_WARNING, log
                 log(f"lookup for {self.key.hex()}: the completion callback raised {e!r}", LOG_WARNING)
         return found
+
+    def verified(self) -> Callable[[bytes], bool]:
+        """Whether a node a run knew of (and hadn't seen fail) is verified for the size estimate's sample
+        (density.verified_sample, told to on_complete): it answered, in any run, or its identity is known. A reply can
+        name made-up IDs just beyond the beta closest, which a run completes without querying; a node still out when
+        the run completed counts if its identity is known, as a real server's slow answer is common."""
+        with self._lock:
+            answered = set(self._answered)
+        return lambda node_id: node_id in answered or self.is_known(node_id)
+
+    def known_distances(self) -> dict[bytes, int]:
+        """The nodes the last run knew of and hadn't seen fail, with their distances to the key."""
+        return dict(self._last_known)
 
     def _credit(self, introducer: bytes | None, node_id: bytes):
         """node_id answered: if introducer named it and it is closer to the key, introducer's answer was useful
