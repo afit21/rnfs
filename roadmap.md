@@ -409,7 +409,7 @@ by publishing. All local; no wire change.
   internet side, or a two-radio relay bridge its radios. The documentation says so. RNS 1.5.6 raises `KeyError` on
   `interface_mode = gateway`; the README says `mode = gateway`
 
-## Less link and lookup traffic (implemented, but for the owner's open items)
+## Less link and lookup traffic (implemented)
 
 Traffic rnfs sends that does no work. Counts are from RNS 1.5.6's code, not yet measured. All local; no wire change.
 
@@ -458,17 +458,15 @@ Traffic rnfs sends that does no work. Counts are from RNS 1.5.6's code, not yet 
     deny-list retries; CLI and API calls, jobs and remote pins always search. Fixed on the way: a probe that
     brought the first block was asked for it again (a whole chunk sent twice)
 
-Open (owner's decision):
-* One link for publishing. A publish looks up servers over the shared anonymous link, then opens a separate
-  identified link to each server it stores to: about 5 more packets per stored server each round, on radio for a
-  slow publisher. Identifying the publishing lookup's links from the start and storing over them saves that, but
-  every server the lookup queries, not just those that store the record, learns which identity publishes which
-  key
-* Republishing less often on fast nodes: 24 h today, 3 days on slow nodes, and it MUST stay under 3.5 days
-  (`PROVIDER_TTL / 2`). Two or three days cuts fast nodes' stores 2–3×; records lost to departed servers stay lost
-  longer. Measure with the storage and topology simulations, and against the 4.5-day newcomer expiry
-* Compressed `/blocks` responses: decided; see "Resumable and compressed block transfers" below, which carries
-  them with resumable transfers in one new optional request
+Decided (2026-10-20):
+* One link for publishing: not planned (see Not planned). Identifying the publishing lookup's links would save
+  about 5 packets per stored server each round, but every server the lookup queries would learn which identity
+  publishes which key
+* Republishing less often on fast nodes: not in 0.2.0 (see Future). Sweep providing and the publisher's state on
+  disk already made a fast node's round cheap (lookups level off at about servers ÷ 12.5 whatever the key count,
+  about 0.9 KB written a key), so the 2–3× fewer stores matter less than records lost to departed servers staying
+  lost longer
+* Compressed `/blocks` responses: built as `/range` (see "Resumable and compressed block transfers")
 
 ## Providing files inside folders (implemented)
 
@@ -788,7 +786,7 @@ local or an existing refusal (`False`), and gets a regression test in `tests/sec
     headers scanned before anything is stored; a `meta` mark collects after a start that finds it (no schema step)
   - REV11: `MAX_DEPARTED` = 50,000 standings without records, fewest refresh days first
 
-## Fetching reliably on LoRa (implemented, but for the last bullet)
+## Fetching reliably on LoRa (implemented)
 
 Fetching files of a few hundred KiB over LoRa is the use to keep working well. At 1 kbit/s a 100 KiB file is about
 123 KB on air (16 minutes), a 2 KiB file about 9.5 KB, more than half of it the lookup.
@@ -821,9 +819,8 @@ Fetching files of a few hundred KiB over LoRa is the use to keep working well. A
   estimates its clock's offset from recent announces' emission times and warns above 5 minutes
 * `max_storage` counts each block's disk allocation (rounded up to the filesystem's block or cluster), not its
   length: small blocks take 16–32 KiB on FAT32
-* A start after an unclean stop lists only the block subdirectories that changed since the last durability
-  point (by recorded directory times, compared for equality; a full scan where the filesystem doesn't keep
-  them), if the Raspberry Pi measurement shows the full scan hurts
+* A start after an unclean stop listing only the block subdirectories that changed: moved to Future, as the
+  Raspberry Pi measurement it depended on can't be made
 * As implemented (all measured on fakes; real LoRa untested):
   - Lost packets: a request RNS times out, whose link times out under it, or whose new link isn't established
     is `LOST` (`PeerClient`): its link is closed and the request retried on a new one after the busy delay; the
@@ -852,7 +849,6 @@ Fetching files of a few hundred KiB over LoRa is the use to keep working well. A
     4 KiB); `status` adds `allocated_bytes` and `allocation_unit`, `used_bytes` unchanged. A mixed 297 MiB store
     takes 298 MiB at 4 KiB units and 312 MiB at 32 KiB; 2,000 small notes 4.1 MiB → 9.4 / 63 MiB. Quotas on
     what others make the node store still count bytes, as in 0.1.x
-  - The last bullet waits on the Raspberry Pi measurement
 
 ## Using more of Reticulum (implemented)
 
@@ -964,7 +960,7 @@ mirror) would also take 2.5–3.5× less airtime compressed.
 
 # Future
 
-What can't ship in 0.2.0: it waits on older nodes leaving the network or on Reticulum, or isn't planned.
+What isn't in 0.2.0: it waits on older nodes leaving the network, on Reticulum or on evidence it is needed, or isn't planned.
 
 ## Fewer name announces (once 0.1.5 and 0.1.6 resolvers are gone)
 
@@ -973,6 +969,20 @@ What can't ship in 0.2.0: it waits on older nodes leaving the network or on Reti
   `keeper_query = always`, so measure its airtime on LoRa against the announces it saves before adopting it.
   Paths at transport nodes lapse a week after a name's last announce, so even then a name needs a keepalive
   announce more often than that
+
+## Faster starts after an unclean stop (if they prove slow)
+
+* A start after an unclean stop lists only the block subdirectories that changed since the last durability point
+  (by recorded directory times, compared for equality; a full scan where the filesystem doesn't keep them).
+  Planned for 0.2.0 on condition that a Raspberry Pi measurement showed the full scan hurts; that measurement
+  can't be made, and on a desktop a start takes 1.2 s at 1M blocks after a clean stop. Build it if users report
+  slow starts after crashes: FAT filesystems keep directory times coarsely, so it needs care there
+
+## Republishing less often on fast nodes
+
+* 24 h today, 3 days on slow nodes; it MUST stay under 3.5 days (`PROVIDER_TTL / 2`). Two or three days would cut
+  fast nodes' stores 2–3×, while records lost to departed servers stay lost longer. Measure with the storage and
+  topology simulations, and against the 4.5-day newcomer expiry, before changing it
 
 ## Waiting on Reticulum
 
@@ -984,6 +994,9 @@ What can't ship in 0.2.0: it waits on older nodes leaving the network or on Reti
 
 ## Not planned
 
+* One link for publishing: storing over the publishing lookup's links, identified from the start, would save about
+  5 packets per stored server each round, but every server a lookup queries would learn which identity publishes
+  which key, not just those that store the record
 * A global `PROVIDER_TTL` of 48 hours (as in IPFS) would clear floods faster, but older nodes republish every 3
   days (slow nodes, kept names) and would lose their records: it breaks compatibility. The 4.5-day newcomer
   expiry gets most of the benefit locally
