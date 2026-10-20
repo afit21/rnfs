@@ -450,14 +450,21 @@ class NetworkFacadeTest(NodeTest):
             self.b.read_file(f"{cid}/missing")
 
     def test_read_file_checks_the_deny_list_before_the_first_byte(self):
-        """A file whose hash is denied raises Denied at the first chunk, after its info."""
-        cid = self.a.add_stream(io.BytesIO(b"unwanted" * 100))["cid"]
+        """A file of several chunks whose hash is denied raises Denied at the first chunk, after its info; one of one
+        block is denied by its CID, the hash naming it, so not even fetched."""
+        data = b"unwanted" * (CHUNK_SIZE // 4)
+        cid = self.a.add_stream(io.BytesIO(data))["cid"]
         self.advertise(cid)
-        self.b.deny.add(["sha256:" + hashlib.sha256(b"unwanted" * 100).hexdigest()])
+        self.b.deny.add(["sha256:" + hashlib.sha256(data).hexdigest()])
         info, chunks = self.b.read_file(cid)
-        self.assertEqual(info["size"], 800)
+        self.assertEqual(info["size"], len(data))
         with self.assertRaises(Denied):
             next(chunks)
+        small = self.a.add_stream(io.BytesIO(b"unwanted" * 100))["cid"]
+        self.advertise(small)
+        self.b.deny.add(["sha256:" + hashlib.sha256(b"unwanted" * 100).hexdigest()])
+        with self.assertRaises(Denied):
+            self.b.read_file(small)
 
     def test_invalid_root_reported(self):
         self.b.fetcher.mark_invalid(Cid.for_block(RAW, b"bad"))
@@ -579,9 +586,8 @@ class SealedCheckTest(NodeTest):
             next(chunks)
         stored = b"".join(self.a.read(cid, raw=True))
         self.a.deny.add(["sha256:" + hashlib.sha256(stored).hexdigest()])
-        info, chunks = self.a.read_file(cid)
-        with self.assertRaises(Denied):
-            next(chunks)
+        with self.assertRaises(Denied):  # one block: its CID is denied with the hash of its (sealed) bytes
+            self.a.read_file(cid)
 
     def test_the_memo_is_bounded(self):
         """At most NOT_SEALED_MEMO targets are remembered, the least recently used forgotten first."""
