@@ -252,7 +252,21 @@ def _process_alive(pid: int) -> bool:
         return False
     except OSError:  # PermissionError: it runs, as another user
         return True
-    return True
+    return not _zombie(pid)
+
+
+def _zombie(pid: int) -> bool:
+    """True if pid has exited but its parent hasn't reaped it (Linux: state Z in /proc/<pid>/stat): a daemon a
+    container's init doesn't wait for stays one, and `rnfs stop` waited its whole timeout for it. False where that
+    can't be told."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            stat = f.read()
+    except OSError:
+        return False
+    # "pid (comm) state ...": comm may hold spaces and parentheses, so the state follows the last ")"
+    end = stat.rfind(b")")
+    return end != -1 and stat[end + 2:end + 3] == b"Z"
 
 
 def _windows_process_alive(pid: int) -> bool:

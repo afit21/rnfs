@@ -256,6 +256,21 @@ class DaemonFileTest(unittest.TestCase):
         with mock.patch.object(ctypes, "WinDLL", create=True, side_effect=OSError("no kernel32")):
             self.assertTrue(apiclient._windows_process_alive(4321))
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "reads /proc")
+    def test_a_process_exited_but_not_reaped_isnt_alive(self):
+        """A daemon a container's init doesn't wait for stays a zombie: rnfs stop waited its whole timeout for it."""
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            deadline = time.monotonic() + 10
+            while not apiclient._zombie(child.pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(apiclient._zombie(child.pid))
+            self.assertFalse(apiclient._process_alive(child.pid))
+        finally:
+            child.wait()
+        self.assertTrue(apiclient._process_alive(os.getpid()))
+        self.assertFalse(apiclient._zombie(os.getpid()))
+
     def test_removed_only_by_its_own_daemon(self):
         """cli.remove_daemon_info leaves a daemon.json another process wrote."""
         self.write({"pid": os.getpid() + 1, "api_port": 9555})
