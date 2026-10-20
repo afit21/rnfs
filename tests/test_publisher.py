@@ -847,7 +847,9 @@ class PublisherTest(PublisherCase):
 
     def test_lookups_at_once_send_what_one_at_a_time_sends(self):
         """Lookups finishing in any order, each finding its own nodes: every node gets the same /provide
-        requests, keys and withdrawals in the same order, as when the lookups run one at a time."""
+        requests, keys and withdrawals in the same order, as when the lookups run one at a time. Compared per node:
+        /provide goes to PROVIDE_PARALLEL servers at once, so the order the client sees calls to different servers in
+        is the threads' (under CPU load it differed, and the test failed)."""
         cids = self.due_keys(20)
         self.nodes_of = lambda key: near(key) + ([node for i, node in enumerate((N1, N2, N3)) if key[i] % 2] or [N1])
         self.lookup_delay = lambda key: 0.005 + key[3] % 5 / 200  # 5-25 ms, so they finish out of order
@@ -866,7 +868,10 @@ class PublisherTest(PublisherCase):
                     self.assertEqual(self.running.peak, 1)
                 else:
                     self.assertGreater(self.running.peak, 1)
-                rounds.append((result, self.client.calls))
+                calls: dict[bytes, list] = {}
+                for node_id, keys, withdrawn in self.client.calls:
+                    calls.setdefault(node_id, []).append((keys, withdrawn))
+                rounds.append((result, calls))
         self.assertEqual(rounds[0], rounds[1])
 
     def test_slow_nodes_look_up_one_at_a_time(self):

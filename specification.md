@@ -202,7 +202,10 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
 encoded with msgpack by RNS. Requesters use RNS's RTT-based request timeout (`timeout=None`). RNS stops that
 timeout once a response Resource starts arriving, so requests other than `/blocks` (which has stall detection,
 section 7) SHOULD also have a hard deadline from when they were sent (rnfs: twice RNS's request timeout), and
-pass a `max_response_size` just above their largest honest answer.
+pass a `max_response_size` just above their largest honest answer. RNS (1.5.6) registers a request as pending only
+after `Link.request` has sent it, and drops a response that matches no pending request, so on a fast link a response
+can arrive first and be lost; a requester SHOULD keep such a response and hand it over once the request is
+registered (rnfs: `links.EarlyResponses`), or the request waits out RNS's timeout, 11 s at least.
 
 | Path | Request | Response | Section |
 |---|---|---|---|
@@ -1115,14 +1118,17 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   A node that knows few identities (on a LoRa island, or just started) finds x's `K` closest among them, padded
   with servers it knows far from x: p comes out short and the region holds many keys the lookup learned little
   about. rnfs therefore also sizes regions by the network size estimate N (above, "Identities placed next to a
-  key"): the region's prefix is never shorter than ⌊log2(N ÷ `K`) − 1⌋ (the far half asked about stays the one p as found
-  gives), and a key of the region is covered only if the `K`-th closest server learned lies within 1.5 times
-  (`K` − 1/3) × 2^128 ÷ N of it (the median distance of a `K`-th closest among N servers); the region's other keys
-  are looked up in turn like any key not yet covered. While there is no estimate yet (a node's first lookups after
-  its first start), a region is x alone. In a simulated world of 1,000 servers, 21% of them on LoRa islands that
-  hear 16% of the rest, an island node's records reached 6.6 of their 10 closest instead of 3.8 (a lookup per key:
-  7.9), and a node's first round after its first start 6.3 instead of 0.3; a backbone node needs 15–45% more
-  lookups for the keys a region knows too sparsely by chance (1,000 servers, 3,000 keys: 114 instead of 80).
+  key"): the region's prefix is never shorter than ⌊log2(N ÷ `K`) − 1⌋ (the far half asked about stays the one p
+  as found gives), and while there is no estimate yet (a node's first lookups after its first start), a region is x
+  alone. Such a node also hears of servers (named in answers) whose identity it doesn't know, which a store would
+  reach only through a path request: a key of the region is covered only if at most 2 of its `K` closest servers
+  heard of are such servers; the region's other keys are looked up in turn like any key not yet covered. A node that
+  knows the identity of every server it hears of covers every key of its regions, so its lookups still level off at
+  about servers ÷ 12.5 (a rule from N alone, the `K`-th closest within 1.5 times its median distance, looked up
+  about 8% of keys on their own, as `K`-th distances spread that far by chance: 2,000 servers, 1M keys, 78,287
+  lookups instead of 176). In a simulated world of 1,000 servers, 21% of them on LoRa islands that hear 16% of the
+  rest, an island node's records reached 7.0 of their 10 closest instead of 3.8 (a lookup per key: 7.8), and a
+  node's first round after its first start 6.5 instead of 0.3, with a backbone node's lookups unchanged.
   A round takes at most 50,000 keys, those due longest (never published ones in key order), and the rounds that
   follow at once take the rest: the keys of a round are a slice of the key space, and come due again together, so
   the rounds need no more lookups than one would. rnfs keeps where and when it last published each key in its state

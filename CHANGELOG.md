@@ -418,14 +418,16 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   not keys, so a round publishes every due key of up to 10 regions.
 - **Sweep providing on LoRa islands and at a first start:** a node that knows few identities (on an island, or just
   started) found a key's 10 closest among them, padded with servers far from the key, so its regions held many keys
-  its lookup knew little about. Regions are now also sized by the network size estimate: never shorter than it
-  implies, covering only the keys whose servers the lookup knows as densely as it expects (the others get lookups
-  of their own), and a key a lookup until there is an estimate. Over test_topology's world of backbone and islands
-  (1,000 / 3,000 servers), an island node's records reach 6.6 / 4.5 of their true 10 closest instead of 3.8 / 2.3 (a
-  lookup per key: 7.9 / 5.1), and a node's first round after its first start 6.3 / 4.9 instead of 0.3 / 0.1, its
-  second 7.5 / 6.8 instead of 1.9 / 0.7. It costs island nodes keys per round (1.6 / 1.2 keys a region lookup instead
-  of 6.6 / 4.9, so a slow island node's round of 10 lookups publishes fewer keys), and fast backbone nodes 15–45%
-  more lookups (1,000 servers: 79 instead of 63 for 600 keys, 114 instead of 80 for 3,000).
+  its lookup knew little about. Regions are now never shorter than the network size estimate implies, a key a
+  lookup until there is an estimate, and a region covers only the keys it can store on all but 2 of their 10 closest
+  servers it heard of (it heard of others whose identity it doesn't know: the others get lookups of their own). Over
+  test_topology's world of backbone and islands (1,000 / 3,000 servers), an island node's records reach 7.0 / 4.7 of
+  their true 10 closest instead of 3.8 / 2.3 (a lookup per key: 7.8 / 5.0), and a node's first round after its first
+  start 6.5 / 5.0 instead of 0.3 / 0.1, its second 7.8 / 6.9 instead of 1.9 / 0.7. It costs island nodes keys per
+  round (1.5 / 1.2 keys a region lookup instead of 6.6 / 4.9, so a slow island node's round of 10 lookups publishes
+  fewer keys); a backbone node, which knows every identity it hears of, runs as many lookups as before
+  (`tests/bench_publisher.py`, 2,000 servers: 159 for 100,000 keys and 176 for 1M, against 158 and 176 without the
+  size estimate).
 - **Stores to long-known servers too:** each key is also stored on the 10 servers closest to it among those the
   node first heard at least `provider_seniority` (1 day) ago and has heard in the last 2 × `announce_interval`.
   Without an attack they are mostly the key's 10 closest already, so this adds few stores; identities generated
@@ -712,7 +714,14 @@ Faster:
   with nothing due) 80 → 0.1 ms at 100,000 keys and about 1,100 → 0.1 ms at 1M; disk 278 → 290 B a key (the due
   index); bytes written per round 55–83 KB → 0.8–0.95 KB a key (SQLite's WAL and checkpoints: rows are written in
   key order, and an item's row once a round instead of at each save). A first round of 1M keys took 20 rounds of
-  50,000 and 175 region lookups, against one round of 157. Raspberry Pi SD-card numbers are still to be measured.
+  50,000 and 175 region lookups, against one round of 157 (the same with the network size estimate given, as a
+  node's regions are sized: 176 and 159). Raspberry Pi SD-card numbers are still to be measured.
+- An answer that comes back before RNS has registered its request is no longer lost. RNS registers a request only
+  after sending it and drops an answer it can't match, so on a fast link with a busy process (about 1 request in
+  800 with 16 at once over local TCP and the CPU busy) the request waited out RNS's whole timeout, 11 s at least,
+  and failed. One such `/find` held back a whole publishing round: `tests/interop.py` sometimes took 10 to 25 s
+  longer to find a node providing what it had just added. The answer is now kept and handed over once the request
+  is registered.
 
 ## 0.1.6
 

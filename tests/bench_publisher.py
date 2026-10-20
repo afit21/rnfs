@@ -133,6 +133,10 @@ class _Lookup:
         """Every server learned, all answered."""
         return dict(self.known)
 
+    def heard(self):
+        """Every server it heard of: those learned, every identity known (as a node that hears every announce)."""
+        return set(self.known)
+
     def remaining(self):
         """Time left: plenty."""
         return 600.0
