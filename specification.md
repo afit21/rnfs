@@ -202,7 +202,10 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
 encoded with msgpack by RNS. Requesters use RNS's RTT-based request timeout (`timeout=None`). RNS stops that
 timeout once a response Resource starts arriving, so requests other than `/blocks` (which has stall detection,
 section 7) SHOULD also have a hard deadline from when they were sent (rnfs: twice RNS's request timeout), and
-pass a `max_response_size` just above their largest honest answer.
+pass a `max_response_size` just above their largest honest answer. RNS (1.5.6) registers a request as pending only
+after `Link.request` has sent it, and drops a response that matches no pending request, so on a fast link a response
+can arrive first and be lost; a requester SHOULD keep such a response and hand it over once the request is
+registered (rnfs: `links.EarlyResponses`), or the request waits out RNS's timeout, 11 s at least.
 
 | Path | Request | Response | Section |
 |---|---|---|---|

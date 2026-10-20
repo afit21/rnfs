@@ -689,6 +689,12 @@ Faster:
   layout, took 4.2 s and 74 s. A cold cache and a slow disk should gain more, as the table is one file read in
   order: Raspberry Pi SD-card numbers are still to be measured (`tests/bench_startup.py`, `--cold` for a cache
   dropped as after a reboot).
+- An answer that comes back before RNS has registered its request is no longer lost. RNS registers a request only
+  after sending it and drops an answer it can't match, so on a fast link with a busy process (about 1 request in
+  800 with 16 at once over local TCP and the CPU busy) the request waited out RNS's whole timeout, 11 s at least,
+  and failed. One such `/find` held back a whole publishing round: `tests/interop.py` sometimes took 10 to 25 s
+  longer to find a node providing what it had just added. The answer is now kept and handed over once the request
+  is registered.
 
 ## 0.1.6
 
