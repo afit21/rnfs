@@ -931,6 +931,63 @@ class RangeTransferTest(FetcherTest):
         self.assertGreater(last[0][1], 2 * self.config.min_rate_sample)
         self.assertEqual(self.fetcher.ranges.partials.count(), 0)  # every partial dropped once its block is stored
 
+    def test_a_slow_nodes_probe_brings_a_single_chunk_file_in_compressed_ranges(self):
+        # On a radio the probe of an open link is most often what brings a small file (measured over LoRa: a 24 KB
+        # text sent whole with /blocks, 2.5 times the airtime bz2 needed)
+        self.fetcher = self.make_fetcher(slow=True)
+        self.config.max_parallel_providers = None
+        data = text_of(CHUNK_SIZE // 2)
+        built = self.file(data)
+        self.assertTrue(built.cid.is_raw)
+        self.hold(P1)
+        self.client.links = [P1]
+        self.fetch_all(built.cid)
+        self.assertEqual(self.read(built.cid), data)
+        asked = self.ranges_of(P1, built.cid)
+        self.assertGreater(len(asked), 1)
+        self.assertTrue(all(compress for _, _, compress in asked))
+        self.assertEqual(self.lookups, [])
+        self.assertEqual(self.fetcher.ranges.partials.count(), 0)
+
+    def test_a_probe_an_old_node_leaves_unanswered_is_asked_again_with_blocks(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        self.config.max_parallel_providers = None
+        data = text_of(CHUNK_SIZE // 2)
+        built = self.file(data)
+        self.hold(P1)
+        self.client.no_range.add(P1)  # an rnfs 0.1.x node
+        self.client.links = [P1]
+        self.fetch_all(built.cid)
+        self.assertEqual(self.read(built.cid), data)
+        self.assertEqual(len(self.ranges_of(P1, built.cid)), 1)
+        self.assertEqual(self.client.requests, [(P1, [built.cid]), (P1, [built.cid])])  # the range, then /blocks
+        self.assertEqual(self.lookups, [])  # not a miss: no lookup
+        self.assertFalse(self.routing.is_banned(P1))
+
+    def test_a_probe_that_stalls_mid_block_is_resumed_by_its_node(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        self.config.max_parallel_providers = None
+        data = os.urandom(CHUNK_SIZE // 2)  # random: ranges of exactly min_rate_sample each
+        built = self.file(data)
+        self.hold(P1)
+        step = self.config.min_rate_sample
+        stalled = []
+
+        def stall_once(cid, offset, max_bytes, compress):
+            """The second range stalls once."""
+            if offset == step and not stalled:
+                stalled.append(offset)
+                return client_module.RangeResult(STALLED, reason="no progress for 120s")
+            return None
+        self.client.range_behaviour[P1] = stall_once
+        self.client.links = [P1]
+        self.fetch_all(built.cid)
+        self.assertEqual(self.read(built.cid), data)
+        offsets = [offset for offset, _, _ in self.ranges_of(P1, built.cid)]
+        self.assertEqual(offsets[:3], [0, step, step])  # the probe's range, the stalled one, and it again
+        self.assertEqual(len(offsets), len(set(offsets)) + 1)  # nothing held asked for again
+        self.assertEqual(self.lookups, [])
+
     def test_a_fast_link_keeps_blocks(self):
         built = self.file(os.urandom(3 * CHUNK_SIZE))
         self.hold(P1)

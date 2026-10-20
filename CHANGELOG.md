@@ -545,7 +545,10 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   `max(min_rate_sample, response_target` at the link's rate estimate) bytes on the wire (16 KiB at 1 kbit/s, about 2
   minutes, instead of a whole 64–128 KiB chunk), compressed with bz2, and keeps what arrived in a partial block
   (`<rnfs dir>/state/partial`, at most 64, deleted at start), verified whole against the CID before it is stored and
-  never served; a provider whose response stalled gets ranges on any link. Measured with the real fetcher over a fake
+  never served; a provider whose response stalled gets ranges on any link. The first request of a fetch, to a node with
+  an open link or a remembered provider before any search, uses ranges by the same rule: on a radio it is most often
+  what brings a single-chunk file (over LoRa between two Heltec V3 RNodes at 3.5 kbit/s, a 24 KB text came whole in
+  88 s, where bz2 makes it 9.8 KB). Measured with the real fetcher over a fake
   1 kbit/s link: a stall anywhere in a 64 KiB chunk now resends 8 KiB on average (1.1 minutes) instead of 32 KiB
   (4.4 minutes), at most 15.6 KB instead of 64.7 KB; a Gutenberg book (Pride and Prejudice, 772 KB) takes 2.8–2.9×
   less airtime (1.74 hours to 0.63, counting about 0.7 KB of RNS overhead per response). A requester decompresses an

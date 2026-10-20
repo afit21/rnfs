@@ -1396,7 +1396,11 @@ link in about a third of the airtime.
    would hold the search up a round trip, and several would each send the root. A slow node, whose links are all
    slow, asks its one (`max_parallel_providers` is 1 there): a hit saves a whole lookup over the radio for one
    request on a link already open. For a remote pin, the node that asked is asked first, link or not and over any
-   link (rnfs 0.2.0): it is the one node known to hold the content before its provider records are out.
+   link (rnfs 0.2.0): it is the one node known to hold the content before its provider records are out. A node that
+   would ask a provider for the root with `/range` (item 7: over a slow link, a single-chunk file's root) SHOULD ask
+   it so in this step too (rnfs 0.2.0): on a radio this request is most often what brings a small file. One that
+   sends part of the block is a provider holding a partial block, and one that leaves the `/range` unanswered is
+   asked again at once with `/blocks` (section 7, `/range`), not taken as a miss.
    - **Remembered providers** (rnfs 0.2.0). A node SHOULD remember, for a few hours, the providers that served
      verified blocks of a root, and ask them in this step, after a remote pin's asker and before the nodes with open
      links, so fetching a root again once its links have closed (a gateway reload, `pin add` after `cat`) doesn't

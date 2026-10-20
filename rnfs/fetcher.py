@@ -11,8 +11,10 @@ Providers, in the order they are tried:
    and whatever its link's speed (the node that asked for a remote pin, which may not have published its records
    yet); then the providers remembered for the root (Fetcher.remembered: nodes that served verified blocks of it
    within REMEMBER_FOR), then the nodes with an open outgoing link, each group ranked as providers are; on a node that
-   isn't slow, none of the last two over a slow link (below). A remembered provider that answers None, or whose
-   request fails, is forgotten for the root; one that is busy is kept;
+   isn't slow, none of the last two over a slow link (below). A probe uses /range where a provider would (Ranges,
+   below: over a slow link that is a single-chunk file's root), and one that sends part of the block becomes its
+   provider, owning the partial. A remembered provider that answers None, or whose request fails, is forgotten for the
+   root; one that is busy is kept;
 2. if none has it, providers found by a Lookup running in the background, so downloading starts with
    the first one found; the search ends once max_parallel_providers providers are known and the root
    block has arrived, when the lookup is complete, or at lookup_timeout. Providers in the routing table
@@ -117,7 +119,7 @@ range achieved (Fetch._range_plan). A range that doesn't complete its block come
 (Fetch._owners: no other provider is given it, so two partials of one block don't both cross the channel), and the
 provider is paced as after any response. A provider that leaves a /range unanswered (an older node, or a lost packet)
 is asked with /blocks for the rest of the fetch, the block at once, without counting against it
-(peer_client.UNSUPPORTED); two such silences in a row, in one fetch or several, record the node as not answering /range
+(peer_client.UNSUPPORTED; a probe likewise, asked again with /blocks); two such silences in a row, in one fetch or several, record the node as not answering /range
 (rnfs.ranges.RangeSupport).
 
 Within `with observing(observer):`, every fetch the thread opens reports its total size and each block it
@@ -1256,6 +1258,11 @@ class Fetch:
             asked_now = [cid for cid in cids if cid in outstanding]
             self._handle(event.node_id, cids, event.result, probe, wanted, children, outstanding, budget,
                          event.sent_at, event.rate, counted=not abandoned)
+            if probe and event.result.status == peer_client.UNSUPPORTED and not self.closed:
+                # A probe with /range left unanswered, as an older node leaves it: asked again at once with /blocks,
+                # on the same link, as a provider would be (rnfs.ranges counted the silence)
+                in_flight[event.node_id] = (cids, True)
+                self._send(event.node_id, cids)
             self._settle_duplicate(event.node_id, in_flight)
             still_asked = {cid for asked, _ in in_flight.values() for cid in asked}
             requeue = [cid for cid in cids if cid in outstanding and cid not in pending and cid not in still_asked]
@@ -1341,7 +1348,7 @@ class Fetch:
         now = self.fetcher.clock()
         usable = self._usable()
         if not usable and not in_flight:
-            self._discover(pending, in_flight)
+            self._discover(pending, in_flight, wanted)
             return
         busy_providers = sum(1 for _, probe in in_flight.values() if not probe)
         # The slow interfaces a request is in flight over: providers behind one share it, one request at a time
@@ -1388,24 +1395,32 @@ class Fetch:
         slow link, a raw chunk declared RANGE_MIN_BLOCK or larger (or of no declared size), compressed; from a
         provider that stalled before, the same chunks in ranges of at most STALLED_RANGE; and any block a partial is
         held of from provider. Never to a node known not to answer /range."""
+        if provider.no_ranges:
+            return None
+        return self._plan(provider.node_id, provider.path, cid, wanted, provider.stalls, provider.ratio)
+
+    def _plan(self, node_id: bytes, path: mesh.PathInfo, cid: Cid, wanted: dict[Cid, list[Expect]], stalls: int = 0,
+              ratio: float = 1.0) -> RangePlan | None:
+        """_range_plan for node_id, reached by path, which stalled stalls times in this fetch: also a probe's, which
+        has no provider yet (_discover)."""
         store = self.fetcher.ranges
-        if provider.no_ranges or not store.usable(provider.node_id):
+        if not store.usable(node_id):
             return None
         expects = wanted.get(cid)
         declared = expects[0].size if expects and cid.is_raw else None
         large = cid.is_raw and (declared is None or declared >= RANGE_MIN_BLOCK)
-        held = store.partials.length(cid, provider.node_id)
+        held = store.partials.length(cid, node_id)
         if not held and not large:
             return None
-        slow = self._slow(provider.node_id, provider.path)
-        if not held and not (slow or provider.stalls):
+        slow = self._slow(node_id, path)
+        if not held and not (slow or stalls):
             return None
-        rate = self.client.rate_estimate(provider.node_id)
+        rate = self.client.rate_estimate(node_id)
         timed = rates.transfer_bytes(self.config.response_target, rate) if rate else 0
         target = max(self.config.min_rate_sample, timed)
         if not slow:
             target = min(target, STALLED_RANGE)  # it stalled: lose less to the next stall
-        return RangePlan(slow, min(target, MAX_BLOCK_SIZE), provider.ratio, declared)
+        return RangePlan(slow, min(target, MAX_BLOCK_SIZE), ratio, declared)
 
     def _duplicate(self, usable: list[_Provider], in_flight: dict, busy_providers: int, now: float):
         """End-game duplication (NET-4; section 7, item 7): with nothing left to ask for, ask idle providers on
@@ -1600,7 +1615,7 @@ class Fetch:
 
     # Finding providers
 
-    def _discover(self, pending: _Pending, in_flight: dict):
+    def _discover(self, pending: _Pending, in_flight: dict, wanted: dict[Cid, list[Expect]]):
         """No usable provider: ask the hint, the remembered providers and the nodes with open links, else start the
         lookup (unless a search found none lately and the fetch isn't explicit)."""
         if not self._probed:
@@ -1636,10 +1651,14 @@ class Fetch:
                 first = pending.popleft()
                 self._remembered_asked = set(candidates).intersection(remembered)
                 log(f"asking {plural(len(candidates), 'node')} for {first} before searching"
-                    + (f" ({len(self._remembered_asked)} remembered)" if self._remembered_asked else ""), LOG_VERBOSE)
+                    + (f" ({len(self._remembered_asked)} remembered)" if self._remembered_asked else "")
+                    + f": {', '.join(node_name(node_id) for node_id in candidates)}", LOG_VERBOSE)
                 for node_id in candidates:
                     in_flight[node_id] = ([first], True)
-                    self._send(node_id, [first])
+                    # With /range where a provider would be asked with it: over a slow link the probe is most often
+                    # what brings a single-chunk file, so it is compressed and resumable as any other request there
+                    path = paths[node_id] if node_id in paths else self._path(node_id)
+                    self._send(node_id, [first], self._plan(node_id, path, first, wanted))
                 return
         if self._lookup is None and self.from_node is None and self._unfound_ago is None:
             ago = None if self.explicit else self.fetcher.unfound(self.root)
@@ -1764,11 +1783,21 @@ class Fetch:
         if result.blocks:
             self._served(node_id)
         if probe:
-            # A node asked first that has the block becomes a provider; one that hasn't isn't penalised
-            if result.blocks and provider is None:
+            # A node asked first that has the block (or sent part of it, with /range) becomes a provider; one that
+            # hasn't isn't penalised
+            if (result.blocks or result.partial) and provider is None:
                 provider = self._new_provider(node_id)
                 log(f"{node_name(node_id)} (asked first) has {self.root}", LOG_VERBOSE)
+                if result.ratio is not None:
+                    provider.ratio = min(max(result.ratio, 1.0), ranges.MAX_RATIO)
+                for cid in result.partial:
+                    if cid in outstanding:
+                        self._owners[cid] = node_id  # it resumes from what it sent
+                if result.partial:
+                    self._progress_at = self.fetcher.clock()
                 self._pace(provider, sent_at, rate)
+            elif result.status == peer_client.UNSUPPORTED:
+                pass  # it left /range unanswered: asked again with /blocks at once (_handle_event)
             elif not result.blocks and node_id in self._remembered_asked and result.status != peer_client.BUSY:
                 # A remembered provider that answered None (it no longer has it) or failed: not asked first again for
                 # this root. One that was busy may still have it
