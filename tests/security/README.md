@@ -166,7 +166,7 @@ N1's page half is in the content table.
 
 | ID | Test modules | Code guarded | Fix commits |
 |---|---|---|---|
-| none (fuzzing) | `test_fuzz_parsers.py` (needs hypothesis) | the strict parsers of untrusted bytes: `rnfs/content/cid.py`, `rnfs/content/dag.py`, `rnfs/content/storage.py`, `rnfs/names.py`, `rnfs/network/`, `rnfs/uris.py`, `rnfs/gateway.py` | `077f33a` (test); found T1 |
+| none (fuzzing) | `test_fuzz_parsers.py` (needs hypothesis) | the strict parsers of untrusted bytes: `rnfs/content/cid.py`, `rnfs/content/dag.py`, `rnfs/content/storage.py`, `rnfs/names.py`, `rnfs/network/`, `rnfs/uris.py`, `rnfs/gateway.py`; 0.2.0's: `rnfs/network/protocol.py` (`/range`: `parse_range_request`, `parse_range_response`, `decompress_range`, `is_range_unserved`; the prechecks `body_refusal`, `response_refusal`, `page_response_refusal`, `metadata_refusal`), `rnfs/network/server.py` (the `/range` handler), `rnfs/network/client.py` (`block_range`), `rnfs/ranges.py` (partial blocks, `RangeSupport`'s saved rows), `rnfs/network/guards.py` (`_page_refusal`), `rnfs/network/nomadnet.py` (`segment_refusal`, `_sent_name`), `rnfs/nomadnet.py` (`parse`, `snapshot_name`, `is_not_allowed`), and the saved rows of `rnfs/dht/routing.py` (`restore`), `rnfs/dht/firstseen.py` and `rnfs/dht/scores.py` | `077f33a` (test); found T1, and in 0.2.0 a score past its limit (`41c60df`) |
 
 ## 0.2.0 review (REV)
 
