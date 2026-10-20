@@ -748,6 +748,9 @@ Faster:
   (NomadNet's "Request Not Allowed" among them) could be lost the same way and the add fail.
 
 Fixed:
+- **A collection after a start no longer reads every pin's DAG again**: a sealed folder's unpack ends with one, and on
+  a cloud node with 857k blocks the first unpack after a start held its result for 3 minutes, its files written at
+  once. The DAGs the start's first refresh found complete are taken whole without being read.
 - **A file-hash deny entry stops a one-block file everywhere** (spec section 8): a file of one block has its content's
   hash as its CID's digest, and the specification says either entry stops it, but a `sha256:` entry was only checked
   where content is assembled. A cloud node with such an entry refused the file to its own `cat` and gateway, yet

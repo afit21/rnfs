@@ -723,6 +723,22 @@ class EvictionTest(StorageTest):
         self.assertEqual(lost, set())  # a is still complete; b was never a target
         self.assertEqual(self.storage.cached_fetches(), [(root.cid, ("a",), a.cid)])
 
+    def test_collect_reads_nothing_of_a_dag_memoised_complete(self):
+        """dag_blocks (the first refresh's, at every start) memoises a pin's DAG as complete; a collection then takes
+        it whole without reading it again (a sealed folder's unpack, collecting at its end, waited 3 minutes on a node
+        with 857k blocks while every node was read), and still deletes what nothing reaches."""
+        root, a, b = self.tree()
+        self.storage.pin(root.cid, "user")
+        self.storage.dag_blocks(root.cid)
+        orphan = self.add(b"nothing reaches this")
+        read = set()
+        real = Storage._read_node
+        with mock.patch.object(Storage, "_read_node", lambda s, cid: (read.add(cid), real(s, cid))[1]):
+            self.assertEqual(self.storage.collect(), 1)
+        self.assertEqual(read, set())
+        self.assertFalse(self.storage.has(orphan.cid))
+        self.assertTrue(self.storage.is_complete(root.cid))
+
     def test_warm_reads_what_the_path_walk_reaches(self):
         """_warm and _path_cids share one path walk: warming reads exactly the stored nodes a record's path
         reaches, through index nodes, missing names, files and nodes not stored, and the locked walk then reads

@@ -1047,13 +1047,17 @@ class Storage:
         with self._lock:
             links = dict(self._links)
             steps = {cid: dict(names) for cid, names in self._steps.items()} if paths else {}
+            # A DAG memoised as complete is taken whole by the walk (_reach): nothing of it needs reading. After a
+            # start, what is provided has been (the first refresh's dag_blocks), so the first collection reads
+            # (almost) nothing: on a node with 857k blocks a sealed folder's unpack waited 3 minutes for it
+            complete = set(self._complete)
         found_links: dict[Cid, tuple[Cid, ...]] = {}
         found_steps: dict[tuple[Cid, str], tuple[Cid, bool] | None] = {}
         seen: set[Cid] = set()
         stack = list(roots)
         while stack:
             cid = stack.pop()
-            if cid in seen or cid.is_raw:
+            if cid in seen or cid.is_raw or cid in complete:
                 continue
             seen.add(cid)
             listed = links.get(cid)
