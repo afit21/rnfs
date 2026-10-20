@@ -305,7 +305,7 @@ class FollowFeature(Feature):
         try:
             if quota == 0:
                 raise TooLarge("follow fetches are off (follow_quota is 0)")
-            with self.node.fetcher.open(target, pinned=True) as fetch:
+            with self.node.pinned_fetch(target) as fetch:
                 # A pinned fetch never stops at max_storage, so without this the name's owner could fill the disk
                 expect = fetch.resolve()
                 content = fetch.size_of(expect)

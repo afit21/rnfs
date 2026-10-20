@@ -15,14 +15,16 @@ import unittest
 
 import RNS
 
+from rnfs import fetcher
 from rnfs.config import Config
-from rnfs.constants import GIB
+from rnfs.constants import CHUNK_SIZE, GIB
 from rnfs.content.cid import Cid
 from rnfs.features.follow import follow_source
 from rnfs.node import RnfsNode
 from tests.security._content_helpers import SLACK
 from tests.test_names import FakeNetwork
 from tests.test_names_keep import KeeperNet
+from tests.test_node import _CancelAfter
 
 A_ID, B_ID = bytes([0xA] * 16), bytes([0xB] * 16)
 QUOTA = 50_000
@@ -97,6 +99,7 @@ class FollowQuotaTest(unittest.TestCase):
         self.assertEqual(pins.get(self.honest), {self.source})
         self.assertNotIn(target, pins)
         self.assertEqual(entry["pinned"], str(self.honest))
+        self.assertEqual(self.b.storage.cached_fetches(), [])  # refused: what it got isn't kept for a retry
 
     def test_default_is_one_gib(self):
         self.assertEqual(Config().follow_quota, 1 * GIB)
@@ -117,12 +120,29 @@ class FollowQuotaTest(unittest.TestCase):
         self.assertLessEqual(self.downloaded, QUOTA + SLACK)
         self.assertNotIn(empties, self.b.storage.pins())
         self.assertEqual(self.b.storage.pins().get(self.honest), {self.source})
+        self.assertEqual(self.b.storage.cached_fetches(), [])
 
     def test_target_within_the_quota_is_pinned(self):
         small = self.move(Cid.parse(self.a.add_stream(io.BytesIO(os.urandom(QUOTA // 2)))["cid"]), 2)
         self.assertTrue(self.follow.check(self.name, network=False))
         self.assertEqual(self.b.storage.pins().get(small), {self.source})
         self.assertNotIn(self.honest, self.b.storage.pins())
+
+    def test_a_fetch_cut_short_keeps_its_progress(self):
+        """A new target's fetch that fails (here cut short) keeps what it got as a cached fetch, so the next check
+        resumes from there; the old target stays pinned meanwhile."""
+        self.b.config.follow_quota = 8 * CHUNK_SIZE
+        target = self.move(Cid.parse(self.a.add_stream(io.BytesIO(os.urandom(4 * CHUNK_SIZE)))["cid"]), 2)
+        with fetcher.observing(_CancelAfter(2)):
+            self.assertFalse(self.follow.check(self.name, network=False))
+        self.assertEqual(self.b.storage.cached_fetches(), [(target, (), target)])
+        self.assertEqual(self.b.storage.pins().get(self.honest), {self.source})
+        kept = self.b.storage.stat(target)["local_bytes"]
+        self.assertGreater(kept, 0)
+        self.downloaded = 0
+        self.assertTrue(self.follow.check(self.name, network=False))
+        self.assertEqual(self.b.storage.pins().get(target), {self.source})
+        self.assertEqual(self.downloaded, self.b.storage.dag_bytes(target) - kept)  # only what it didn't have
 
     def test_zero_quota_fetches_nothing(self):
         self.b.config.follow_quota = 0

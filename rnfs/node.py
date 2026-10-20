@@ -1685,6 +1685,39 @@ class RnfsNode:
             except Exception as e:  # noqa: BLE001 - never hide the fetch's own outcome
                 log(f"enforcing max_storage after a fetch failed: {e!r}", LOG_ERROR)
 
+    @contextmanager
+    def pinned_fetch(self, root: Cid, names: list[str] | tuple[str, ...] = ()) -> Iterator[Fetch]:
+        """A fetch to pin what it fetches (pin add, dir set and rm, remote pins, followed names, deny lists): its
+        caller pins inside it, so nothing it fetched is unprotected.
+
+        A fetch that fails keeps what it got as a cached fetch of <root>/<names>, as get's and cat's do, so trying
+        again resumes from there rather than from nothing (a 4 MiB pin over LoRa failing at 90%), unless it failed
+        because the content is denied (Denied), is an invalid DAG (InvalidDag), or is more than a quota or bound
+        allows (TooLarge): trying again fails the same way, so its blocks are left for the next collection. The
+        record is never provided as a download of the user's (it was fetched to be pinned): once complete, the
+        pin is. Like a cached fetch, it may be evicted before the next try.
+        """
+        recorded = False
+        try:
+            with self.fetcher.open(root, names, pinned=True) as fetch:
+                try:
+                    yield fetch
+                except (Denied, InvalidDag, TooLarge):
+                    raise
+                except BaseException:
+                    recorded = fetch.downloaded_blocks > 0
+                    try:
+                        self._record_fetch(fetch, True)  # never provided as the user's download
+                    except Exception as e:  # noqa: BLE001 - never hide the fetch's own outcome
+                        log(f"recording what a failed fetch of {root} got failed: {e!r}", LOG_ERROR)
+                    raise
+        finally:
+            if recorded:
+                try:
+                    self._enforce_storage()
+                except Exception as e:  # noqa: BLE001 - never hide the fetch's own outcome
+                    log(f"enforcing max_storage after a fetch failed: {e!r}", LOG_ERROR)
+
     def _record_fetch(self, fetch: Fetch, for_gateway: bool):
         """Record a cached fetch (or mark an existing one used), then update what is provided."""
         target = fetch.target.cid if fetch.target is not None else fetch.root
@@ -2048,7 +2081,7 @@ class RnfsNode:
         _caller_source(source)
         root, names = self._parse_target(target)
         child = Cid.parse(child_cid)
-        with self.fetcher.open(root, pinned=True) as fetch, self.fetcher.open(child, pinned=True) as child_fetch:
+        with self.pinned_fetch(root) as fetch, self.pinned_fetch(child) as child_fetch:
             fetch.fetch_dag(fetch.resolve())
             child_fetch.fetch_dag(child_fetch.resolve())
             new_root = edit.dir_set(root, names, name, child, executable, fetch.get, fetch.session.put)
@@ -2064,7 +2097,7 @@ class RnfsNode:
         _caller_source(source)
         edit.check_entry_target(target)
         root, names = self._parse_target(target)
-        with self.fetcher.open(root, pinned=True) as fetch:
+        with self.pinned_fetch(root) as fetch:
             fetch.fetch_dag(fetch.resolve())
             new_root = edit.dir_rm(root, names, fetch.get, fetch.session.put)
             self.storage.pin(new_root, source)
@@ -2112,7 +2145,7 @@ class RnfsNode:
         """Fetch the target completely and pin it with source ("user", or the caller's app's)."""
         _caller_source(source)
         root, names = self._parse_target(target)
-        with self.fetcher.open(root, names, pinned=True) as fetch:
+        with self.pinned_fetch(root, names) as fetch:
             expect = fetch.resolve()
             fetch.fetch_dag(expect)
             self.storage.pin(expect.cid, source)
@@ -2565,7 +2598,7 @@ class RnfsNode:
                 if (source, cid) in self._remote_released:
                     return  # released while it waited
             self._served(source, cid, FETCHING)
-            with observing(observer), self.fetcher.open(cid, pinned=True) as fetch:
+            with observing(observer), self.pinned_fetch(cid) as fetch:
                 expect = fetch.resolve()
                 content = fetch.size_of(expect)
                 # Nothing else is being fetched for source (_remote_pin_worker), so its pins are all it uses

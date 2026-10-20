@@ -1613,7 +1613,7 @@ its `start()` raising is logged and the others still start (`RnfsNode._start_fea
 | `peers` | `peers.py` | `rnfs peers`, `rnfs stats`; client-mode nodes' mode and last-heard time come from the node's `rnfs.dht` announce handler, which counts every announce in `Traffic`; `first_heard`, `rtt`, `online` and `peer` events (Mesh) | reads `Traffic`, the routing table, links, paths |
 | `jobs` | `jobs.py` | `JobsFeature` (the job manager), `Job` (a pin, add or import job keeps its `source`, saved in its record only when it isn't `user`, so other records are as 0.1.6 wrote them; `app_removed` cancels an app's), CLI progress formatting | `fetcher.observing(observer)`: a thread-local observer every `Fetch` picks up (`total`, `block`, `cancelled` checked at each step, raising `fetcher.Cancelled`) |
 | `keepers` | `keepers.py` | signed records (`SignedRecord`, `parse_signed`, `sign_record`, `from_announce_data`), `/name`, `KeeperClient`, `KeeperStore` | `Feature.requests`; `publisher.DhtKey` and `Publisher.add_key_source` (non-CID keys published like CIDs); `NameManager.keepers` (`published`, `heard`, `query`, `always_ask`, `local_record`), `NameManager.offer()`/`record()`; the 5-argument announce handler (packet hash) |
-| `follow` | `follow.py` | followed names: each check and fetch one at a time, `fetcher.open(pinned=True)`, pin inside the fetch's protection, old pin released after | keepers' `FOLLOW` reason |
+| `follow` | `follow.py` | followed names: each check and fetch one at a time, `node.pinned_fetch` (a pinned fetch whose progress a failure keeps as cache), pin inside the fetch's protection, old pin released after | keepers' `FOLLOW` reason |
 | `contacts` | `contacts.py` | address book; `expand_target`, `lookup(nick, kind)`, `resolve_id(text, kind)`, `node_arg` | `RnfsNode._parse_target` (never for the gateway), `JobsFeature.submit` |
 | `deny` | `deny.py` | `deny_lists` sources (`parse_source`, `validate_settings` from `Config.validate`): `check(source)` resolves a name (persisted), fetches the target pinned, checks it is a file within `MAX_LIST_BYTES`, parses it, pins it `deny` and `accept`s it, then releases unused `deny` pins; `run_due` on `rnfs-deny`, after the join (`CHECK_INTERVAL` for names, `retry_delay` backoff); sources no longer configured are forgotten at start | `node.deny` (core); `DENY` in `storage.check_source` |
 | `settings` | `settings.py` | `rnfs config`, `GET /api/config`, `POST /api/config/set`: rnfs.toml read and rewritten, `LIVE` settings applied to the running node | `config.settings_schema`, `Config.combine`, `config.edit_settings`; `Config.overrides`/`given_defaults` (set by `Config.load`); the live hooks below |
@@ -1996,6 +1996,13 @@ Everything in the specification is implemented, with these simplifications and a
   children by `_range_leaves`, never kept on the fetch, since another read of the same fetch may run between a
   generator's steps; `reserve` counts a file node not yet received as `MAX_BLOCK_SIZE` against it, so a
   small honest range ending inside two nodes of a level asks for them in two requests instead of one.
+- A failed fetch keeps what it stored as a cached fetch: `RnfsNode._fetching` (get, cat, ls, stat, the gateway)
+  records every fetch when it ends, and `RnfsNode.pinned_fetch` (`pin add`, `dir set`/`dir rm`, remote pins, and
+  the follow and deny features' fetches, all with `pinned=True`) records one that raised, except for `Denied`,
+  `InvalidDag` and `TooLarge` (a quota or bound: a retry fails the same way), inside the fetch's protection
+  session, then enforces `max_storage`. Its record is made as a gateway fetch's is (`_record_fetch(for_gateway=True)`:
+  not a target `roots` provides), since it was fetched to be pinned; a remote pin's quota check that drops the pin
+  returns inside the fetch rather than raising, so it records nothing either.
 - `max_storage` is soft. An unpinned fetch evicts other cached fetches (LRU) to make room for each response
   and goes above `max_storage` when nothing is evictable; when its session ends the node evicts again, which
   may evict what it fetched if pins alone fill `max_storage`. Any fetch is refused with `StorageFull` ("not

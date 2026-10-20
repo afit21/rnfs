@@ -460,6 +460,11 @@ Changed:
 - `Config.validate` refuses `api_port` equal to a non-zero `gateway_port`.
 - A request that times out raises `ConnectionFailed` saying the daemon "didn't answer within its timeout".
 - `Config.load` reports invalid TOML as "<path> isn't valid TOML: …" (still a `ValueError`).
+- A fetch to pin that fails keeps what it got: `pin add`, `dir set` and `dir rm`, remote pins, followed names and
+  deny lists record it as a cached fetch, as `get` and `cat` already did, so trying again resumes rather than
+  starting over (a 4 MiB pin over LoRa failing at 90% fetched all of it again). Not when it failed on denied
+  content, an invalid DAG or a size bound or quota (`TooLarge`), which a retry can't get past. The record is cache
+  like any other (evictable, removed by `gc`), and never provided as a download of the user's.
 
 Faster:
 - Range reads (`cat`, the gateway, sealed reads) size their window by the providers' links: they fetched 32 chunks

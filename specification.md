@@ -1212,6 +1212,11 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
 **Cache** is everything else.
 - Each cached fetch is recorded as the `<root>/<path>` it fetched, which keeps the path's nodes as well as the
   target's DAG.
+- A fetch that fails is recorded too, so trying again resumes from what it stored (section 7). That includes a
+  fetch to pin (`pin add`, `dir set` and `dir rm`, a remote pin, a followed name's target, a deny list; rnfs 0.2.0),
+  unless it failed because the content is denied, is an invalid DAG, or exceeds a size bound or quota ("too
+  large"), which trying again can't change. Such a record never counts as a download of the user's: under `roots`
+  it isn't provided (the pin is, once complete).
 - When storage exceeds `max_storage`, cached fetches are evicted least recently used first; `gc` evicts them
   all, and `cache rm <cid>` those leading to one CID (a pin of the same content keeps its blocks).
 - `add --no-pin` stores what it adds as a cached fetch of its CID instead of pinning it: evicted least recently

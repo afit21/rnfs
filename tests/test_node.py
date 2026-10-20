@@ -16,7 +16,7 @@ import RNS
 from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE, DEFAULT_BOOTSTRAP_NODES, K
 from rnfs.content import dag, seal
-from rnfs.content.cid import RAW, Cid
+from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.seal import SEGMENT_SIZE
 from rnfs.content.storage import remote_source
 from rnfs import fetcher
@@ -1191,6 +1191,131 @@ class StopTest(NodeTest):
         self.assertFalse(workers[0].is_alive(), "stop didn't wait for the remote-pin worker")
         self.assertLess(time.monotonic() - started, node_module.STOP_TIMEOUT)
         self.assertEqual(state_rows(self.b.config.state_dir, "SELECT cid FROM remote_pins"), [(cid.binary,)])
+
+
+class _CancelAfter(fetcher.Observer):
+    """Cancels the fetches it watches once they have downloaded blocks blocks."""
+
+    def __init__(self, blocks: int):
+        """Let blocks blocks be downloaded."""
+        self.left = blocks
+
+    def block(self, cid, length, downloaded):
+        """Count a block downloaded."""
+        if downloaded:
+            self.left -= 1
+
+    def cancelled(self) -> bool:
+        """True once the blocks allowed have been downloaded."""
+        return self.left <= 0
+
+
+class FailedPinnedFetchTest(NodeTest):
+    """A pinned fetch that fails keeps what it got as a cached fetch, as get's does, unless trying again can't help."""
+
+    def setUp(self):
+        """A provides a file of 8 chunks; B counts the blocks it downloads."""
+        super().setUp()
+        self.data = os.urandom(8 * CHUNK_SIZE)
+        self.cid = Cid.parse(self.a.add_stream(io.BytesIO(self.data))["cid"])
+        self.advertise(str(self.cid))
+        self.downloaded = 0
+        real = self.net.blocks
+
+        def counting(node_id, cids, on_progress=None):
+            """NetClient.blocks, counting the blocks returned."""
+            result = real(node_id, cids, on_progress)
+            self.downloaded += len(result.blocks)
+            return result
+
+        self.net.blocks = counting
+
+    def interrupted(self, call, blocks: int = 3):
+        """Run call() with its fetches cancelled after blocks blocks."""
+        with fetcher.observing(_CancelAfter(blocks)), self.assertRaises(fetcher.Cancelled):
+            call()
+
+    def test_a_failed_pin_add_resumes_from_what_it_got(self):
+        """pin add cut short keeps its blocks as a cached fetch of the target, not provided as the user's download;
+        the next pin add downloads only the rest, and the record stays as cache."""
+        self.interrupted(lambda: self.b.pin_add(str(self.cid)))
+        stored = self.b.storage.stat(self.cid)["local_blocks"]
+        self.assertGreaterEqual(stored, 3)
+        self.assertEqual(self.b.storage.cached_fetches(), [(self.cid, (), self.cid)])
+        self.assertNotIn(self.cid, self.b._eligible_targets())  # fetched to be pinned, not the user's download
+        self.assertEqual(self.b.storage.pins(), {})
+        self.b.storage.collect()  # unreferenced blocks go; a cached fetch's stay
+        self.downloaded = 0
+        self.b.pin_add(str(self.cid))
+        self.assertEqual(self.downloaded, 9 - stored)  # of the root and 8 chunks, only those not stored
+        self.assertTrue(self.b.storage.is_complete(self.cid))
+
+    def test_dir_set_and_rm_keep_their_progress(self):
+        """dir rm and dir set cut short keep what they got of the directory and of the child as cached fetches."""
+        directory = Cid.parse(self.a.add_path(self.tree())["cid"])
+        self.advertise(str(directory))
+        self.interrupted(lambda: self.b.dir_rm(f"{directory}/big.bin"), blocks=2)
+        self.assertEqual(self.b.storage.cached_fetches(), [(directory, (), directory)])
+        self.b.pin_add(str(directory))  # all of it now, so dir set fetches only the child
+        self.interrupted(lambda: self.b.dir_set(str(directory), "copy", str(self.cid)))
+        self.assertEqual({target for _, _, target in self.b.storage.cached_fetches()}, {directory, self.cid})
+
+    def test_a_failed_remote_pin_keeps_its_progress(self):
+        """A remote pin whose fetch fails (here the disk filling up after its first response) keeps what it got for
+        its next try."""
+        self.b.config.remote_pin_identities = [IDENTITY.hex()]
+        checks = 0
+        real = self.b.storage.check_disk
+
+        def filling(nbytes):
+            """Storage.check_disk, failing from the second response on."""
+            nonlocal checks
+            checks += 1
+            if checks > 1:
+                raise StorageFull("not enough free disk space")
+            real(nbytes)
+
+        with mock.patch.object(self.b.storage, "check_disk", filling):
+            self.assertTrue(self.b.backend.remote_pin(IDENTITY, self.cid, True))
+            self.assertTrue(wait_for(lambda: not self.b._remote_reserved.get(remote_source(IDENTITY)),
+                                     what="the remote pin's fetch"))
+        self.assertEqual(self.b.storage.cached_fetches(), [(self.cid, (), self.cid)])
+        self.assertEqual(self.b.pin_remote_served()["pins"][0]["reason"], "storage_full")
+
+    def test_nothing_is_kept_when_trying_again_cannot_help(self):
+        """A pinned fetch failing on a size bound or a quota (TooLarge), on denied content or on an invalid DAG
+        records nothing: its blocks are left for the next collection."""
+        self.b.config.max_download_size = CHUNK_SIZE
+        with self.assertRaises(TooLarge):
+            self.b.pin_add(str(self.cid))
+        self.b.config.max_download_size = None
+        self.assertGreaterEqual(self.downloaded, 1)  # the root, which showed the size
+        chunk = dag.decode(self.b.storage.get(self.cid)).children[2].cid
+        self.b.deny.add([str(chunk)])
+        with self.assertRaises(Denied):
+            self.b.pin_add(str(self.cid))
+        self.b.deny.remove([str(chunk)])
+        # A file node whose child is a correctly hashed block that isn't a DAG node
+        garbage = b"\x00not a DAG node"
+        child = Cid.for_block(DAG, garbage)
+        node = dag.encode(dag.FileNode([dag.Child(child, 10)]))
+        root = Cid.for_block(DAG, node)
+        served = {root: node, child: garbage}
+
+        def serving(node_id, cids, on_progress=None):
+            """The broken file's blocks."""
+            result = BlocksResult(OK)
+            result.blocks = {cid: served[cid] for cid in cids if cid in served}
+            result.missing = [cid for cid in cids if cid not in served]
+            return result
+
+        self.net.blocks = serving
+        self.advertise(str(root))
+        with self.assertRaises(InvalidDag):
+            self.b.pin_add(str(root))
+        self.assertTrue(self.b.storage.has(root))  # it got the root before the child broke a check
+        self.assertEqual(self.b.storage.cached_fetches(), [])
+        self.assertEqual(self.b.storage.pins(), {})
 
 
 class MakeRoomTest(NodeTest):
