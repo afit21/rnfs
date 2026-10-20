@@ -22,7 +22,7 @@ from rnfs.content.storage import remote_source
 from rnfs import fetcher
 from rnfs.errors import Denied, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
 from rnfs.features.keepers import name_key
-from rnfs.network.client import OK, BlocksResult
+from rnfs.network.client import OK, BlocksResult, RangeResult
 from rnfs.network.identity import parse_node_id
 from rnfs import fsutil, node as node_module, statedb
 from rnfs.dht.density import MIN_SIZE_SAMPLES, SPACE
@@ -108,6 +108,21 @@ class NetClient:
             else:
                 result.blocks[cid] = block
         result.unsent = list(cids[8:])
+        return result
+
+    def block_range(self, node_id, cid, held=b"", max_bytes=0, compress=False, block_size=None, on_progress=None):
+        """Serve a range from a node's backend as a 0.2.0 node answers /range (uncompressed)."""
+        node = self.nodes.get(node_id)
+        if node is None:
+            return RangeResult("failed", reason="unreachable")
+        block = node.backend.served_block(cid)
+        if block is None:
+            return RangeResult(OK, missing=True)
+        data = block[len(held):len(held) + max_bytes]
+        result = RangeResult(OK, size=len(block), data=data, wire=len(data), elapsed=0.0)
+        if len(held) + len(data) == len(block):
+            result.block = held + data if cid.verify(held + data) else None
+            result.bad = result.block is None
         return result
 
     def pin(self, node_id, cid, pin):
@@ -1278,6 +1293,42 @@ class _CancelAfter(fetcher.Observer):
     def cancelled(self) -> bool:
         """True once the blocks allowed have been downloaded."""
         return self.left <= 0
+
+
+class PartialBlockTest(NodeTest):
+    """/range's partial blocks (rnfs 0.2.0): B fetching over a slow link keeps the ranges it got in a partial file,
+    which is never stored as a block or served, and is gone at its next start."""
+
+    def test_a_partial_block_is_never_served_and_is_cleaned_at_start(self):
+        data = os.urandom(2 * CHUNK_SIZE)
+        cid = Cid.parse(self.a.add_stream(io.BytesIO(data))["cid"])
+        self.advertise(str(cid))
+        chunk = dag.decode(self.a.storage.get(cid)).children[0].cid
+        self.b.fetcher.slow_node = True  # every link slow: chunks come in ranges
+        real = self.net.block_range
+        ranges = []
+
+        def one_range_of_the_chunk(node_id, asked, held=b"", max_bytes=0, compress=False, block_size=None,
+                                   on_progress=None):
+            """A's first range of the chunk, then a lost link."""
+            ranges.append((asked, len(held)))
+            if asked == chunk and held:
+                return RangeResult("failed", reason="unreachable")
+            return real(node_id, asked, held, max_bytes, compress, block_size, on_progress)
+        self.net.block_range = one_range_of_the_chunk
+        with self.assertRaises(NotFound):
+            b"".join(self.b.read(str(cid)))
+        self.assertIn((chunk, 0), ranges)
+        partial_dir = os.path.join(self.b.config.state_dir, "partial")
+        self.assertEqual(len(os.listdir(partial_dir)), 1)  # the chunk's first range, kept to resume from
+        self.assertFalse(self.b.storage.has(chunk))  # never a block
+        self.assertIsNone(self.b.backend.served_block(chunk))  # never served
+        self.assertIsNone(self.net.block_range(B_ID, chunk, b"", 1024).size)  # nor as a range
+        # The next start of B deletes it
+        self.b.stop()
+        restarted = RnfsNode.offline(self.b.config, B_ID, self.net, FakeNetwork())
+        self.addCleanup(restarted.stop)
+        self.assertEqual(os.listdir(partial_dir), [])
 
 
 class FailedPinnedFetchTest(NodeTest):

@@ -20,7 +20,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from rnfs.config import Config  # noqa: E402
-from rnfs.constants import BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, KIB, MAX_BLOCK_SIZE, PIN_PATH, PROVIDE_PATH  # noqa: E402
+from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, KIB, MAX_BLOCK_SIZE, PIN_PATH,  # noqa: E402
+                            PROVIDE_PATH, RANGE_BZ2, RANGE_PATH)
 from rnfs.content.cid import RAW, Cid  # noqa: E402
 from rnfs.network import client, links, paths, protocol  # noqa: E402
 
@@ -222,6 +223,81 @@ class PeerClientTest(unittest.TestCase):
         self.assertLess(result.elapsed, 0.5)  # opening the link isn't counted
         self.respond(lambda link, path, data: False)
         self.assertIsNone(self.call(lambda: self.client.blocks(NODE, [cid])).elapsed)
+
+    # /range (rnfs 0.2.0)
+
+    def serve_ranges(self, block: bytes, compress_answers: bool = False):
+        """Answer /range as a 0.2.0 node would from block (bz2 when asked and compress_answers)."""
+        def answer(link, path, data):
+            """[size, encoding, bytes] for the range asked."""
+            self.assertEqual(path, RANGE_PATH)
+            _, offset, max_bytes, flags = data
+            part = block[offset:offset + max_bytes]
+            if flags & RANGE_BZ2 and compress_answers:
+                return protocol.encode_range_response(len(block), RANGE_BZ2, protocol.compress_range(part))
+            return protocol.encode_range_response(len(block), 0, part)
+        self.respond(answer)
+
+    def test_range_brings_part_then_the_whole_verified_block(self):
+        cid, block = block_of(40 * KIB, 1)
+        self.serve_ranges(block)
+        first = self.call(lambda: self.client.block_range(NODE, cid, b"", 16 * KIB))
+        self.assertEqual((first.status, first.size, first.data, first.block), (client.OK, 40 * KIB, block[:16 * KIB],
+                                                                               None))
+        path, data, max_response_size = fakes.FakeLink.created[0].requests[0]
+        self.assertEqual((path, data), (RANGE_PATH, [cid.binary, 0, 16 * KIB, 0]))
+        self.assertEqual(max_response_size, 17 * KIB)
+        last = self.call(lambda: self.client.block_range(NODE, cid, block[:32 * KIB], 16 * KIB, block_size=40 * KIB))
+        self.assertEqual((last.status, last.data, last.block, last.bad), (client.OK, block[32 * KIB:], block, False))
+        self.assertEqual(fakes.FakeLink.created[0].requests[1][1], [cid.binary, 32 * KIB, 16 * KIB, 0])
+        self.assertEqual(self.client.traffic.peer(NODE)["received"], 40 * KIB)  # counted once verified
+
+    def test_range_compressed(self):
+        data = b"a line of text that repeats itself, as text does\n" * 400
+        cid = Cid.for_block(RAW, data)
+        self.serve_ranges(data, compress_answers=True)
+        result = self.call(lambda: self.client.block_range(NODE, cid, b"", len(data), compress=True))
+        self.assertEqual((result.block, result.compressed), (data, True))
+        self.assertEqual(fakes.FakeLink.created[0].requests[0][1][3], RANGE_BZ2)
+
+    def test_range_mismatch_is_bad(self):
+        cid, block = block_of(1000, 1)
+        self.serve_ranges(b"x" + block[1:])
+        result = self.call(lambda: self.client.block_range(NODE, cid, b"", 1000))
+        self.assertEqual((result.status, result.bad, result.block), (client.OK, True, None))
+        self.assertEqual(self.client.traffic.peer(NODE)["bad"], 1)
+
+    def test_range_unserved_busy_and_malformed(self):
+        cid, block = block_of(1000, 1)
+        for answer, status, missing in (([], client.OK, True), (False, client.BUSY, False),
+                                        ([1000, 0, b"short"], client.FAILED, False),
+                                        ([999, 0, block[:100]], client.FAILED, False),  # not the size known
+                                        ([1000, RANGE_BZ2, block[:100]], client.FAILED, False),  # not asked for
+                                        ([b"a", b"b"], client.FAILED, False), ("x", client.FAILED, False)):
+            with self.subTest(answer=answer):
+                self.respond(lambda link, path, data: answer)
+                result = self.call(lambda: self.client.block_range(NODE, cid, b"", 100, block_size=1000))
+                self.assertEqual((result.status, result.missing, result.data), (status, missing, b""))
+
+    def test_range_left_unanswered_is_silent(self):
+        # What a node before 0.2.0 does: RNS times the request out with the link up
+        self.respond(lambda link, path, data: fakes.FAIL)
+        cid = block_of(10, 1)[0]
+        result = self.call(lambda: self.client.block_range(NODE, cid, b"", 10))
+        self.assertEqual((result.status, result.silent), (client.LOST, True))
+        self.assertTrue(self.client.has_link(NODE))  # the link is fine: /blocks goes on it next
+        self.assertEqual(self.client.traffic.peer(NODE)["failed"], 0)  # not the node's failure
+        # A link the node closed under it isn't silence: a refusal, as for /blocks
+        self.close_under_request(links.DESTINATION_CLOSED)
+        result = self.call(lambda: self.client.block_range(NODE, cid, b"", 10))
+        self.assertEqual((result.status, result.reason, result.silent), (client.BUSY, "closed", False))
+
+    def test_range_stall_closes_link(self):
+        self.respond(lambda link, path, data: fakes.Stall(50_000))
+        cid = block_of(10, 1)[0]
+        result = self.call(lambda: self.client.block_range(NODE, cid, b"", 10))
+        self.assertEqual(result.status, client.STALLED)
+        self.assertFalse(self.client.has_link(NODE))
 
     def test_hold_link(self):
         self.assertFalse(self.client.hold_link(NODE, 60))  # no link to hold
@@ -441,6 +517,8 @@ CLIENT_CONFIG = """
 
 E2E_BLOCKS = [(60_000, seed) for seed in range(4)] + [(500, 99)]  # sizes and seeds of the served blocks
 E2E_MISSING = 1234  # seed of a block nobody serves
+# A compressible block the server serves too, which the client fetches in compressed /range requests (rnfs 0.2.0)
+E2E_TEXT = b"".join(b"line %d of a text that compresses well, as text does\n" % i for i in range(2000))[:100_000]
 
 
 def start_reticulum(configdir: str):
@@ -455,6 +533,7 @@ class E2EBackend:
     def __init__(self):
         """Serve the integration test's blocks."""
         self.blocks = dict(block_of(size, seed) for size, seed in E2E_BLOCKS)
+        self.blocks[Cid.for_block(RAW, E2E_TEXT)] = E2E_TEXT
         self.records: dict[bytes, list[bytes]] = {}
         self.lock = threading.Lock()
 
@@ -557,6 +636,16 @@ def run_e2e_client(configdir: str, server_hex: str):
     results["verified"] = all(cid.verify(block) for cid, block in received.items())
     results["missing"] = [str(cid) for cid in missing]
     results["rate"] = peers.rate_estimate(server_id)
+    # /range (rnfs 0.2.0): the text block in compressed ranges of 16 KiB, each checked and the whole verified
+    text_cid, held, ranges = Cid.for_block(RAW, E2E_TEXT), b"", []
+    for _ in range(20):
+        answer = peers.block_range(server_id, text_cid, held, 16 * KIB, compress=True)
+        ranges.append([answer.status, len(answer.data), answer.wire, answer.compressed])
+        if answer.status != client.OK or answer.block is not None:
+            break
+        held += answer.data
+    results["ranges"] = ranges
+    results["range_block"] = answer.block == E2E_TEXT
     results["ping"] = peers.ping(server_id)
     deadline = time.monotonic() + 15
     while server_id not in heard and time.monotonic() < deadline:
@@ -640,6 +729,12 @@ class TwoNodeTest(unittest.TestCase):
         self.assertIsInstance(results["ping"], float)
         self.assertTrue(results["heard_server"])
         self.assertEqual(results["mode"], 1)
+        # /range over real RNS: compressed ranges (single packets and Resources, both past the guards' precheck)
+        # rebuild the block, verified; each range's bytes on the wire well under its bytes
+        self.assertTrue(results["range_block"], results["ranges"])
+        self.assertTrue(all(status == client.OK and compressed for status, _, _, compressed in results["ranges"]),
+                        results["ranges"])
+        self.assertLess(sum(wire for _, _, wire, _ in results["ranges"]), len(E2E_TEXT) // 3)
         # The server found its response Resources and recorded the link's rate when they completed
         self.assertGreaterEqual(server_state["rates"], 1)
         self.assertEqual(server_state["responses"], 0)

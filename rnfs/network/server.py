@@ -26,8 +26,8 @@ import RNS
 from RNS.vendor import umsgpack
 
 from rnfs.config import Config
-from rnfs.constants import (BLOCKS_PATH, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK, PIN_PATH,
-                            PROVIDE_PATH, RESPONSE_OVERHEAD)
+from rnfs.constants import (BLOCKS_PATH, FIND_PATH, KIB, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK, MIB, PIN_PATH,
+                            PROVIDE_PATH, RANGE_BZ2, RANGE_PATH, RESPONSE_OVERHEAD)
 from rnfs.content.cid import Cid
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_VERBOSE, LOG_WARNING, ThrottledLog, log, node_name, plural, size
 from rnfs.network import guards, protocol, rates
@@ -89,6 +89,12 @@ OVER_RATE_REFUSALS = 2 * MAX_REQUESTS_PER_LINK
 OVER_RATE_LOG_INTERVAL = 60.0  # seconds between log lines about requests over the rate limit
 # IncomingLinks.take_token outcomes
 REQUEST_OK, REQUEST_REFUSED, REQUEST_DROPPED = "ok", "refused", "dropped"
+# /range compression (section 7): bz2 costs about a hundred times what re-checking a block's hash does (about 5 ms for
+# 128 KiB on a desktop), so the node compresses at most COMPRESS_RATE bytes of ranges a second, in bursts of up to
+# COMPRESS_BURST, and sends the rest as they are. Only slow links ask for compression, whose ranges arrive a few KiB a
+# second at most, so it binds only on a requester asking for more than any slow link carries
+COMPRESS_RATE = 256 * KIB
+COMPRESS_BURST = 1 * MIB
 
 
 class Backend(Protocol):
@@ -662,6 +668,31 @@ class Cooldowns:
             self.until.popitem(last=False)
 
 
+class CompressionBudget:
+    """The bytes /range may compress: a token bucket of burst bytes, refilled at rate bytes a second, starting full.
+    Thread-safe."""
+
+    def __init__(self, rate: float, burst: float, clock: Callable[[], float] = time.monotonic):
+        """A full bucket."""
+        self.rate = rate
+        self.burst = burst
+        self.clock = clock
+        self.tokens = float(burst)
+        self.updated = clock()
+        self.lock = threading.Lock()
+
+    def take(self, nbytes: int) -> bool:
+        """Spend nbytes if the bucket holds them; False (nothing spent) if not: send that range as it is."""
+        with self.lock:
+            now = self.clock()
+            self.tokens = min(float(self.burst), self.tokens + max(0.0, now - self.updated) * self.rate)
+            self.updated = now
+            if self.tokens < nbytes:
+                return False
+            self.tokens -= nbytes
+            return True
+
+
 class UploadPacer:
     """max_upload_rate between responses: a link's next response starts no sooner than bytes × 8 / cap
     seconds after the previous one started. Thread-safe."""
@@ -709,6 +740,7 @@ class RequestServer:
         self.incoming = IncomingLinks(config.max_incoming_links, clock)
         self.pacer = UploadPacer(clock)
         self.cooldowns = Cooldowns(config.blocks_cooldown, clock)
+        self.compression = CompressionBudget(COMPRESS_RATE, COMPRESS_BURST, clock)  # /range's bz2 (section 7)
         # mesh: airtime controls on /blocks and the traffic counters (shared with the client by the node)
         self.airtime = mesh.AirtimePolicy(config, clock)
         self.traffic = traffic if traffic is not None else mesh.Traffic()
@@ -741,6 +773,7 @@ class RequestServer:
             PROVIDE_PATH: self._handle_provide,
             BLOCKS_PATH: self._handle_blocks,
             PIN_PATH: self._handle_pin,
+            RANGE_PATH: self._handle_range,  # rnfs 0.2.0
         }
         # Paths added by features (rnfs.features: Feature.requests), within the same per-link limit
         for path, handler in backend.feature_requests().items():
@@ -969,9 +1002,37 @@ class RequestServer:
                     f"{plural(served, 'block')} of {len(cids)} requested")
         return self._serve(BLOCKS_PATH, link_id, request_id, remote_identity, max_bytes, build)
 
+    def _handle_range(self, path, data, request_id, link_id, remote_identity):
+        """Answer /range (rnfs 0.2.0) as /blocks is answered (_serve): a byte range of one served block, sent whole as
+        a /blocks response's first block is, compressed if asked and smaller, within the compression budget."""
+        parsed = protocol.parse_range_request(data)
+        if parsed is None:
+            return False
+        cid, offset, max_bytes, flags = parsed
+
+        def build(limit: int):
+            """The answer: [size, encoding, bytes], [] if the block isn't served, False past its end. The range is
+            sent whole, whatever the budget left (limit), as /blocks's first served block is."""
+            block = self.backend.served_block(cid)
+            if block is None:
+                return [], False, f"nothing: {cid} isn't served"
+            if offset > len(block):
+                return False, False, f"offset {offset} is past the end of {cid} ({len(block)} bytes)"
+            data = block[offset:offset + protocol.range_length(len(block), offset, max_bytes)]
+            encoding, payload = protocol.RANGE_RAW, data
+            if flags & RANGE_BZ2 and data and self.compression.take(len(data)):
+                compressed = protocol.compress_range(data)
+                if len(compressed) < len(data):
+                    encoding, payload = RANGE_BZ2, compressed
+            what = f"{size(len(data))} of {cid} from byte {offset}" + (
+                f" (bz2: {size(len(payload))})" if encoding == RANGE_BZ2 else "")
+            return protocol.encode_range_response(len(block), encoding, payload), True, what
+        return self._serve(RANGE_PATH, link_id, request_id, remote_identity, max_bytes, build)
+
     def _serve(self, path: str, link_id: bytes, request_id: bytes, remote_identity, max_bytes: int,
                build: Callable[[int], tuple]):
-        """Answer a /blocks request within the per-link limit, the response pools, upload pacing and the budget.
+        """Answer a /blocks or /range request within the per-link limit, the response pools, upload pacing and the
+        budget: one path for both, so /range counts against everything /blocks does (section 7).
 
         build(limit) makes the response once every check has passed, given the budget for blocks after the first
         served one: (body, whether it carries blocks, what it is, for the log). A body of False refuses the request.

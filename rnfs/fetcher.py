@@ -107,9 +107,22 @@ its requests still in flight, unless another fetch has a request on the same (sh
 finish, rather than fail the other's. It never cancels a response's Resource: a responder would take that for a
 rejection and cool the requester down (section 3).
 
+Ranges (rnfs 0.2.0; specification section 7, `/range`; rnfs.ranges). Over a slow link (Fetch._slow), a raw chunk
+whose parent declares at least RANGE_MIN_BLOCK (or no size) is asked for alone, a byte range at a time with /range,
+compressed; so is one from a provider whose response stalled earlier in the fetch (uncompressed, ranges of at most
+STALLED_RANGE), and any block a partial is held of from that provider. Each range aims at max(min_rate_sample,
+response_target of transfer at the link's rate estimate) bytes on the wire, times the compression that provider's last
+range achieved (Fetch._range_plan). A range that doesn't complete its block comes back as progress
+(BlocksResult.partial): the block goes back to the front of the queue, owned by that provider while it is usable
+(Fetch._owners: no other provider is given it, so two partials of one block don't both cross the channel), and the
+provider is paced as after any response. A provider that leaves its first /range unanswered (an older node) is
+recorded as not answering it, and the block asked for again at once with /blocks, without counting against it
+(peer_client.UNSUPPORTED).
+
 Within `with observing(observer):`, every fetch the thread opens reports its total size and each block it
 meets to the Observer, and raises Cancelled once observer.cancelled() is true (background jobs use this).
 """
+import os
 import queue
 import threading
 import time
@@ -118,7 +131,7 @@ from contextlib import contextmanager
 from itertools import islice
 from typing import Callable, Iterator, NamedTuple
 
-from rnfs import statedb
+from rnfs import ranges, statedb
 from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE, KIB, K, MAX_BLOCK_SIZE, MAX_CHILDREN, MAX_DEPTH, MAX_REQUEST_SIZE
 from rnfs.content import walker
@@ -152,6 +165,10 @@ MAX_REMEMBERED = 4096
 # (Fetcher.unfound); at most MAX_UNFOUND roots are remembered so, the oldest forgotten first
 UNFOUND_FOR = 600
 MAX_UNFOUND = 4096
+# Ranges (the module docstring): raw chunks declared this large or larger are fetched in ranges over slow links, and a
+# provider that stalled gets ranges of at most STALLED_RANGE on the wire
+RANGE_MIN_BLOCK = 4 * KIB
+STALLED_RANGE = CHUNK_SIZE // 2
 
 
 def import_invalid(value: list, tx) -> int:
@@ -394,6 +411,15 @@ class ResultEvent(NamedTuple):
     rate: float | None  # the link's rate estimate it was sent with (the responder's upload cap derives from it)
 
 
+class RangePlan(NamedTuple):
+    """How a request asks for its one block with /range (Fetch._range_plan)."""
+
+    compress: bool  # ask for bz2 (over slow links)
+    target: int  # bytes on the wire the range aims at
+    ratio: float  # the compression the provider's last range achieved (1: none known)
+    size: int | None  # the block's length, if its parent declares it
+
+
 class ProviderEvent(NamedTuple):
     """A provider the lookup found, queued by the lookup thread as its reply arrives."""
 
@@ -495,7 +521,7 @@ class _Provider:
     """What a fetch knows about one provider."""
 
     __slots__ = ("node_id", "order", "busy", "busy_until", "stalls", "lost", "failed", "path", "pacing_until",
-                 "pacing_retry")
+                 "pacing_retry", "ratio")
 
     def __init__(self, node_id: bytes, order: int, path: mesh.PathInfo = mesh.NO_PATH):
         """A provider found order-th, path hops away (looked up once, when found)."""
@@ -509,6 +535,7 @@ class _Provider:
         self.failed = False
         self.pacing_until = 0.0  # until then, a refusal is most likely the responder's upload pacing...
         self.pacing_retry = 0.0  # ...and is retried after this many seconds
+        self.ratio = 1.0  # the compression its last compressed /range answer achieved (ranges)
 
 
 class Fetcher:
@@ -570,6 +597,10 @@ class Fetcher:
         # root -> {provider: when it last served verified blocks of it}, least recently used root first (remembered)
         self._remembered: OrderedDict[Cid, dict[bytes, float]] = OrderedDict()
         self._unfound: OrderedDict[Cid, float] = OrderedDict()  # root -> when a search found no provider; oldest first
+        # /range: which nodes answer it (persisted) and the partial blocks (under the state directory, in memory without
+        # one), shared by every fetch (rnfs.ranges)
+        self.ranges = ranges.Ranges(ranges.RangeSupport(self._db), ranges.Partials(
+            None if state_dir is None else os.path.join(state_dir, ranges.PARTIAL_DIR)))
 
     @property
     def max_parallel(self) -> int:
@@ -763,6 +794,7 @@ class Fetch:
         self._threads: set[int] = set()
         self._links_closed: set[bytes] = set()
         self._credited: set[bytes] = set()  # nodes whose /find answers led to a provider that served this fetch
+        self._owners: dict[Cid, bytes] = {}  # blocks a provider holds part of (ranges): left to it while it is usable
         if from_node is not None:
             self._new_provider(from_node)
 
@@ -1137,6 +1169,8 @@ class Fetch:
             self.node_bytes += len(block)
         budget.count(cid, len(block), children[wanted[cid][0]])
         self.session.put(cid, block)
+        self._owners.pop(cid, None)
+        self.fetcher.ranges.partials.drop(cid)  # any provider's partial of it: nothing more to resume
         self._progress_at = self.fetcher.clock()
         self.downloaded_blocks += 1
         self.downloaded_bytes += len(block)
@@ -1319,18 +1353,57 @@ class Fetch:
             slot = self._slot(provider)
             if slot is not None and slot in slots:
                 continue
-            batch = self._take_batch(pending, provider.node_id, wanted, budget)
+            others = self._others_owned(pending, provider.node_id)  # left to the providers holding part of them
+            plan = self._range_plan(provider, pending[0], wanted) if pending else None
+            batch = self._take_batch(pending, provider.node_id, wanted, budget, limit=1 if plan else None)
+            pending.push_front(others)
             if batch:
                 in_flight[provider.node_id] = (batch, False)
                 for cid in batch:
                     self._expects[cid] = wanted[cid]
                 self._sent_at[provider.node_id] = now
                 self._expected[provider.node_id] = self._expected_time(provider.node_id, batch, wanted)
-                self._send(provider.node_id, batch)
+                self._send(provider.node_id, batch, plan)
                 busy_providers += 1
                 slots.add(slot)
         if not pending and busy_providers < self.fetcher.max_parallel:
             self._duplicate(usable, in_flight, busy_providers, now)
+
+    def _others_owned(self, pending: _Pending, node_id: bytes) -> list[Cid]:
+        """Take from pending's front the blocks another usable provider holds part of (_owners), to put back once
+        node_id's batch is taken: each is left to the provider that can resume it."""
+        taken = []
+        while pending:
+            owner = self._owners.get(pending[0])
+            provider = self._providers.get(owner) if owner is not None else None
+            if owner is None or owner == node_id or provider is None or provider.failed:
+                break
+            taken.append(pending.popleft())
+        return taken
+
+    def _range_plan(self, provider: _Provider, cid: Cid, wanted: dict[Cid, list[Expect]]) -> RangePlan | None:
+        """How to ask provider for cid with /range, or None to use /blocks (the module docstring, "Ranges"): over a
+        slow link, a raw chunk declared RANGE_MIN_BLOCK or larger (or of no declared size), compressed; from a
+        provider that stalled before, the same chunks in ranges of at most STALLED_RANGE; and any block a partial is
+        held of from provider. Never to a node known not to answer /range."""
+        store = self.fetcher.ranges
+        if not store.usable(provider.node_id):
+            return None
+        expects = wanted.get(cid)
+        declared = expects[0].size if expects and cid.is_raw else None
+        large = cid.is_raw and (declared is None or declared >= RANGE_MIN_BLOCK)
+        held = store.partials.length(cid, provider.node_id)
+        if not held and not large:
+            return None
+        slow = self._slow(provider.node_id, provider.path)
+        if not held and not (slow or provider.stalls):
+            return None
+        rate = self.client.rate_estimate(provider.node_id)
+        timed = rates.transfer_bytes(self.config.response_target, rate) if rate else 0
+        target = max(self.config.min_rate_sample, timed)
+        if not slow:
+            target = min(target, STALLED_RANGE)  # it stalled: lose less to the next stall
+        return RangePlan(slow, min(target, MAX_BLOCK_SIZE), provider.ratio, declared)
 
     def _duplicate(self, usable: list[_Provider], in_flight: dict, busy_providers: int, now: float):
         """End-game duplication (NET-4; section 7, item 7): with nothing left to ask for, ask idle providers on
@@ -1431,9 +1504,9 @@ class Fetch:
             log(f"could not close the link to {node_name(node_id)}: {e}", LOG_WARNING)
 
     def _take_batch(self, pending: _Pending, node_id: bytes, wanted: dict[Cid, list[Expect]],
-                    budget: _DagBudget | None) -> list[Cid]:
+                    budget: _DagBudget | None, limit: int | None = None) -> list[Cid]:
         """The next CIDs to ask node_id for: what one response can carry and one request packet on its link can
-        hold, at least one.
+        hold, at least one, and at most limit if given (a /range request's one block).
 
         Under a DAG limit, only what the room budget leaves can take for sure (_DagBudget.room), but at least one
         CID when no request is in flight: so a fetch downloads at most about one block beyond the limit. With no
@@ -1449,6 +1522,8 @@ class Fetch:
         # one count covers every batch taken from the front of pending
         mdu = self.client.link_mdu(node_id) or MAX_REQUEST_SIZE
         fit = max(1, protocol.blocks_batch_size(max_bytes, list(islice(pending, MAX_BATCH)), mdu))
+        if limit is not None:
+            fit = min(fit, limit)
         room = None if budget is None else budget.room((cid for cids, _ in self._in_flight.values() for cid in cids),
                                                        wanted)
         batch: list[Cid] = []
@@ -1484,8 +1559,9 @@ class Fetch:
         size = sum(self._guess(cid, wanted) for cid in batch)
         return rates.transfer_seconds(min(size, max(carried, self._guess(batch[0], wanted))), rate)
 
-    def _send(self, node_id: bytes, cids: list[Cid]):
-        """Ask node_id for cids on a request thread, which queues the result."""
+    def _send(self, node_id: bytes, cids: list[Cid], plan: RangePlan | None = None):
+        """Ask node_id for cids on a request thread, which queues the result: with /blocks, or with plan, the next
+        range of the one block in cids with /range (rnfs.ranges; /blocks if its partial is in use elsewhere)."""
         self._links_closed.discard(node_id)  # a link closed before (a lost request's) isn't this request's
         def progress(fraction: float):
             """The response is arriving: the fetch isn't hung (on the request thread, so only _heard_at is written)."""
@@ -1500,7 +1576,12 @@ class Fetch:
             self._threads.add(ident)  # until its request is over: the link's users that are this fetch's
             try:
                 rate = self.client.rate_estimate(node_id)
-                result = self.client.blocks(node_id, cids, on_progress=progress)
+                result = None
+                if plan is not None:
+                    result = self.fetcher.ranges.fetch(self.client, node_id, cids[0], plan.target, plan.ratio,
+                                                       plan.compress, plan.size, on_progress=progress)
+                if result is None:
+                    result = self.client.blocks(node_id, cids, on_progress=progress)
             except Exception as e:  # noqa: BLE001 - any client failure is a failed request, retried elsewhere; logged
                 # The client reports network failures in its result, so this is a bug: logged here, inside the
                 # except, so the debug log has its traceback
@@ -1642,6 +1723,8 @@ class Fetch:
             provider.failed = True
             self.fetcher.scores.failed(provider.node_id)
             self.fetcher.forget(self.root, provider.node_id)
+            for cid in [cid for cid, owner in self._owners.items() if owner == provider.node_id]:
+                del self._owners[cid]  # left to the others now (its partials stay, for a later fetch)
             self._live -= 1
             log(f"provider {node_name(provider.node_id)} failed for {self.root}: {why}", LOG_VERBOSE)
 
@@ -1694,12 +1777,22 @@ class Fetch:
         now = self.fetcher.clock()
         if result.status != peer_client.LOST:
             provider.lost = 0  # it answered (or failed outright)
+        if result.ratio is not None:
+            provider.ratio = min(max(result.ratio, 1.0), ranges.MAX_RATIO)
         if result.status == peer_client.OK:
             provider.busy = 0
             if result.missing:
                 self._fail(provider, f"doesn't have {plural(len(result.missing), 'block')} of the root it advertised")
-            elif result.blocks:
+            elif result.blocks or result.partial:
+                for cid in result.partial:
+                    if cid in outstanding:
+                        self._owners[cid] = node_id  # it resumes from what it sent
+                if result.partial:
+                    self._progress_at = now  # a range arrived: not hung, though no block is stored yet
                 self._pace(provider, sent_at, rate)
+        elif result.status == peer_client.UNSUPPORTED:
+            # A node left /range unanswered, as an older one does (rnfs.ranges): asked with /blocks at once, not counted
+            provider.busy_until = 0.0
         elif result.status == peer_client.BUSY and result.reason not in ("cancelled", "closed") \
                 and now < provider.pacing_until:
             # Refused soon after it served us: most likely its upload pacing, which isn't a failure (a response

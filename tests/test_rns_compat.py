@@ -84,6 +84,9 @@ INTERNALS = [
                               "is_response=True, auto_compress=auto_compress)",
                               "RNS.Resource(packed_response, self, request_id=request_id, is_response=True, "
                               "auto_compress=auto_compress)"))),
+    Internal("ranges.py, network/client.py", "Link.handle_request sending nothing for a request whose path has no "
+             "handler (how a node before 0.2.0 meets /range: the requester learns from the silence, rnfs.ranges), "
+             "and answering one that has", lambda: _unhandled_path_unanswered()),
     Internal("network/server.py", "Link.register_outgoing_resource(resource), looked up on the link (and so "
              "replaceable per link) when a Resource is advertised",
              lambda: (_params(RNS.Link.register_outgoing_resource, "resource"),
@@ -503,6 +506,37 @@ def _advertisement_round_trip():
         with mock.patch.object(guards, "_scope", guards.PROCESS):  # whatever scope another test left
             reason = guards.refusal(adv, link)
         _true(reason == refused, f"guards.refusal: {reason}")
+
+
+def _unhandled_path_unanswered():
+    """Link.handle_request, on an active incoming link, sends nothing for a request whose path has no handler (as an
+    rnfs 0.1.x node meets /range), and answers one whose path has one."""
+    destination = _destination("rnfs", "dht")
+    link = RNS.Link(owner=destination)
+    link.destination = destination
+    link.link_id = bytes(16)
+    link.mdu = RNS.Link.MDU
+    link.status = RNS.Link.ACTIVE
+    sent = []
+    request = [time.time(), RNS.Identity.truncated_hash(protocol.RANGE_PATH.encode("utf-8")), [b"x", 0, 1, 0]]
+    class Recorded(RNS.Packet):
+        """A packet noted rather than sent."""
+
+        def __init__(self, *args, **kwargs):
+            sent.append(args)
+
+        def send(self):
+            return None
+    with mock.patch.object(RNS, "Packet", Recorded), \
+            mock.patch.object(RNS, "Resource", lambda *args, **kwargs: sent.append(args)):
+        link.handle_request(bytes(16), request)
+        _true(sent == [], "a request for a path without a handler was answered")
+        with mock.patch.object(RNS.Transport, "register_destination"):
+            destination.register_request_handler(protocol.RANGE_PATH, lambda path, data, request_id, link_id,
+                                                 identity, requested_at: False, allow=RNS.Destination.ALLOW_ALL)
+        link.handle_request(bytes(16), request)
+        _true(len(sent) == 1, "a request for a path with a handler wasn't answered")
+    _source(RNS.Link.handle_request, "if path_hash in self.destination.request_handlers:")
 
 
 def _dht_link_names():

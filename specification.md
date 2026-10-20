@@ -6,8 +6,10 @@ pinning, mutable names and a gateway — built on what RNS already provides.
 
 **Version.** This document describes rnfs 0.2.0. The wire format (request paths and messages, CIDs and DAG
 bytes, chunk boundaries, provider and name records, announce app_data and the LXMF field) is byte-identical
-since rnfs 0.1.3, so nodes of 0.1.3 and later work together. `tests/test_wire.py` checks the current code
-against vectors that 0.1.3's and 0.1.4's own code produced (`tests/fixtures/wire`).
+since rnfs 0.1.3, so nodes of 0.1.3 and later work together. 0.2.0 adds one optional request, `/range` (section 7),
+which older nodes don't answer and newer ones send only to nodes that do; every other message, and every CID, is
+unchanged. `tests/test_wire.py` checks the current code against vectors that 0.1.3's and 0.1.4's own code produced
+(`tests/fixtures/wire`), and `/range` against vectors of its own, made by 0.2.0.
 
 **Principles**
 - No compatibility with IPFS or libp2p is required. Follow IPFS where its design helps; drop what exists only
@@ -207,11 +209,16 @@ pass a `max_response_size` just above their largest honest answer.
 | `/find` | `key` | `[[provider IDs], [node IDs]]` | 6 |
 | `/provide` | `[[key, …], [withdrawn key, …]]` | `True` if recorded | 6 |
 | `/blocks` | `[max_bytes, [cid, …]]` | `[block or None, …]` | 7 |
+| `/range` (0.2.0, optional) | `[cid, offset, max_bytes, flags]` | `[size, encoding, bytes]`, or `[]` | 7 |
 | `/pin` | `[cid, pin]` | `True` if accepted | 8 |
 | `/name` | `name` | `[public_key, name_hash, random_hash, ratchet, signature, app_data]`, or `[]` | 9 |
 
 - Field types: keys, node IDs and names are 16-byte `bin`; CIDs are binary CIDs as `bin`; blocks are `bin`;
-  `max_bytes` is a non-negative integer; `pin` is a boolean; every `/name` response field is `bin`.
+  `max_bytes` is a non-negative integer; `pin` is a boolean; every `/name` response field is `bin`; `/range`'s
+  `offset`, `max_bytes`, `flags`, `size` and `encoding` are non-negative integers and its `bytes` a `bin`.
+- A node that has no handler for a path doesn't answer it: RNS drops such a request unanswered (RNS 1.5.6
+  `Link.handle_request`). That is how a node before 0.2.0 meets `/range`, and why a requester learns which nodes
+  answer it before relying on it (section 7, `/range`).
 - Any request of another shape, or one refused under the limits below, is answered `False` at once — never
   left unanswered, except a request over `MAX_REQUEST_SIZE`, which RNS drops unanswered, and a flood over the
   per-link request rate (below), which after a few refusals is dropped unanswered.
@@ -222,8 +229,10 @@ pass a `max_response_size` just above their largest honest answer.
 
 **Limits.** These keep a node usable under load.
 - Requests are at most `MAX_REQUEST_SIZE` (`Destination.set_max_request_size`).
-- Per link: at most `MAX_REQUESTS_PER_LINK` requests in progress, of which at most one is `/blocks`.
-  Requesters MUST stay within this.
+- Per link: at most `MAX_REQUESTS_PER_LINK` requests in progress, of which at most one is `/blocks` or `/range`.
+  Requesters MUST stay within this. Everything this section says of `/blocks` responses (the pools, deadlines,
+  displacement, cooldowns, upload pacing, `max_upload_rate` and the airtime controls) holds for `/range` responses
+  too: they share the slots, the budget and the counters (section 7, `/range`).
 - **Request rate per link.** RNS decrypts and decodes every request packet and starts a thread for it before
   any handler runs, so nothing in rnfs stops that work; a node SHOULD at least keep a flood from costing it
   the handler's work and an answer. rnfs takes a token from a per-link bucket (2000 requests, refilled at 2000
@@ -318,7 +327,8 @@ pass a `max_response_size` just above their largest honest answer.
   decompresses before any rnfs check runs. A node that has its process to itself (the daemon) also sets RNS's
   maximum decompressed Resource size (`RNS.Resource.AUTO_COMPRESS_MAX_SIZE` in RNS 1.5.6) to 0, which also
   stops RNS compressing anything the process sends; a node embedded in another program leaves that setting to
-  the program.
+  the program. `/range`'s compression (section 7) is inside the message, an ordinary `bin` in an uncompressed
+  Resource or packet, so none of this changes for it, and its decompression is bounded by the requester itself.
 - RNS checks request and response size limits against a Resource's data size but allocates by its transfer
   size, so a node SHOULD reject, before accepting it, any incoming Resource advertisement that is a request
   (rnfs requests always fit one packet), or whose transfer size exceeds its data size or `MAX_RESPONSE_SIZE`
@@ -333,8 +343,9 @@ pass a `max_response_size` just above their largest honest answer.
   to some 70 times their size in objects (a 1 MiB response: ~70 MB and ~0.3 s of CPU). So on `rnfs.dht`
   links a node SHOULD check a response's msgpack headers before RNS decodes it, without building objects, and
   refuse one that can't be an rnfs response: anything but `[request_id, response]` with a 16-byte `bin`
-  request ID and a response that is `True`, `False`, `nil`, a `/find` answer, or a list of at most 26 entries
-  (the most CIDs a `/blocks` request can carry), each a `bin` of at most `MAX_BLOCK_SIZE` or `nil`, with
+  request ID and a response that is `True`, `False`, `nil`, a `/find` answer, a list of at most 26 entries
+  (the most CIDs a `/blocks` request can carry), each a `bin` of at most `MAX_BLOCK_SIZE` or `nil`, or (rnfs
+  0.2.0) a `/range` answer, a list of two non-negative integers and a `bin` of at most `MAX_BLOCK_SIZE`, with
   nothing after it. rnfs checks responses sent as a Resource, and those sent as one packet larger than RNS's
   default MTU (only links that negotiated a larger MTU carry them; smaller ones decode to little). A refused
   response fails its request as a malformed one does. A responder sends no requests, so a response packet on
@@ -357,7 +368,8 @@ pass a `max_response_size` just above their largest honest answer.
     isn't closed as idle (`link_idle_timeout`): a 64 KiB chunk takes about 9 minutes at 1 kbit/s, and so does the
     wait, and a new link would have no rate estimate for the next response's size and pacing.
 
-**Airtime controls.** A node MAY limit the airtime it spends answering `/blocks` with the settings below.
+**Airtime controls.** A node MAY limit the airtime it spends answering `/blocks` with the settings below; each
+applies to `/range` (section 7) exactly as to `/blocks`, and "`/blocks`" below means both.
 Each limit answers `/blocks` with `False`, which the requester treats as busy (section 6), moving on to
 another provider after `max_failures` refusals in a row. These limits MUST NOT apply to `/find`, `/provide`,
 `/pin` or `/name`, whose answers are tiny and which the DHT needs, and don't affect announces. A request
@@ -1290,6 +1302,75 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
 - Passes `max_response_size = min(max(max_bytes, MAX_BLOCK_SIZE) + 1 KiB, MAX_RESPONSE_SIZE)` to RNS.
 - MUST verify every block against its CID before storing or using it.
 
+**`/range`** (rnfs 0.2.0; optional, and additive: `/blocks` is unchanged and every node MUST still answer it). A
+byte range of one block, compressed if the requester asks. An RNS Resource is delivered whole or not at all, and a
+`/blocks` response carries at least one whole block, so at 1 kbit/s every response is a 64–128 KiB chunk (9–18
+minutes) and a stall loses half of one on average; ranges make a block's transfer resumable, and text crosses the
+link in about a third of the airtime.
+- **Request:** `[cid, offset, max_bytes, flags]`: a binary CID; the range's first byte, `0 ≤ offset ≤
+  MAX_BLOCK_SIZE`; the most bytes wanted, `1 ≤ max_bytes ≤ MAX_BLOCK_SIZE`; and `flags`, of which bit 0 (`1`,
+  `RANGE_BZ2`) asks for the bytes as a bz2 stream if that makes them smaller. The other bits are reserved:
+  requesters send 0 there, responders ignore them. The integers are never booleans. Any other shape is malformed,
+  answered `False`.
+- **Response:** `[size, encoding, data]`, where `size` is the block's length and `data` the block's bytes from
+  `offset`, `min(max_bytes, size − offset)` of them, as they are (`encoding` 0) or as one bz2 stream (`encoding` 1,
+  only if asked). `[]` if the node doesn't hold or serve the block (a `/blocks` entry's `None`: RNS sends
+  nothing for a handler's `None`); `False` if it refuses under its limits, or `offset` is past `size`.
+- **Responder.** A `/range` response is a `/blocks` response for every rule of section 3 and this section: it serves
+  only what `/blocks` would serve, re-checked against its CID; it takes the link's one `/blocks` slot (at most one
+  `/blocks` or `/range` in progress per link) and a slot in the same response pools, with the same deadline,
+  displacement, cooldowns and upload pacing; the same airtime controls refuse it and `upload_budget` charges it, by
+  its packed size; a completed one gives the link a rate estimate. Its range is sent whole, as a `/blocks`
+  response's first block is, so a `/range` response is never larger than the `/blocks` response for the same block
+  could be. A responder compresses only when asked and only if the stream is smaller, and MAY send the bytes as they
+  are anyway (rnfs: once its compression budget, 256 KiB of input a second node-wide in bursts of up to 1 MiB, is
+  spent: bz2 costs about a hundred times what re-checking the block's hash does, about 5 ms for 128 KiB on a
+  desktop, and only slow links ask for it).
+- **Requester.** Passes `max_response_size = min(max_bytes + 1 KiB, MAX_RESPONSE_SIZE)` to RNS, and checks every
+  answer before keeping any of it: its shape; `size` at most `MAX_BLOCK_SIZE`, equal to a raw chunk's size if its
+  parent declares one, and to the `size` of earlier ranges of the block from that provider; an encoding it asked
+  for; and the bytes, decompressed to at most `max_bytes + 1` bytes and never more (a decompression bomb ends there,
+  however small its input), which must be one complete stream with nothing after it, of exactly
+  `min(max_bytes, size − offset)` bytes. An answer failing a check is malformed (section 6: its provider fails),
+  and the partial block it was for is dropped. rnfs neither sends nor accepts compressed Resources on `rnfs.dht`
+  links still (section 3).
+- **Partial blocks.** The requester keeps the bytes of a block received from one provider, in order, as a partial
+  block, and asks that provider for the rest from where it ends, so a stall (item 7 below) loses at most the range
+  that was in flight. Once complete, the whole block is verified against its CID; a mismatch is a block not
+  matching its CID (section 10: the provider is banned) and nothing of it is kept. A partial block is never stored
+  as a block, served or read before that check. It belongs to one provider: another provider asked for the same
+  block starts one of its own, and while the first provider is usable the block is left to it. rnfs keeps at most
+  64 (the least recently written dropped first) in `<rnfs dir>/state/partial`, deletes them all at start, and
+  drops a block's once the block is stored.
+- **Older nodes.** A node of rnfs 0.1.x has no handler for `/range`, and RNS drops a request for a path without a
+  handler, unanswered (section 3), so the requester waits out RNS's request timeout. It costs the older node
+  nothing more: its per-link request rate and slots are counted inside rnfs's handlers, which never run, so no
+  refusal, cooldown or ban follows, and nothing is logged. So a requester learns per node whether it answers
+  `/range`: a `/range` that RNS times out with the link up, to a node not known to answer it, records that it
+  doesn't, and the block is asked for again at once with `/blocks`, on the same link and from the same provider,
+  without counting it against the provider; any answer (`False` and `[]` included) records that it does. The
+  record is kept across restarts (rnfs: up to 10,000 nodes, the least recently checked dropped first); one saying
+  a node doesn't answer is forgotten after 7 days, and the node is asked once more. One answer covers ranges and
+  compression, which is asked per request. A `/range` left unanswered by a node known to answer it is unanswered
+  as any request is (section 6). On a lossy path a node that answers `/range` may be recorded as not, its request
+  or its answer lost: it is then asked with `/blocks` until the record lapses, which is how it was fetched from
+  before 0.2.0.
+- **When rnfs uses it.** Over slow links (item 7 below), for raw chunks whose parent declares at least 4 KiB (or
+  doesn't declare a size: a single-chunk file's root), one block a request, asking for compression; over any link,
+  for the raw chunks of a provider whose response stalled earlier in the fetch, without compression; and for any
+  block it holds a partial block of from that provider. `/blocks` everywhere else: over fast links a whole block is
+  fine, and a batch of small blocks costs one request. Each range aims at `max(min_rate_sample, response_target of
+  transfer at the link's rate estimate)` bytes on the wire, at most `MAX_BLOCK_SIZE`: what a `/blocks` response is
+  budgeted, but never less than what gives the link a rate estimate. With compression it asks for that many bytes
+  times the ratio its last compressed range from that provider achieved (1 to 4), and once a range of a block comes
+  back uncompressed it asks for the rest of that block uncompressed. Upload pacing (section 3) applies between
+  ranges as between `/blocks` responses. At 1 kbit/s a range is 16 KiB on the wire, about 2 minutes. Text
+  compresses to about a third: a Gutenberg book (Pride and Prejudice, 772 KB) with bz2, 3.2× in 64 KiB pieces,
+  2.7× in 16 KiB and 2.9× in 32 KiB; random bytes not at all, and are sent as they are. Measured with rnfs's fetcher
+  over a fake 1 kbit/s link, the book takes 2.8× less airtime with `/range` than with `/blocks` (counting about
+  0.7 KB of RNS overhead per response), and a stall anywhere in a 64 KiB chunk sends 8 KiB again on average (at most
+  one range, 16 KiB) instead of 32 KiB (at most the chunk).
+
 **Fetching a target** (`get`, `cat`, `pin add`, `export`):
 1. Ask up to `max_parallel_providers` nodes with an open outgoing link for the root with `/blocks`; if none
    has it, find providers (section 6). A node that isn't slow asks none over a slow link (item 7): on a radio each
@@ -1372,7 +1453,8 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
    under the same rule), which doesn't count as a stall of its provider. rnfs duplicates each request at most once, and
    never over a slow link (so never on slow nodes), where it would spend the channel's airtime twice.
 8. Blocks are stored as they arrive, so an interrupted fetch resumes where it stopped. An RNS Resource is only
-   delivered when complete, so a response lost mid-transfer yields nothing and its blocks are requested again.
+   delivered when complete, so a response lost mid-transfer yields nothing and its blocks are requested again; a
+   `/range` response lost so loses only its range, the partial block keeping the ranges before it (`/range`, above).
 9. When the target is complete, the node provides it if its strategy says so (section 6).
 
 ## 8. Storage
@@ -1841,15 +1923,15 @@ as is cheap. Rules live in the sections referenced.
 | Hiding content near a key | Provider search doesn't stop at the first reply that lists providers (6) |
 | Routing table takeover with new identities | Only proven-reachable nodes stored; full buckets keep long-lived nodes (6) |
 | Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup (a slow node 10 per publishing lookup, 3 per search); lookup time budget (6) |
-| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress, was rejected or cancelled before a quarter of it was sent, or fell far behind its schedule; many fast-link slots; requester stall detection, and end-game duplication of a response still arriving after `deadline_slack` (2, 3, 7) |
+| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress, was rejected or cancelled before a quarter of it was sent, or fell far behind its schedule; many fast-link slots; requester stall detection, and end-game duplication of a response still arriving after `deadline_slack`; over slow links, and after a stall, blocks fetched in ranges (`/range`), so a stall loses one range, the partial block verified whole against its CID and never served (2, 3, 7) |
 | Request flooding, link exhaustion | Request size, per-link and global limits; a per-link request rate limit; eviction of idle incoming links; half-open links capped in their own bucket, oldest closed first (3) |
-| Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links; `rnfs.dht` responses' msgpack headers checked before RNS decodes them (3, 7) |
+| Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links; `rnfs.dht` responses' msgpack headers checked before RNS decodes them; a `/range` answer's bz2 bytes decompressed to at most the range asked for plus one byte, and refused past it (3, 7) |
 | Reading another node's download history | Only provided content is served (7). Under the default `roots`, complete cached downloads are provided; `pinned` keeps them private |
 | Name rollback or forgery | Self-certifying names; RNS-verified signatures; persisted highest sequence (9) |
 | Forged or withheld kept names | Records verified against the name's key; highest persisted sequence; several keepers asked, ranked by routing-table standing from before the query and drawn from different sources; answers from established keepers only settle a name with no known sequence (9) |
 | Tampered or spliced sealed files | Per-segment HMAC bound to the header, index and final flag, checked before decrypting (5) |
 | Unwanted content on a public gateway or provider node | Deny lists: denied CIDs never fetched, stored, served or provided, anywhere in a DAG; file hashes checked where content is assembled; lists size-capped and checked before use (8) |
-| Uploads exhausting a shared channel | `upload_budget` (charged for bytes sent, at most half of it per requester in flight), interface rules and quiet hours, applied to `/blocks` only (3) |
+| Uploads exhausting a shared channel | `upload_budget` (charged for bytes sent, at most half of it per requester in flight), interface rules and quiet hours, applied to `/blocks` and `/range` only (3) |
 | Names and paths chosen by others reaching the local user | Default output names only if printable, not hidden, not starting with `-` and one valid file name, else the CID; non-printable characters escaped in output and logs (11) |
 | Republishing and retries draining airtime | Small `keep_max_names`; slower, jittered republishing of name keys; paced lookups on slow nodes; follow backoff (6, 9) |
 
@@ -2471,6 +2553,7 @@ rest decide validity and interoperability.
 | `MAX_REQUEST_SIZE` | 1 KiB | Including RNS request framing |
 | `MAX_REQUESTS_PER_LINK` | 2 | At most one of them `/blocks` |
 | `MAX_RESPONSE_SIZE` | 1 MiB − 1 | Encoded response; one RNS Resource segment |
+| `RANGE_BZ2` | 1 | `/range`'s compression: the flag bit asking for bz2, and the encoding of an answer in bz2 (section 7) |
 
 The FastCDC parameters (`MIN_SIZE`, `AVG_SIZE`, `MAX_SIZE`, `GEAR`, the masks) and the sealed-file format's
 constants are fixed in section 5; they matter only to writers that choose them and to readers of sealed files.

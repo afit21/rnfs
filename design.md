@@ -154,7 +154,7 @@ rnfs/
     nomadnet.py       fetching a page or file from a NomadNet node over a link of its own, bounded per link
                       (Transfer: segment sequence and decompression bound, a page's size, metadata check) (11)
     server.py         RequestServer: handlers, every section 3 limit, airtime policy, feature paths (3, 7)
-    client.py         PeerClient: /find, /provide, /blocks (with stall detection), /pin, ping (sections 3, 6, 7)
+    client.py         PeerClient: /find, /provide, /blocks and /range (with stall detection), /pin, ping (3, 6, 7)
     announces.py      rnfs.dht announces carrying the DHT mode, and the announce handler (section 3)
     identity.py       node identity file, node ID helpers
   mesh.py             provider ranking (PathInfo, provider_rank, RnsPaths), airtime policy, Traffic (3, 6)
@@ -165,6 +165,8 @@ rnfs/
   name_sync.py        NameSync: names kept pointing at a folder's content, settle time, hourly limit (section 9)
   denylist.py         DenyList: denied CIDs and file hashes, local entries, accepted lists (section 8)
   fetcher.py          fetching a target from providers; observing() for job progress (sections 6, 7)
+  ranges.py           /range on the requesting side: which nodes answer it (persisted), partial blocks, one range
+                      fetched into one (section 7)
   publisher.py        provide strategy, batched /provide, republish, withdrawal, extra key sources (section 6)
   node.py             RnfsNode: wires everything; the facade below
   node_content.py     node side of --no-pin, sealing/unsealing, raw blocks and archive streams
@@ -671,7 +673,11 @@ last `find` went to node_id and failed because it closed the link, `links.closed
 naming the other end by its role, or `LinkPool.refused`, a link closed as it was established, which charges no path
 request; a thread-local `(node ID, closed)`, read by the node's `_query_failed`, which then counts nothing, and by
 `probe_off_island`, which takes it as reached; a `/blocks` on such a link is `BUSY` with `.reason` "closed", which the
-fetcher counts as busy, never as pacing), `pin(node_id, cid, pin) -> bool`,
+fetcher counts as busy, never as pacing), `block_range(node_id, cid, held, max_bytes,
+compress, block_size, on_progress) -> RangeResult` (0.2.0: the next range after the `held` bytes, checked by
+`protocol.parse_range_response`; `.block` the whole block once a range ends it, verified; `.bad` if that fails;
+`.silent` when RNS timed it out with the link up, as an older node leaves `/range`; counted in traffic only once the
+block verifies, and a silence not at all), `pin(node_id, cid, pin) -> bool`,
 `ping(node_id) -> float | None`, `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs.dht`
 destination of the identity RNS recalls, and only if its hash is the node ID asked for (in private mode, also only if
 that identity is on `members`); the idle sweep (`LinkPool.sweep`) closes a shared link with no request in progress
@@ -1923,7 +1929,10 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   pins accepted and not yet fetched, in order; about once a second and at stop, rewritten whole), with
   `remote_pin_retries` (0.2.0: those whose content wasn't found, when each is tried again and was first not found;
   rewritten in the same transaction); fetcher:
-  `invalid` (invalid roots, oldest first; with the cache records);
+  `invalid` (invalid roots, oldest first; with the cache records) and `range_support` (0.2.0, rnfs/ranges.py: whether
+  each node answers `/range` and when that was found, at most 10 000; NORMAL, written as an answer changes or is a
+  day old). The partial blocks of `/range` are files in `<rnfs dir>/state/partial`, not the database, deleted at
+  start;
 - `remote_pins_asked` and `remote_pins_served` (0.2.0, rnfs/remote_pins.py: the remote pins this node asked for and
   their checks, at most 10 000, saved after each ask and with the batched saves; the latest outcome of each remote
   pin served, at most 1 000, saved with the remote pins waiting; NORMAL, changed rows only; tables of their own, so
@@ -2270,6 +2279,36 @@ Everything in the specification is implemented, with these simplifications and a
   probes no open link or remembered provider that is slow, so a gateway with TCP and LoRa interfaces fetches in
   parallel over TCP only. A slow node still probes its `max_parallel` (by default one) nodes, as before: a hit saves a
   lookup.
+- Ranges (0.2.0, spec section 7 `/range`): `Fetch._assign` asks `_range_plan(provider, pending[0], wanted)` before
+  taking a batch: a `RangePlan(compress, target, ratio, size)` when the provider isn't recorded as not answering
+  `/range` (`Ranges.usable`) and the head CID is a raw chunk declared `RANGE_MIN_BLOCK` (4 KiB) or more, or of no
+  declared size, over a slow link (`_slow`; compressed), or from a provider that stalled earlier in the fetch
+  (uncompressed, `target` at most `STALLED_RANGE`, 32 KiB), or any CID a partial of that provider's is held of; the
+  batch is then that one CID (`_take_batch(limit=1)`). `target` is `max(min_rate_sample, response_target` at the
+  link's rate estimate), at most `MAX_BLOCK_SIZE`; `ratio` is the compression that provider's last range achieved
+  (`_Provider.ratio`, 1 to `ranges.MAX_RATIO`, 4). `_send` runs `Fetcher.ranges.fetch` on the request thread
+  (falling back to `PeerClient.blocks` if the partial is held by another request), which returns a `BlocksResult`:
+  the block, verified whole (`PeerClient.block_range` verifies `held + data` against the CID when the range ends
+  the block), `bad`, `missing`, a status, `partial` (bytes now held) and `ratio`, or `UNSUPPORTED`. `_handle` sets
+  `_owners[cid]` for a partial (`_others_owned` keeps the block from other providers while its owner is usable;
+  `_fail` releases them), counts it as progress, paces as after a served response, and on `UNSUPPORTED` clears the
+  provider's busy wait so the block goes out again at once with `/blocks`. `_accept` drops a stored block's
+  partials (`Partials.drop`). `rnfs/ranges.py`: `RangeSupport` (`answers(node_id)`: True, False within `RECHECK`,
+  7 days, or None; `record`, written to `range_support` only when the answer changes or is a day old, at most
+  `MAX_NODES`, 10,000, least recently checked dropped), `Partials` (per `(cid, node)` key, files
+  `<state>/partial/<key>.part` or memory; `acquire`/`release` so one request uses a partial at a time; at most
+  `MAX_PARTIALS`, 64, least recently written evicted; `reset` on an inconsistent answer or unreadable file; every
+  `.part` deleted when the Fetcher starts) and `Ranges.fetch` (sizes the range from `target`, `ratio` and what is
+  held, sends it, records the node's answer: `silent`, RNS's timeout with the link up, from a node not known to
+  answer means it doesn't, `UNSUPPORTED`; any answer means it does; then appends the bytes, or forgets the partial
+  on `missing`, `bad`, a malformed answer or the completed block). Server side, `_handle_range` parses
+  (`protocol.parse_range_request`), and `_serve`, the path `_handle_blocks` takes too, applies every `/blocks` rule
+  before its `build(limit)` makes the answer: the served block's range, whole, compressed (`protocol.compress_range`,
+  bz2 at level 9) if asked, smaller, and `RequestServer.compression` (a `CompressionBudget` of `COMPRESS_RATE`, 256
+  KiB/s, bursts of `COMPRESS_BURST`, 1 MiB) allows; `[]` if not served, `False` past its end. `protocol.
+  parse_range_response` checks an answer and decompresses it with `decompress_range` (at most the expected length
+  plus one byte; refused unless one complete stream with nothing after it), and `body_refusal` accepts the answer's
+  shape (`_range_answer_end`).
 - Remembered providers (0.2.0; in memory only): `Fetcher._remembered`, an `OrderedDict` root -> {node ID: when it last
   served}, least recently used root first, holds every node `Fetch._served` reports (verified blocks of the fetch's
   root, `Fetcher.remember`), at most `K` per root (the least recent to serve dropped) and `MAX_REMEMBERED` (4,096)

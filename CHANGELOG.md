@@ -10,19 +10,19 @@ identities are generated next to its key (the density check, disjoint lookup pat
 log); LoRa islands (fast nodes sparing them, two-level records, partition mode); and new features (per-app API
 tokens, encrypted folders, NomadNet add, gateway sites, name sync, name key backups, remote pin status, network
 status, files inside folders provided by their own CIDs). LXMF messaging moved out of rnfs into an app of its own
-(Removed, below). No wire-format or CID changes: these nodes, 0.1.6, 0.1.5, 0.1.4 and 0.1.3 nodes work together
-(`tests/interop.py` against 0.1.6 passes). The local API stays compatible but for LXMF: every route, field and
-status of 0.1.6 is unchanged but LXMF's, which are gone, and error bodies gain a field. The upgrade of an
-`<rnfs dir>` is automatic and one-way.
+(Removed, below). The wire format gained one optional request, `/range` (Added, below), which these nodes send
+only to nodes that answer it; nothing else on the wire changed, and CIDs are unchanged: these nodes, 0.1.6, 0.1.5,
+0.1.4 and 0.1.3 nodes work together (`tests/interop.py` against 0.1.6 passes). The local API stays compatible but
+for LXMF: every route, field and status of 0.1.6 is unchanged but LXMF's, which are gone, and error bodies gain a
+field. The upgrade of an `<rnfs dir>` is automatic and one-way.
 
 Upgrade notes:
 - **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
   `routing`, `peer_scores`, `announce_first_seen`, `provider_standing`, `remote_pins_asked`, `remote_pins_served`,
-  `name_syncs`, `name_sync_files`, `published_heal`, `name_announces`); an older rnfs can't open it afterwards. Pins made before the
-  `name_syncs`, `name_sync_files`, `published_heal`, `remote_pin_retries`); an older rnfs can't open it
-  afterwards. Pins made before the
-  upgrade have no `added` time, name keys made before it count as never exported (`rnfs status` lists them until
-  `rnfs name export` is run), and remote pins asked before it have no status entry.
+  `name_syncs`, `name_sync_files`, `published_heal`, `name_announces`, `remote_pin_retries`, `range_support`); an
+  older rnfs can't open it afterwards. Pins made before the upgrade have no `added` time, name keys made before it
+  count as never exported (`rnfs status` lists them until `rnfs name export` is run), and remote pins asked before
+  it have no status entry.
 - **LXMF:** rnfs no longer sends or receives LXMF (Removed, below). Pins of links auto-fetched over LXMF change
   source from `lxmf:<address>` to `app:lxmf:<address>` (`pin ls` shows the new one), an app called `lxmf`'s, so
   they stay pinned for an LXMF app to take over; nothing is released by the change, and an older `pins.json`
@@ -529,6 +529,23 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   each other. While full, a Newcomer's record expires 4.5 days after it was last stored (otherwise every record
   still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way by tier, with a
   share kept for Newcomers (Security, above).
+- **Resumable and compressed block transfers** (spec section 7, `/range`): a new optional request, `/range`
+  (`[cid, offset, max_bytes, flags]`, answered `[size, encoding, bytes]`), the one addition to the wire in 0.2.0;
+  `/blocks` is unchanged. Over slow links a node fetches each raw chunk of 4 KiB or more in ranges of about
+  `max(min_rate_sample, response_target` at the link's rate estimate) bytes on the wire (16 KiB at 1 kbit/s, about 2
+  minutes, instead of a whole 64–128 KiB chunk), compressed with bz2, and keeps what arrived in a partial block
+  (`<rnfs dir>/state/partial`, at most 64, deleted at start), verified whole against the CID before it is stored and
+  never served; a provider whose response stalled gets ranges on any link. Measured with the real fetcher over a fake
+  1 kbit/s link: a stall anywhere in a 64 KiB chunk now resends 8 KiB on average (1.1 minutes) instead of 32 KiB
+  (4.4 minutes), at most 15.6 KB instead of 64.7 KB; a Gutenberg book (Pride and Prejudice, 772 KB) takes 2.8–2.9×
+  less airtime (1.74 hours to 0.63, counting about 0.7 KB of RNS overhead per response). A requester decompresses an
+  answer itself, to at most the range it asked for plus one byte, and refuses anything else (a decompression bomb
+  ends there; `tests/security/test_range_decompression.py`, `test_range_limits.py`). A responder answers `/range`
+  exactly as `/blocks`: the same response slots, pools, cooldowns, upload pacing, airtime controls and
+  `upload_budget`, and compresses at most 256 KiB a second.
+  Nodes before 0.2.0 leave `/range` unanswered (RNS drops a request for a path without a handler, which costs them
+  nothing and counts against nothing): a node learns that from one RNS request timeout per such node, asks it with
+  `/blocks` from then on, and keeps that in the new `range_support` table, asking again after 7 days.
 
 Changed:
 - A pacing wait no longer closes the link: after a response on a slow link the fetcher waits as long again before
