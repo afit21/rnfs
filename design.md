@@ -624,16 +624,18 @@ non-members (`_is_member_publisher`: this node, a publisher whose `/provide` the
 this run, or a node ID whose recalled identity is a member, as routing admission checks). In private mode the
 node also drops non-members' records at start (`ProviderStore.retain`).
 
-`client.py` — `PeerClient(links, config)`:
-`find(node_id, key) -> (providers, nodes) | None`, `provide(node_id, keys, withdrawn) -> set[bytes]` (identified
-link, batched; the keys the node may have recorded: every key, or those of the batches up to and including the
-first refused or unanswered one), `blocks(node_id, cids, on_progress=None) -> BlocksResult` (status OK / BUSY /
-FAILED / STALLED; blocks verified against their CIDs; `.blocks: dict[Cid, bytes]`, `.missing` answered None,
-`.unsent` cut by the budget, `.bad` hash mismatches, `.elapsed` from sending to the answer, which the fetcher
-paces by), `link_mdu(node_id)` (an open link's, which the fetcher sizes batches by), `pin(node_id, cid, pin) -> bool`, `ping(node_id) -> float |
-None`, `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs.dht` destination of the identity
-RNS recalls, and only if its hash is the node ID asked for (in private mode, also only if that identity is on
-`members`); the idle sweep spares a link `LinkPool.get()` handed out within `link_idle_timeout`.
+`client.py` — `PeerClient(links, config)`: `find(node_id, key) -> (providers, nodes) | None`, `provide(node_id, keys,
+withdrawn) -> set[bytes]` (identified link, batched; the keys the node may have recorded: every key, or those of the
+batches up to and including the first refused or unanswered one), `blocks(node_id, cids, on_progress=None) ->
+BlocksResult` (status OK / BUSY / FAILED / STALLED / LOST, unanswered as a lossy link loses a request
+(`PeerClient._lost`: RNS gave up on it with the link up, or the link timed out under it, `links.timed_out`; or a new
+link to a node with a path and identity wasn't established, `LinkPool.unestablished`), which the fetcher retries on a
+new link; blocks verified against their CIDs; `.blocks: dict[Cid, bytes]`, `.missing` answered None, `.unsent` cut by
+the budget, `.bad` hash mismatches, `.elapsed` from sending to the answer, which the fetcher paces by),
+`link_mdu(node_id)` (an open link's, which the fetcher sizes batches by), `pin(node_id, cid, pin) -> bool`,
+`ping(node_id) -> float | None`, `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs.dht`
+destination of the identity RNS recalls, and only if its hash is the node ID asked for (in private mode, also only if
+that identity is on `members`); the idle sweep spares a link `LinkPool.get()` handed out within `link_idle_timeout`.
 
 `announces.py` — `DhtAnnouncer(destination, config, needs_reach=None)` sets `app_data` to the mode and runs the
 announce schedule; a client announces periodically only while `needs_reach()` (the node's `_needs_reach`:
@@ -2105,32 +2107,46 @@ Everything in the specification is implemented, with these simplifications and a
   holding pins. Both stores are `RowStore`s in SNAPSHOT mode, NORMAL: asked entries saved after each ask and with
   the batched saves, served outcomes with the remote pins waiting (every second, in `maintain`); each change tells
   the node, which publishes a `remote_pin` event.
-- Byte-range reads (`cat`, gateway) walk the file lazily and fetch 32 chunks (`WINDOW`) at a time ahead of what
-  has been written out. The next window is asked for before the current one is handed to the reader, so every
-  provider stays busy across window boundaries (a block that arrives after the call that asked for it is stored,
-  not dropped). A reader that stops early has fetched at most one window more than it read; when its fetch ends,
+- Byte-range reads (`cat`, gateway, sealed reads) walk the file lazily and fetch a window of chunks at a time ahead of
+  what has been written out: `WINDOW` (32) while a usable provider is reached over a fast link, else `SLOW_WINDOW` (1),
+  also while none is known yet (`Fetch._window`, asked once each window's first chunk is reached, so the file nodes
+  above it have brought their providers). The next window is asked for before the current one is handed to the reader,
+  so every provider stays busy across window boundaries (a block that arrives after the call that asked for it is
+  stored, not dropped). A reader that stops early has fetched at most one window more than it read; when its fetch ends,
   the links it still has requests on are closed (`PeerClient.close_unless_used`) unless another fetch is using one,
-  whose request is then left to finish: never a `Resource.cancel()`, which a 0.1.6 server cools down (NET-1). A
-  read may meet at most `max_output_entries` pieces much shorter than `CHUNK_SIZE`, which bounds files built from
-  repeated tiny or empty subtrees without limiting honest large files.
+  whose request is then left to finish: never a `Resource.cancel()`, which a 0.1.6 server cools down (NET-1). A read may
+  meet at most `max_output_entries` pieces much shorter than `CHUNK_SIZE`, which bounds files built from repeated tiny
+  or empty subtrees without limiting honest large files.
 - `fetch_dag` and `fetch_listing` are one `ensure()` over a `_Walk`: a block's children are queued as soon as it is
   stored or downloaded, not one tree level at a time, and `max_entries` is counted per block. A parent is stored
   before its children are asked for, so an interrupted fetch resumes from what it stored, as before.
 - End game (NET-4): when nothing is left to ask for and a provider is idle, a batch in flight longer than
-  `deadline_slack` is asked of it too (once, not on slow nodes, within `max_parallel`); the first verified copy
-  wins, and the slower request's link is closed as above, without counting as a stall.
+  `deadline_slack` and `DUPLICATE_AFTER` (1.5) times its expected time (`Fetch._expected_time`: its blocks'
+  guessed bytes at the rate estimate it was sent with; none without one) is asked of it too (once, within
+  `max_parallel`, and only of a provider not over a slow link); the first verified copy wins, and the slower
+  request's link is closed as above, without counting as a stall.
+- Slow links per provider: `Fetch._slow(node_id, path)` is true on a slow node, else by the link's rate estimate
+  if it has one (below `slow_bitrate`), else if the cached `PathInfo`'s next-hop bitrate is below it or
+  `Fetcher.slow_path` (the node's `SlowPaths`) says so. `_assign` gives the providers over slow links behind one
+  next-hop interface one slot (`Fetch._slot`, `("slow", interface)`), and on a node that isn't slow `_discover`
+  probes no open link that is slow, so a gateway with TCP and LoRa interfaces fetches in parallel over TCP only. A
+  slow node still probes its `max_parallel` (by default one) open links, as before: a hit saves a lookup.
 - Archive import pins only roots whose every block was in the archive, and reads at most 1024 roots. It
   verifies every block, including ones already stored, and stops with `StorageFull` like a fetch when a block
   not yet stored would leave less than the disk reserve free (`Storage.check_disk`).
-- Upload pacing: `RequestServer` holds an accepted `/blocks` back at most `MAX_PACING_WAIT` (5.625 s, half of
-  RNS's request timeout without RTT) and refuses one that would wait longer. After a response on a slow link,
-  `Fetch._pace` waits as long again as the request took before asking that provider again, and a refusal within
-  4 × that time of the request being sent isn't counted towards `max_failures` (retried after an eighth of it,
-  at least `busy_delay`). A `Fetch` exiting with an error (or cancelled) closes the links of its requests still
-  in flight. It never cancels a response's Resource (`Resource.cancel()`), and nothing in the fetcher may: on
-  RNS 1.5.6 that reaches the provider as a rejection, which before a quarter of the response is sent cools the
-  requester down there (`RequestServer._concluded`), while a closed link doesn't. In private mode, incoming
-  links not identified as a member's are closed first to make room.
+- Upload pacing: `RequestServer` holds an accepted `/blocks` back at most `MAX_PACING_WAIT` (5.625 s, half of RNS's
+  request timeout without RTT) and refuses one that would wait longer. After a response on a slow link, `Fetch._pace`
+  waits as long again as the request took before asking that provider again, holding its link meanwhile
+  (`PeerClient.hold_link`, `LinkPool.hold`: the idle sweep counts it as handed out when the wait ends), so the link and
+  its rate estimate survive a wait longer than `link_idle_timeout`, and a refusal within 4 × that time of the request
+  being sent isn't counted towards `max_failures` (retried after an eighth of it, at least `busy_delay`). A `LOST`
+  result (above) closes the provider's link (`Fetch._close_link`, so not one another fetch uses) and asks again after
+  `busy_delay`, failing the provider after `max_failures` in a row (`_Provider.lost`, reset by any other outcome). A
+  `Fetch` exiting with an error (or cancelled) closes the links of its requests still in flight. It never cancels a
+  response's Resource (`Resource.cancel()`), and nothing in the fetcher may: on RNS 1.5.6 that reaches the provider as a
+  rejection, which before a quarter of the response is sent cools the requester down there (`RequestServer._concluded`),
+  while a closed link doesn't. In private mode, incoming links not identified as a member's are closed first to make
+  room.
 - A shared-folder entry that fails to import because of its content (an `RnfsError`: the deny list, too large or
   too deep) isn't tried again until it changes; one that fails for a reason that may pass (`OSError`, including a
   pin the state database couldn't save, or `StorageFull`) is tried again `RETRY_AFTER` (600 s) later, as is one

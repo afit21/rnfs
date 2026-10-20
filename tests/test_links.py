@@ -19,7 +19,7 @@ class FakeReceipt:
     def __init__(self, link):
         """Receipt for a request on link."""
         self.link = link
-        self.request_id = bytes([len(link.requests)]) * 16
+        self.request_id = bytes([len(link.requests) % 256]) * 16  # a link may carry more than 256 requests
         self.response = None
         self.response_size = None
         self.progress = 0.0
@@ -39,6 +39,7 @@ class FakeLink:
     PENDING, ACTIVE, CLOSED = 0, 2, 4
     TRAFFIC_TIMEOUT_FACTOR = 6
     establish_delay = 0.0
+    establishes = None  # function(link) -> False to have establishment time out, as a lost link request does
     responder = None  # function(link, path, data) -> response, SILENT, FAIL or a Stall
     response_size = 10  # what receipts report as the response's size
     created: list["FakeLink"] = []
@@ -58,6 +59,10 @@ class FakeLink:
         def establish():
             """Become active and report it."""
             time.sleep(FakeLink.establish_delay)
+            if FakeLink.establishes is not None and not FakeLink.establishes(self):
+                self.teardown_reason = links.LINK_TIMEOUT
+                self.teardown()
+                return
             if self.status == FakeLink.PENDING:
                 self.status = FakeLink.ACTIVE
                 established_callback(self)
@@ -326,6 +331,24 @@ class LinkPoolTest(unittest.TestCase):
         self.assertEqual(peer.link.status, FakeLink.ACTIVE)
         self.now[0] += 301  # not used after all
         self.assertEqual(self.pool.sweep(), 1)
+
+    def test_sweep_keeps_a_held_link(self):
+        # A requester waiting out the provider's upload pacing (9 minutes for a LoRa chunk) holds its link
+        self.assertFalse(self.pool.hold(NODE, 600))  # no link yet
+        peer = run(self, lambda: self.pool.get(NODE))
+        self.assertTrue(self.pool.hold(NODE, 600))
+        self.assertTrue(self.pool.hold(NODE, 10))  # a shorter hold doesn't cut a longer one short
+        peer.link.idle = 590
+        self.now[0] += 590
+        self.assertEqual(self.pool.sweep(), 0)
+        self.assertIs(run(self, lambda: self.pool.get(NODE)), peer)  # handed out meanwhile: still held
+        peer.link.idle = 600 + 299
+        self.now[0] += 10 + 299  # link_idle_timeout after the hold ends, less a second
+        self.assertEqual(self.pool.sweep(), 0)
+        peer.link.idle += 2
+        self.now[0] += 2
+        self.assertEqual(self.pool.sweep(), 1)
+        self.assertEqual(peer.link.status, FakeLink.CLOSED)
 
     def test_sweep_rechecks_under_the_lock(self):
         # get() hands the link out after sweep() found it idle but before it is closed

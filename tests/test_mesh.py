@@ -124,7 +124,7 @@ class FetcherOrderTest(FetcherTest):
     def test_open_links_ranked(self):
         self.config.max_parallel_providers = 2
         self.client.links = [P1, P2, P3]  # most recently used first
-        self.fetcher.path_info = paths({P1: (3, None), P3: (1, 9600)})
+        self.fetcher.path_info = paths({P1: (3, None), P3: (1, 1_000_000)})
         self.fetch_all(self.block.cid)
         probed = {node for node, _ in self.client.requests[:2]}
         self.assertEqual(probed, {P3, P1})  # P2's path is unknown: last
@@ -134,7 +134,7 @@ class FetcherOrderTest(FetcherTest):
         a node it doesn't answer for falls back to path_info, and a failing path_infos to path_info alone."""
         self.config.max_parallel_providers = 2
         self.client.links = [P1, P2, P3]
-        one_by_one = paths({P1: (3, None), P3: (1, 9600)})
+        one_by_one = paths({P1: (3, None), P3: (1, 1_000_000)})
         calls = []
 
         def together(node_ids):
@@ -154,7 +154,7 @@ class FetcherOrderTest(FetcherTest):
             raise RuntimeError("no RNS")
         self.config.max_parallel_providers = 2
         self.client.links = [P1, P2, P3]
-        self.fetcher.path_info = paths({P1: (3, None), P3: (1, 9600)})
+        self.fetcher.path_info = paths({P1: (3, None), P3: (1, 1_000_000)})
         self.fetcher.path_infos = broken
         self.fetch_all(self.block.cid)
         self.assertEqual({node for node, _ in self.client.requests[:2]}, {P3, P1})

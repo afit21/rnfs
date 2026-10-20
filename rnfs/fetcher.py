@@ -7,7 +7,8 @@ fetch_listing() fetch what the operation needs. Blocks already stored are never 
 CID is fetched once however often it appears.
 
 Providers, in the order they are tried:
-1. up to max_parallel_providers nodes with an open outgoing link, asked for the first missing block;
+1. up to max_parallel_providers nodes with an open outgoing link (on a node that isn't slow, none over a slow
+   link, below), asked for the first missing block;
 2. if none has it, providers found by a Lookup running in the background, so downloading starts with
    the first one found; the search ends once max_parallel_providers providers are known and the root
    block has arrived, when the lookup is complete, or at lookup_timeout. Providers in the routing table
@@ -17,31 +18,35 @@ Providers, in the order they are tried:
    by default none are known).
 `get --from` uses only the given node.
 
-A provider fails, and isn't used again during the fetch, when its link fails, it answers None for a block
-of the root it advertised, it is busy max_failures times in a row (each retried after BUSY_DELAY), or it
-stalls twice. When no providers are left, the lookup runs again for a fresh random half of providers,
-within the same lookup_timeout. A block not matching its CID bans the provider; a correctly hashed block
-that isn't a valid DAG node marks the root invalid locally and fails the fetch (a stored block that no
-longer matches its CID is local damage: it is deleted and fetched again). A fetch that gets no verified
-block and no response progress for lookup_timeout + stall_timeout fails, so a hung one ends.
+A provider fails, and isn't used again during the fetch, when its link fails (no path, closed by the provider, a
+malformed answer), it answers None for a block of the root it advertised, it is busy max_failures times in a row (each
+retried after BUSY_DELAY), its requests go unanswered max_failures times in a row the way a lossy link loses them
+(peer_client.LOST: each has its link closed and is retried on a new one after BUSY_DELAY), or it stalls twice. When no
+providers are left, the lookup runs again for a fresh random half of providers, within the same lookup_timeout. A block
+not matching its CID bans the provider; a correctly hashed block that isn't a valid DAG node marks the root invalid
+locally and fails the fetch (a stored block that no longer matches its CID is local damage: it is deleted and fetched
+again). A fetch that gets no verified block and no response progress for lookup_timeout + stall_timeout fails, so a hung
+one ends.
 
 Local scores (rnfs.dht.scores, section 6): a response with verified blocks raises its provider's score, and, once
 per fetch, the scores of the nodes whose /find answers listed it; a provider that fails falls, one sending a block
 not matching its CID much further.
 
 End-game duplication (NET-4; section 7): once nothing is left to ask for, an idle provider is also asked for a
-batch another has had in flight for longer than deadline_slack, so a response dripping in (never stalling, its
-deadline hours away at unmeasured_bitrate) doesn't hold the fetch up. Each request is duplicated at most once,
-and only while fewer than max_parallel_providers requests are in flight (never on a slow node). The first
+batch another has had in flight for longer than deadline_slack (and, on a link with a rate estimate, DUPLICATE_AFTER
+times its blocks' transfer time at it), so a response dripping in (never stalling, its deadline hours away at
+unmeasured_bitrate) doesn't hold the fetch up. Each request is duplicated at most once, only while fewer than
+max_parallel_providers requests are in flight, and never over a slow link (so never on a slow node). The first
 verified copy wins: the request still sending what has arrived has its link closed (unless another fetch has a
 request on it: then it is left to finish), and its outcome isn't counted against its provider.
 
-Upload pacing (section 3): a responder starts a slow link's next /blocks response no sooner than its size at
-the upload cap (by default half the rate estimate) after the previous one started, and refuses a request it
-would have to hold back for longer than a few seconds. So after a response on a slow link, a provider isn't
-asked again until as long as that request took has passed again. Refusals within four times that of a
-served response aren't counted towards max_failures (the estimates at the two ends differ, and a responder
-may set a lower cap): they are retried every eighth of that time, or BUSY_DELAY if longer.
+Upload pacing (section 3): a responder starts a slow link's next /blocks response no sooner than its size at the upload
+cap (by default half the rate estimate) after the previous one started, and refuses a request it would have to hold back
+for longer than a few seconds. So after a response on a slow link, a provider isn't asked again until as long as that
+request took has passed again, and its link counts as in use meanwhile (PeerClient.hold_link), so the idle sweep doesn't
+close it and lose the rate estimate. Refusals within four times that of a served response aren't counted towards
+max_failures (the estimates at the two ends differ, and a responder may set a lower cap): they are retried every eighth
+of that time, or BUSY_DELAY if longer.
 
 Limits (sections 7 and 8): max_download_size bounds both the target's verified size and the DAG node bytes a
 fetch downloads (a DAG of empty files has size 0 but can hold gigabytes of directory nodes); listings and
@@ -65,7 +70,11 @@ it is asked for or read; a complete stored DAG is checked whole, since fetch_dag
 blocks against a quota).
 
 Requests are spread over up to max_parallel_providers providers (1 on slow nodes), one /blocks request in
-flight per provider. Request threads only call the client and note when a response last made progress
+flight per provider. A provider is reached over a slow link (Fetch._slow) when its link's rate estimate is below
+slow_bitrate, or, with none, when the next-hop interface to it is or it is behind a slow path (fetcher.slow_path,
+mesh.SlowPaths); the providers over slow links behind one next-hop interface share one request in flight
+(Fetch._slot), so a node with a fast and a slow interface, which isn't slow, runs parallel requests over the fast
+one only. Request threads only call the client and note when a response last made progress
 (Fetch._heard_at, which the no-progress deadline reads with the fetch thread's own _progress_at); all other
 fetch state is changed by the thread that runs the fetch, from the events they queue (ResultEvent, and the
 lookup thread's ProviderEvent and LookupDone).
@@ -75,13 +84,14 @@ soon as it is met, stored or downloaded, rather than once its whole tree level h
 for a level's last response. A parent is always stored before its children are asked for, so whatever an
 interrupted fetch stored hangs together from the target, and the next fetch resumes from it.
 
-read_range fetches WINDOW chunks at a time, and asks for the next window's before handing the reader this one's
-bytes, so the providers don't sit idle between windows; a block that a request brings after the call that asked
-for it has returned is stored all the same. A fetch that ends by an error, is cancelled, or ends with requests it
-no longer needs (a reader that stopped early, which has had at most one window fetched that it didn't read)
-closes the links of its requests still in flight, unless another fetch has a request on the same (shared) link:
-then its request is left to finish, rather than fail the other's. It never cancels a response's Resource: a
-responder would take that for a rejection and cool the requester down (section 3).
+read_range fetches WINDOW chunks at a time (SLOW_WINDOW while no provider known is reached over a fast link: 32 chunks
+take about 5 hours on LoRa before the first byte), and asks for the next window's before handing the reader this one's
+bytes, so the providers don't sit idle between windows; a block that a request brings after the call that asked for it
+has returned is stored all the same. A fetch that ends by an error, is cancelled, or ends with requests it no longer
+needs (a reader that stopped early, which has had at most one window fetched that it didn't read) closes the links of
+its requests still in flight, unless another fetch has a request on the same (shared) link: then its request is left to
+finish, rather than fail the other's. It never cancels a response's Resource: a responder would take that for a
+rejection and cool the requester down (section 3).
 
 Within `with observing(observer):`, every fetch the thread opens reports its total size and each block it
 meets to the Observer, and raises Cancelled once observer.cancelled() is true (background jobs use this).
@@ -111,10 +121,14 @@ from rnfs import mesh
 BUSY_DELAY = 2.0  # seconds before a busy provider is asked again
 MAX_STALLS = 2  # a provider that stalls this often fails
 WINDOW = 32  # chunks fetched ahead of what a byte-range read has written out
+SLOW_WINDOW = 1  # the same while no provider known is over a fast link (Fetch._window): one chunk, one ahead
 POLL = 0.5  # seconds between checks while waiting for responses
 DAG_NODE_GUESS = 8 * KIB  # assumed size of a DAG node block when reserving a request's batch
 MAX_BATCH = 32  # CIDs reserved for one request at most; the client sends as many as fit one packet
 MAX_INVALID = 10_000  # roots remembered as invalid; past this the oldest is forgotten
+# End-game duplication: a batch on a link with a rate estimate is asked of another provider too only once it has
+# been in flight this many times as long as its bytes take at that rate (and deadline_slack at least)
+DUPLICATE_AFTER = 1.5
 
 
 def import_invalid(value: list, tx) -> int:
@@ -456,7 +470,7 @@ class _Walk:
 class _Provider:
     """What a fetch knows about one provider."""
 
-    __slots__ = ("node_id", "order", "busy", "busy_until", "stalls", "failed", "path", "pacing_until",
+    __slots__ = ("node_id", "order", "busy", "busy_until", "stalls", "lost", "failed", "path", "pacing_until",
                  "pacing_retry")
 
     def __init__(self, node_id: bytes, order: int, path: mesh.PathInfo = mesh.NO_PATH):
@@ -467,6 +481,7 @@ class _Provider:
         self.busy = 0  # busy refusals in a row
         self.busy_until = 0.0
         self.stalls = 0
+        self.lost = 0  # requests unanswered in a row the way a lossy link loses them (peer_client.LOST)
         self.failed = False
         self.pacing_until = 0.0  # until then, a refusal is most likely the responder's upload pacing...
         self.pacing_retry = 0.0  # ...and is retried after this many seconds
@@ -507,6 +522,9 @@ class Fetcher:
         # path_info of several nodes at once (mesh.RnsPaths.infos: one RPC to a shared instance, not one each)
         self.path_infos: Callable[[list[bytes]], dict[bytes, mesh.PathInfo]] = lambda node_ids: {
             node_id: self.path_info(node_id) for node_id in node_ids}
+        # Whether a node is behind a slow path (mesh.SlowPaths: more than SLOW_PATH_HOPS hops, or this node's last link
+        # to it was slow); the node sets its own. Without it, rate estimates and next-hop bitrates alone tell slow links
+        self.slow_path: Callable[[bytes], bool] = lambda node_id: False
         self._lock = threading.Lock()
         self._db = None if state_dir is None else statedb.connect(state_dir)
         self._invalid: OrderedDict[Cid, None] = OrderedDict()  # oldest first
@@ -637,6 +655,7 @@ class Fetch:
         # thread's clock; a request duplicated -> its duplicate, and back, while each is in flight; and the
         # requests whose links were closed because the other copy won, whose outcome isn't counted
         self._sent_at: dict[bytes, float] = {}
+        self._expected: dict[bytes, float | None] = {}  # its bytes' transfer time at its link's rate estimate, if any
         self._duplicated: dict[bytes, bytes] = {}
         self._duplicates: dict[bytes, bytes] = {}
         self._abandoned: set[bytes] = set()
@@ -812,7 +831,8 @@ class Fetch:
 
     def read_range(self, target: Expect, offset: int = 0, length: int | None = None) -> Iterator[bytes]:
         """The bytes of the file target in [offset, offset + length), fetching only the chunks covering them
-        and the nodes above, WINDOW chunks at a time. Raises ValueError for a directory.
+        and the nodes above, a window of chunks at a time (_window: WINDOW, or SLOW_WINDOW while no provider known
+        is over a fast link). Raises ValueError for a directory.
 
         The next window's chunks are asked for before this one's bytes are handed to the reader, so the
         providers keep working while it reads; a reader that stops early has fetched at most one window more
@@ -847,15 +867,30 @@ class Fetch:
                 yield from self._read_window(window, ahead)
                 window = ahead
 
-    @staticmethod
-    def _next_window(leaves: Iterator[tuple[Expect, int, int]],
+    def _next_window(self, leaves: Iterator[tuple[Expect, int, int]],
                      small: walker.SmallLeaves) -> list[tuple[Expect, int, int]]:
-        """The next WINDOW chunks of a range's walk (fewer at its end, none past it), each met by small."""
-        window = []
-        for leaf in islice(leaves, WINDOW):
-            small.meet(leaf[2])
+        """The next window of chunks of a range's walk (fewer at its end, none past it), each met by small: sized by
+        _window once its first chunk is reached, so the file nodes above it, fetched on the way, have brought
+        their providers."""
+        first = next(leaves, None)
+        if first is None:
+            return []
+        small.meet(first[2])
+        window = [first]
+        for leaf in islice(leaves, self._window() - 1):
+            small.meet(leaf[2])  # each as it is reached, before the walk fetches the nodes above the next
             window.append(leaf)
         return window
+
+    def _window(self) -> int:
+        """Chunks a byte-range read fetches at a time: WINDOW if a usable provider is reached over a fast link
+        (not _slow), else SLOW_WINDOW, with as many asked for ahead. With every provider over a slow link (or none
+        known yet: say, the root and file nodes were stored already), a large window would hold the reader's first
+        byte back for hours, while the providers can't send any faster anyway (they share one request per slow
+        interface, _slot)."""
+        if any(not self._slow(provider.node_id, provider.path) for provider in self._usable()):
+            return WINDOW
+        return SLOW_WINDOW
 
     def _read_window(self, window: list[tuple[Expect, int, int]],
                      ahead: list[tuple[Expect, int, int]]) -> Iterator[bytes]:
@@ -1078,6 +1113,7 @@ class Fetch:
             cids = event.cids
             _, probe = in_flight.pop(event.node_id, (cids, False))
             self._sent_at.pop(event.node_id, None)
+            self._expected.pop(event.node_id, None)
             abandoned = event.node_id in self._abandoned
             self._abandoned.discard(event.node_id)
             asked_now = [cid for cid in cids if cid in outstanding]
@@ -1168,10 +1204,16 @@ class Fetch:
             self._discover(pending, in_flight)
             return
         busy_providers = sum(1 for _, probe in in_flight.values() if not probe)
+        # The slow interfaces a request is in flight over: providers behind one share it, one request at a time
+        slots = {self._slot(self._providers[node_id]) for node_id, (_, probe) in in_flight.items()
+                 if not probe and node_id in self._providers}
         for provider in usable:
             if not pending or busy_providers >= self.fetcher.max_parallel:
                 break
             if provider.node_id in in_flight or provider.busy_until > now:
+                continue
+            slot = self._slot(provider)
+            if slot is not None and slot in slots:
                 continue
             batch = self._take_batch(pending, provider.node_id, wanted, budget)
             if batch:
@@ -1179,21 +1221,26 @@ class Fetch:
                 for cid in batch:
                     self._expects[cid] = wanted[cid]
                 self._sent_at[provider.node_id] = now
+                self._expected[provider.node_id] = self._expected_time(provider.node_id, batch, wanted)
                 self._send(provider.node_id, batch)
                 busy_providers += 1
+                slots.add(slot)
         if not pending and busy_providers < self.fetcher.max_parallel:
             self._duplicate(usable, in_flight, busy_providers, now)
 
     def _duplicate(self, usable: list[_Provider], in_flight: dict, busy_providers: int, now: float):
-        """End-game duplication (NET-4; section 7, item 7): with nothing left to ask for, ask idle providers too
-        for the batches others have had in flight for longer than deadline_slack, oldest first, each at most
-        once, and within max_parallel requests in flight. A duplicate is sized for its own provider's link and
-        what one response carries (_take_batch)."""
-        idle = [provider for provider in usable if provider.node_id not in in_flight and provider.busy_until <= now]
+        """End-game duplication (NET-4; section 7, item 7): with nothing left to ask for, ask idle providers on
+        fast links too for the batches others have had in flight for longer than deadline_slack and DUPLICATE_AFTER
+        times their expected time (_expected_time, if their link has a rate estimate), oldest first, each at most
+        once, and within max_parallel requests in flight. Nothing is duplicated over a slow link (_slow): it would
+        spend the radio's airtime twice. A duplicate is sized for its own provider's link and what one response
+        carries (_take_batch)."""
+        idle = [provider for provider in usable if provider.node_id not in in_flight and provider.busy_until <= now
+                and not self._slow(provider.node_id, provider.path)]
         if not idle:
             return
         slow = sorted((sent_at, node_id) for node_id, sent_at in self._sent_at.items()
-                      if node_id in in_flight and now - sent_at > self.config.deadline_slack
+                      if node_id in in_flight and now - sent_at > self._duplicate_after(node_id)
                       and node_id not in self._duplicated and node_id not in self._duplicates
                       and node_id not in self._abandoned)
         for sent_at, node_id in slow:
@@ -1213,10 +1260,41 @@ class Fetch:
                 f"{now - sent_at:.0f}s; asking {node_name(provider.node_id)} too", LOG_VERBOSE)
             in_flight[provider.node_id] = (batch, False)
             self._sent_at[provider.node_id] = now
+            self._expected[provider.node_id] = self._expected_time(provider.node_id, batch, self._expects)
             self._duplicated[node_id] = provider.node_id
             self._duplicates[provider.node_id] = node_id
             self._send(provider.node_id, batch)
             busy_providers += 1
+
+    def _duplicate_after(self, node_id: bytes) -> float:
+        """Seconds node_id's request in flight must have taken before it is duplicated: deadline_slack, or
+        DUPLICATE_AFTER times its expected time if longer."""
+        expected = self._expected.get(node_id)
+        return max(self.config.deadline_slack, DUPLICATE_AFTER * expected if expected is not None else 0.0)
+
+    def _slow(self, node_id: bytes, path: mesh.PathInfo) -> bool:
+        """True if node_id is reached over a slow link: by the rate estimate of the link to it, if it has one (below
+        slow_bitrate); else if the next-hop interface on the path to it runs below slow_bitrate, or it is behind a
+        slow path (fetcher.slow_path). On a slow node, every link is."""
+        if self.fetcher.slow_node:
+            return True
+        rate = self.client.rate_estimate(node_id)
+        if rate is not None:
+            return rate < self.config.slow_bitrate
+        if path.bitrate is not None and path.bitrate < self.config.slow_bitrate:
+            return True
+        try:
+            return bool(self.fetcher.slow_path(node_id))
+        except Exception:  # noqa: BLE001 - RNS internals and traffic counters: not known to be slow if they fail
+            return False
+
+    def _slot(self, provider: _Provider) -> tuple | None:
+        """What provider's requests share, one at a time, with those of other providers: its next-hop interface if
+        its link is slow (_slow; an unknown interface counts as one), so providers behind one slow interface don't
+        contend for its channel; None for a fast link (a slot of its own)."""
+        if not self._slow(provider.node_id, provider.path):
+            return None
+        return ("slow", provider.path.interface)
 
     def _settle_duplicate(self, node_id: bytes, in_flight: dict):
         """node_id's request has been answered: if it was one of a duplicated pair and the other copy, still in
@@ -1273,8 +1351,7 @@ class Fetch:
         total = 0
         while pending and len(batch) < fit:
             cid = pending[0]
-            known = wanted[cid][0].size if cid.is_raw else None
-            guess = known if known is not None else (CHUNK_SIZE if cid.is_raw else DAG_NODE_GUESS)
+            guess = self._guess(cid, wanted)
             if batch and total + guess > carried:
                 break
             if room is not None:
@@ -1285,8 +1362,27 @@ class Fetch:
             total += guess
         return batch
 
+    @staticmethod
+    def _guess(cid: Cid, wanted: dict[Cid, list[Expect]]) -> int:
+        """The bytes a block not yet received is taken to have when sizing a batch: a raw chunk's declared size,
+        else CHUNK_SIZE for a raw chunk and DAG_NODE_GUESS for a DAG node."""
+        known = wanted[cid][0].size if cid.is_raw and cid in wanted else None
+        return known if known is not None else (CHUNK_SIZE if cid.is_raw else DAG_NODE_GUESS)
+
+    def _expected_time(self, node_id: bytes, batch: list[Cid], wanted: dict[Cid, list[Expect]]) -> float | None:
+        """Seconds batch's blocks (as _guess takes them, at most what one response carries beyond its first) take at
+        the rate estimate of the link to node_id; None if it has none."""
+        rate = self.client.rate_estimate(node_id)
+        if not rate:
+            return None
+        carried = rates.response_capacity(rates.requester_max_bytes(rate, self.config), rate, None,
+                                          self.config.response_target)
+        size = sum(self._guess(cid, wanted) for cid in batch)
+        return rates.transfer_seconds(min(size, max(carried, self._guess(batch[0], wanted))), rate)
+
     def _send(self, node_id: bytes, cids: list[Cid]):
         """Ask node_id for cids on a request thread, which queues the result."""
+        self._links_closed.discard(node_id)  # a link closed before (a lost request's) isn't this request's
         def progress(fraction: float):
             """The response is arriving: the fetch isn't hung (on the request thread, so only _heard_at is written)."""
             self._heard_at = self.fetcher.clock()
@@ -1324,8 +1420,13 @@ class Fetch:
             banned = self.fetcher.routing.is_banned
             linked = [n for n in self.client.open_links() if n != self.fetcher.own_id and not banned(n)]
             # Ranked like providers; most recently used breaks ties. Their paths in one go: attached to a shared
-            # instance, that is one RPC rather than one per link before the first request (plan C1)
+            # instance, that is one RPC rather than one per link before the first request (plan C1). A node that
+            # isn't slow probes none over a slow link: each would hold the lookup up by a radio round trip, and
+            # several would each send the root. A slow node, whose every link is slow, keeps its one probe (it
+            # probes max_parallel links): one that hits saves a whole lookup over the radio
             paths = self._paths(linked)
+            if not self.fetcher.slow_node:
+                linked = [node_id for node_id in linked if not self._slow(node_id, paths[node_id])]
             ranked = sorted(enumerate(linked), key=lambda item: self._rank(item[1], paths[item[1]], item[0]))
             candidates = [node_id for _, node_id in ranked][:self.fetcher.max_parallel]
             if candidates and pending:
@@ -1454,6 +1555,8 @@ class Fetch:
         if provider is None or provider.failed or not counted:
             return
         now = self.fetcher.clock()
+        if result.status != peer_client.LOST:
+            provider.lost = 0  # it answered (or failed outright)
         if result.status == peer_client.OK:
             provider.busy = 0
             if result.missing:
@@ -1474,6 +1577,16 @@ class Fetch:
             provider.stalls += 1
             if provider.stalls >= MAX_STALLS:
                 self._fail(provider, f"stalled {provider.stalls} times")
+        elif result.status == peer_client.LOST:
+            # A lost packet, most likely (at 5% packet loss, more than half of 1 MiB fetches lose a request): asked
+            # again on a new link after the busy delay. The link is closed first, so a response still being
+            # sent on it stops (a link closing starts no cooldown, section 3) and the next isn't refused for it
+            provider.lost += 1
+            self._close_link(node_id)
+            if provider.lost >= self.config.max_failures:
+                self._fail(provider, f"{result.reason or 'no answer'} {provider.lost} times in a row")
+            else:
+                provider.busy_until = now + self.fetcher.busy_delay
         else:
             self._fail(provider, result.reason or "request failed")
 
@@ -1496,6 +1609,9 @@ class Fetch:
             # transfer time has passed UPLOAD_CAP_DIVISOR times since it started: took has passed once already
             provider.busy_until = max(provider.busy_until, now + (rates.UPLOAD_CAP_DIVISOR - 1) * took)
             self._progress_at = max(self._progress_at, provider.busy_until)  # waiting isn't hanging
+            # Waiting is using the link: on LoRa a 64 KiB chunk takes about 9 minutes, and so does the wait, longer
+            # than link_idle_timeout; a link swept meanwhile would take its rate estimate, and the pacing, with it
+            self.client.hold_link(provider.node_id, provider.busy_until - now)
 
 
 def describe(fetch: Fetch) -> str:

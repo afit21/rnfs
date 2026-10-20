@@ -26,6 +26,7 @@ class FakeClient:
         self.mdu: int | None = None  # every link's MDU; None, as for a node with no open link: not known
         self.requests: list[tuple[bytes, list[Cid]]] = []
         self.closed: list[bytes] = []
+        self.held: list[tuple[bytes, float]] = []  # hold_link calls: (node, seconds)
         self.kept_open: list[bytes] = []  # close_unless_used calls that left the link open
         self.users: dict[bytes, dict[int, int]] = {}  # node -> threads with a /blocks call to it in progress
         self.lock = threading.Lock()
@@ -45,6 +46,12 @@ class FakeClient:
     def link_mdu(self, node_id: bytes):
         """The same MDU for every link (None: not known)."""
         return self.mdu
+
+    def hold_link(self, node_id: bytes, seconds: float) -> bool:
+        """Count the link to node_id as in use for seconds (noted)."""
+        with self.lock:
+            self.held.append((node_id, seconds))
+        return True
 
     def close(self, node_id: bytes):
         """Close the link to node_id (noted)."""

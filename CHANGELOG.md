@@ -492,6 +492,28 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   share kept for Newcomers (Security, above).
 
 Changed:
+- A pacing wait no longer closes the link: after a response on a slow link the fetcher waits as long again before
+  asking that provider again (the responder's upload pacing), and on LoRa a 64 KiB chunk takes about 9 minutes, so
+  the wait outlasted `link_idle_timeout` (5 minutes) and the idle link was closed, taking its rate estimate with it:
+  the next response was sized and paced as on a new link. The link now counts as in use while its provider is
+  waited for.
+- Slow links are judged per provider, not per node: a gateway with a TCP and a LoRa interface isn't a slow node,
+  so it ran 3 parallel `/blocks`, probed open links for the root and duplicated any batch out for 30 s, all over
+  the radio. Now a provider is reached over a slow link when the link's rate estimate is below `slow_bitrate` (or,
+  without one, the next-hop interface is, or the provider is behind a slow path); providers over slow links
+  behind one next-hop interface share one request at a time, a node that isn't slow probes no open link over a
+  slow link (a slow node still probes one, as before: a hit saves a lookup over the radio), nothing is duplicated
+  onto a slow link, and on fast links a batch is duplicated only once it has taken 1.5 times its blocks' transfer
+  time at the rate estimate (and `deadline_slack`, as before).
+- A lost packet no longer drops a provider: a `/blocks` request RNS times out (its packet or its answer's lost,
+  which RNS doesn't resend), whose link times out under it, or whose new link isn't established, failed its
+  provider for the rest of the fetch at once, so at 5% packet loss most 1 MiB fetches from one provider failed.
+  Now its link is closed (which starts no cooldown at the provider) and the request asked again on a new link
+  after the busy delay; the provider fails after `max_failures` such requests in a row. A link closed by either
+  end, no path, or a malformed answer still fails it at once. Measured over the fake link of
+  `tests/test_fetcher.py`'s `LossyLinkTest` (one provider, each request lost with probability 5%), 1 MiB fetches
+  succeeded 39% of the time before and 99.7% after (300 fetches each), or 97.6% when each new link's request and
+  proof are lost at 5% too.
 - A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private
   mode) announces `rnfs.dht` only at startup, no longer every `announce_interval`; nothing needs to reach it. It
   announces again at once when it starts to provide. Servers, and clients that provide, announce as before.
@@ -511,6 +533,10 @@ Changed:
 - `Config.load` reports invalid TOML as "<path> isn't valid TOML: …" (still a `ValueError`).
 
 Faster:
+- Range reads (`cat`, the gateway, sealed reads) size their window by the providers' links: they fetched 32 chunks
+  (2 MiB) before handing over the first byte, about 5 hours at LoRa's 1 kbit/s. While no provider known is reached
+  over a fast link (or none is known yet), the window is one chunk with the next asked for ahead, so the first
+  byte comes after one chunk (about 9 minutes at 1 kbit/s); over fast links it stays 32.
 - A start no longer lists every stored block before the API answers: their sizes are kept in the state database
   (`block_sizes`) and read from there after a clean stop. After a crash or power loss the start lists them all,
   as before, and corrects the table. Opening storage on a desktop NVMe disk (warm cache), small blocks: 100 000

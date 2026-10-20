@@ -12,14 +12,18 @@ from rnfs.constants import BLOCKS_PATH, FIND_PATH, PIN_PATH, PROVIDE_PATH
 from rnfs.content.cid import Cid
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name, plural, size
 from rnfs.network import protocol, rates
-from rnfs.network.links import Exchange, LinkPool
+from rnfs.network.links import Exchange, LinkPool, timed_out
 from rnfs import mesh
 
 # BlocksResult statuses
 OK = "ok"  # the node answered; see blocks, missing, unsent and bad
 BUSY = "busy"  # refused (False) under the node's limits, or the node cancelled the response (displaced or
 #               past its deadline, .reason "cancelled"); retry after a short delay. The link stays open
-FAILED = "failed"  # no link, no answer, or a malformed answer
+FAILED = "failed"  # no link (no path, or closed by the other node or this one), or a malformed answer
+# No answer the way a lossy link loses one: RNS timed the request out (the request or its answer lost), the response
+# transfer failed, the link timed out under it, or a new link to a node with a path wasn't established. Retry it on
+# a new link after a short delay (the fetcher closes this one)
+LOST = "lost"
 STALLED = "stalled"  # the response stopped making progress or missed its deadline; the link was closed
 
 
@@ -66,6 +70,12 @@ class PeerClient:
         """The packet MDU of the open link to node_id, which bounds the requests sent on it, or None."""
         peer = self.links.shared_peer(node_id)
         return peer.mdu() if peer is not None and peer.is_active() else None
+
+    def hold_link(self, node_id: bytes, seconds: float) -> bool:
+        """Count the shared link to node_id as in use for seconds more (LinkPool.hold): the fetcher waiting out the
+        node's upload pacing, so the idle sweep doesn't close the link, and with it the rate estimate the next
+        request is sized and paced by. False if there is no open link."""
+        return self.links.hold(node_id, seconds)
 
     def close(self, node_id: bytes):
         """Close the shared link to node_id, cancelling any transfer on it."""
@@ -205,6 +215,8 @@ class PeerClient:
             return BlocksResult(OK)
         peer = self.links.get(node_id)
         if peer is None:
+            if self.links.unestablished(node_id):
+                return BlocksResult(LOST, unsent=wanted, reason="link not established")
             return BlocksResult(FAILED, unsent=wanted, reason="unreachable")
 
         rate = peer.rate
@@ -230,7 +242,7 @@ class PeerClient:
             return BlocksResult(BUSY, unsent=wanted, reason="cancelled")
         if not exchange.answered:
             log(f"no answer from {name} to /blocks", LOG_VERBOSE)
-            return BlocksResult(FAILED, unsent=wanted, reason="no answer")
+            return BlocksResult(LOST if self._lost(peer, exchange) else FAILED, unsent=wanted, reason="no answer")
         if exchange.response is False:
             log(f"{name} is busy and refused /blocks", LOG_VERBOSE)
             return BlocksResult(BUSY, unsent=wanted, reason="busy")
@@ -247,6 +259,17 @@ class PeerClient:
         # From when it was sent: not opening the link or waiting for its /blocks slot
         result.elapsed = max(0.0, self.links.clock() - exchange.sent_at)
         return result
+
+    @staticmethod
+    def _lost(peer, exchange: Exchange) -> bool:
+        """True if a /blocks request sent on peer went unanswered the way a lossy link loses one: RNS gave up on it
+        with the link still up (it timed out: the request or the response's advertisement was lost, or the response
+        transfer ran out of retries), or the link itself timed out under it. Not when it wasn't sent, or the link
+        was closed by either end. A response RNS rejected at its advertisement (too large) fails the same way and
+        can't be told from a lost one, so it is retried too: no more than a busy refusal costs (section 6)."""
+        if peer.is_active():
+            return exchange.receipt is not None
+        return timed_out(peer.link)
 
     def _stall_watchdog(self, rate: float | None) -> Callable[[Exchange, float], str | None]:
         """Stall test for a /blocks response on a link with this rate estimate (section 7, step 5)."""
