@@ -1,7 +1,9 @@
 """Tests for sweep providing (rnfs/dht/sweep.py): regions, the far half's extra /find, the order lookups take keys in,
-and placement over a simulated network against per-key lookups and the true closest servers."""
+and placement over a simulated network against per-key lookups and the true closest servers, also for nodes on LoRa
+islands and at their first start (test_topology's world)."""
 import os
 import random
+import statistics
 import tempfile
 import threading
 import unittest
@@ -9,6 +11,7 @@ import unittest
 from rnfs.config import Config
 from rnfs.constants import ID_LENGTH, K
 from rnfs.content.storage import Storage
+from rnfs.dht.density import SizeEstimate
 from rnfs.dht.lookup import FIRST, SLOW_PATH, UNRELIABLE, Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable, distance
@@ -20,6 +23,7 @@ from tests.fakes.log import quiet_log
 from tests.support import FakeClock
 from tests.test_lookup import CONFIG, FakeNetwork
 from tests.test_publisher import FakeLookup
+from tests.test_topology import Peer, Topology
 
 OWN = bytes(ID_LENGTH)
 
@@ -333,6 +337,119 @@ class SimulatedNetworkTest(unittest.TestCase):
         exact = sum(1 for item in result["published"] if sent[item.key] == set(self.net.true_closest(item.key)))
         self.assertGreaterEqual(exact, 0.99 * len(result["published"]))
         self.assertTrue(all(isinstance(item, DhtKey) for item in result["published"]))
+
+
+class TopologySweepTest(unittest.TestCase):
+    """Sweep providing in test_topology's world (1,000 servers, 21% of them on 8 LoRa islands that hear their own island
+    and 16% of the rest), with the real Publisher and Sweep over each node's own lookups (rnfs.dht.lookups: disjoint
+    paths, the slow nodes' budgets of unknown IDs), against one lookup per key run by a twin of the node (so neither
+    learns from the other): of each key's true K closest servers, how many its round stores to (the region's K closest
+    and each path's), and the lookups the round runs. Stores to island servers aren't modelled as failing: an island's
+    gateway is up.
+
+    Measured over 5 worlds (docs/simulations/topology section 11.3, item 6, found 3.7 / 2.2 of 10 on an island against
+    7.0 / 6.6 with a lookup per key, at 1,000 / 3,000 servers): an island node's round placed 3.8 of 10 (6.6 keys a
+    region lookup) against 7.7 one lookup per key; a backbone node's 7.9 against 7.8 (island servers rank last there,
+    so about 2 of each key's true 10 are left out either way), in 63 lookups for 600 keys; a backbone node's first round
+    after its first start 0.3 of 10 (3 lookups for 100 keys, its few known servers padding the first lookup's result),
+    its second 1.9. In a world of 3,000 servers (islands hearing 5.3% of the rest; 3 worlds): island 2.3 of 10 against
+    5.8 (4.9 keys a region lookup), backbone 7.9 against 8.1 in 175 lookups, first start 0.1 and its second round 0.7.
+    The suite runs one world, in a few seconds."""
+
+    @classmethod
+    def setUpClass(cls):
+        """One world for the class."""
+        cls.world = Topology(7)
+
+    def round(self, peer: Peer, keys: list[bytes]) -> tuple[dict, dict[bytes, set[bytes]]]:
+        """One publish round of a Publisher over peer's lookups providing keys, its region lookups one at a time:
+        (its result, key -> the servers it stored to)."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        storage = Storage(os.path.join(tmp.name, "blocks"), os.path.join(tmp.name, "state"), 10**9)
+        self.addCleanup(storage.close)
+        client = FakeClient()
+        publisher = Publisher(peer.id, Config(rnfs_dir=tmp.name), storage, ProviderStore(None), client,
+                              peer.lookups.publish, peer.slow, clock=FakeClock(1_000_000.0), lookups_at_once=1)
+        publisher.add_key_source(lambda: set(keys))
+        publisher.refresh()
+        result = publisher.publish_due()
+        sent: dict[bytes, set[bytes]] = {}
+        for node_id, stored, _ in client.calls:
+            for key in stored:
+                sent.setdefault(key, set()).add(node_id)
+        return result, sent
+
+    def placed(self, key: bytes, nodes) -> int:
+        """How many of key's true K closest servers are among nodes."""
+        return len(set(nodes) & set(self.world.true_closest(key)))
+
+    @staticmethod
+    def per_key(peer: Peer, key: bytes) -> set[bytes]:
+        """The servers a lookup of key's own (a region of one key) stores it to."""
+        region = find_region(peer.lookups.publish(key), key, peer.id, lambda bits: 1)
+        return set(region.closest_to(key) + region.path_closest(key))
+
+    def newcomer(self, rng: random.Random) -> Peer:
+        """A backbone node at its first start: it knows the identities of 2 bootstrap servers and of those its join's
+        own-ID lookup asked, and has no network size estimate yet."""
+        peer = Peer(self.world)
+        boot = rng.sample(self.world.backbone, 2)
+        peer.known = set(boot)
+        peer.table = RoutingTable(peer.id, CONFIG, clock=self.world.net.clock)
+        for node_id in boot:
+            peer.table.heard(node_id)
+        peer.lookups.sizes = SizeEstimate()
+        peer.new_lookup(peer.id, peer.table.closest(peer.id, K)).find_closest()
+        for node_id in list(peer.known):
+            peer.table.heard(node_id)
+        return peer
+
+    def island_round(self) -> tuple[float, float, float]:
+        """Island nodes on two islands each run a round over 200 due keys (SLOW_ROUND_LOOKUPS region lookups):
+        (mean of each published key's true K closest stored to, the same with a lookup per key for 30 of them,
+        keys published per region lookup)."""
+        rng = random.Random(81)
+        swept, alone, per_lookup = [], [], []
+        for island in (0, 1):
+            keys = [rng.randbytes(ID_LENGTH) for _ in range(200)]
+            result, sent = self.round(Peer(self.world, island=island), keys)
+            published = [item.key for item in result["published"]]
+            self.assertEqual(result["lookups"], SLOW_ROUND_LOOKUPS)
+            swept += [self.placed(key, sent.get(key, ())) for key in published]
+            twin = Peer(self.world, island=island)
+            alone += [self.placed(key, self.per_key(twin, key)) for key in published[:30]]
+            per_lookup.append(len(published) / result["lookups"])
+        return statistics.mean(swept), statistics.mean(alone), statistics.mean(per_lookup)
+
+    def test_island_node(self):
+        """The regression: an island node's region lookup covers several due keys, sized by a result padded with the
+        island servers it knows far from the key, and the region's other keys miss most of their true closest."""
+        swept, alone, per_lookup = self.island_round()
+        self.assertGreaterEqual(alone, 6.5)
+        self.assertLessEqual(swept, alone - 2.5)
+        self.assertGreaterEqual(per_lookup, 4)
+
+    def test_backbone_node(self):
+        """A backbone node's round: placed as well as a lookup per key, in under one lookup per 5 keys."""
+        rng = random.Random(82)
+        keys = [rng.randbytes(ID_LENGTH) for _ in range(600)]
+        result, sent = self.round(Peer(self.world), keys)
+        self.assertEqual(len(result["published"]), len(keys))
+        swept = statistics.mean(self.placed(key, sent[key]) for key in keys)
+        twin = Peer(self.world)
+        alone = statistics.mean(self.placed(key, self.per_key(twin, key)) for key in keys[:60])
+        self.assertGreaterEqual(swept, alone - 0.3)
+        self.assertLessEqual(result["lookups"], len(keys) / 5)
+
+    def test_first_start(self):
+        """The regression: a node's first round after its first start, with no size estimate and few servers known,
+        covers most due keys with its first lookups and places them on almost none of their true closest."""
+        rng = random.Random(83)
+        keys = [rng.randbytes(ID_LENGTH) for _ in range(100)]
+        result, sent = self.round(self.newcomer(rng), keys)
+        self.assertLessEqual(result["lookups"], 10)
+        self.assertLessEqual(statistics.mean(self.placed(key, sent.get(key, ())) for key in keys), 1.5)
 
 
 class RegionPathsTest(unittest.TestCase):
