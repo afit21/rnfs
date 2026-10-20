@@ -852,6 +852,23 @@ class SecurityTest(NodeTest):
         self.assertEqual(small.storage.cached_fetches(), [])
         self.assertLessEqual(small.storage.used_bytes(), small.storage.pinned_bytes())
 
+    def test_max_storage_counts_disk_allocation(self):
+        # On FAT32 (32 KiB clusters) small files' blocks take far more disk than their bytes
+        with mock.patch.object(fsutil, "allocation_unit", return_value=32 * 1024):
+            small = self.make_node("fat", N1, max_storage=10**9)
+        cids = [small.add_stream(io.BytesIO(b"%d" % i * 100), pin=False)["cid"] for i in range(20)]
+        status = small.status()
+        self.assertEqual(status["allocation_unit"], 32 * 1024)
+        self.assertEqual(status["allocated_bytes"], 20 * 32 * 1024)
+        self.assertEqual(status["used_bytes"], 10 * 100 + 10 * 200)  # still the blocks' bytes, as in 0.1.6
+        # A lower max_storage: the bytes fit, the allocation doesn't
+        small.storage.max_storage = small.config.max_storage = 10 * 32 * 1024
+        small._enforce_storage()  # what the maintenance pass and the setting run
+        self.assertLessEqual(small.storage.allocated_bytes(), small.config.max_storage)
+        kept = {str(target) for target in small.storage.cached_targets()}
+        self.assertTrue(kept)
+        self.assertEqual(kept, set(cids[-len(kept):]))  # the least recently added went first
+
     def test_fetch_too_big_for_the_disk_is_refused(self):
         big = self.a.add_stream(io.BytesIO(os.urandom(4 * CHUNK_SIZE)))["cid"]
         self.advertise(big)

@@ -547,6 +547,15 @@ Changed:
   (1,029 blocks) to a new store on a desktop NVMe disk: 1.02 → 1.41 s; a tree of 1,024 8 KiB files 0.95 → 1.43 s;
   fetching them (each block synced on its own) unchanged at about 13.5 s (`tests/bench_block_writes.py`,
   `today`, median of 3). Raspberry Pi SD-card numbers are still to be measured.
+- `max_storage` counts what blocks take on disk: each block is a file of its own, so its size rounded up to the
+  filesystem's block or cluster (read once at the start: at least 4 KiB, 16–32 KiB on a FAT32 USB drive), not its
+  length. On FAT32 a store of small files took several times `max_storage`: 2,000 notes of 200 B–8 KB are 4.1 MiB
+  of blocks but 63 MiB of 32 KiB clusters (9.4 MiB at 4 KiB). Stores of large files barely change (64 KiB chunks
+  fill whole clusters: a mixed store of 297 MiB takes 298 MiB at 4 KiB, 312 MiB at 32 KiB), so cache is evicted a
+  little sooner. `rnfs status` (`GET /api/status`) gains `allocated_bytes`, what `max_storage` counts, and
+  `allocation_unit`; `used_bytes` stays the blocks' bytes. Quotas (`follow_quota`, `remote_pin_quota`) and
+  `max_download_size` still count bytes of content and blocks. Nothing is stored for it: it follows from the block
+  sizes rnfs keeps.
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather
   than sending the request on a second connection as it did for them until now (the fallback planned to go in
   0.2.0): stop such a daemon and start the new one. Every daemon of 0.1.5 or later works as before.

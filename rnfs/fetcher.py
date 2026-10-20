@@ -1149,7 +1149,7 @@ class Fetch:
         nothing is evictable), and check the disk. Raises StorageFull if the disk can't take them."""
         if nbytes == 0:
             return
-        if not self.pinned and self.storage.used_bytes() + nbytes > self.storage.max_storage:
+        if not self.pinned and self.storage.allocated_bytes() + nbytes > self.storage.max_storage:
             self.fetcher.make_room(nbytes)
         self.storage.check_disk(nbytes)  # each response, so a DAG whose nodes alone are large stops too
 

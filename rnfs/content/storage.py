@@ -15,6 +15,9 @@
 - max_storage is soft: no fetch is refused for it, and storage may exceed it while fetches run or when
   pins alone fill it. The hard bound is the disk: check_disk() refuses blocks that would leave less than
   DISK_RESERVE free on the filesystem holding the blocks.
+- max_storage counts what the blocks take on disk (allocated_bytes): each block's size rounded up to the block
+  store's allocation unit (fsutil.allocation_unit, read once at the start), since each is a file of its own and
+  a small one takes a whole cluster (16-32 KiB on FAT32). used_bytes, the quotas and stat count block bytes.
 
 Pins and cache records are persisted in the state database (rnfs.statedb), and only read from it at startup:
 each pin and release at once, as one row inserted or deleted and committed durably (after the blocks it keeps
@@ -38,7 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Callable, Iterator
 
-from rnfs import denylist, ids, statedb
+from rnfs import denylist, fsutil, ids, statedb
 from rnfs.constants import MAX_BLOCK_SIZE, MIB
 from rnfs.content import blockstore, dag, walker
 from rnfs.content.blockstore import BlockStore
@@ -348,6 +351,7 @@ class Storage:
             self._db.close()
             raise
         self._used = sum(self._sizes.values())
+        self._allocated = sum(map(self._allocation, self._sizes.values()))
         self._pins: dict[Cid, set[str]] = {}
         # When each pinned CID was first pinned by any source (Unix time; pin_times); one pinned before rnfs 0.2.0
         # has none
@@ -398,6 +402,9 @@ class Storage:
             with self._db.transaction(durable=True) as tx:
                 statedb.set_meta(tx, SIZES_STORE, "clean", 0)
         self.blocks = BlockStore(blocks_dir, report=lambda text: log(f"storage: {text}", LOG_NOTICE))
+        # What the blocks' filesystem allocates a file in, read once: the filesystem under a directory rnfs keeps
+        # open doesn't change while it runs, and a stat per block would cost a syscall each
+        self.allocation_unit = fsutil.allocation_unit(self.blocks.directory)
         sizes = self._load_sizes() if clean == 1 else None
         if sizes is not None:
             # Blocks found directly in blocks/: those a failed move left there are in the table, but an older rnfs
@@ -641,6 +648,7 @@ class Storage:
             if cid not in self._sizes:
                 self._sizes[cid] = self._sizes_dirty[cid] = len(block)
                 self._used += len(block)
+                self._allocated += self._allocation(len(block))
                 self._changes += 1
                 if not protected:
                     self._maybe_garbage = True
@@ -649,6 +657,15 @@ class Storage:
         """Bytes of every stored block."""
         with self._lock:
             return self._used
+
+    def allocated_bytes(self) -> int:
+        """What every stored block takes on disk (_allocation of each one's size): what max_storage bounds."""
+        with self._lock:
+            return self._allocated
+
+    def _allocation(self, length: int) -> int:
+        """What a block of length bytes takes on disk: a file of its own, so rounded up to the allocation unit."""
+        return fsutil.allocated(length, self.allocation_unit)
 
     def block_count(self) -> int:
         """Number of stored blocks."""
@@ -1076,7 +1093,7 @@ class Storage:
         matches the disk; it is left out of deleted, and the next collection tries again.
         """
         deleted: set[Cid] = set()
-        freed = 0
+        freed = released = 0  # bytes, and what they took on disk
         deferred = False
         if self._closed:
             return deleted, freed  # the sizes are saved: the blocks stay, and are collected after the next start
@@ -1087,13 +1104,16 @@ class Storage:
                     deferred = True
                     continue
                 deleted.add(cid)
-                freed += self._sizes.pop(cid)
+                length = self._sizes.pop(cid)
+                freed += length
+                released += self._allocation(length)
                 self._sizes_dirty[cid] = None
                 self._links.pop(cid, None)
                 self._steps.pop(cid, None)
                 self._reported_damaged.discard(cid)
         if deleted:
             self._used -= freed
+            self._allocated -= released
             self._generation += 1
             self._complete = {root: blocks for root, blocks in self._complete.items() if not blocks & deleted}
             self._complete_bytes = {root: n for root, n in self._complete_bytes.items() if root in self._complete}
@@ -1114,8 +1134,9 @@ class Storage:
         return deleted, freed
 
     def _evict_to(self, limit: int) -> tuple[set[Cid], int, int]:
-        """Delete unreached blocks, then cached fetches least recently used first, until at most limit bytes
-        are stored or nothing evictable is left; returns (deleted, bytes freed, records evicted) (lock held).
+        """Delete unreached blocks, then cached fetches least recently used first, until the blocks take at most
+        limit bytes on disk (allocated_bytes) or nothing evictable is left; returns (deleted, bytes freed, records
+        evicted) (lock held).
 
         One walk: what pins and sessions reach, then each record's own blocks from the most recently used
         down, keeping records while everything kept fits; the older ones are evicted.
@@ -1127,7 +1148,8 @@ class Storage:
         # What pins and sessions don't reach, rather than what they do: the bytes kept follow from it with one
         # pass over the stored blocks, and the blocks to delete are what is left of it once records are kept
         dead = self._sizes.keys() - live
-        kept = self._used - sum(map(self._sizes.__getitem__, dead))
+        allocation = self._allocation
+        kept = self._allocated - sum(allocation(self._sizes[cid]) for cid in dead)
         partial: set[Cid] = set()  # path nodes kept without the rest of their DAG: see _reach
         records = list(self._cache.items())  # oldest first
         keep = 0
@@ -1135,7 +1157,7 @@ class Storage:
             reached = self._reach({target}, live, damaged, partial)
             path = self._path_cids(root, names, damaged) - live
             more = reached | path
-            more_bytes = sum(map(self._sizes.__getitem__, more))
+            more_bytes = sum(allocation(self._sizes[cid]) for cid in more)
             if kept + more_bytes > limit:
                 break
             live |= more
@@ -1356,15 +1378,16 @@ class Storage:
                               f"{size(reserve)} reserve free ({size(usage.free)} free)")
 
     def evict(self, needed: int = 0) -> set[Cid]:
-        """Enforce max_storage, leaving room for needed more bytes: delete unreached blocks, then cached
-        fetches least recently used first. Evicts a margin more, so it needn't run again at once.
+        """Enforce max_storage over what the blocks take on disk (allocated_bytes), leaving room for needed more
+        bytes: delete unreached blocks, then cached fetches least recently used first. Evicts a margin more, so it
+        needn't run again at once.
 
         Returns pins and cached targets that were complete and no longer are, for withdrawal.
         """
         def wanted() -> bool:
             """Whether eviction has anything to do (lock held)."""
             # With nothing evictable, don't walk everything to find that out again
-            return self._used + needed > self.max_storage and (bool(self._cache) or self._maybe_garbage)
+            return self._allocated + needed > self.max_storage and (bool(self._cache) or self._maybe_garbage)
 
         with self._lock:
             if not wanted():

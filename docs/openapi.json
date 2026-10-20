@@ -6495,10 +6495,20 @@
             "description": "Blocks stored."
           },
           "used_bytes": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Bytes of the blocks stored."
           },
           "max_storage": {
-            "type": "integer"
+            "type": "integer",
+            "description": "The max_storage setting: cached fetches are evicted while allocated_bytes is above it."
+          },
+          "allocated_bytes": {
+            "type": "integer",
+            "description": "What the blocks stored take on disk: each block's size rounded up to allocation_unit, since each is a file of its own. What max_storage counts (rnfs 0.2.0)."
+          },
+          "allocation_unit": {
+            "type": "integer",
+            "description": "The bytes the blocks' filesystem allocates a file in (its block or cluster size, at least 4096), read at the start (rnfs 0.2.0)."
           },
           "names": {
             "type": "integer",
@@ -6564,6 +6574,8 @@
           "blocks",
           "used_bytes",
           "max_storage",
+          "allocated_bytes",
+          "allocation_unit",
           "names",
           "unexported_names",
           "announces_held",
