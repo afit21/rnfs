@@ -677,7 +677,7 @@ until the wrapper's first release; the owner decided to remove it in 0.2.0 witho
   are kept. Served outcomes carry a reason (quota, not found, denied, queue full, ...). `remote_pin` events report both
   sides.
 
-## Security fixes from the 0.2.0 review (to do)
+## Security fixes from the 0.2.0 review (implemented)
 
 A review of 0.2.0 against remote and local attackers (read-only; findings checked against the code). Each fix is
 local or an existing refusal (`False`), and gets a regression test in `tests/security/` as CONTRIBUTING asks.
@@ -724,6 +724,38 @@ local or an existing refusal (`False`), and gets a regression test in `tests/sec
 * Provider standings of publishers with no records left are capped by count (today only by `PROVIDER_TTL`)
 * Docs: an app token can do whatever the CLI can, managing apps included in effect; sealed files depend on the
   recipient's node key, which is always online and stored unencrypted; what `provide_entries` publishes
+* As implemented (IDs REV1–REV12 in this order, `tests/security/test_rev<N>_*.py`, indexed in
+  `tests/security/README.md`):
+  - REV1: `add` also refuses anything in the rnfs dir outside `files/` (`shared_folder.add_refused_reason`):
+    `refused_reason` allows the rnfs dir's top level, where the shared folder lives, so `add ~/.rnfs/api_token`
+    would have stayed open. Walks skip, and refuse as a root, the rnfs dir and its private subdirectories by
+    `(st_dev, st_ino)` of the resolved directories (`shared_folder.private_dirs`, `BuildOptions.skip_dirs`)
+  - REV2: a token bucket per 30 s window, 60 rows open to every tier plus 30 each kept for Earned and Known,
+    carried over up to 6 h; withdrawals spend it but are never refused, refreshes are free. Measured: a new record
+    costs 12–36 kB of writes on a 1M-record database, so a Newcomer flood writes at most about 150 kB/s (was about
+    22.6 MB/s in-process, 9.5 MB/s at 100 requests a second over a 165k-record store)
+  - REV3: Newcomers keep a tenth of a full key (`KEY_NEWCOMER_SHARE`); Known records give way only to Known
+    storers, and only when nothing else is left
+  - REV4: 3 failures of known servers wake an immediate probe; partition mode follows only if it fails, or if
+    nothing off the island was heard this run. Island content still found 100% of the time; 0.2 timeouts and 33 s
+    a search (0.15 and 31 s before: the probe); the week without flapping unchanged
+  - REV5: a page over 16 MiB (`MAX_PAGE_SIZE`) fails as too large, not as refused
+  - REV6: on a site, sniffing gives only an allow-list of passive types (`SITE_SNIFFED_TYPES`: images, audio,
+    video, woff2, wasm, UTF-8 text), so PDF downloads too unless named `.pdf`; a site whose root is itself a file
+    sniffs as on the path gateway (it is its origin's only content)
+  - REV7: when full, the log forgets first a server silent for 2 × `announce_interval`, then the not-yet-senior
+    server first heard most recently, a live senior one only when nothing else can go (forgetting departed
+    seniors first keeps them from filling a long-running node's log). A flood of 1.5× the log every 6 h: 200 of
+    200 honest servers senior after 2 days, against none
+  - REV8: counting only verified nodes underestimated islands (898 → 256 of 1,000 servers; the density check
+    then flagged 93% of island searches): a sample is instead the run of verified servers from the closest out to
+    the first unverified one, at most `K`, its last distance scaled to rank `K`. Made-up IDs: 288 → 318 over 300
+    servers (743 before); islands 946 of 1,000, flagged 8.3%; about 1.3× left to an attacker asked in every lookup
+  - REV9: the gap was on every answer the API writes (open status, 403, 404, 405); the stand-in proof is computed
+    for every name, so time doesn't tell either
+  - REV10: counted per block and chunk in allocation units (`fsutil.allocation_unit`, at least 4 KiB), the tar's
+    headers scanned before anything is stored; a `meta` mark collects after a start that finds it (no schema step)
+  - REV11: `MAX_DEPARTED` = 50,000 standings without records, fewest refresh days first
 
 ## Fetching reliably on LoRa (to do)
 
