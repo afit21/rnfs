@@ -226,6 +226,10 @@ class Status(_Object):
     max_storage: int | None = None
     names: int | None = None
     unexported_names: list | None = None  # aliases whose key was never exported or imported (rnfs 0.2.0)
+    announces_held: list | None = None  # aliases whose announces wait for the clock to pass their last (rnfs 0.2.0)
+    # The network's clock less this node's (seconds, positive when it is behind), estimated from the announces heard;
+    # None until enough were (rnfs 0.2.0)
+    clock_offset: int | None = None
     local_servers: int | None = None  # the servers on this node's island it knows of (rnfs 0.2.0)
     partition: bool | None = None  # cut off from the servers beyond its island: local ones only (rnfs 0.2.0)
     partition_since: float | None = None  # Unix time partition mode began, while in it

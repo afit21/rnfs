@@ -1352,7 +1352,33 @@ A **name** is a mutable pointer to a CID, owned by a key pair: the IPNS equivale
    names pinned; any other pin of the source is released at the next start, section 8).
 5. Announce, and re-announce every `announce_interval`. In private mode the announce reaches outsiders all the
    same (section 3), and the publish warns of it: rnfs adds a `warning` to the result (`POST /api/name/publish`
-   and `rnfs name publish`, which prints it to stderr).
+   and `rnfs name publish`, which prints it to stderr). While the clock is behind the name's last announce, the
+   announce is held (below), and the result says so in `announce_held`.
+
+**Announces and the clock** (rnfs 0.2.0). An announce carries the time it was emitted, by its sender's clock,
+signed (bytes 5–10 of its random blob). RNS 1.5.6 replaces a path with a later announce of no more hops only if it
+was emitted strictly later than every announce the path holds (`Transport.inbound`), and an announce that doesn't
+change the path never reaches announce handlers. So a node whose clock went back (a Raspberry Pi without a clock,
+restarted on the time it last saved) has its name announces dropped silently by every node holding a path to the
+name, until that path lapses: a week after the node took it (`DESTINATION_TIMEOUT`; a day on access point
+interfaces, 6 hours on roaming ones).
+- A publisher SHOULD keep, per name, the emission time of its last announce, and not announce the name while its
+  clock is behind it (holding the announce rather than sending one RNS drops). rnfs persists it in whole seconds,
+  as RNS signs it; the newest emission RNS holds a path to the name from (the key announced on another machine
+  before) counts too. A publish while held is committed as usual (persisted, pinned, kept by keepers, resolvable
+  here and through keepers); its result carries `announce_held`, why, and `status` lists the held names in
+  `announces_held`. The held announce goes out once the clock passes the last one (rechecked every minute), or
+  anyway once the name has been held a week in all, counted across restarts, by when the paths that would drop
+  it have lapsed. A clock in the same second as the last announce isn't held (RNS drops that announce too, until
+  the next re-announce, as before 0.2.0).
+- A node SHOULD estimate its clock's offset from the emission times of announces it hears live (rnfs.dht announces
+  and names' announces, not path responses, and not those of names it is resolving, which a shared instance may
+  pass on as announces): per sender its least delayed announce over 2 × `announce_interval`, and the median over
+  senders, so that a few wrong or lying clocks can't move it. A node publishing many names has one clock, so
+  names count for fewer senders than nodes do, except to make up the 5 an estimate needs. Late and replayed
+  announces can only make the clock look ahead, never behind. rnfs reports the estimate in `status`
+  (`clock_offset`, seconds, positive when this node's clock is behind; null until 5 senders were heard) and logs a
+  warning while it is over 5 minutes off; it never changes the clock or what the node does.
 
 Before the first publish of a key imported from elsewhere, or found without stored state, the node resolves
 the name through the network and asks keepers (below), since the key's earlier records may be held only there.
@@ -1705,7 +1731,7 @@ are local conveniences, not part of the protocol.
 | `providers <cid>` | Find nodes providing a CID |
 | `ping <node ID>` | Open a link and report its round-trip time (`rnprobe` can't probe `rnfs.dht`, which doesn't send delivery proofs) |
 | `name create\|rm\|export\|import <alias>`, `name list` | Manage name keys; `rm` releases the name's pin. A name can't move to another key, so losing its key loses the name for good: `create` and `import` say so and give the `export` command, the node remembers which keys were exported (by `name export`) or imported, and `status` lists the others (`unexported_names`; keys made before rnfs 0.2.0 count as never exported) |
-| `name publish <alias> <cid>[/path]`, `name resolve <name>` | Mutable names. Every `<name>` argument is 32 hex digits or a name contact's nick |
+| `name publish <alias> <cid>[/path]`, `name resolve <name>` | Mutable names. Every `<name>` argument is 32 hex digits or a name contact's nick. `publish` says on stderr when the name's announce is held because the clock is behind its last announce (`announce_held`, section 9) |
 | `name keep\|unkeep <name>`, `name kept` | Keep a name's signed record and serve it (section 9) |
 | `name follow\|unfollow <name>`, `name following` | Keep a name's latest target pinned (section 9) |
 | `name sync <alias> <folder>`, `name unsync <alias>`, `name syncs [--json]` | Keep a name pointing at a folder's current content, published at most once an hour once it has been unchanged a minute (section 9, Syncing a folder); `syncs` lists each sync's folder, state (`new`, `settling`, `waiting`, `synced`, `paused` and why), the root last imported and the one last published and when (rnfs: `POST /api/name/sync {"alias", "path"}`, `POST /api/name/unsync {"alias"}`, `GET /api/name/syncs`) |
@@ -1717,7 +1743,7 @@ are local conveniences, not part of the protocol.
 | `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
 | `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), the local servers it knows of (`local_servers`, section 6 "LoRa islands") and whether it is in partition mode and since when (`partition`, `partition_since`: Unix time, or null), what it sees of the network (`network`, `record_store`: Network status, below), storage use, traffic, jobs, deny-list entries and sources (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), the local servers it knows of (`local_servers`, section 6 "LoRa islands") and whether it is in partition mode and since when (`partition`, `partition_since`: Unix time, or null), the clock's estimated offset from the network's and the names whose announces are held (`clock_offset`, `announces_held`: section 9, "Announces and the clock"; `rnfs status` warns on stderr of an offset over 5 minutes and of held names), what it sees of the network (`network`, `record_store`: Network status, below), storage use, traffic, jobs, deny-list entries and sources (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
 
 **Network status** (rnfs 0.2.0). `status` (`GET /api/status`, the library's `Status`) also reports what the node can
 see of the network from its own state, with nothing sent to learn it: the cheapest way to learn how big the network

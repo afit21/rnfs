@@ -1050,8 +1050,9 @@ class ApiConnection:
         self.post("/api/name/rm", alias=alias)
 
     def name_publish(self, alias: str, target: str) -> dict:
-        """Point a name of this node at a target: {"name", "cid", "sequence"}, and "warning" in private mode (the
-        name's announce is visible outside the private network)."""
+        """Point a name of this node at a target: {"name", "cid", "sequence"}, "warning" in private mode (the
+        name's announce is visible outside the private network), and "announce_held" while the node's clock is behind
+        the name's last announce (why: the announce goes out once the clock passes it)."""
         return self.post("/api/name/publish", alias=alias, target=target)
 
     def name_sync(self, alias: str, path: str) -> dict:

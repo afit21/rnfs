@@ -18,7 +18,7 @@ status of 0.1.6 is unchanged but LXMF's, which are gone, and error bodies gain a
 Upgrade notes:
 - **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
   `routing`, `peer_scores`, `announce_first_seen`, `provider_standing`, `remote_pins_asked`, `remote_pins_served`,
-  `name_syncs`, `name_sync_files`, `published_heal`); an older rnfs can't open it afterwards. Pins made before the
+  `name_syncs`, `name_sync_files`, `published_heal`, `name_announces`); an older rnfs can't open it afterwards. Pins made before the
   upgrade have no `added` time, name keys made before it count as never exported (`rnfs status` lists them until
   `rnfs name export` is run), and remote pins asked before it have no status entry.
 - **LXMF:** rnfs no longer sends or receives LXMF (Removed, below). Pins of links auto-fetched over LXMF change
@@ -201,6 +201,16 @@ Added:
   which keys were exported by `name export` or imported, and `rnfs status` (`GET /api/status`,
   `Status.unexported_names`) lists the names whose key never was. `name list` entries and `rnfs.Name` gain
   `exported`.
+- **Clock problems are noticed:** RNS drops an announce emitted (by its sender's clock) no later than the one it took
+  a path from, so a Raspberry Pi without a clock that came back on an older time lost its name updates silently, for
+  up to a week. The node now remembers each name's last announce (`name_announces`) and holds the name's announces
+  while its clock is behind it: a publish is committed as usual, its result says why the announce is held
+  (`announce_held`, printed by `rnfs name publish`, a `RuntimeWarning` from `Name.publish`), and the announce goes
+  out once the clock passes the last one, or after a week held in all. `GET /api/status` (`Status`) gains
+  `announces_held` and `clock_offset`, the clock's offset from the network's estimated from the emission times of
+  the announces heard (the median over senders, so a few wrong clocks don't move it); a warning is logged, and
+  printed by `rnfs status`, while it is over 5 minutes off. The estimate never changes the clock or what the node
+  does. Name syncs publish through the same path.
 - **Pin by NomadNet address:** `rnfs add <destination>:/page/<path>` (a page as the node renders it) or
   `<destination>:/file/<path>` (a file it serves) fetches it from that NomadNet node over a link of rnfs's own and adds
   it like a file, pinned `user` (with an app's token, that app's source) with the link as its origin in `pin ls`; the

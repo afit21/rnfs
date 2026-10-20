@@ -949,6 +949,163 @@ class RefreshCacheTest(NamesTestCase):
         self.assertEqual(self.manager._refreshing, {})
 
 
+class AnnounceHoldTest(NamesTestCase):
+    """A name's announces are held while the clock is behind its last announce, which RNS would take them as replays
+    of (section 9, "Announces and the clock"). The wall clock and the monotonic one are separate here."""
+
+    def setUp(self):
+        """A manager whose monotonic clock is its own, with a published name announced at the start."""
+        super().setUp()
+        self.mono = FakeClock(50_000.0)
+        self.manager = self.make_manager()
+        self.name = self.manager.create("site")
+        self.manager.publish("site", CID_A)
+        self.manager.start()
+        self.last = int(self.clock.now)
+        self.assertEqual(self.announced(), [encode_record(1, CID_A)])
+
+    def make_manager(self) -> NameManager:
+        """A manager over the same directory, its wall clock self.clock and its monotonic clock self.mono."""
+        mono = getattr(self, "mono", None) or self.clock
+        manager = NameManager(self.config, self.pins, network=self.network, clock=self.clock, monotonic=mono,
+                              wait=lambda event, timeout: event.is_set())
+        self.addCleanup(manager.close)
+        return manager
+
+    def announced(self) -> list:
+        """The records announced for the name so far."""
+        return self.network.destinations[self.name].announced
+
+    def restart_behind(self, seconds: float) -> NameManager:
+        """Stop the manager and start another with the clock set seconds before the last announce."""
+        self.manager.stop()
+        self.manager.close()
+        self.clock.now = self.last - seconds
+        self.manager = self.make_manager()
+        self.manager.start()
+        return self.manager
+
+    def test_last_announce_is_persisted(self):
+        """Each announce's emission time is saved, in whole seconds as RNS signs it."""
+        self.assertEqual(self.rows("SELECT name, emitted, held FROM name_announces"), [(self.name, self.last, 0.0)])
+        self.clock.now += 3600.5
+        self.mono.now += 3600
+        self.manager.announce_due()
+        self.assertEqual(self.rows("SELECT emitted FROM name_announces"), [(self.last + 3600,)])
+
+    def test_publish_held_while_the_clock_is_behind(self):
+        """A Pi without a clock comes back 10 minutes behind its last announce: the start's announce is held, and a
+        publish is committed but held too, its result and status saying so, until the clock passes it."""
+        manager = self.restart_behind(600)
+        self.assertEqual(len(self.announced()), 0)  # a new destination: nothing announced through it
+        self.assertEqual(manager.announce_status()["announces_held"], ["site"])
+        result = manager.publish("site", CID_B)
+        self.assertEqual(result["sequence"], 2)
+        self.assertIn("10 min behind the name's last announce", result["announce_held"])
+        self.assertEqual(self.announced(), [])
+        # Committed: resolved and kept here, and pinned, like any publish
+        self.assertEqual(manager.resolve(self.name, persist=True)["cid"], str(CID_B))
+        self.assertIn(CID_B, self.pins.sources)
+
+        # Rechecked every minute; still behind
+        self.clock.now += 300
+        self.mono.now += 300
+        self.assertLessEqual(manager.announce_due(), names.HOLD_RECHECK)
+        self.assertEqual(self.announced(), [])
+        # The clock passes the last announce: the new record goes out, and the hold ends
+        self.clock.now = self.last + 1
+        self.mono.now += 60
+        manager.announce_due()
+        self.assertEqual(self.announced(), [encode_record(2, CID_B)])
+        self.assertEqual(manager.announce_status()["announces_held"], [])
+        self.assertNotIn("announce_held", manager.publish("site", CID_C))
+        self.assertEqual(self.announced()[-1], encode_record(3, CID_C))
+
+    def test_a_clock_at_the_last_announce_is_not_held(self):
+        """Only a clock behind holds: one in the same second as the last announce announces (RNS may drop that one,
+        as it did before 0.2.0, until the next re-announce)."""
+        manager = self.restart_behind(0)
+        self.assertEqual(self.announced(), [encode_record(1, CID_A)])
+        self.assertNotIn("announce_held", manager.publish("site", CID_B))
+
+    def test_a_path_heard_from_the_key_elsewhere_holds_too(self):
+        """A key used on another machine: the newest emission RNS holds a path to the name from counts as its last
+        announce, though this node never announced it."""
+        self.network.emitted[self.name] = self.clock.now + 120
+        self.assertIn("2 min behind", self.manager.publish("site", CID_B)["announce_held"])
+        self.assertEqual(self.announced(), [encode_record(1, CID_A)])
+
+    def test_held_at_most_a_week_in_all(self):
+        """A clock far behind (no saved time at all) holds the announces for HOLD_LIMIT, counted across restarts: by
+        then every path taken from the last announce has lapsed, and the announces go out though still behind."""
+        manager = self.restart_behind(365 * 24 * 3600)
+        self.assertEqual(manager.announce_status()["announces_held"], ["site"])
+        for _ in range(4):  # 4 days, a minute at a time being too slow: one recheck a day
+            self.mono.now += 24 * 3600
+            manager.announce_due()
+        self.assertEqual(self.announced(), [])
+        manager = self.restart_behind(365 * 24 * 3600)  # the 4 days held are saved at stop
+        self.assertEqual(self.rows("SELECT held FROM name_announces"), [(4 * 24 * 3600.0,)])
+        self.mono.now += 3 * 24 * 3600 - 1
+        manager.announce_due()
+        self.assertEqual(self.announced(), [])
+        self.mono.now += names.HOLD_RECHECK
+        manager.announce_due()
+        self.assertEqual(self.announced(), [encode_record(1, CID_A)])
+        self.assertEqual(manager.announce_status()["announces_held"], [])
+        # Announced at the clock as it is: the next announces aren't held
+        self.assertEqual(self.rows("SELECT emitted, held FROM name_announces"), [(int(self.clock.now), 0.0)])
+        self.assertNotIn("announce_held", manager.publish("site", CID_B))
+
+    def test_held_time_saved_while_held(self):
+        """The time held is saved within HOLD_SAVE while held, not only at stop, so a crash loses little of it."""
+        manager = self.restart_behind(600)
+        self.mono.now += names.HOLD_SAVE - 1
+        manager.announce_due()
+        self.assertEqual(self.rows("SELECT held FROM name_announces"), [(0.0,)])
+        self.mono.now += names.HOLD_RECHECK
+        manager.announce_due()
+        self.assertEqual(self.rows("SELECT held FROM name_announces"), [(names.HOLD_SAVE - 1 + names.HOLD_RECHECK,)])
+
+    def test_removed_name_drops_its_hold(self):
+        """Removing a held name ends its hold; its last announce stays saved, for when the key comes back."""
+        manager = self.restart_behind(600)
+        manager.remove("site")
+        self.assertEqual(manager.announce_status()["announces_held"], [])
+        self.assertEqual(self.rows("SELECT name FROM name_announces"), [(self.name,)])
+
+    def test_malformed_rows_are_dropped(self):
+        """A damaged name_announces row only loses a reason to hold: the node starts and announces."""
+        self.manager.stop()
+        self.manager.close()
+        state_execute(self.config.state_dir, "UPDATE name_announces SET emitted = 'soon', held = 'x'")
+        self.clock.now -= 600
+        manager = self.make_manager()
+        manager.start()
+        self.assertEqual(self.announced(), [encode_record(1, CID_A)])
+
+    def test_status_reports_the_clock_estimate(self):
+        """announce_status gives the clock estimate from the name announces heard: none until enough senders."""
+        self.assertEqual(self.manager.announce_status(), {"announces_held": [], "clock_offset": None})
+        for i in range(1, 6):
+            self.network.emitted[other_name(i)] = self.clock.now + 400
+            self.network.announce(other_name(i), encode_record(1, CID_A), self.clock.now)
+        self.assertEqual(self.manager.announce_status()["clock_offset"], 400)
+
+    def test_path_responses_and_asked_names_are_not_samples(self):
+        """A path response, or an announce of a name a resolve is waiting for (a shared instance passes path answers
+        on as announces), says nothing of its owner's clock now."""
+        for i in range(1, 6):
+            self.network.emitted[other_name(i)] = self.clock.now - 3600
+            self.network.handlers[0].received_announce(other_name(i), None, encode_record(1, CID_A), None, True)
+        self.assertEqual(self.manager.clock_skew.estimate(), (None, 0))
+        self.manager._waiters[other_name(1)] = [threading.Event()]
+        self.manager._heard(other_name(1), encode_record(2, CID_A))
+        self.assertEqual(self.manager.clock_skew.estimate(), (None, 0))
+        self.manager._heard(other_name(2), encode_record(2, CID_A))
+        self.assertEqual(self.manager.clock_skew.estimate(), (None, 1))
+
+
 class StateTest(NamesTestCase):
     """The published and held records in the state database: what a save writes, failed commits, damaged rows."""
 

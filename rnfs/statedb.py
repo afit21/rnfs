@@ -254,6 +254,12 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         # 0.2.0, section 6 "LoRa islands"): republished when partition mode ends, also after a restart
         "CREATE TABLE published_heal (item TEXT PRIMARY KEY) WITHOUT ROWID",
     )),
+    ("name_announces", (
+        # This node's last announce of each of its names (rnfs 0.2.0; rnfs.names, "Announces and the clock"): when it
+        # was emitted (Unix time, whole seconds, as RNS signs it; NULL if none went out yet), and for how many seconds
+        # the name's announces have been held since, the clock being behind it. Kept when the name is removed
+        "CREATE TABLE name_announces (name BLOB PRIMARY KEY, emitted INTEGER, held REAL NOT NULL) WITHOUT ROWID",
+    )),
 )
 
 

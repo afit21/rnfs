@@ -419,6 +419,14 @@ class PublicTests:
             self.assertEqual(name.publish(cid).sequence, 2)
         self.assertEqual(rnfs.Name.from_dict(name.to_dict()), name)
 
+        # An announce held for the clock is warned of the same way
+        def held_publish(alias, target):
+            return {**original(alias, target), "announce_held": "announce held: this node's clock is behind"}
+
+        with mock.patch.object(self.rnfs._backend, "name_publish", held_publish), \
+                self.assertWarnsRegex(RuntimeWarning, "clock is behind"):
+            self.assertEqual(name.publish(cid).sequence, 3)
+
     def test_watch_hears_newer_records_on_the_event_thread(self):
         """A watch hears newer records only, on the event thread, with the names lock free, until cancelled."""
         first, second = self.rnfs.add(b"one").cid, self.rnfs.add(b"two").cid
