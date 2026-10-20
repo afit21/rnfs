@@ -165,7 +165,9 @@ class SharedFolderTargetTest(unittest.TestCase):
         0.1.6 scan (over the same state) releases that pin and empties the shared_folder table."""
         self.point_at(os.path.join(self.root, "names"))
         earlier = self.open()
-        with mock.patch.object(shared_folder, "refused_reason", lambda real, rnfs_dir: None):  # as 0.1.5 scanned
+        # As 0.1.5 scanned: neither the path check nor (REV1) the device-and-inode one
+        with mock.patch.object(shared_folder, "refused_reason", lambda real, rnfs_dir: None), \
+                mock.patch.object(shared_folder, "private_dirs", lambda rnfs_dir: frozenset()):
             imported = earlier.scan()
         key = Cid.for_block(RAW, NAME_KEY)
         self.assertEqual(imported, {key})

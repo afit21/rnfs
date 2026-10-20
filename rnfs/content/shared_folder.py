@@ -23,8 +23,11 @@ the rnfs dir, a directory holding it, or one inside the subdirectories holding i
 is refused, with a warning: it counts as empty, so nothing in it is imported and every folder pin is released
 (audit CONT-3). The check is made on the folder as opened, which the scan then walks, so a link retargeted after
 it can't redirect the scan. A folder below a directory other users can change, who could retarget it, is scanned
-with a warning.
+with a warning. Another way to those directories that the path check can't see, such as a bind mount, is caught by
+device and inode (private_dirs, taken at the start of each scan): the folder is refused if it is one, and an entry
+or a directory inside one that is one is skipped with a warning (audit REV1).
 """
+import dataclasses
 import errno
 import hashlib
 import json
@@ -142,6 +145,38 @@ def refused_reason(real: str, rnfs_dir: str) -> str | None:
         if fsutil.is_below(real, private):
             return f"it is inside {private}, where rnfs keeps its keys and state"
     return None
+
+
+def add_refused_reason(path: str, rnfs_dir: str) -> str | None:
+    """Why `add` may not add path, or None: what refused_reason refuses (the rnfs dir, a directory holding it, or
+    anything inside its PRIVATE_SUBDIRS), and anything else inside the rnfs dir but outside its shared folder,
+    files/, such as api_token, rnfs.toml or the Reticulum config (audit REV1). path is resolved, a link at its end
+    too (add follows it); what is in files/ is shared anyway."""
+    real = os.path.realpath(path)
+    reason = refused_reason(real, rnfs_dir)
+    if reason is not None:
+        return reason
+    root = os.path.realpath(rnfs_dir)
+    if fsutil.is_below(real, root) and not fsutil.is_below(real, os.path.realpath(os.path.join(root, "files"))):
+        return f"it is inside {root}, where rnfs keeps its token and settings (only its files/ may be added)"
+    return None
+
+
+def private_dirs(rnfs_dir: str) -> frozenset[builder.DirId]:
+    """The (st_dev, st_ino) of the rnfs dir and each of its PRIVATE_SUBDIRS, each resolved (one may be a link to
+    another disk), for a walk to skip (builder.BuildOptions.skip_dirs) however it reaches them: by a bind mount
+    too, which refused_reason's path check can't see. Taken when a walk starts; one missing or unreadable is left
+    out, and so is one whose filesystem reports no inode number (0), which would match others."""
+    root = os.path.realpath(rnfs_dir)
+    found = set()
+    for path in (root, *(os.path.join(root, name) for name in PRIVATE_SUBDIRS)):
+        try:
+            st = os.stat(path)
+        except (OSError, ValueError):
+            continue
+        if stat.S_ISDIR(st.st_mode) and st.st_ino != 0:
+            found.add((st.st_dev, st.st_ino))
+    return frozenset(found)
 
 
 def loose_ancestor(real: str) -> str | None:
@@ -516,6 +551,7 @@ class SharedFolder:
         options: the chunker and the deny list's file-hash check every import is built with (builder.BuildOptions;
         by default those of this context, builder.current_options)."""
         options = options if options is not None else builder.current_options()
+        options = dataclasses.replace(options, skip_dirs=options.skip_dirs | private_dirs(self.rnfs_dir))
         with self._lock:
             os.makedirs(self.directory, exist_ok=True)
             current: dict[str, tuple[str, Cid]] = {}
@@ -526,7 +562,8 @@ class SharedFolder:
                     raise NotADirectoryError(f"{display_path(self.directory)} is not a directory")
                 # A refused folder counts as empty: every folder pin is released, so a node whose folder already
                 # led into the rnfs dir (as 0.1.5 allowed) stops providing what it imported from there
-                items = builder.list_directory(folder) if self._check_target(folder, st) else []
+                checked = self._check_target(folder, st, options.skip_dirs)
+                items = builder.list_directory(folder) if checked else []
                 for item in items:
                     result = self._scan_item(folder, item, options)
                     if result is not None:
@@ -544,11 +581,14 @@ class SharedFolder:
             self._importer.retain(names)
             return pins
 
-    def _check_target(self, folder: builder.Handle, st: os.stat_result) -> bool:
+    def _check_target(self, folder: builder.Handle, st: os.stat_result, skip_dirs: frozenset[builder.DirId]) -> bool:
         """False, with a warning while it stays so, if the folder open as folder (whose stat is st) may not be
-        scanned (refused_reason; scan then treats it as empty); a warning, once per directory, about a loose ancestor (loose_ancestor)."""
+        scanned (refused_reason, or one of skip_dirs, private_dirs; scan then treats it as empty); a warning, once
+        per directory, about a loose ancestor (loose_ancestor)."""
         real = opened_path(folder, st, self.directory)
         reason = refused_reason(real, self.rnfs_dir)
+        if reason is None and builder.is_skipped_dir(st, skip_dirs):
+            reason = builder.PRIVATE_DIR
         if reason is not None:
             self._warn_once("target", f"not scanning {display_path(self.directory)}: {reason}. Its pins with "
                                       f"source folder were released; point it at another directory")
@@ -578,6 +618,9 @@ class SharedFolder:
                 return None
             if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
                 self._warn_once(f"special:{item.name}", f"skipped {shown}: not a regular file or directory")
+                return None
+            if builder.is_skipped_dir(st, options.skip_dirs):
+                self._warn_once(f"private:{item.name}", f"skipped {shown}: {builder.PRIVATE_DIR}")
                 return None
             # Signature and import both read this one open entry, so a swap after the check above can't
             # make either follow a symlink out of the folder or block on a FIFO

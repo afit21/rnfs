@@ -117,18 +117,21 @@ def add_sealed_path(path: str, put: builder.Put, wrap: bool, recipients: list[by
 
     A folder is packed as one tar (tarstream.folder_chunks: add's rules, everything under the folder's name, at
     most max_entries files and directories) and sealed as `<folder>.tar` (folder_sealed_name), which is also its
-    visible name with wrap."""
+    visible name with wrap. As builder.build_path, a path that is one of options.skip_dirs is refused (ValueError)
+    and a directory inside the folder that is one is skipped with a warning."""
     from rnfs.content import tarstream
 
     handle, st = builder.open_path(path)
     try:
+        skip_dirs = options.skip_dirs if options is not None else frozenset()
+        builder.check_root(st, path, skip_dirs)
         name = os.path.basename(os.path.normpath(os.path.abspath(path)))
         progress = options.progress if options is not None else None
         warnings: list[str] = []
         if stat.S_ISDIR(st.st_mode):
             sealed_name = folder_sealed_name(name, seal_name)
             tar = tarstream.IteratorReader(tarstream.folder_chunks(handle, path, name, max_entries, warnings.append,
-                                                                   progress))
+                                                                   progress, skip_dirs=skip_dirs))
             try:
                 built = builder.add_stream(seal.SealingReader(tar, recipients, sealed_name), put, None,
                                            sealed_name if wrap else None, options=options)

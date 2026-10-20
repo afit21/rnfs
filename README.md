@@ -365,7 +365,8 @@ shared automatically. `rnfs pin rm <cid>` stops sharing, and `rnfs gc` frees spa
 didn't pin. By default your node also shares what you download while it's cached, so others can see what you
 fetched; `provide_strategy = "pinned"` shares only what you pin. Every file and folder inside what you pin is also
 findable by its own CID (`provide_entries`), so a file you shared in a folder can be fetched without the folder's
-CID; on a slow radio node, only while there are few of them.
+CID; on a slow radio node, only while there are few of them. `add` refuses the rnfs dir (`~/.rnfs`) and any folder holding it, such as `~`: it holds
+your node's keys and API token.
 
 ### 4. Names: a link that can change
 

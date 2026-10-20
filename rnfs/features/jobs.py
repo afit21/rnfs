@@ -696,9 +696,10 @@ class JobsFeature(Feature):
         if job.nomadnet is not None:
             return self.node.add_nomadnet(job.nomadnet, progress=_answer_progress(job), **(job.options or {}),
                                           **_source(job))
-        from rnfs.content import builder
+        from rnfs.content import builder, shared_folder
         try:
-            job.total(builder.tree_size(job.path, job.check_cancelled))
+            skip_dirs = shared_folder.private_dirs(self.node.config.root)  # as add_path skips them
+            job.total(builder.tree_size(job.path, job.check_cancelled, skip_dirs))
         except OSError:
             pass  # add_path reports it, in its own words
         return self.node.add_path(job.path, progress=job.read, **(job.options or {}), **_source(job))
@@ -814,6 +815,12 @@ class JobsFeature(Feature):
         if path is not None and not os.path.lexists(path):
             # As add_path and import_archive say it, but before queueing: the CLI and apps learn it at once
             raise NotFound(f"no such file or directory: {path}" if kind == "add" else f"no such file: {path}")
+        if kind == "add" and path is not None:
+            from rnfs.content import shared_folder
+            # As add_path refuses it (audit REV1), before the size of all of ~ is measured for nothing
+            refused = shared_folder.add_refused_reason(path, self.node.config.root)
+            if refused is not None:
+                raise ValueError(f"refusing to add {path}: {refused}")
         if kind == "import" and not os.path.isfile(path):
             # A FIFO or device would hold a job slot until something writes to it (import_archive refuses it too)
             raise ValueError(f"{path} is not a regular file")

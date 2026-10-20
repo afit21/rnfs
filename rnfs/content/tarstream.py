@@ -516,12 +516,13 @@ class _Packing:
     """What folder_chunks keeps while it walks: the entries met, the bytes written, and the options."""
 
     def __init__(self, max_entries: int, warn: Callable[[str], None], progress: Callable[[int], None] | None,
-                 mtime: int):
+                 mtime: int, skip_dirs: frozenset[builder.DirId] = frozenset()):
         """Nothing written yet."""
         self.max_entries = max_entries
         self.warn = warn
         self.progress = progress
         self.mtime = mtime
+        self.skip_dirs = skip_dirs
         self.entries = 0
         self.written = 0
 
@@ -539,11 +540,13 @@ class _Packing:
 
 
 def folder_chunks(handle: builder.Handle, path: str, top: str, max_entries: int, warn: Callable[[str], None],
-                  progress: Callable[[int], None] | None = None, mtime: int | None = None) -> Iterator[bytes]:
+                  progress: Callable[[int], None] | None = None, mtime: int | None = None,
+                  skip_dirs: frozenset[builder.DirId] = frozenset()) -> Iterator[bytes]:
     """The tar of the folder open as handle (builder.open_path of path), everything under one top directory top/, so
     that `tar xf` puts nothing else in the directory it is run in. The folder is walked as `add` walks one
     (builder._build_tree): hidden files included; symlinks, devices, sockets, FIFOs, names that aren't valid UTF-8 or
-    break the name rules, and entries that change while being opened skipped with a warning (warn(text)); a file
+    break the name rules, the directories of skip_dirs (builder.BuildOptions.skip_dirs: the rnfs dir's, by another
+    path) and entries that change while being opened skipped with a warning (warn(text)); a file
     with other hard links read as any file (no hard-link members, which build_tar would skip). Names a tar
     shouldn't hold (safe_name) are skipped with a warning too, as the writer of a stored DAG skips them. Members as
     that writer makes them (_header_of: PAX, 0755/0644, dated mtime, now if None), after the sealed-folder marker
@@ -560,7 +563,7 @@ def folder_chunks(handle: builder.Handle, path: str, top: str, max_entries: int,
         raise ValueError(f"{builder.display_path(top)!r} isn't valid as an entry name")
     if not safe_name(top):
         raise ValueError(f"{builder.display_path(top)!r} holds a character some extractors read as a path separator")
-    packing = _Packing(max_entries, warn, progress, int(time.time()) if mtime is None else mtime)
+    packing = _Packing(max_entries, warn, progress, int(time.time()) if mtime is None else mtime, skip_dirs)
     listing = builder.list_directory(handle)
     marker = folder_marker()
     packing.written += len(marker)
@@ -597,6 +600,9 @@ def _pack_directory(handle: builder.Handle, listing: list, path: str, member: st
             continue
         if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
             packing.warn(f"skipped {shown}: not a regular file or directory")
+            continue
+        if builder.is_skipped_dir(st, packing.skip_dirs):
+            packing.warn(f"skipped {shown}: {builder.PRIVATE_DIR}")
             continue
         # Changed is raised only by opening and listing, before anything of the entry is written, so skipping it
         # never leaves part of a member in the tar

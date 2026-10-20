@@ -60,6 +60,13 @@ Security:
   assembled may not outgrow the advertised total; a file's metadata must be a small flat map, checked before RNS
   decodes it; a page must be one flat byte string, checked from its msgpack headers before RNS decodes it. The
   daemon's process-wide decompression limit stays 0, and `rnfs.dht` links keep every rule they have.
+- **`add` refuses the rnfs dir** (specification section 5): `rnfs add ~` pinned and provided the node identity, the
+  name keys, `api_token` and `rnfs.db`, each findable by its own CID with `provide_entries`, and an app token could
+  read the CLI's token through `add`. `add` (the CLI, the API, add jobs, sealed folders) now refuses the rnfs dir, a
+  directory holding it, anything inside `storage/`, `names/`, `state/`, `blocks/` or `lxmf/`, and anything else in
+  the rnfs dir but outside `files/`. Every walk (`add`, the shared folder, `name sync`, sealed folders) also skips,
+  with a warning, a directory that is the rnfs dir or one of those subdirectories by device and inode, which catches
+  a bind mount of them; one given as the root is refused.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
