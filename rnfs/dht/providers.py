@@ -1193,7 +1193,7 @@ class ProviderStore:
         with self._lock:
             count, capacity = self._count(), self._capacity()
             full = count >= capacity
-            used, capacity = self._reported_usage(count, capacity)
+            used, capacity = self._reported_usage(count, capacity, full)
             records, publishers = list(self._tier_records), self._publishers
         tiers = {}
         for tier in reversed(TIERS):  # highest first, as rnfs status lists them
@@ -1206,25 +1206,28 @@ class ProviderStore:
         return {"bytes": round(used), "budget": self.record_budget, "capacity": math.floor(capacity),
                 "full": full, "publishers": publishers, "own_records": records[OWN], "tiers": tiers}
 
-    def _reported_usage(self, count: int, capacity: float) -> tuple[float, float]:
+    def _reported_usage(self, count: int, capacity: float, full: bool) -> tuple[float, float]:
         """(bytes counting against the budget, records the store would hold when full) for usage(), with count records
-        held and _capacity() capacity. Lock held.
+        held, _capacity() capacity and whether that makes the store full. Lock held.
 
         _capacity divides the database by the records (at least MEASURE_RECORDS), so while they are few next to the
         rest of rnfs's state (a node's block sizes alone take tens of megabytes for a million blocks) each looks
         to cost kilobytes and the capacity looks a fraction of what it is. Whether the store is full goes by the
         database reaching the budget either way; for the report, the room left is counted at RECORD_BYTES_ESTIMATE a
-        record instead, within the free disk. A fixed record size (record_bytes) is reported as it is."""
+        record instead, within the free disk, but never as fewer records than the store takes (capacity): with the
+        rest of the state over the budget there is no room left by that count, yet the store, measuring a record over
+        at least MEASURE_RECORDS, still takes records until it is full. A fixed record size (record_bytes) is reported
+        as it is."""
         if self.fixed_record_bytes is not None or self._db_bytes is None:
             size = self.fixed_record_bytes or self._record_bytes
             return count * size, capacity
         used = self._db_bytes + max(0, count - self._measured) * RECORD_BYTES_ESTIMATE
-        if count >= capacity:
+        if full:
             return used, count
         room = max(0, self.record_budget - used)
         if self._room is not None:
             room = min(room, max(0, self._room - max(0, count - self._measured) * RECORD_BYTES_ESTIMATE))
-        return used, count + room / RECORD_BYTES_ESTIMATE
+        return used, max(capacity, count + room / RECORD_BYTES_ESTIMATE)
 
     def publisher_count(self) -> int:
         """Number of publishers with records here."""

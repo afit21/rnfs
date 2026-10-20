@@ -1,6 +1,7 @@
 """Tests for the provider record store (rnfs/dht/providers.py): TTL, republishing, withdrawal, /find replies, the
 cap of publishers per key, the record budget and its storage tiers, and the records on disk (the state database's
 provider tables): batched writes, restarts and the upgrade of 0.1.x's tables."""
+import math
 import os
 import random
 import tempfile
@@ -811,6 +812,25 @@ class BudgetTest(StoreTestCase):
         self.assertLess(store._capacity(), usage["capacity"] / 10)  # what the report said before
         self.assertFalse(usage["full"])
         self.assertAlmostEqual(usage["tiers"]["newcomer"]["share"], 0.0, places=4)
+
+    def test_capacity_reported_is_never_below_what_the_store_takes(self):
+        """With the rest of rnfs's state over the budget, no room is left by the report's count, yet the store (a
+        record measured over at least MEASURE_RECORDS) still takes records: the report said "room for 200 records,
+        not full" while the store went on to take thousands. It reports what the store takes."""
+        store = self.new_store(record_bytes=None)
+        with store._db.transaction(durable=False) as tx:  # about 20 MB of other state
+            tx.execute("CREATE TABLE other_state (x BLOB)")
+            tx.executemany("INSERT INTO other_state VALUES (?)", [(bytes(1000),) for _ in range(20_000)])
+        store.record_budget = 10_000_000
+        for n in range(200):
+            store.store(ident(10_000 + n), ident(1 + n % 5))
+        store.save()
+        usage = store.usage()
+        self.assertGreater(usage["bytes"], store.record_budget)
+        self.assertFalse(usage["full"])
+        self.assertGreater(store._capacity(), 200)
+        self.assertEqual(usage["capacity"], math.floor(store._capacity()))
+        self.assertTrue(store.store(ident(20_000), ident(9)))  # as the report says: not full
 
     def test_free_disk_bounds_the_store(self):
         """Records never take the disk the blocks' reserve needs: free_space() is the room left beyond it."""

@@ -460,8 +460,9 @@ class _Database:
                             "one (rnfs never moves state back to an older format)")
         # An existing database's upgrade can take minutes on a large one (steps that move rows): said, so a start that
         # is busy with it isn't taken for a hung one. A new database's steps only create tables
-        started = time.monotonic()
-        if 0 < version < len(SCHEMA):
+        upgrading = 0 < version < len(SCHEMA)
+        started = time.monotonic() if upgrading else None
+        if upgrading:
             steps = plural(len(SCHEMA) - version, "step")
             log(f"upgrading the state database {self.path} for this version of rnfs ({steps}; once, and on a large "
                 "database it takes a while)", LOG_NOTICE)
@@ -473,7 +474,7 @@ class _Database:
                     else:
                         tx.execute(step)
                 tx.execute(f"PRAGMA user_version = {number + 1}")
-        if 0 < version < len(SCHEMA):
+        if started is not None:
             log(f"upgraded the state database in {time.monotonic() - started:.1f} s", LOG_NOTICE)
 
     @contextmanager

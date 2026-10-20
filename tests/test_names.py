@@ -1021,6 +1021,15 @@ class AnnounceHoldTest(NamesTestCase):
         self.assertNotIn("announce_held", manager.publish("site", CID_C))
         self.assertEqual(self.announced()[-1], encode_record(3, CID_C))
 
+    def test_a_held_reason_leaves_out_an_estimate_under_a_second(self):
+        manager = self.restart_behind(600)
+        with mock.patch.object(manager.clock_skew, "behind", return_value=0.4):
+            reason = manager.publish("site", CID_B)["announce_held"]
+        self.assertNotIn("going by the announces heard", reason)  # not "it is 0 s behind"
+        with mock.patch.object(manager.clock_skew, "behind", return_value=600.0):
+            reason = manager.publish("site", CID_C)["announce_held"]
+        self.assertIn("going by the announces heard, it is 10 min behind", reason)
+
     def test_a_clock_at_the_last_announce_is_not_held(self):
         """Only a clock behind holds: one in the same second as the last announce announces (RNS may drop that one,
         as it did before 0.2.0, until the next re-announce)."""
