@@ -60,6 +60,10 @@ Security:
   assembled may not outgrow the advertised total; a file's metadata must be a small flat map, checked before RNS
   decodes it; a page must be one flat byte string, checked from its msgpack headers before RNS decodes it. The
   daemon's process-wide decompression limit stays 0, and `rnfs.dht` links keep every rule they have.
+- **A NomadNet page answer may be at most 16 MiB** (specification section 11): RNS reads an answer without metadata
+  (a page) whole into memory and decodes it, so a "page" as large as the free disk could exhaust a small node's
+  memory. One advertised larger is refused at its first segment, before any of it is transferred (the add fails
+  with too large); files, written to disk, keep the bound above.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves

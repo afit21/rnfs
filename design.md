@@ -151,7 +151,7 @@ rnfs/
                       same for NomadNet links this node opened, against a page's shape; the half-open
                       incoming link cap per destination (3)
     nomadnet.py       fetching a page or file from a NomadNet node over a link of its own, bounded per link
-                      (Transfer: segment sequence and decompression bound, metadata check) (11)
+                      (Transfer: segment sequence and decompression bound, a page's size, metadata check) (11)
     server.py         RequestServer: handlers, every section 3 limit, airtime policy, feature paths (3, 7)
     client.py         PeerClient: /find, /provide, /blocks (with stall detection), /pin, ping (sections 3, 6, 7)
     announces.py      rnfs.dht announces carrying the DHT mode, and the announce handler (section 3)
@@ -1396,7 +1396,10 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   `guards.mark_nomadnet` right after `RNS.Link` is made), identifies if asked, and sends one request; a "Request
   Not Allowed" answer on an identified link is retried once after identifying again. Per request a `Transfer` holds
   the state RNS's callbacks fill in, hooked on the link: `set_resource_started_callback` (`resource_started`:
-  `max_decompressed_size` = `MAX_EFFICIENT_SIZE` + 1, then `segment_refusal`), and on the link instance
+  `max_decompressed_size` = `MAX_EFFICIENT_SIZE` + 1, then `segment_refusal`, then on the first segment of an
+  answer without metadata its total against `MAX_PAGE_SIZE`, 16 MiB, reported as `TooLarge`: RNS's
+  `Link.response_resource_concluded` reads such an answer whole and unpacks it, about twice its size in memory,
+  whereas a file arrives as an open file and is copied in chunks), and on the link instance
   `resource_concluded` (RNS's, then the assembled size against the total and, on segment 1, `metadata_refusal` on
   the `.meta` file RNS wrote, removed if refused so RNS never decodes it) and `receive` (notes an advertised size
   over the bound, which RNS rejects silently, to report `TooLarge`). Refusing cancels the Resource and tears the
