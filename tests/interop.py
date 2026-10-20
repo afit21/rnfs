@@ -558,9 +558,9 @@ class Network:
 
         wait_for(resolver_has, 240, f"{resolver.name} to get the record from {keeper.name} with "
                                     f"{publisher.name} stopped")
-        # Every version logs each keeper query's outcome; the record must have come from one (the keeper being
-        # the only one left), not from an announce
-        asked = re.compile(rf"rnfs keepers: (asked \d+ of \d+ keepers of name {name}: [1-9]\d* verifying records?)")
+        # Every version logs each keeper query's outcome ("asked 2 of 2 keepers", or 0.1.3's "asked 2 keepers"); the
+        # record must have come from one (the keeper being the only one left), not from an announce
+        asked = re.compile(rf"rnfs keepers: (asked \d+ (?:of \d+ )?keepers of name {name}: [1-9]\d* verifying records?)")
         evidence = wait_for(lambda: next((m.group(1) for line in resolver.log_since(start)
                                           if (m := asked.search(line))), None), 180,
                             f"{resolver.name}'s log to show a keeper query that got the record")
