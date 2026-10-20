@@ -49,6 +49,11 @@ republishing at the same time, as it would in use.
 | The laptop's `/provide` links meanwhile | about half timed out (RNS's per-hop establishment timeout against 20 s round trips) |
 | Channel load | 80–100 % over 15 s on both radios during a fetch; laptop airtime 52 % over 15 s at its peak |
 
+The hour after these fetches, with nothing asked of either node: the laptop transmitted 6.6 % of the time and the PC
+7.3 %, the channel busy 18–19 %. Nearly all of the laptop's was two publishing rounds storing the roots of what it
+had just fetched (2 keys, then 1, batched per server: about 25 identified links, to every one of the network's 12–13
+servers); the PC's was its serving, its own records and the announces it relays from the backbone.
+
 At this rate one node's own work fills the channel: a fetch, its search running on until the root arrives, and the
 publisher storing the roots of what was just fetched (`provide_strategy = "roots"`: each cached download is
 published, an identified link to each of about 10 servers, about 6.4 s of airtime each at 1 kbit/s by the load
@@ -108,6 +113,11 @@ rnfs's to change; the API answers only after it.
 ## Interoperability
 
 - A 300 KB file each way between Montreal (development) and Stockholm (0.1.6): 3–4 s, bytes identical.
+- A 30 MB file from Montreal to three development nodes at once: US central 26.6 s (about 1.2 MB/s), Madrid 1,715 s
+  and Johannesburg 2,903 s, bytes identical. The slow two are Reticulum's routes: Madrid reached Montreal in 4 hops
+  through the Broken Hill gateway in Australia, Johannesburg through Cape Town at a 3.2 s round trip. US central,
+  done in 26 s and providing the file from then on (2 hops from Madrid), wasn't used: a fetch searches again only
+  once every provider it has failed, not when the one it has is slow.
 - `tests/interop.py` against 0.1.6, with every fix here (`cb89212`): every scenario passes both ways (providers,
   fetch, bulk and small with and without an upload cap, ranges learnt after two silences, names, keepers).
 - The NomadNet gateway's `rnfs.Client` (0.1.5) against a development daemon: `node_id`, `ls`, `get(raw=True)`,
