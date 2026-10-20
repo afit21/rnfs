@@ -955,24 +955,42 @@ class RequestServer:
         return self._in_slot(link_id, lambda: self.backend.remote_pin(remote_identity.hash, cid, pin) is True)
 
     def _handle_blocks(self, path, data, request_id, link_id, remote_identity):
-        """Answer /blocks within the per-link limit, the response pools, upload pacing and the budget."""
+        """Answer /blocks within the per-link limit, the response pools, upload pacing and the budget (_serve)."""
         parsed = protocol.parse_blocks_request(data)
+        if parsed is None:
+            return False
+        max_bytes, cids = parsed
+
+        def build(limit: int):
+            """The response: each block or None until the budget (the first served block always included)."""
+            entries = select_blocks(cids, self.backend.served_block, limit, self.backend.served_block_size)
+            served = sum(1 for entry in entries if entry is not None)
+            return (protocol.encode_blocks_response(entries), served > 0,
+                    f"{plural(served, 'block')} of {len(cids)} requested")
+        return self._serve(BLOCKS_PATH, link_id, request_id, remote_identity, max_bytes, build)
+
+    def _serve(self, path: str, link_id: bytes, request_id: bytes, remote_identity, max_bytes: int,
+               build: Callable[[int], tuple]):
+        """Answer a /blocks request within the per-link limit, the response pools, upload pacing and the budget.
+
+        build(limit) makes the response once every check has passed, given the budget for blocks after the first
+        served one: (body, whether it carries blocks, what it is, for the log). A body of False refuses the request.
+        """
         link = self._find_link(link_id)
-        if parsed is None or link is None:
+        if link is None:
             return False
         identity = bytes(remote_identity.hash) if remote_identity is not None else None
         if self.cooldowns.active(link_id, identity):
-            log("refused /blocks: that requester's last response made no progress", LOG_VERBOSE)
+            log(f"refused {path}: that requester's last response made no progress", LOG_VERBOSE)
             return False
         # mesh airtime controls: refused (False) at once, so the requester tries another provider
         refusal = self.airtime.refusal(mesh.interface_names(getattr(link, "attached_interface", None)))
         if refusal is not None:
             self.traffic.refused(refusal)
-            log(f"refused /blocks: {refusal.replace('_', ' ')}", LOG_VERBOSE)
+            log(f"refused {path}: {refusal.replace('_', ' ')}", LOG_VERBOSE)
             return False
-        max_bytes, cids = parsed
         if not self.incoming.start_request(link_id, blocks=True) and not self._after_previous(link, link_id):
-            log("refused /blocks: a response is still in progress on that link", LOG_VERBOSE)
+            log(f"refused {path}: a response is still in progress on that link", LOG_VERBOSE)
             return False
 
         response = None
@@ -981,7 +999,7 @@ class RequestServer:
             # Refusals come first and at once: pacing, then the pools; only an accepted request waits
             wait = self.pacer.wait_time(link_id)
             if wait > MAX_PACING_WAIT:
-                log(f"refused /blocks: the link's upload cap allows the next response in {wait:.0f}s", LOG_VERBOSE)
+                log(f"refused {path}: the link's upload cap allows the next response in {wait:.0f}s", LOG_VERBOSE)
                 return False
             rate = self.rates.get(link_id)
             slow = rates.link_is_slow(link, rate, self.config)
@@ -997,7 +1015,7 @@ class RequestServer:
                 self._cancel(displaced, "made no progress; displaced by a new request" if displaced.idle
                              else "displaced by a new request")
             if response is None:
-                log(f"refused /blocks: every {'slow' if slow else 'fast'}-link response slot is busy", LOG_VERBOSE)
+                log(f"refused {path}: every {'slow' if slow else 'fast'}-link response slot is busy", LOG_VERBOSE)
                 return False
             if wait > 0:
                 self._pace(response, wait)
@@ -1014,11 +1032,14 @@ class RequestServer:
             if share is not None:
                 if share <= 0:
                     self.traffic.refused(mesh.REFUSED_BUDGET)
-                    log("refused /blocks: that requester's responses in flight hold half of upload_budget", LOG_VERBOSE)
+                    log(f"refused {path}: that requester's responses in flight hold half of upload_budget",
+                        LOG_VERBOSE)
                     return False
                 limit = min(limit, max(0, share - RESPONSE_OVERHEAD))
-            entries = select_blocks(cids, self.backend.served_block, limit, self.backend.served_block_size)
-            body = protocol.encode_blocks_response(entries)
+            body, carries, what = build(limit)
+            if body is False:
+                log(f"refused {path}: {what}", LOG_VERBOSE)
+                return False
             packed = protocol.packed_response_size(request_id, body)
             mdu = link.get_mdu() or protocol.DEFAULT_MDU
             single = packed <= mdu
@@ -1026,18 +1047,16 @@ class RequestServer:
             # The upload budget is charged for responses carrying blocks (answers of only None are tiny), as
             # they are sent: up front only a reservation of about one packet (its advertisement), or all of it
             # if it goes as one packet or its progress can't be followed
-            if any(entry is not None for entry in entries) and not self._admit(
-                    response, packed, packed if single or untracked else min(packed, mdu)):
+            if carries and not self._admit(response, packed, packed if single or untracked else min(packed, mdu)):
                 self.traffic.refused(mesh.REFUSED_BUDGET)
-                log(f"refused /blocks: {size(packed)} is over what is left of upload_budget", LOG_VERBOSE)
+                log(f"refused {path}: {size(packed)} is over what is left of upload_budget", LOG_VERBOSE)
                 return False
             if response.finished:
                 return False  # displaced while it was being built (_admit charged nothing, or _finish settled)
             with self.lock:
                 if link_id in self.links:  # a closed link's entry would never be forgotten
                     self.pacer.started(link_id, packed, cap)
-            served = sum(1 for entry in entries if entry is not None)
-            log(f"/blocks: sending {plural(served, 'block')} of {len(cids)} requested ({size(packed)})", LOG_VERBOSE)
+            log(f"{path}: sending {what} ({size(packed)})", LOG_VERBOSE)
             self.traffic.sent(node_id_for_identity(remote_identity) if remote_identity is not None else None,
                               mesh.interface_label(getattr(link, "attached_interface", None)), packed)
             if single:
