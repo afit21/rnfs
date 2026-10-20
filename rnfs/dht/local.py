@@ -16,16 +16,21 @@ records and the local-first search. No RNS dependency: the node judges each serv
   before) and cut island-to-island lookup airtime by 42%.
 
 - **Partition mode** (PartitionMode). The servers that aren't local are *off-island*. A node enters partition mode
-  after FAILURES_TO_ENTER (3) failures in a row reaching off-island servers (a /find or /provide unanswered, no answer
-  from any off-island server between), or after off-island silence (no fresh off-island announce nor answer) longer
-  than SILENCE_FACTOR (4) times the usual gap between the off-island announces it heard (their mean over the last
-  GAP_SAMPLES, once it has MIN_GAPS; at least MIN_SILENCE) if an off-island probe then fails: with servers announcing
-  every 6 h, an island hearing 20 of them hears one every ~18 minutes, so silence alone would flap on a small network.
-  In it, lookups and publishes use local servers only (`allows`), so a lookup doesn't spend minutes on timeouts. Any
-  off-island answer or fresh off-island announce ends it, and a probe (one /find to an off-island server, the failed
-  ones and the recently heard in turn) every PROBE_INTERVAL (slow nodes: SLOW_PROBE_INTERVAL, doubling to
-  SLOW_PROBE_MAX, as each probe on radio costs a link's airtime) keeps it from sticking. Leaving it starts the heal
-  republish (the node's on_change).
+  when an off-island probe (one /find to an off-island server) fails after FAILURES_TO_ENTER (3) failures in a row
+  reaching off-island servers it knows (a /find or /provide unanswered, no answer from any off-island server between),
+  or after off-island silence (no fresh off-island announce nor answer) longer than SILENCE_FACTOR (4) times the usual
+  gap between the off-island announces it heard (their mean over the last GAP_SAMPLES, once it has MIN_GAPS; at least
+  MIN_SILENCE): with servers announcing every 6 h, an island hearing 20 of them hears one every ~18 minutes, so silence
+  alone would flap on a small network. A failure counts only for a server the node knows (`known`: in its routing
+  table or first-seen log, or with an identity or path RNS knows): an off-island server's /find reply can name made-up
+  IDs, which fail, and 3 of them used to enter partition mode at once. Known servers' failures too only ask for a
+  probe, as a server can name 3 identities it announced and lets fail: the probe goes to an off-island server that
+  answered or announced itself recently, never to an ID that only ever failed. With none to probe (nothing beyond the
+  island answered or announced this run) the failures enter partition mode. In it, lookups and publishes use local
+  servers only (`allows`), so a lookup doesn't spend minutes on timeouts. Any off-island answer or fresh off-island
+  announce ends it, and a probe (those recently heard or answered in turn, those that failed since after the rest)
+  every PROBE_INTERVAL (slow nodes: SLOW_PROBE_INTERVAL, doubling to SLOW_PROBE_MAX, as each probe on radio costs a
+  link's airtime) keeps it from sticking. Leaving it starts the heal republish (the node's on_change).
 
 At most MAX_LOCAL_SERVERS are kept, and the judgements of at most MAX_JUDGED servers (the least recently judged
 forgotten first): an island has tens of servers, but local_interfaces may name a busy hub.
@@ -43,7 +48,7 @@ MAX_LOCAL_SERVERS = 1024  # local servers kept; the least recently judged local 
 MAX_JUDGED = 4096  # servers whose judgement is kept (local or not); the least recently judged forgotten first
 SCAN_INTERVAL = 600.0  # seconds between reads of the path table for the local servers
 # Partition mode
-FAILURES_TO_ENTER = 3  # failures in a row reaching off-island servers that enter it (the study's PH)
+FAILURES_TO_ENTER = 3  # failures in a row reaching known off-island servers that ask for a probe (the study's PH)
 SILENCE_FACTOR = 4  # off-island silence counts once over this many times the usual gap between off-island announces
 MIN_SILENCE = 600.0  # seconds: and never under this
 GAP_SAMPLES = 32  # the usual gap is the mean of this many recent gaps between off-island announces
@@ -51,12 +56,17 @@ MIN_GAPS = 8  # silence doesn't count before this many gaps were measured
 PROBE_INTERVAL = 300.0  # seconds between off-island probes in partition mode
 SLOW_PROBE_INTERVAL = 900.0  # on slow nodes, the first; doubling after each failed probe up to SLOW_PROBE_MAX
 SLOW_PROBE_MAX = 7200.0
-RECENT_OFF_ISLAND = 16  # off-island servers remembered as probe targets (heard or answered; and those that failed)
+RECENT_OFF_ISLAND = 16  # off-island servers remembered as probe targets (heard or answered), and those that failed
 
 
 def _never(node_id: bytes) -> bool:
     """Default exclude: excludes nothing."""
     return False
+
+
+def _always(node_id: bytes) -> bool:
+    """Default known: every server is known."""
+    return True
 
 
 class LocalServers:
@@ -161,25 +171,30 @@ def _remember(nodes: OrderedDict, node_id: bytes):
 class PartitionMode:
     """Whether this node is cut off from the servers beyond its island (see the module docstring). Thread-safe.
 
-    is_local(id) says which servers are local; the rest are off-island. The node reports off-island answers
-    (answered), failures (failed) and fresh announces (announced), asks probe_due() and probe_target() and reports the
-    probe's outcome (probed); on_change(active) is called, without the lock, on entering and leaving. clock is
-    monotonic, wall_clock gives since's wall time."""
+    is_local(id) says which servers are local; the rest are off-island. known(id) says which servers the node knows:
+    only their failures count. The node reports off-island answers (answered), failures (failed) and fresh announces
+    (announced), asks probe_due() and probe_target() and reports the probe's outcome (probed); on_change(active) is
+    called, without the lock, on entering and leaving, and on_probe() when failures make a probe due (so the node can
+    send it at once). clock is monotonic, wall_clock gives since's wall time."""
 
     def __init__(self, is_local: Callable[[bytes], bool], slow: bool = False,
                  on_change: Callable[[bool], object] = lambda active: None,
-                 clock: Callable[[], float] = time.monotonic, wall_clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.monotonic, wall_clock: Callable[[], float] = time.time,
+                 known: Callable[[bytes], bool] = _always, on_probe: Callable[[], object] = lambda: None):
         """Not in partition mode, nothing heard yet."""
         self.is_local = is_local
+        self.known = known
         self.slow = slow
         self.on_change = on_change
+        self.on_probe = on_probe
         self.clock = clock
         self.wall_clock = wall_clock
         self._lock = threading.Lock()
         self.active = False
         self.since: float | None = None  # wall time it was entered, while active
         self.entered = 0  # times entered since start
-        self._failures = 0  # off-island failures in a row
+        self._failures = 0  # failures in a row reaching known off-island servers
+        self._wanted = False  # those failures ask for a probe (outside partition mode)
         self._last_contact = clock()  # an off-island answer or fresh announce (or the start)
         self._last_announce: float | None = None  # the last fresh off-island announce
         self._clean = False  # no partition mode since _last_announce: the gap to the next one is a usual gap
@@ -200,6 +215,7 @@ class PartitionMode:
             return
         with self._lock:
             self._failures = 0
+            self._wanted = False
             self._last_contact = self.clock()
             self._unreached.pop(node_id, None)
             _remember(self._recent, node_id)
@@ -208,16 +224,23 @@ class PartitionMode:
             self.on_change(False)
 
     def failed(self, node_id: bytes):
-        """A /find or /provide to node_id failed: the FAILURES_TO_ENTER-th off-island failure in a row enters partition
-        mode."""
-        if self.is_local(node_id):
+        """A /find or /provide to node_id failed. Only an off-island server the node knows counts (a reply can name
+        made-up IDs): the FAILURES_TO_ENTER-th such failure in a row asks for a probe (on_probe), or with no server to
+        probe enters partition mode."""
+        if self.is_local(node_id) or not self.known(node_id):
             return
         with self._lock:
             self._failures += 1
             _remember(self._unreached, node_id)
-            entered = self._failures >= FAILURES_TO_ENTER and self._enter()
+            if self.active or self._wanted or self._failures < FAILURES_TO_ENTER:
+                return
+            self._failures = 0
+            self._wanted = bool(self._targets())
+            entered = not self._wanted and self._enter()
         if entered:
             self.on_change(True)
+        else:
+            self.on_probe()
 
     def announced(self, node_id: bytes):
         """A fresh announce of node_id, an off-island server, arrived (emitted within minutes: not a path answer from a
@@ -229,6 +252,7 @@ class PartitionMode:
             self._last_announce = now
             self._last_contact = now
             self._failures = 0
+            self._wanted = False
             self._unreached.pop(node_id, None)
             _remember(self._recent, node_id)
             left = self._leave()
@@ -248,36 +272,43 @@ class PartitionMode:
         return max(MIN_SILENCE, SILENCE_FACTOR * sum(self._gaps) / len(self._gaps))
 
     def probe_due(self) -> bool:
-        """Whether an off-island probe is due: in partition mode every probe interval; otherwise once off-island
-        silence passes silence_limit()."""
+        """Whether an off-island probe is due: in partition mode every probe interval; otherwise once failures asked
+        for one, or off-island silence passes silence_limit()."""
         with self._lock:
             now = self.clock()
             if self.active:
                 return self._next_probe is not None and now >= self._next_probe
+            if self._wanted:
+                return True
             limit = self._silence_limit()
             return limit is not None and now - self._last_contact > limit
 
     def probe_target(self) -> bytes | None:
-        """The off-island server to probe: in turn, those that failed and those recently heard or answered (most recent
-        first); None if none is known."""
+        """The off-island server to probe: in turn, those recently heard or answered that haven't failed since (most
+        recent first), then those that have; None if none is known. An ID that never answered nor announced itself
+        is never one: a reply can name made-up IDs, which would fail every probe."""
         with self._lock:
-            targets = list(reversed(self._unreached)) + [n for n in reversed(self._recent) if n not in self._unreached]
-            targets = [n for n in targets if not self.is_local(n)]
+            targets = self._targets()
             if not targets:
                 return None
             self._turn += 1
             return targets[(self._turn - 1) % len(targets)]
 
+    def _targets(self) -> list[bytes]:
+        """probe_target()'s choices, in order (lock held)."""
+        recent = [n for n in reversed(self._recent) if not self.is_local(n)]
+        return [n for n in recent if n not in self._unreached] + [n for n in recent if n in self._unreached]
+
     def probed(self, node_id: bytes, answered: bool):
-        """The probe of node_id was answered or not. Unanswered after silence, partition mode is entered; in it, the
-        next probe is scheduled (on slow nodes later each time)."""
+        """The probe of node_id was answered or not. Unanswered after silence or failures, partition mode is entered;
+        in it, the next probe is scheduled (on slow nodes later each time)."""
         if answered:
             self.answered(node_id)
             return
         if self.is_local(node_id):
             return
         with self._lock:
-            self._failures += 1
+            self._wanted = False
             _remember(self._unreached, node_id)
             if self.active:
                 if self.slow:
@@ -290,11 +321,15 @@ class PartitionMode:
 
     def no_target(self):
         """A probe was due but no off-island server is known to probe: the node knows only its island, so the silence
-        counts from now."""
+        counts from now; if failures asked for the probe, partition mode is entered, as with none to probe then."""
         with self._lock:
             self._last_contact = self.clock()
             if self.active:
                 self._next_probe = self.clock() + self._probe_interval
+            entered = self._wanted and self._enter()
+            self._wanted = False
+        if entered:
+            self.on_change(True)
 
     def state(self) -> dict:
         """{"partition": whether in partition mode, "partition_since": the wall time it was entered, or None}."""
@@ -306,6 +341,7 @@ class PartitionMode:
         if self.active:
             return False
         self.active = True
+        self._wanted = False
         self.since = self.wall_clock()
         self.entered += 1
         self._clean = False

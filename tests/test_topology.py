@@ -22,9 +22,10 @@ it published before and during the partition, with and without local servers (th
 it), two-level records, the local-first search and partition mode. Island nodes' lookups run on simulated time, a /find
 over LoRa taking 8 s and one to a server they can't reach 40 s, within lookup_timeout (600 s). Over 3 worlds of 7
 islands, 10 keys each way: found 67% (published before) and 91% (during) -> 100% and 100%; per search 11.7 timeouts and
-490 s -> 0.15 and 31 s (the study: 55-72%, about 300 s and 7 timeouts -> 100%, 28 s), the timeouts being the 3 that
-enter partition mode, in the first search. What the island published during the partition: found from the backbone 0%
-until the publisher's next republish, 99.5% after the heal republish (the study: 1-14% before). A week of partition
+490 s -> 0.2 and 33 s (the study: 55-72%, about 300 s and 7 timeouts -> 100%, 28 s), the timeouts being the 3 that
+ask for a probe and the probe, which enters partition mode, in the first search. What the island published during
+the partition: found from the backbone 0% until the publisher's next republish, 99.5% after the heal republish (the
+study: 1-14% before). A week of partition
 mode's own clock, 5 or 20 servers beyond the island each announcing every 6 hours (announces up to 10 minutes late, 10%
 lost), the gateway down for 12 hours on the fourth day: entered once in each of 10 runs (12-338 minutes into the cut:
 the silence limit, 67-343 minutes, from the last off-island contact), left 0-49 minutes after the gateway came back,
@@ -214,7 +215,9 @@ class IslandPeer(Peer):
         self.local = LocalServers()
         for n in world.islands[island]:
             self.local.note(n, two_level)
-        self.partition = PartitionMode(self.local.is_local, slow=True)
+        # Failures count for servers whose identity it knows; the probe they ask for is sent at once, as the node's
+        # local-servers thread is woken to send it
+        self.partition = PartitionMode(self.local.is_local, slow=True, known=self.is_known, on_probe=self.probe)
         self.marked: set[bytes] = set()  # keys whose last round reached no off-island server
         super().__init__(world, island=island)
         if two_level:
@@ -390,7 +393,7 @@ class IslandPartitionTest(unittest.TestCase):
         self.assertTrue(new["entered"])
         self.assertGreaterEqual(old["timeouts"], 8)
         self.assertGreaterEqual(old["seconds"], 300)
-        # Over every search: 3 enter partition mode, and the fallback's 2 paths may have one out each when it begins
+        # Over every search: 3 ask for a probe, whose failure enters partition mode; queries may be out when it begins
         self.assertLessEqual(new["total"], 5)
         self.assertLessEqual(new["seconds"], 60)
 

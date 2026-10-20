@@ -99,6 +99,7 @@ class PartitionModeTest(unittest.TestCase):
                              self.wall)
 
     def test_three_off_island_failures_in_a_row(self):
+        """With nothing heard from beyond the island to probe, the third failure in a row enters it at once."""
         for n in range(FAILURES_TO_ENTER - 1):
             self.mode.failed(ident(0x200 + n))
         self.mode.failed(ident(1))  # a local failure doesn't count
@@ -111,19 +112,48 @@ class PartitionModeTest(unittest.TestCase):
         self.assertTrue(self.mode.allows(ident(1)))
         self.assertFalse(self.mode.allows(ident(0x200)))
 
+    def test_three_failures_ask_for_a_probe(self):
+        """With an off-island server that answered, the failures ask for a probe of it (on_probe), and partition mode
+        starts only if the probe fails."""
+        probes = []
+        self.mode.on_probe = lambda: probes.append(True)
+        self.mode.answered(ident(0x400))
+        for n in range(FAILURES_TO_ENTER):
+            self.mode.failed(ident(0x200 + n))
+        self.assertEqual((self.mode.active, self.mode.probe_due(), probes), (False, True, [True]))
+        self.mode.failed(ident(0x210))  # no second request while the first is due
+        self.assertEqual(probes, [True])
+        self.assertEqual(self.mode.probe_target(), ident(0x400))
+        self.mode.probed(ident(0x400), True)
+        self.assertFalse(self.mode.active or self.mode.probe_due())
+        for n in range(FAILURES_TO_ENTER):
+            self.mode.failed(ident(0x200 + n))
+        self.mode.probed(self.mode.probe_target(), False)
+        self.assertTrue(self.mode.active)
+        self.assertEqual(self.changes, [True])
+
+    def test_only_known_servers_failures_count(self):
+        mode = PartitionMode(lambda n: False, known=lambda n: n != ident(0x666), clock=self.clock)
+        for _ in range(2 * FAILURES_TO_ENTER):
+            mode.failed(ident(0x666))
+        self.assertFalse(mode.active or mode.probe_due())
+        self.assertIsNone(mode.probe_target())
+
     def test_an_off_island_answer_resets_the_count(self):
         self.mode.failed(ident(0x200))
         self.mode.failed(ident(0x201))
         self.mode.answered(ident(0x202))
         self.mode.failed(ident(0x203))
         self.mode.failed(ident(0x204))
-        self.assertFalse(self.mode.active)
+        self.assertFalse(self.mode.active or self.mode.probe_due())
 
     def enter(self, mode: PartitionMode | None = None):
-        """Enter partition mode by failures."""
+        """Enter partition mode by failures, and the probe they ask for failing if there is one to probe."""
         mode = mode or self.mode
         for n in range(FAILURES_TO_ENTER):
             mode.failed(ident(0x200 + n))
+        if not mode.active:
+            mode.probed(mode.probe_target(), False)
         self.assertTrue(mode.active)
 
     def test_ended_by_an_off_island_answer_or_announce(self):
@@ -175,13 +205,15 @@ class PartitionModeTest(unittest.TestCase):
 
     def test_probes_in_partition_mode(self):
         self.mode.announced(ident(0x600))
-        self.enter()
+        self.mode.answered(ident(0x601))
+        self.enter()  # the failures' probe went to 0x601, the most recent, and failed
         self.assertFalse(self.mode.probe_due())
         self.clock.now += PROBE_INTERVAL
         self.assertTrue(self.mode.probe_due())
-        targets = [self.mode.probe_target() for _ in range(5)]
-        # Those that failed (most recent first), then the recently heard, in turn
-        self.assertEqual(targets, [ident(0x202), ident(0x201), ident(0x200), ident(0x600), ident(0x202)])
+        targets = [self.mode.probe_target() for _ in range(4)]
+        # In turn the recently heard or answered, those that failed since last; never 0x200-0x202, which only ever
+        # failed (a reply can name made-up IDs)
+        self.assertEqual(targets, [ident(0x601), ident(0x600), ident(0x601), ident(0x600)])
         self.mode.probed(targets[0], False)
         self.assertFalse(self.mode.probe_due())
         self.clock.now += PROBE_INTERVAL
@@ -434,8 +466,14 @@ class PartitionWiringTest(IslandCase):
     def test_a_probe_ends_it(self):
         clock = FakeClock()
         self.node.partition.clock = clock
+        for n in self.backbone:
+            self.node._answered(n)  # the backbone answered before the gateway went down
         self.cut()
         self.node.lookups.search(ident(0x4444)).find_providers(lambda provider: None)
+        # The failures asked for a probe, which the local-servers thread sends at once (woken); it fails
+        self.assertFalse(self.node.partition.active)
+        self.assertTrue(self.node._local_wake.is_set() and self.node.partition.probe_due())
+        self.node.check_local()
         self.assertTrue(self.node.partition.active)
         self.node.check_local()
         self.assertTrue(self.node.partition.active)  # no probe due yet

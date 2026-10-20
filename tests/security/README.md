@@ -163,3 +163,12 @@ N1's page half is in the content table.
 | ID | Test modules | Code guarded | Fix commits |
 |---|---|---|---|
 | none (fuzzing) | `test_fuzz_parsers.py` (needs hypothesis) | the strict parsers of untrusted bytes: `rnfs/content/cid.py`, `rnfs/content/dag.py`, `rnfs/content/storage.py`, `rnfs/names.py`, `rnfs/network/`, `rnfs/uris.py`, `rnfs/gateway.py` | `077f33a` (test); found T1 |
+
+## 0.2.0 review (REV)
+
+A read-only review of 0.2.0 against remote and local attackers, fixed before 0.2.0 was released; the findings are
+the roadmap's "Security fixes from the 0.2.0 review".
+
+| ID | Test modules | Code guarded | Fix commits |
+|---|---|---|---|
+| REV4 | `test_rev4_forced_partition.py` | `rnfs/dht/local.py` (`PartitionMode.failed`, `probe_target`), `rnfs/node.py` (`_knows_server`, `_run_local`) | "Partition mode can't be forced from outside (REV4)" |

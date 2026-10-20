@@ -60,6 +60,12 @@ Security:
   assembled may not outgrow the advertised total; a file's metadata must be a small flat map, checked before RNS
   decodes it; a page must be one flat byte string, checked from its msgpack headers before RNS decodes it. The
   daemon's process-wide decompression limit stays 0, and `rnfs.dht` links keep every rule they have.
+- **Partition mode can't be forced from outside** (spec section 6, "LoRa islands"; REV4): a server beyond the island
+  could answer a slow node's `/find` with 3 made-up IDs, whose failures entered partition mode at once. Only failures
+  of servers the node knows (its routing table or first-seen log, or an identity or path RNS knows) count, and 3 in a
+  row ask for a probe of an off-island server that answered or announced itself recently, as silence does: partition
+  mode starts only if that probe fails (or nothing beyond the island was heard to probe). An ID that only ever failed
+  is never a probe target.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
@@ -373,12 +379,12 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   nodes with no slow interface and no `local_interfaces` are unchanged. New settings `local_interfaces`,
   `local_hops`, `local_replicas`; `rnfs status` gains `local_servers`.
 - **Partition mode** (spec section 6, "LoRa islands"): a node with local servers that fails 3 times in a row to reach
-  off-island servers, or hears no off-island announce or answer for over 4 times the usual gap between off-island
-  announces (at least 10 minutes) and then gets no answer from one it probes, uses its local servers only for
-  lookups and publishing, so a search during a gateway outage ends in the time its island takes instead of minutes
-  of link timeouts. Any off-island answer or fresh announce ends it, and a probe of one off-island server every 5
-  minutes (on slow nodes after 15 minutes, doubling up to 2 hours) keeps it from sticking. Silence alone never enters
-  it, so a small connected network with sparse announces doesn't flap. `rnfs status` gains `partition` and
+  off-island servers it knows, or hears no off-island announce or answer for over 4 times the usual gap between
+  off-island announces (at least 10 minutes), and then gets no answer from one it probes, uses its local servers
+  only for lookups and publishing, so a search during a gateway outage ends in the time its island takes instead of
+  minutes of link timeouts. Any off-island answer or fresh announce ends it, and a probe of one off-island server
+  every 5 minutes (on slow nodes after 15 minutes, doubling up to 2 hours) keeps it from sticking. Silence alone never
+  enters it, so a small connected network with sparse announces doesn't flap. `rnfs status` gains `partition` and
   `partition_since`.
 - **The heal republish:** keys whose last publish round reached no server beyond the island (during a partition) are
   marked, and republished as soon as partition mode ends, paced as a slow node's rounds are, so the rest of the
@@ -387,7 +393,7 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
 
   Together, over the fake network of `tests/test_topology.py` (1,000 servers, 21% on 8 islands, an island's gateway
   down): a neighbour found what an island node published before the partition 100% of the time instead of 67%, and
-  what it published during it 100% instead of 91%, with 0.15 timeouts and 31 s of simulated time per search instead
+  what it published during it 100% instead of 91%, with 0.2 timeouts and 33 s of simulated time per search instead
   of 11.7 and 490 s; the backbone found what was published during the partition 0% of the time until the heal
   republish, 99.5% after it. Over a simulated week with 5 or 20 servers beyond the island announcing every 6 hours,
   partition mode was entered only while the gateway was down, and left within 49 minutes of its coming back.

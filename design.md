@@ -560,16 +560,19 @@ becomes exactly those it found local, and earlier local ones it didn't see are j
 `closest(key, count, exclude)`, `nodes()`, `len()`. `judge_all(paths, is_server, is_local)` judges a scan's
 `PathInfo`s of the destinations that are known servers. `first_count(named)`: `LOCAL_FIRST` (1) when
 `local_interfaces` names the island, else `LOCAL_FIRST_RADIUS` (3). `Lookups(local_first=)` passes those nodes as a
-search's first lookup's `first`. `PartitionMode(is_local, slow, on_change, clock=monotonic, wall_clock)`: `active`,
-`since` (wall time), `entered`; `allows(id)` (not active, or local); `answered(id)` (off-island: resets the failures,
-notes contact, ends it), `failed(id)` (off-island: the `FAILURES_TO_ENTER`-th in a row enters it), `announced(id)` (a
-fresh off-island announce: a gap sample in `_gaps`, a deque of `GAP_SAMPLES`, only if no partition mode since the last
-(`_clean`); contact; ends it); `silence_limit()` (None below `MIN_GAPS`, else max(`MIN_SILENCE`, `SILENCE_FACTOR` ×
-the mean)); `probe_due()` (active: `_next_probe` passed; else silence since `_last_contact` over the limit);
-`probe_target()` (`_unreached` then `_recent`, most recent first, each at most `RECENT_OFF_ISLAND`, taken in turn);
-`probed(id, answered)` (answered: as `answered`; else counted, and outside partition mode it enters; in it the next
-probe is `PROBE_INTERVAL`, 300 s, later, or on slow nodes `SLOW_PROBE_INTERVAL`, 900 s, doubling to `SLOW_PROBE_MAX`,
-7200 s, reset at each entry); `no_target()` (silence counts from now); `state()` (`partition`, `partition_since`).
+search's first lookup's `first`. `PartitionMode(is_local, slow, on_change, clock=monotonic, wall_clock, known,
+on_probe)`: `active`, `since` (wall time), `entered`; `allows(id)` (not active, or local); `answered(id)` (off-island:
+resets the failures, notes contact, ends it), `failed(id)` (off-island and `known(id)`: the `FAILURES_TO_ENTER`-th in
+a row sets `_wanted`, a probe due at once, and calls `on_probe()`, or with no `_targets()` enters it), `announced(id)`
+(a fresh off-island announce: a gap sample in `_gaps`, a deque of `GAP_SAMPLES`, only if no partition mode since the
+last (`_clean`); contact; ends it); `silence_limit()` (None below `MIN_GAPS`, else max(`MIN_SILENCE`,
+`SILENCE_FACTOR` × the mean)); `probe_due()` (active: `_next_probe` passed; else `_wanted`, or silence since
+`_last_contact` over the limit); `probe_target()` (`_targets()`: the off-island servers of `_recent`, heard or
+answered, most recent first, those not in `_unreached` (failed since) before those in it, each at most
+`RECENT_OFF_ISLAND`, taken in turn; an ID only in `_unreached` is never one, REV4); `probed(id, answered)` (answered:
+as `answered`; else outside partition mode it enters; in it the next probe is `PROBE_INTERVAL`, 300 s, later, or on
+slow nodes `SLOW_PROBE_INTERVAL`, 900 s, doubling to `SLOW_PROBE_MAX`, 7200 s, reset at each entry); `no_target()`
+(silence counts from now; if `_wanted`, enters it); `state()` (`partition`, `partition_since`).
 `on_change(active)` runs outside its lock.
 
 `firstseen.py` — `FirstSeenLog(state_dir=None, clock=time.time, max_rows=MAX_FIRST_SEEN)`, a `node.Store`:
@@ -1681,7 +1684,7 @@ at most every `EVENT_INTERVAL` (1 s) on the job's thread, its progress is a `job
 | Thread | Owner | Does |
 |---|---|---|
 | `rnfs-join`, `rnfs-publisher`, `rnfs-names`, `rnfs-maintenance` | node | joining (and joining again while under `MIN_SERVERS`), publishing, name announces, periodic saves and eviction |
-| `rnfs-local` | node (`_run_local`), only on a node that may have local servers | every 30 s: the path table read for the local servers every 10 minutes, and partition mode's off-island probes (`check_local`) |
+| `rnfs-local` | node (`_run_local`), only on a node that may have local servers | every 30 s, or at once when failures ask for a probe: the path table read for the local servers every 10 minutes, and partition mode's off-island probes (`check_local`) |
 | `rnfs-remote-pin-checks`, `rnfs-remote-pin-check` | node | checking whether the remote pins asked for are done: a pass every 30 s once joined, its provider lookups on up to 4 threads at once (1 on slow nodes, shared with on-demand checks) |
 | `rnfs-announcer`, `rnfs-response-monitor`, `rnfs-link-sweeper` | network | rnfs.dht announces, `/blocks` deadlines and displacement, idle links |
 | `rnfs-lookup`, `rnfs-lookup-path`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin`, `rnfs-publish-lookup`, `rnfs-publish-provide` | per operation | lookups, a disjoint lookup's paths (all but the first, which runs in the caller's thread; every path for `find_providers`), fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting), a publishing round's region lookups (up to 4 at once) and its `/provide`s (`rnfs-publish-provide`, up to 16 at once), both ended with the round and none on slow nodes |
@@ -1894,7 +1897,10 @@ Everything in the specification is implemented, with these simplifications and a
   `Traffic.announced` counts as fresh to `_fresh_announce`, which tells it of servers `_heard_server` judged off-island
   (`local.judged(id) is False`); the publisher (`set_islands`) each `/provide` that recorded keys or opened no link.
   `_wired_lookup` adds `allowed=partition.allows`, and `_start_nodes` puts the K closest local servers first while it
-  is active. `check_local` probes when `probe_due()` (`probe_off_island`: `client.find(target, own ID)` on the
+  is active. Its `known` is `_knows_server` (`_is_server`, or RNS knows the identity, `_is_known`, or a path,
+  `_path_hops`), so made-up IDs a reply names don't count; its `on_probe` sets `_local_wake`, which `_run_local` waits
+  on between checks (`LOCAL_CHECK`), so the probe failures ask for goes at once; `stop` sets it too. `check_local`
+  probes when `probe_due()` (`probe_off_island`: `client.find(target, own ID)` on the
   `rnfs-local` thread; an answer goes to `routing.answered`, a failure isn't counted there). `_partition_changed` logs
   the change and, on leaving, calls `Publisher.heal()`; `_contact` (an off-island answer, fresh announce or probe
   answer outside partition mode) calls it once after a start too (`_heal_at_contact`), for marks a restart kept after

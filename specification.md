@@ -761,30 +761,38 @@ or protocol constant changes.
   their replies lists a provider; their replies seed the rest of the lookup as any answer does (its start nodes),
   and the lookup's bounds and checks are unchanged. Its fallback over disjoint paths doesn't ask them first again.
 - **Partition mode.** Servers that aren't local are *off-island*. A node with local servers SHOULD notice when it is
-  cut off from them and then use its local servers only. rnfs enters partition mode:
-  - after 3 failures in a row reaching off-island servers (a `/find` unanswered, or a `/provide` for which no
-    identified link could be opened; any off-island answer between resets the count; local ones don't count), or
+  cut off from them and then use its local servers only. rnfs enters partition mode when a probe of an off-island
+  server (below) goes unanswered:
+  - after 3 failures in a row reaching off-island servers it knows (a `/find` unanswered, or a `/provide` for which
+    no identified link could be opened; any off-island answer between resets the count; local ones don't count).
+    A server it knows is one in its routing table or announce first-seen log, or whose identity or path RNS knows:
+    a `/find` reply can name made-up IDs, which always fail, and they don't count. The probe goes at once, to a
+    server that answered or announced itself recently (with none, nothing beyond the island having been heard since
+    the start, the failures enter partition mode without one); or
   - after off-island silence (no off-island answer nor fresh announce) longer than 4 times the usual gap between the
     off-island announces it heard (their mean over the last 32 gaps, counted once it has 8, and none that spanned
-    partition mode), and at least 10 minutes, if a probe (below) then goes unanswered. Silence alone doesn't enter
-    it: with servers announcing every 6 hours, an island hearing 20 of them hears one about every 18 minutes, and
-    such gaps vary, so a fixed silence would flap on a small connected network. A fresh announce is one RNS didn't
-    mark as a path response, emitted within the last 15 minutes (allowing 5 minutes of clock difference, as a peer's
-    online state is judged, section 11): an island node's cached answer for an off-island server says nothing about
-    the way off the island.
+    partition mode), and at least 10 minutes. Silence alone doesn't enter it: with servers announcing every 6 hours,
+    an island hearing 20 of them hears one about every 18 minutes, and such gaps vary, so a fixed silence would flap
+    on a small connected network. A fresh announce is one RNS didn't mark as a path response, emitted within the last
+    15 minutes (allowing 5 minutes of clock difference, as a peer's online state is judged, section 11): an island
+    node's cached answer for an off-island server says nothing about the way off the island.
+
+  Failures alone don't enter it either, as a server beyond the island can name in its replies servers it controls
+  and lets fail.
 
   In partition mode, lookups (searches and their fallback, publishing's region and widened lookups) query local
   servers only, starting from the local servers closest to the key, and a lookup running when it begins drops its
   off-island nodes as their turn comes; a publish round stores to and withdraws from local servers only (the
   withdrawals for others stay queued, and a store set's off-island servers are left out). So a search on the island
   ends in about the time its local servers take instead of minutes of link timeouts. Any off-island answer or fresh
-  off-island announce ends it. While in it the node probes one off-island server (a `/find` for its own ID, to those
-  that failed and those heard most recently in turn; a failed probe isn't counted against the server in the routing
-  table) every 5 minutes, or on a slow node after 15 minutes, doubling after each unanswered probe up to 2 hours: a
-  probe costs a path request and a link's airtime on radio, and every node of a cut-off island probes. The node's
-  status says whether it is in partition mode and since when. With a hop radius, island servers beyond `local_hops`
-  count as off-island: their announces and answers keep a node out of partition mode or end it, so on wide islands
-  set `local_interfaces`.
+  off-island announce ends it. While in it the node probes one off-island server (a `/find` for its own ID, to the
+  servers that answered or announced themselves most recently in turn, those that failed since after the rest, never
+  an ID that only ever failed; a failed probe isn't counted against the server in the routing table) every 5
+  minutes, or on a slow node after 15 minutes, doubling after each unanswered probe up to 2 hours: a probe costs a
+  path request and a link's airtime on radio, and every node of a cut-off island probes. The node's status says
+  whether it is in partition mode and since when. With a hop radius, island servers beyond `local_hops` count as
+  off-island: their announces and answers keep a node out of partition mode or end it, so on wide islands set
+  `local_interfaces`.
 - **The heal republish.** Records stored during a partition sit on island servers only, so after it the rest of the
   network finds them only once the publisher republishes (rnfs: every 3 days on a slow node): 1–14% of the time in
   the simulation. A node SHOULD mark each key whose last round reached no off-island server (rnfs: in partition mode,
@@ -801,8 +809,8 @@ or protocol constant changes.
   content published before a partition was found 78% of the time (55% with none). Over the fake network of
   `tests/test_topology.py` (1,000 servers, 21% on 8 islands; a `/find` over LoRa taking 8 s, one to a server out of
   reach 40 s), with partition mode and the heal republish (below): a neighbour found what an island node published
-  before a partition 100% of the time instead of 67%, and what it published during it 100% instead of 91%, with 0.15
-  timeouts and 31 s per search instead of 11.7 and 490 s; the backbone found what was published during the partition
+  before a partition 100% of the time instead of 67%, and what it published during it 100% instead of 91%, with 0.2
+  timeouts and 33 s per search instead of 11.7 and 490 s; the backbone found what was published during the partition
   0% of the time until the heal republish, 99.5% after it.
 
 **Local scores.** A node MAY keep a private score for each peer it deals with, earned by work it checked itself.
