@@ -894,7 +894,7 @@ rnfs already uses most of what RNS 1.5.6 offers an application. Worth adopting, 
     check waits their 95th percentile within [15 s, `path_timeout`]. Shortened waits aren't measured; everything
     else (names, nodes a user or remote pin names, stores, fetches, joins) keeps `path_timeout`
 
-## Scale (to do)
+## Scale (implemented)
 
 * Sweep regions sized by servers that answered. `sweep.find_region` takes a region's prefix from the 10th closest
   server its lookup found, answered or not; on an island that result is padded with island servers far from the
@@ -913,6 +913,27 @@ rnfs already uses most of what RNS 1.5.6 offers an application. Worth adopting, 
   other nodes asked for (`remote:`) or followed names (`follow:`), so a node doesn't publish the file CIDs of
   content others asked it to keep. Its cap of 100,000 entry keys becomes a setting (`provide_entries_max`), as a
   large mirror (the Gutenberg mirror's files and folders) passes it and gets none
+* As implemented:
+  - Sweep regions: the roadmap's "10th closest that answered" measured wrong with the real code (a lookup's answered
+    servers include the hops on its way, so that prefix is shorter: backbone exactness 100% → 82%). Built instead:
+    the prefix is never shorter than floor(log2(N ÷ `K`) − 1) from the network size estimate (the far half still
+    asked about at the prefix as found); a region covers a key unless more than 2 of its 10 closest servers heard
+    of are ones whose identity the node doesn't know (`Lookup.heard`: what an island node lacks is identities, not
+    density), the rest get lookups of their own; with no estimate yet a region is its key alone. In test_topology's
+    world (real `Publisher` and `Sweep`): island placement 3.8 / 2.3 → 7.0 / 4.7 of 10 at 1,000 / 3,000 servers (a
+    lookup per key 7.8 / 5.0); a first round after a first start 0.3 / 0.1 → 6.5 / 5.0; backbone unchanged
+    (`tests/bench_publisher.py`, 2,000 servers: 159 / 176 lookups a round for 100k / 1M keys, 158 / 176 without the
+    estimate). An island region lookup covers about 1.5 keys, not 5.5: slow island nodes' capacity per round is
+    lower than "Providing at scale" estimated
+  - The publisher's state: `publish_items` (a row per provided item, an index on when it is next due) and
+    `publish_stores` (a round's stores, appended as it goes, merged after a crash); 0.1.x's `published` rows move
+    there at the upgrade. A wake asks the index; a round reads at most 50,000 due keys, in key-space slices.
+    Desktop NVMe: memory 1.3 KB → 160–190 B a key, a wake 80 ms (100k keys) and 1.1 s (1M) → 0.1 ms, writes per
+    round 55–83 KB → about 0.9 KB a key, a restart with 1M keys 18.7 → 5.6 s
+  - `provide_entries` provides the entries of pins from the user's own sources (user, folder, `name:`, `app:`), not
+    `remote:`, `follow:` or `deny`, also when set to `true`; a pin the user also holds counts as the user's. The
+    cap is `provide_entries_max` (default 100,000), applied at once; pins are taken oldest first, whole, so a single
+    pin past the cap provides none of its entries
 
 ## Resumable and compressed block transfers (implemented)
 
