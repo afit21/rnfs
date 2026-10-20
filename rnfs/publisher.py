@@ -1,7 +1,8 @@
 """Keeping what this node provides advertised in the DHT (specification section 6).
 
 - **What is provided** (provide_strategy): `pinned` provides every complete pin; `roots` also every complete
-  fetched target while it is cached (the node says which cached targets qualify: gateway fetches never do).
+  fetched target while it is cached (the node says which cached targets qualify: gateway fetches never do); `auto`,
+  the default, is `pinned` on a slow node and `roots` on others (effective_strategy: Publisher.strategy).
   Only these CIDs' DAGs are served to /blocks (section 7). A CID whose DAG holds a block the deny list (the
   storage's) denies is never provided: a change to the list takes effect at the next refresh(). A refresh
   recomputes this only when something it is computed from changed (the node's generation(), the deny list,
@@ -257,6 +258,15 @@ Widen = Callable[[bytes, Region], list[bytes]]
 # What the publisher provides: a CID, or a feature's DhtKey. Both have .key, hashing, str() and parse(), but only a
 # Cid has .binary or is served, so code that needs those must check (provided() does)
 ProvidedItem = Cid | DhtKey
+
+
+def effective_strategy(strategy: str, slow_node: bool) -> str:
+    """The provide strategy a node uses: provide_strategy as set, or for "auto" (the default) "pinned" on a slow node,
+    where each download's root would be published to about 10 servers over the radio (an identified link each, about
+    as much airtime as a small download, and it says what the user fetched), "roots" on others."""
+    if strategy == "auto":
+        return "pinned" if slow_node else "roots"
+    return strategy
 
 
 def key_interval(key: bytes, base: float) -> float:
@@ -964,6 +974,11 @@ class Publisher:
             return {"provided_entries": len(self._entries), "provide_entries_off": self._entries_off,
                     "provide_entries_capped": capped}
 
+    @property
+    def strategy(self) -> str:
+        """The provide strategy in use: provide_strategy, "auto" worked out for this node (effective_strategy)."""
+        return effective_strategy(self.config.provide_strategy, self.slow_node)
+
     def provided_keys(self) -> frozenset[bytes]:
         """The non-CID keys this node currently provides."""
         with self._lock:
@@ -992,7 +1007,7 @@ class Publisher:
         added since add their blocks to it; only one gone or changed builds it again.
         """
         pinned = candidates = self.storage.pinned_cids()  # the same frozenset until pins change: not copied
-        if self.config.provide_strategy == "roots":
+        if self.strategy == "roots":
             candidates = pinned | (self.storage.cached_targets() & set(self.cached_eligible()))
         dags: dict[Cid, frozenset[Cid]] = {}
         for cid in candidates:
@@ -1169,7 +1184,7 @@ class Publisher:
             # Read before computing: a change made while this computes moves the generation past what is
             # remembered here, so the next refresh computes again (perhaps once more than needed), never misses it
             inputs = (None if self.generation is None
-                      else (self.generation(), denied, keys, self.config.provide_strategy, self._entries_input()))
+                      else (self.generation(), denied, keys, self.strategy, self._entries_input()))
             last = self._inputs
             if (inputs is not None and last is not None and (last[1] is denied or last[1] == denied)
                     and last[0] == inputs[0] and last[2:] == inputs[2:]):

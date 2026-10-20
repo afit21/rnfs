@@ -1845,7 +1845,7 @@ class RnfsNode:
             self._note_fetched(target)
         if dropped:
             self._prune_fetched()  # records past MAX_CACHE_RECORDS: no longer cached, so no longer provided
-        if dropped or (self.config.provide_strategy == "roots" and not for_gateway):
+        if dropped or (self.publisher.strategy == "roots" and not for_gateway):
             self.publisher.refresh()
 
     # Facade: content

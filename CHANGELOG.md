@@ -566,6 +566,12 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   costs two request timeouts a week.
 
 Changed:
+- **A slow node no longer publishes what it downloads, by default** (spec section 6, "Provide strategy"):
+  `provide_strategy` gains `auto`, the new default, which is `pinned` on a slow node and `roots` (as before) on
+  others. Over LoRa each download's root went to about 10 servers, an identified link each: at 977 bit/s the hour
+  after three 16 KB downloads the laptop transmitted 6.6% of the time, nearly all of it publishing their roots, and it
+  told every node which files its user fetched. A slow node set to `roots` keeps doing so. After the upgrade a slow node
+  with the setting unset withdraws its cached downloads' records (paced, as any withdrawal).
 - **`provide_entries` covers the user's own content only** (a changed default): the files and folders inside pins of
   the user, the shared folder, names and apps are provided by their own CIDs, but not those inside pins other nodes
   asked for (`remote:`) or followed names (`follow:`), so a node doesn't publish the file CIDs of content others

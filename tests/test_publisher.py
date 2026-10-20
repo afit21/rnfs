@@ -294,9 +294,17 @@ class PublisherCase(unittest.TestCase):
 class PublisherTest(PublisherCase):
     """The publisher's provide set, publishing, withdrawals and refreshes."""
 
-    def test_roots_is_the_default(self):
+    def test_auto_is_the_default_pinned_on_a_slow_node(self):
+        """Over a radio each download's root would go to about 10 servers, an identified link each: about the airtime
+        of a small download (and it tells them what was fetched). A slow node provides its pins only unless set."""
         from rnfs.config import Config
-        self.assertEqual(Config().provide_strategy, "roots")
+        self.assertEqual(Config().provide_strategy, "auto")
+        self.assertEqual(publisher_module.effective_strategy("auto", slow_node=False), "roots")
+        self.assertEqual(publisher_module.effective_strategy("auto", slow_node=True), "pinned")
+        self.assertEqual(publisher_module.effective_strategy("roots", slow_node=True), "roots")  # as set
+        self.assertEqual(self.publisher.strategy, "roots")
+        self.publisher.slow_node = True
+        self.assertEqual(self.publisher.strategy, "pinned")
 
     def test_pinned_strategy(self):
         self.config.provide_strategy = "pinned"

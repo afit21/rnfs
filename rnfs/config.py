@@ -45,7 +45,7 @@ FLAGS = ("private", "gateway_scripts", "default_bootstrap", "debug_log")
 OPTIONAL_FLAGS = ("provide_entries",)  # true, false, or unset (None: a default that depends on the node)
 IDENTITY_LISTS = ("members", "remote_pin_identities")  # RNS identity hashes: 32 hex digits, optionally <bracketed>
 # Settings that take one of a few words (Config.validate), core and feature ones alike
-CHOICES = {"slow": ("yes", "no", "auto"), "dht_mode": ("server", "client"), "provide_strategy": ("pinned", "roots"),
+CHOICES = {"slow": ("yes", "no", "auto"), "dht_mode": ("server", "client"), "provide_strategy": ("pinned", "roots", "auto"),
            "keeper_query": ("fallback", "always")}
 _HEX_ID = ids.HEX16  # the name other modules used before rnfs.ids
 
@@ -114,7 +114,8 @@ DESCRIPTIONS = {
     "members": "Private mode's member identity hashes (hex)",
     "private": "Private mode: talk to members only",
     "scan_interval": "How often the shared folder and the folders synced to names are scanned",
-    "provide_strategy": "roots (pins and complete cached downloads) or pinned (pins only) are provided",
+    "provide_strategy": "roots (pins and complete cached downloads) or pinned (pins only) are provided; auto: pinned "
+                        "on a slow node, roots on others",
     "provide_entries": "Also provide every file and folder inside the user's own complete pins (not remote pins or "
                        "followed names'); unset: on, but on slow nodes only while republishing stays under 2% of "
                        "the channel",
@@ -221,7 +222,9 @@ class Config:
     members: list[str] = field(default_factory=list)  # private mode's member identity hashes (hex)
     private: bool = False  # private mode (section 3)
     scan_interval: float = 60
-    provide_strategy: str = "roots"  # "roots" (pins and complete cached downloads) or "pinned" (pins only)
+    # "roots" (pins and complete cached downloads), "pinned" (pins only), or "auto": pinned on a slow node, where
+    # publishing each download's root costs about the airtime of a small download, roots elsewhere
+    provide_strategy: str = "auto"
     # Also provide the CID of every file and directory inside the user's own complete pins (spec section 6). None:
     # on, up to provide_entries_max; on slow nodes only while the estimated republish airtime stays small
     provide_entries: bool | None = None

@@ -1149,7 +1149,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--dht-mode", choices=["server", "client"])
     daemon.add_argument("--slow", choices=["yes", "no", "auto"])
     daemon.add_argument("--private", action="store_true", default=None, help="private mode: members only")
-    daemon.add_argument("--provide-strategy", choices=["pinned", "roots"])
+    daemon.add_argument("--provide-strategy", choices=["pinned", "roots", "auto"])
     daemon.add_argument("--no-gateway-scripts", action="store_true", help="don't let gateway pages run scripts")
     daemon.add_argument("--debug-log", action="store_true", default=None,
                         help="also write every message, gateway request and RNS message to <rnfs dir>/debug.log")

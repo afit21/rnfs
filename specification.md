@@ -1250,15 +1250,19 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   many keys don't come due at once (256 slots) while keys sharing their leading bits come due together (the
   same servers are closest to them); the jittered interval stays below `PROVIDER_TTL / 2`.
 - **Provide strategy** (`provide_strategy`):
-  - `roots` (default) provides every complete pin, and every complete fetched target while it is cached
+  - `roots` provides every complete pin, and every complete fetched target while it is cached
     (so at most `max_storage` of downloads at a time). That is every complete download, whatever the command:
     `get`, `cat`, and even `stat`, `info` or `ls` of another node's content when what they fetched is the
     whole target (a small file is one block). Anyone can look up the provider records, or ask the node for
     the blocks (section 7), and so learn what it fetched.
   - `pinned` provides every complete pin only, so downloads are never published or served.
+  - `auto` (default, rnfs 0.2.0) is `pinned` on a slow node (section 2) and `roots` on others.
 
   `roots` helps popular content spread; `pinned` uses less airtime and doesn't publish what a user
-  downloads. Gateway fetches are never provided under either.
+  downloads. Gateway fetches are never provided under either. A slow node SHOULD NOT provide its downloads unless its
+  user asks: each is published to about 10 servers over the radio, an identified link each (about 6.4 s of airtime at
+  1 kbit/s), as much airtime as a small download's own; measured over LoRa at 977 bit/s, the hour after three 16 KB
+  downloads the laptop transmitted 6.6% of the time, nearly all of it publishing their roots.
   Keepers also provide the keys of the names they keep (section 9), under any strategy.
 - **Entries** (`provide_entries`). A node MAY also provide the CID of every file and directory inside a complete
   pin of the user's own content: each CID a directory entry names, at every depth (through index nodes too), so
@@ -2680,7 +2684,7 @@ Reticulum, the DHT mode and private mode never apply before a restart.
 | `private` | off | Private mode (section 3) |
 | `members` | empty | Private mode's member identities |
 | `scan_interval` | 60 s | Shared folder, and folders synced to names (section 9) |
-| `provide_strategy` | `roots` | `roots` (pins and complete cached downloads) or `pinned` (pins only) |
+| `provide_strategy` | `auto` | `roots` (pins and complete cached downloads), `pinned` (pins only), or `auto`: `pinned` on a slow node, `roots` on others |
 | `provide_entries` | unset: on, up to `provide_entries_max` entry keys; on slow nodes only while republishing stays under 2% of the channel | Also provide every file and folder inside the user's own complete pins (section 6: not remote pins or followed names'). `true` or `false` overrides the default either way |
 | `provide_entries_max` | 100,000 | Entry keys `provide_entries` provides at most: pins oldest first, each pin's entries all or none (section 6). 0: none |
 | `gateway_scripts` | on | |
