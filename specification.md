@@ -156,9 +156,13 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   nodes over its radio too. A node running its own RNS instance SHOULD send the path request for a node a `/find` reply
   named, whose identity it doesn't know, only on the interface its path to the replying node uses
   (`Transport.next_hop_interface`, `request_path(on_interface=...)`; rnfs: searches' and publishing's lookups, not the
-  join's). An interface RNS spawned (a hub's interface for one client, an AutoInterface's for one peer) stands for all
-  its parent's: the request goes on each of them with one tag, as RNS itself forwards a local client's request. A
-  lookup has other candidates, so a miss isn't asked again on every interface. Joins, names, providers and links to
+  join's), when that interface is fast (its bitrate at least `slow_bitrate`): an ID named by a node reached over the
+  internet side is asked only there. One named by a node reached over a slow interface, or one whose bitrate RNS
+  doesn't give, is asked on every interface: it may be an island server, reachable only over the radio, or an
+  internet one, reachable only over the other side. An interface RNS spawned (a hub's interface for one client, an
+  AutoInterface's for one peer) stands for all its parent's: the request goes on each of them with one tag, as RNS
+  itself forwards a local client's request. A lookup has other candidates, so a miss isn't asked again on every
+  interface. Joins, names, providers and links to
   known IDs ask on every interface. Through a shared instance nothing changes: the instance forwards a client's request
   on all its interfaces (`Transport.path_request`), so scoping it there would need an RNS change. RNS documents
   `on_interface` as not for normal use, but in RNS 1.5.6 an outgoing path request is filtered by nothing else (no

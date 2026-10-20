@@ -11,7 +11,7 @@ from rnfs.network import paths
 from tests.fakes.log import quiet_log
 from tests.support import FakeClock, wait_for
 
-A, B, C = bytes([1]) * 16, bytes([2]) * 16, bytes([3]) * 16
+A, B, C, D = bytes([1]) * 16, bytes([2]) * 16, bytes([3]) * 16, bytes([4]) * 16
 setUpModule, tearDownModule = quiet_log()
 
 
@@ -214,9 +214,10 @@ class BudgetTest(unittest.TestCase):
 class FakeInterface:
     """An RNS interface as scoping reads it."""
 
-    def __init__(self, name, parent=None, online=True, out=True):
+    def __init__(self, name, parent=None, online=True, out=True, bitrate=10_000_000):
         """An interface called name, spawned by parent if given."""
         self.name, self.parent_interface, self.online, self.OUT = name, parent, online, out
+        self.bitrate = bitrate
         self.spawned_interfaces = None
 
 
@@ -240,13 +241,13 @@ class ScopeTest(unittest.TestCase):
             self.sent_on.append((destination, on_interface, tag))
             record(destination, on_interface, tag)
         self.transport.request_path = request_path
-        self.lora, self.tcp = FakeInterface("LoRa"), FakeInterface("TCP")
+        self.lora, self.tcp = FakeInterface("LoRa", bitrate=1_200), FakeInterface("TCP")
         self.server = FakeInterface("hub")
         self.server.spawned_interfaces = [object()]  # a parent: its own sending does nothing
         self.clients = [FakeInterface(f"client {n}", parent=self.server) for n in range(2)]
         self.transport.interfaces = [self.lora, self.tcp, self.server, *self.clients]
         self.transport.local_client_interfaces = []
-        self.next_hops = {A: self.tcp, B: self.clients[1]}
+        self.next_hops = {A: self.tcp, B: self.clients[1], D: self.lora}
         self.transport.next_hop_interface = self.next_hops.get
         self.reticulum = types.SimpleNamespace(is_connected_to_shared_instance=False,
                                                get_interface_stats=lambda: stats())
@@ -255,7 +256,7 @@ class ScopeTest(unittest.TestCase):
             """Advance virtual time."""
             self.clock.now += seconds
         self.budget = paths.PathRequests(transport=lambda: self.transport, reticulum=lambda: self.reticulum,
-                                         clock=self.clock, sleep=sleep)
+                                         clock=self.clock, sleep=sleep, slow_bitrate=100_000)
 
     def interfaces(self, destination) -> list:
         """The interfaces destination's path requests went on (None: every interface)."""
@@ -266,6 +267,13 @@ class ScopeTest(unittest.TestCase):
         self.assertTrue(self.budget.await_path(C, 30))
         self.assertEqual(self.interfaces(C), [self.tcp])
         self.assertEqual(self.budget.scoped, 1)
+
+    def test_named_by_a_node_over_the_radio_is_asked_everywhere(self):
+        # It may be an island server (reachable over the radio only) or an internet one (over TCP only)
+        self.budget.named(C, D)
+        self.assertTrue(self.budget.await_path(C, 30))
+        self.assertEqual(self.interfaces(C), [None])
+        self.assertEqual(self.budget.scoped, 0)
 
     def test_a_spawned_interface_stands_for_its_parents(self):
         self.transport.answer = lambda destination: False
@@ -281,6 +289,9 @@ class ScopeTest(unittest.TestCase):
             "not named": lambda: None,
             "named long ago": lambda: (self.budget.named(C, A), setattr(self.clock, "now", self.clock.now + 301)),
             "path to the namer unknown": lambda: self.budget.named(C, bytes(16)),
+            "the namer's interface of unknown bitrate": lambda: (self.budget.named(C, A), setattr(
+                self.tcp, "bitrate", None)),
+            "no slow_bitrate given": lambda: (self.budget.named(C, A), setattr(self.budget, "slow_bitrate", None)),
             "through a shared instance": lambda: (self.budget.named(C, A), setattr(
                 self.reticulum, "is_connected_to_shared_instance", True)),
             "interface offline": lambda: (self.budget.named(C, A), setattr(self.tcp, "online", False)),

@@ -237,7 +237,7 @@ INTERNALS = [
              "(the packet's attached_interface, the only filter _outbound applies to a path request going out), as RNS "
              "itself forwards a local client's request; await_path(on_interface=); next_hop_interface giving the path "
              "table entry's interface; Transport.interfaces and local_client_interfaces; an Interface's OUT, online, "
-             "detached, parent_interface and spawned_interfaces",
+             "detached, parent_interface, spawned_interfaces and bitrate",
              lambda: (_params(RNS.Transport.request_path, "destination_hash", "on_interface", "tag"),
                       _params(RNS.Transport.await_path, "on_interface"),
                       _source(RNS.Transport.request_path, "attached_interface = on_interface",
@@ -252,7 +252,7 @@ INTERNALS = [
                               "return Transport.path_table[destination_hash][IDX_PT_RVCD_IF]"),
                       _has(RNS.Transport, "interfaces", "local_client_interfaces"),
                       _assigns(RNS.Interfaces.Interface.Interface.__init__, "online", "detached", "parent_interface",
-                               "spawned_interfaces"),
+                               "spawned_interfaces", "bitrate"),
                       _has(RNS.Interfaces.Interface.Interface, "OUT"))),
 
     # Sealed files

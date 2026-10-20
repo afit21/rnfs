@@ -25,7 +25,10 @@ resolution too. A node therefore paces its own:
   destination.
 - **Scoping** (named): with its own RNS instance, the path request for a node a /find reply named (its identity
   unknown) goes only on the interface the path to the node that named it uses (Transport.next_hop_interface,
-  request_path's on_interface), so an internet node's lookups don't flood its radio with requests for internet nodes.
+  request_path's on_interface), if that interface is fast (its bitrate at least slow_bitrate), so lookups over the
+  internet side don't flood the node's radio with requests for internet nodes. A node named by one reached over a
+  slow interface (or one of unknown bitrate) is asked on every interface: it may be an island server, reachable only
+  over the radio, or an internet one, reachable only over the other side.
   A spawned interface (a hub's interface for one client, an AutoInterface's for one peer) stands for its parent's
   spawned interfaces: the request goes on each of them with one tag, as RNS itself forwards a local client's request
   interface by interface. A lookup has other candidates, so a miss isn't asked again elsewhere. Joins, names and links
@@ -99,6 +102,13 @@ def _sendable(interface, transport) -> bool:
             and not any(interface is local for local in (getattr(transport, "local_client_interfaces", None) or ())))
 
 
+def _fast(interface, slow_bitrate: float) -> bool:
+    """True if interface's bitrate is known and at least slow_bitrate (as rnfs.network.rates judges interfaces)."""
+    bitrate = getattr(interface, "bitrate", None)
+    return (isinstance(bitrate, (int, float)) and not isinstance(bitrate, bool) and math.isfinite(bitrate)
+            and bitrate >= slow_bitrate)
+
+
 class PathRequests:
     """A node's path requests under one budget (see the module docstring). Thread-safe.
 
@@ -107,9 +117,12 @@ class PathRequests:
 
     def __init__(self, transport: Callable[[], object] = _rns_transport,
                  reticulum: Callable[[], object] = _rns_instance, clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], object] = time.sleep, spacing: float = SPACING):
-        """No request sent yet: the first takes its turn at once."""
+                 sleep: Callable[[float], object] = time.sleep, spacing: float = SPACING,
+                 slow_bitrate: float | None = None):
+        """No request sent yet: the first takes its turn at once. slow_bitrate (bits/s, the node's): interfaces below it
+        are slow, and only a request named over a fast interface is scoped (None: nothing is)."""
         self._transport = transport
+        self.slow_bitrate = slow_bitrate
         self._reticulum = reticulum
         self.clock = clock
         self.sleep = sleep
@@ -286,10 +299,11 @@ class PathRequests:
 
     def _scope(self, destination: bytes, transport) -> list:
         """The interfaces destination's path request goes on: [] for every interface (no scope, a shared instance, or
-        the scope covering every interface anyway), else those of the path to the node that named it."""
+        the scope covering every interface anyway, or the path to the node that named it on a slow interface or one of
+        unknown bitrate), else those of the path to the node that named it."""
         with self._lock:
             hint = self._named.pop(destination, None)
-        if hint is None or not 0 <= self.clock() - hint[1] <= HINT_LIFE:
+        if hint is None or not 0 <= self.clock() - hint[1] <= HINT_LIFE or self.slow_bitrate is None:
             return []
         try:
             reticulum = self._reticulum()
@@ -300,6 +314,8 @@ class PathRequests:
             usable = [candidate for candidate in list(transport.interfaces) if _sendable(candidate, transport)]
             if interface is None or not any(candidate is interface for candidate in usable):
                 return []
+            if not _fast(interface, self.slow_bitrate):
+                return []  # named over the radio: an island server or an internet one, so asked everywhere
             parent = getattr(interface, "parent_interface", None)
             chosen = [interface] if parent is None else [
                 candidate for candidate in usable if getattr(candidate, "parent_interface", None) is parent]

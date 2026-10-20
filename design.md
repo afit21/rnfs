@@ -661,28 +661,29 @@ destination of the identity RNS recalls, and only if its hash is the node ID ask
 that identity is on `members`); the idle sweep spares a link `LinkPool.get()` handed out within `link_idle_timeout`.
 
 `paths.py` — `PathRequests(transport=lambda: RNS.Transport, reticulum=RNS.Reticulum.get_instance, clock, sleep,
-spacing=SPACING)`, the node's path-request budget (spec section 3, "Path requests"): `LinkPool` makes it
-(`LinkPool.paths`, over its own module's RNS, which tests replace) and the node hands it to `RnsNetwork(paths=)` (names)
-and `network/nomadnet.fetch(paths=)`. `await_path(destination, timeout, cancel)` (a known path returns at once; else a
-turn, then RNS's `Transport.await_path` with the whole timeout), `await_known(destination, known, timeout, cancel)`
-(a turn, `request_path`, then `known()` polled every `POLL`: `LinkPool._recall`'s identity wait), `send(destination)`
-(a turn, then `request_path`, unwaited: names), `charge(destination)` (`LinkPool._open` and NomadNet's `open_link` on a
-link not established: a turn taken, and the destination counted as requested). A turn (`_take_turn`) reserves
-`max(now, _next_turn)` and moves `_next_turn` a `spacing` on, so turns go in order of asking and never closer;
-`ready()` (the path or identity arrived) or `cancel` end the wait with nothing sent, and a turn lost so leaves a gap.
-At its turn a request goes unless `busiest_pr_frequency(get_interface_stats())` is over `CEILING` (1.5), else it
-reserves the next turn, for `CEILING_HOLD` (15 s) at most. `_waits` keeps one owner per destination; later callers
-wait on its event (polling `ready()`). `_sent` (an `OrderedDict`, at most `MAX_TRACKED`, older than `PATH_REQUEST_MI`
-forgotten) makes a wait within `PATH_REQUEST_MI` of the last request poll for `timeout` without sending.
-`lacked(destination)`: the last `await_path` or `await_known` for it ended without (`_lacked`, at most `MAX_TRACKED`).
-`named(node_id, by)` keeps a scope for node_id's next request (`_named`, `HINT_LIFE`, 300 s; popped by the request).
-`_scope` turns it into interfaces only with the node's own instance (`is_connected_to_shared_instance` false): the
-`next_hop_interface` of the path to `by`, if it is among the interfaces a request can leave by (`_sendable`: `OUT`,
-`online`, not `detached`, no `spawned_interfaces`, not a local interface type nor in `local_client_interfaces`); a
-spawned interface (a `parent_interface`) widens to every sendable interface of that parent. A scope covering every
-sendable interface is no scope. One interface: RNS's `await_path(on_interface=)`; several: `request_path(on_interface=,
-tag=)` on each with one random tag, then polled. `scoped` counts scoped requests. Counters
-`requests`, `charged`, `joined`, `reused`, `held`, `waited` are for tests and measurements.
+spacing=SPACING, slow_bitrate=None)`, the node's path-request budget (spec section 3, "Path requests"): `LinkPool` makes
+it (`LinkPool.paths`, over its own module's RNS, which tests replace) and the node hands it to `RnsNetwork(paths=)`
+(names) and `network/nomadnet.fetch(paths=)`. `await_path(destination, timeout, cancel)` (a known path returns at once;
+else a turn, then RNS's `Transport.await_path` with the whole timeout), `await_known(destination, known, timeout,
+cancel)` (a turn, `request_path`, then `known()` polled every `POLL`: `LinkPool._recall`'s identity wait),
+`send(destination)` (a turn, then `request_path`, unwaited: names), `charge(destination)` (`LinkPool._open` and
+NomadNet's `open_link` on a link not established: a turn taken, and the destination counted as requested). A turn
+(`_take_turn`) reserves `max(now, _next_turn)` and moves `_next_turn` a `spacing` on, so turns go in order of asking and
+never closer; `ready()` (the path or identity arrived) or `cancel` end the wait with nothing sent, and a turn lost so
+leaves a gap. At its turn a request goes unless `busiest_pr_frequency(get_interface_stats())` is over `CEILING` (1.5),
+else it reserves the next turn, for `CEILING_HOLD` (15 s) at most. `_waits` keeps one owner per destination; later
+callers wait on its event (polling `ready()`). `_sent` (an `OrderedDict`, at most `MAX_TRACKED`, older than
+`PATH_REQUEST_MI` forgotten) makes a wait within `PATH_REQUEST_MI` of the last request poll for `timeout` without
+sending. `lacked(destination)`: the last `await_path` or `await_known` for it ended without (`_lacked`, at most
+`MAX_TRACKED`). `named(node_id, by)` keeps a scope for node_id's next request (`_named`, `HINT_LIFE`, 300 s; popped by
+the request). `_scope` turns it into interfaces only with the node's own instance (`is_connected_to_shared_instance`
+false) and a `slow_bitrate` (`LinkPool` passes the config's): the `next_hop_interface` of the path to `by`, if it is
+fast (`_fast`: a finite `bitrate` at least `slow_bitrate`; slow or unknown: every interface) and among the interfaces a
+request can leave by (`_sendable`: `OUT`, `online`, not `detached`, no `spawned_interfaces`, not a local interface type
+nor in `local_client_interfaces`); a spawned interface (a `parent_interface`) widens to every sendable interface of that
+parent. A scope covering every sendable interface is no scope. One interface: RNS's `await_path(on_interface=)`;
+several: `request_path(on_interface=, tag=)` on each with one random tag, then polled. `scoped` counts scoped requests.
+Counters `requests`, `charged`, `joined`, `reused`, `held`, `waited` are for tests and measurements.
 
 `announces.py` — `DhtAnnouncer(destination, config, needs_reach=None)` sets `app_data` to the mode and runs the
 announce schedule; a client announces periodically only while `needs_reach()` (the node's `_needs_reach`:

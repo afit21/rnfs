@@ -258,7 +258,8 @@ class LinkPool:
         self.identity = identity
         self.config = config
         self.clock = clock
-        self.paths = paths if paths is not None else PathRequests(transport=lambda: RNS.Transport, reticulum=_reticulum)
+        self.paths = paths if paths is not None else PathRequests(transport=lambda: RNS.Transport, reticulum=_reticulum,
+                                                                  slow_bitrate=config.slow_bitrate)
         # Private mode links only to members: every link identifies, and an outsider mustn't learn who we are
         self.members = config.member_set
         self.shared: dict[bytes, PeerLink] = {}
