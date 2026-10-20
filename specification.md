@@ -110,6 +110,25 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   destination of the recalled identity, and only if its hash is the node ID asked for, so one identity can't
   answer for other node IDs through its other destinations.
 
+**Path requests.** RNS limits path requests as it limits announces (to 2% of an interface's bitrate, section 6).
+- Since RNS 1.2.5 every interface limits the path requests arriving on it. In RNS 1.5.6
+  (`Interface.should_ingress_limit_pr`, `Transport.inbound`) an interface, each TCP client a hub spawns included,
+  estimates the rate of incoming path requests from its last few (n requests over the time since the oldest; one
+  older than 10 s is dropped at each estimate). Above 8 a second, or 3 while the interface is under 2 hours old (as a
+  hub's interface for a client that just connected is), later requests wait in one queue of 8, shared by the
+  instance's interfaces, behind all other traffic, and the rest are dropped. A request let through is still answered
+  from the path table, but not forwarded to discover an unknown path. The limit holds for at least 15 s after the
+  rate falls back.
+- The limit counts every application's requests on the interface, so a burst from one costs the others on that
+  interface their path resolution too; RNS's release notes say applications that send many will see their users lose
+  path resolution, by design. On a shared radio channel the gateway's interface counts every node's requests.
+- RNS also sends path requests of its own: after a link that fails to establish, a node that isn't a transport node
+  expires the path and requests it again on every interface, at most once per destination every `PATH_REQUEST_MI`
+  (20 s) (RNS 1.5.6 `Transport.jobs`; `rnsd` does the same for its local clients' links).
+- A transport node answers a request for a destination it has a path to; it forwards one for a path it lacks only as
+  above (an access-point, gateway, roaming or boundary interface, or `recursive_prs`). A node that isn't a transport
+  node answers only for its own destinations.
+
 **Links.**
 - Requests to a node share one outgoing link, opened on demand and closed after `link_idle_timeout` without
   traffic (`Link.no_data_for()`). These links don't identify, so lookups and downloads don't reveal who is
@@ -574,6 +593,13 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
 
 Kademlia, used only for provider records. The distance between IDs `a` and `b` is `a XOR b` as a 128-bit
 big-endian integer; "closest" means smallest distance.
+
+**What announces carry.** Servers are found from their `rnfs.dht` announces (which carry the DHT mode, section 3),
+and names live in announces of their own (section 9). Provider records are never announced: they are stored on the
+servers closest to their key (`/provide`) and looked up (`/find`). RNS floods announces and lets them take at most
+2% of an interface's bitrate, which on a 1 kbit/s channel is about 1,150 announces a day: the presence of about 290
+nodes announcing every `announce_interval` (6 h), not an announce for each CID (one node providing 1,150 CIDs, each
+announced once a day, would take all of it).
 
 **Servers and clients.** As in IPFS, a node runs the DHT as a *server* or a *client* (`dht_mode`):
 - A server answers `/find` and `/provide`, stores provider records, and appears in routing tables.
