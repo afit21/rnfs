@@ -1,8 +1,8 @@
 """Outgoing RNS links to other nodes (specification section 3).
 
-- Requests to a node share one outgoing link, opened on demand and closed after link_idle_timeout without
-  traffic (Link.no_data_for()) or being handed out by LinkPool.get() or held (LinkPool.hold: a requester waiting
-  out the provider's upload pacing, so the next response keeps the link's rate estimate). These links don't identify, so lookups
+- Requests to a node share one outgoing link, opened on demand and closed after link_idle_timeout without traffic
+  (Link.no_data_for()) or being handed out by LinkPool.get() or held (LinkPool.hold: a requester waiting out the
+  provider's upload pacing, so the next response keeps the link's rate estimate). These links don't identify, so lookups
   and downloads don't reveal who asks.
 - A link goes only to a destination whose hash is the node ID asked for (rnfs.dht of the identity RNS
   recalls for it), so one identity can't pose as many node IDs by announcing other destinations.

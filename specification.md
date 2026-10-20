@@ -722,20 +722,19 @@ and repeat.
   answer for a node's next-hop interface for up to 15 seconds (each answer is an RPC to it); hops, and whether
   there is a path at all, are read fresh.
 
-  A provider *fails* when its link fails (there is no path to it, or the link is closed under a request by either
-  end), its answer is malformed, it answers `None` for a block of the root it advertised, it answers `False` (busy
-  or refused) `max_failures` times in a row, its requests go unanswered `max_failures` times in a row, or it
-  stalls twice (section 7). A `False` is retried after a short delay. A request goes *unanswered* when RNS times
-  it out with the link up (on a lossy path its packet or its answer's was lost: RNS resends neither), the link
-  times out under it, or a new link to a node RNS has a path to isn't established (its link request or proof
-  lost); the requester closes that link (which starts no cooldown, section 3) and asks again on a new one after
-  the same short delay. (Failing the provider at once, rnfs before 0.2.0 failed most 1 MiB fetches from one
-  provider at 5% packet loss.) A response RNS rejects at its advertisement as too large fails its request the
-  same way, so it is asked again too, `max_failures` times at most, as a `False` is. A `False` soon after the provider served a response (within 4 × that request's round
-  trip, counted from when it was sent) is taken as upload pacing (section 3) and not counted; it is retried
-  after an eighth of that round trip, or the usual delay if longer. Failed providers are removed and not
-  retried during that fetch. When no providers are left, `/find` runs again for a fresh random half, within the
-  same `lookup_timeout`.
+  A provider *fails* when its link fails (there is no path to it, or the link is closed under a request by either end),
+  its answer is malformed, it answers `None` for a block of the root it advertised, it answers `False` (busy or refused)
+  `max_failures` times in a row, its requests go unanswered `max_failures` times in a row, or it stalls twice (section
+  7). A `False` is retried after a short delay. A request goes *unanswered* when RNS times it out with the link up (on a
+  lossy path its packet or its answer's was lost: RNS resends neither), the link times out under it, or a new link to a
+  node RNS has a path to isn't established (its link request or proof lost); the requester closes that link (which
+  starts no cooldown, section 3) and asks again on a new one after the same short delay. (Failing the provider at once,
+  rnfs before 0.2.0 failed most 1 MiB fetches from one provider at 5% packet loss.) A response RNS rejects at its
+  advertisement as too large fails its request the same way, so it is asked again too, `max_failures` times at most, as
+  a `False` is. A `False` soon after the provider served a response (within 4 × that request's round trip, counted from
+  when it was sent) is taken as upload pacing (section 3) and not counted; it is retried after an eighth of that round
+  trip, or the usual delay if longer. Failed providers are removed and not retried during that fetch. When no providers
+  are left, `/find` runs again for a fresh random half, within the same `lookup_timeout`.
 
 **LoRa islands.** A LoRa mesh joined to the internet through a gateway (an *island*) is part of one DHT with the
 rest, so its own content's records sit on servers anywhere: while the gateway is down (a *partition*) a node there
@@ -1135,26 +1134,25 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
    (item 7): 32 chunks while a provider is reached over a fast link, else one (one chunk, the next asked for
    ahead), also while no provider is known yet; 32 chunks (2 MiB) would hold the first byte back for about 5 hours
    at 1 kbit/s.
-7. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers only
-   contend for the same channel). Whether a link is slow is judged per provider, not per node, so a node with a
-   fast and a slow interface (a gateway) isn't slow but doesn't run parallel transfers over its radio either: a
-   provider is reached over a *slow link* when the link's rate estimate is below `slow_bitrate`, or, without one,
-   when the next-hop interface of the path to it runs below `slow_bitrate` or it is behind a slow path (section 6);
-   the providers over slow links whose paths leave through the same next-hop interface (an unknown one counts as
-   one) have one request in flight between them. A response *stalls* if it makes no progress for `stall_timeout`, or misses the
-   same deadline the responder uses (section 3). A stalled provider's link is closed, which cancels the transfer,
-   and its blocks are requested again from another provider; providers that keep failing are handled as in
-   section 6. A fetch that fails or is cancelled, or whose reader stops early (item 6), closes the links of its
-   requests still in flight, so their responses don't keep using the link and hold up the next `/blocks` to those
-   nodes, unless another fetch has a request on the same link: closing it would fail that one, so the request is
-   left to finish. It never cancels their Resources (section 3, Cooldown). When nothing is left to ask for and a
-   provider is idle, a requester MAY ask it too for a batch that has been in flight for longer than
-   `deadline_slack` (end-game duplication), so a response that keeps making just enough progress not to stall
-   doesn't hold up the fetch; rnfs waits, on a link with a rate estimate, also for 1.5 times the transfer time of
-   the batch's blocks at it, and duplicates only onto a provider that isn't over a slow link. The first verified copy wins; the request still sending blocks that have arrived
-   then has its link closed (left to finish, under the same rule), which doesn't count as a stall of its
-   provider. rnfs duplicates each request at most once, and never over a slow link (so never on slow nodes),
-   where it would spend the channel's airtime twice.
+7. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers only contend
+   for the same channel). Whether a link is slow is judged per provider, not per node, so a node with a fast and a slow
+   interface (a gateway) isn't slow but doesn't run parallel transfers over its radio either: a provider is reached over
+   a *slow link* when the link's rate estimate is below `slow_bitrate`, or, without one, when the next-hop interface of
+   the path to it runs below `slow_bitrate` or it is behind a slow path (section 6); the providers over slow links whose
+   paths leave through the same next-hop interface (an unknown one counts as one) have one request in flight between
+   them. A response *stalls* if it makes no progress for `stall_timeout`, or misses the same deadline the responder uses
+   (section 3). A stalled provider's link is closed, which cancels the transfer, and its blocks are requested again from
+   another provider; providers that keep failing are handled as in section 6. A fetch that fails or is cancelled, or
+   whose reader stops early (item 6), closes the links of its requests still in flight, so their responses don't keep
+   using the link and hold up the next `/blocks` to those nodes, unless another fetch has a request on the same link:
+   closing it would fail that one, so the request is left to finish. It never cancels their Resources (section 3,
+   Cooldown). When nothing is left to ask for and a provider is idle, a requester MAY ask it too for a batch that has
+   been in flight for longer than `deadline_slack` (end-game duplication), so a response that keeps making just enough
+   progress not to stall doesn't hold up the fetch; rnfs waits, on a link with a rate estimate, also for 1.5 times the
+   transfer time of the batch's blocks at it, and duplicates only onto a provider that isn't over a slow link. The first
+   verified copy wins; the request still sending blocks that have arrived then has its link closed (left to finish,
+   under the same rule), which doesn't count as a stall of its provider. rnfs duplicates each request at most once, and
+   never over a slow link (so never on slow nodes), where it would spend the channel's airtime twice.
 8. Blocks are stored as they arrive, so an interrupted fetch resumes where it stopped. An RNS Resource is only
    delivered when complete, so a response lost mid-transfer yields nothing and its blocks are requested again.
 9. When the target is complete, the node provides it if its strategy says so (section 6).

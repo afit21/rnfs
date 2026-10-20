@@ -19,13 +19,14 @@ Providers, in the order they are tried:
 `get --from` uses only the given node.
 
 A provider fails, and isn't used again during the fetch, when its link fails (no path, closed by the provider, a
-malformed answer), it answers None for a block of the root it advertised, it is busy max_failures times in a row
-(each retried after BUSY_DELAY), its requests go unanswered max_failures times in a row the way a lossy link loses
-them (peer_client.LOST: each has its link closed and is retried on a new one after BUSY_DELAY), or it stalls twice. When no providers are left, the lookup runs again for a fresh random half of providers,
-within the same lookup_timeout. A block not matching its CID bans the provider; a correctly hashed block
-that isn't a valid DAG node marks the root invalid locally and fails the fetch (a stored block that no
-longer matches its CID is local damage: it is deleted and fetched again). A fetch that gets no verified
-block and no response progress for lookup_timeout + stall_timeout fails, so a hung one ends.
+malformed answer), it answers None for a block of the root it advertised, it is busy max_failures times in a row (each
+retried after BUSY_DELAY), its requests go unanswered max_failures times in a row the way a lossy link loses them
+(peer_client.LOST: each has its link closed and is retried on a new one after BUSY_DELAY), or it stalls twice. When no
+providers are left, the lookup runs again for a fresh random half of providers, within the same lookup_timeout. A block
+not matching its CID bans the provider; a correctly hashed block that isn't a valid DAG node marks the root invalid
+locally and fails the fetch (a stored block that no longer matches its CID is local damage: it is deleted and fetched
+again). A fetch that gets no verified block and no response progress for lookup_timeout + stall_timeout fails, so a hung
+one ends.
 
 Local scores (rnfs.dht.scores, section 6): a response with verified blocks raises its provider's score, and, once
 per fetch, the scores of the nodes whose /find answers listed it; a provider that fails falls, one sending a block
@@ -39,13 +40,13 @@ max_parallel_providers requests are in flight, and never over a slow link (so ne
 verified copy wins: the request still sending what has arrived has its link closed (unless another fetch has a
 request on it: then it is left to finish), and its outcome isn't counted against its provider.
 
-Upload pacing (section 3): a responder starts a slow link's next /blocks response no sooner than its size at
-the upload cap (by default half the rate estimate) after the previous one started, and refuses a request it
-would have to hold back for longer than a few seconds. So after a response on a slow link, a provider isn't
-asked again until as long as that request took has passed again, and its link counts as in use meanwhile
-(PeerClient.hold_link), so the idle sweep doesn't close it and lose the rate estimate. Refusals within four times that of a
-served response aren't counted towards max_failures (the estimates at the two ends differ, and a responder
-may set a lower cap): they are retried every eighth of that time, or BUSY_DELAY if longer.
+Upload pacing (section 3): a responder starts a slow link's next /blocks response no sooner than its size at the upload
+cap (by default half the rate estimate) after the previous one started, and refuses a request it would have to hold back
+for longer than a few seconds. So after a response on a slow link, a provider isn't asked again until as long as that
+request took has passed again, and its link counts as in use meanwhile (PeerClient.hold_link), so the idle sweep doesn't
+close it and lose the rate estimate. Refusals within four times that of a served response aren't counted towards
+max_failures (the estimates at the two ends differ, and a responder may set a lower cap): they are retried every eighth
+of that time, or BUSY_DELAY if longer.
 
 Limits (sections 7 and 8): max_download_size bounds both the target's verified size and the DAG node bytes a
 fetch downloads (a DAG of empty files has size 0 but can hold gigabytes of directory nodes); listings and
@@ -83,14 +84,14 @@ soon as it is met, stored or downloaded, rather than once its whole tree level h
 for a level's last response. A parent is always stored before its children are asked for, so whatever an
 interrupted fetch stored hangs together from the target, and the next fetch resumes from it.
 
-read_range fetches WINDOW chunks at a time (SLOW_WINDOW while no provider known is reached over a fast link: 32
-chunks take about 5 hours on LoRa before the first byte), and asks for the next window's before handing the reader
-this one's bytes, so the providers don't sit idle between windows; a block that a request brings after the call that asked
-for it has returned is stored all the same. A fetch that ends by an error, is cancelled, or ends with requests it
-no longer needs (a reader that stopped early, which has had at most one window fetched that it didn't read)
-closes the links of its requests still in flight, unless another fetch has a request on the same (shared) link:
-then its request is left to finish, rather than fail the other's. It never cancels a response's Resource: a
-responder would take that for a rejection and cool the requester down (section 3).
+read_range fetches WINDOW chunks at a time (SLOW_WINDOW while no provider known is reached over a fast link: 32 chunks
+take about 5 hours on LoRa before the first byte), and asks for the next window's before handing the reader this one's
+bytes, so the providers don't sit idle between windows; a block that a request brings after the call that asked for it
+has returned is stored all the same. A fetch that ends by an error, is cancelled, or ends with requests it no longer
+needs (a reader that stopped early, which has had at most one window fetched that it didn't read) closes the links of
+its requests still in flight, unless another fetch has a request on the same (shared) link: then its request is left to
+finish, rather than fail the other's. It never cancels a response's Resource: a responder would take that for a
+rejection and cool the requester down (section 3).
 
 Within `with observing(observer):`, every fetch the thread opens reports its total size and each block it
 meets to the Observer, and raises Cancelled once observer.cancelled() is true (background jobs use this).
