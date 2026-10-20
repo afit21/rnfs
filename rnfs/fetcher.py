@@ -1440,8 +1440,10 @@ class Fetch:
             ranked = sorted(enumerate(linked), key=lambda item: self._rank(item[1], paths[item[1]], item[0]))
             candidates = (hinted + [node_id for _, node_id in ranked])[:self.fetcher.max_parallel]
             if candidates and pending:
-                # Each is asked for just the first block missing, which is the root at the start
-                first = pending[0]
+                # Each is asked for just the first block missing, which is the root at the start. Taken from pending as
+                # any request's are, so a probe that brings it doesn't leave it to be asked for again; if none does, it
+                # goes back to the front once the last probe has answered (_handle_event)
+                first = pending.popleft()
                 log(f"asking {plural(len(candidates), 'node')} with an open link for {first}", LOG_VERBOSE)
                 for node_id in candidates:
                     in_flight[node_id] = ([first], True)

@@ -142,6 +142,27 @@ class ProviderDiscoveryTest(FetcherTest):
         self.assertTrue(self.storage.is_complete(built.cid))
         self.assertEqual(self.lookups, [])  # no lookup needed
 
+    def test_a_probe_that_brings_the_block_isnt_asked_for_it_again(self):
+        built = self.file(os.urandom(3 * CHUNK_SIZE))
+        self.hold(P1)
+        self.client.links = [P1]
+        self.fetch_all(built.cid)
+        asked = self.client.asked(P1)
+        self.assertEqual(asked[0], built.cid)
+        self.assertEqual(len(asked), len(set(asked)))  # the root once: the probe brought it
+        self.assertEqual(sorted(map(str, asked)), sorted(map(str, self.network)))
+
+    def test_a_probe_that_misses_leaves_the_block_to_the_lookup(self):
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P3)
+        self.client.links = [P1, P2]  # neither holds anything
+        self.runs.append([P3])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(self.client.asked(P1), [built.cid])
+        self.assertEqual(self.client.asked(P2), [built.cid])
+        self.assertEqual(self.client.asked(P3)[0], built.cid)
+
     def test_open_link_without_the_root_falls_back_to_lookup(self):
         built = self.file(os.urandom(3 * CHUNK_SIZE))
         self.hold(P2)

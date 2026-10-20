@@ -549,6 +549,9 @@ Changed:
   6,431 times rather than 4,490, 1,971 of them within 5 minutes of closing rather than 1,123, while keepalive
   packets fall from 328,237 to 19,826, and link opening, closing and keepalive packets together from 346,199 to
   45,548.
+- A node asked first for a fetch's first block (one with an open link, or a remote pin's asker) that had it was
+  asked for that block again in its next request, so it sent it twice: on LoRa, a whole chunk's airtime more. Now
+  it is asked for the blocks after it.
 - A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private
   mode) announces `rnfs.dht` only at startup, no longer every `announce_interval`; nothing needs to reach it. It
   announces again at once when it starts to provide. Servers, and clients that provide, announce as before.
