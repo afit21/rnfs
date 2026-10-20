@@ -6,7 +6,8 @@ import multiprocessing as mp
 from sim import Sim, Stats, World
 from experiments import STRATS
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
+OUT = "out"  # relative: run from this folder (docs/simulations/README.md)
+os.makedirs(OUT, exist_ok=True)
 J = 40      # ops per partition
 GAP = 120.0 # seconds between ops on the island
 
