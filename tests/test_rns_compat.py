@@ -156,11 +156,11 @@ INTERNALS = [
     Internal("network/links.py", "RequestReceipt link, response_size, get_response() and get_progress()",
              lambda: (_assigns(RNS.RequestReceipt.__init__, "link", "response_size"),
                       _has(RNS.RequestReceipt, "get_response", "get_progress"))),
-    Internal("network/links.py", "a response packet handed to self.handle_response (looked up on the link, so "
-             "replaceable per link: EarlyResponses) with (request_id, response_data, response_size, "
-             "response_transfer_size, metadata, update_sizes, check_size), which answers the link.pending_requests "
-             "entry of that request_id; Link.request registering the RequestReceipt (request_id its packet's "
-             "truncated hash) only after sending the packet",
+    Internal("network/links.py, network/nomadnet.py", "a response packet handed to self.handle_response (looked "
+             "up on the link, so replaceable per link: EarlyResponses) with (request_id, response_data, "
+             "response_size, response_transfer_size, metadata, update_sizes, check_size), which answers the "
+             "link.pending_requests entry of that request_id; Link.request registering the RequestReceipt "
+             "(request_id its packet's truncated hash) only after sending the packet",
              lambda: (_params(RNS.Link.handle_response, "request_id", "response_data", "response_size",
                               "response_transfer_size", "metadata", "update_sizes", "check_size"),
                       _source(RNS.Link._Link__receive,

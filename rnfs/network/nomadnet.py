@@ -28,6 +28,14 @@ links keep every rule they have, and an embedded node leaves its host's settings
 - A page answer is checked from its msgpack headers before RNS decodes it (guards: protocol.page_response_refusal):
   one flat byte string. A file answer is copied, no larger than the advertised total, inside the response callback,
   since RNS deletes its file once the callback returns.
+- An answer sent as a packet (a page that fits one, such as NomadNet's "Request Not Allowed") that arrives before
+  RNS has registered its request is kept and handed over once it is (links.EarlyResponses, as on rnfs.dht links):
+  RNS (1.5.6) would drop it, and the fetch fail after RNS's request timeout. An answer sent as a Resource can arrive
+  early too: RNS ignores an advertisement no pending request matches inside Link.receive, which EarlyResponses (a
+  handle_response hook) doesn't reach. That costs a moment, not the fetch: the node sends the advertisement again
+  once its Resource's timeout passes (the round trip × traffic_timeout_factor, plus 1 s), and by then the request
+  is registered. Replaying the advertisement here would save that second at the price of feeding a packet back
+  into RNS's Link.receive, so the fetch leaves it to RNS.
 - Path requests take their turn in the node's budget (network/paths.py: not part of path_timeout), and a link that
   fails to establish costs a turn, as RNS then requests the path again.
 - Timeouts: the path and the identity (path_timeout each), the link's establishment (RNS's timeout plus
@@ -360,15 +368,16 @@ def fetch(target: nomadnet.NomadnetLink, config, directory: str, identity=None, 
     """
     link = open_link(target, config.path_timeout, paths)
     try:
+        early = links.EarlyResponses.install(link)  # before any request: no answer can come sooner
         if identity is not None:
             link.identify(identity)
-        snapshot = _request(link, target, config, directory, max_size, progress, stop_event)
+        snapshot = _request(link, target, config, directory, max_size, progress, stop_event, early)
         if identity is not None and _not_allowed(snapshot):
             log(f"NomadNet node {node_name(target.destination)} didn't allow {target.path}; identifying again",
                 LOG_VERBOSE)
             _remove(snapshot.path)
             link.identify(identity)
-            snapshot = _request(link, target, config, directory, max_size, progress, stop_event)
+            snapshot = _request(link, target, config, directory, max_size, progress, stop_event, early)
         if _not_allowed(snapshot):
             _remove(snapshot.path)
             how = ("its identity (storage/nomadnet_identity) isn't on the list" if identity is not None
@@ -389,8 +398,9 @@ def _not_allowed(snapshot: Snapshot) -> bool:
 
 
 def _request(link, target: nomadnet.NomadnetLink, config, directory: str, max_size: int | None,
-             progress, stop_event) -> Snapshot:
-    """Send target's request on link and wait for its answer (fetch)."""
+             progress, stop_event, early: links.EarlyResponses | None = None) -> Snapshot:
+    """Send target's request on link and wait for its answer (fetch). early holds the link's answers that came
+    before RNS registered their request (None: a link without RNS's pending requests, a test's)."""
     partial = os.path.join(directory, f"{PARTIAL_PREFIX}{secrets.token_hex(8)}{PARTIAL_SUFFIX}")
     transfer = Transfer(link, partial, max_size)
     link.set_resource_started_callback(transfer.resource_started)
@@ -404,6 +414,9 @@ def _request(link, target: nomadnet.NomadnetLink, config, directory: str, max_si
         if not receipt:
             raise NotFound(f"couldn't send the request for {target.path} to NomadNet node "
                            f"{node_name(target.destination)}")
+        if early is not None and early.deliver(receipt):  # its callbacks have run: transfer has the answer
+            log(f"NomadNet node {node_name(target.destination)} answered {target.path} before RNS had registered "
+                f"the request; handed the answer over", LOG_VERBOSE)
         _wait(link, target, transfer, config, progress, stop_event)
         snapshot = _outcome(target, transfer, max_size)
         ok = True

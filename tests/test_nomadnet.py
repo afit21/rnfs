@@ -27,7 +27,9 @@ from rnfs.network import nomadnet as fetching
 from rnfs.network.identity import load_or_create_identity
 from rnfs.node_content import nomadnet_identity_path
 from rnfs.node import RnfsNode
+from tests.support import wait_for
 from tests.test_jobs import ApiBase, JobsBase
+from tests.test_links import FakeLink, RacingLink
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient, NodeTest
 
@@ -141,7 +143,7 @@ class FetchFlowTest(unittest.TestCase):
         self.enterContext(mock.patch.object(fetching, "_request", self.request))
         self.config = mock.Mock(path_timeout=1)
 
-    def request(self, link, target, config, directory, max_size, progress, stop_event):
+    def request(self, link, target, config, directory, max_size, progress, stop_event, early=None):
         """The next answer, copied as _request copies one."""
         path = os.path.join(directory, f"answer{len(os.listdir(directory))}")
         with open(path, "wb") as f:
@@ -178,6 +180,52 @@ class FetchFlowTest(unittest.TestCase):
         for page in (PAGE_BYTES, b"", nomadnet.NOT_ALLOWED * 5):
             self.answers = [page]
             self.assertEqual(self.fetch().size, len(page))
+
+
+class RacingNomadnetLink(RacingLink):
+    """RacingLink (RNS 1.5.6's Link.request, its answer arriving before the request is registered) with what fetch
+    sets on a NomadNet link."""
+
+    def set_resource_started_callback(self, callback):
+        """Keep the callback: these answers are packets, not Resources."""
+        self.resource_started = callback
+
+
+class EarlyAnswerTest(unittest.TestCase):
+    """A NomadNet answer sent as a packet that arrives before RNS has registered its request (links.EarlyResponses):
+    RNS would drop it, and the fetch fail once RNS's timeout (RacingLink's, shortened) has passed."""
+
+    def setUp(self):
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory())
+        saved = FakeLink.responder, FakeLink.created
+        self.addCleanup(setattr, FakeLink, "created", saved[1])
+        self.addCleanup(setattr, FakeLink, "responder", saved[0])
+        self.answers: list[bytes] = []
+        FakeLink.responder = staticmethod(lambda link, path, data: self.answers.pop(0))
+        self.link = RacingNomadnetLink(None, established_callback=lambda link: None,
+                                       closed_callback=lambda link: None)
+        wait_for(lambda: self.link.status == RNS.Link.ACTIVE, what="the fake link established")
+        self.enterContext(mock.patch.object(fetching, "open_link", lambda target, timeout, paths=None: self.link))
+
+    def fetch(self, identity=None) -> bytes:
+        """What fetching.fetch of PAGE copied, read back."""
+        snapshot = fetching.fetch(nomadnet.parse(PAGE), Config(), self.tmp, identity=identity)
+        with open(snapshot.path, "rb") as f:
+            return f.read()
+
+    def test_an_early_page_is_handed_over(self):
+        self.answers = [PAGE_BYTES]
+        self.assertEqual(self.fetch(), PAGE_BYTES)
+        self.assertEqual(self.link.pending_requests, [])
+        self.assertEqual(self.link.status, RNS.Link.CLOSED)  # the fetch's link closed as it ended
+
+    def test_an_identified_retry_too(self):
+        # "Request Not Allowed", then the page after identifying again: two requests on the link, both early
+        self.answers = [nomadnet.NOT_ALLOWED, PAGE_BYTES]
+        identity = object()
+        self.assertEqual(self.fetch(identity), PAGE_BYTES)
+        self.assertEqual(self.link.identities, [identity, identity])
+        self.assertEqual(len(self.link.requests), 2)
 
 
 class NodeAddTest(NodeTest):

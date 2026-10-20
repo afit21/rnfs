@@ -2458,7 +2458,10 @@ the library). Never through the gateway: web pages must not make the node fetch.
   only to the `nomadnetwork.node` destination of that identity whose hash is the one given, waits for the link
   within RNS's establishment timeout (rnfs: plus 5 s), and sends one request for the path with no data. A page
   comes back as bytes (an executable page as rendered for this request), a file as a Resource whose metadata
-  carries its `name`. Until an answer starts, RNS's request timeout applies (and rnfs's hard deadline, twice it);
+  carries its `name`. An answer that arrives before RNS has registered the request is kept and handed over once it
+  is, as section 3 (Messages) asks of requesters (rnfs: `links.EarlyResponses`; an early Resource advertisement,
+  which RNS ignores, is sent again by the node once its Resource's timeout passes). Until an answer starts, RNS's
+  request timeout applies (and rnfs's hard deadline, twice it);
   once it does, the fetch fails if it makes no progress for `stall_timeout` or isn't complete within its size at
   32 bytes/s. The link is closed when the fetch ends. Nothing answering (NomadNet sends nothing for a path it
   doesn't serve or an error) fails the add.
