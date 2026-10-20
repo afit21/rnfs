@@ -1478,6 +1478,24 @@ class LimitTest(FetcherTest):
         self.assertFalse(self.storage.has(cached.cid))
         self.assertLessEqual(self.storage.used_bytes(), self.storage.max_storage)
 
+    def test_unpinned_fetch_makes_room_by_disk_allocation(self):
+        # On FAT32 each block takes a 32 KiB cluster: cache that is little in bytes but much on disk makes room
+        self.storage.allocation_unit = 32 * 1024  # nothing is stored yet, so there's no total to redo
+        small = [builder.build_bytes(b"%d" % i * 10, self.storage.put) for i in range(20)]
+        cached = builder.build_directory([Entry(f"{i:02d}", f.cid, f.size, 0) for i, f in enumerate(small)],
+                                         self.storage.put)
+        self.storage.record_fetch(cached.cid, [], cached.cid)
+        self.assertLess(self.storage.used_bytes(), 2000)
+        self.storage.max_storage = 25 * 32 * 1024  # the cache takes 21 clusters, the file 9 more
+        built = self.file(os.urandom(4 * CHUNK_SIZE))
+        self.hold(P1)
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertFalse(self.storage.has(cached.cid))
+        self.assertLess(self.storage.used_bytes() + 2000, self.storage.max_storage)  # bytes alone would have fit
+        self.assertLessEqual(self.storage.allocated_bytes(), self.storage.max_storage)
+
     def disk(self, free: int):
         """A mock disk_usage reporting free bytes on a 1 GiB filesystem (reserve: DISK_RESERVE_MIN)."""
         usage = shutil.disk_usage(self.tmp.name)._replace(total=1024 ** 3, free=free)

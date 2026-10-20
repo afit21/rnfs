@@ -244,7 +244,10 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 `storage.py` — `Storage(blocks_dir, state_dir, max_storage)`, thread-safe:
 - blocks: `has(cid)`, `get(cid, verify=False) -> bytes | None` (with `verify`, a block no longer matching its
   CID is deleted), `put(cid, block)` (verifies, even a block already stored; atomic, the file fsynced),
-  `used_bytes()`. Adds, the shared folder and archive import store through `with session.writer() as put:`,
+  `used_bytes()` (the blocks' bytes), `allocated_bytes()` (what they take on disk: each block's size rounded up
+  by `fsutil.allocated` to `allocation_unit`, which `fsutil.allocation_unit(blocks_dir)` gives once at the start,
+  kept as a running total beside `used_bytes` and derived from the block sizes at each start, so nothing extra is
+  stored or stat'ed). Adds, the shared folder and archive import store through `with session.writer() as put:`,
   which writes blocks on up to 16 threads (`WRITE_THREADS`, at most 32 queued) so their fsyncs overlap, and
   has stored every one, or raised the first error, before the block exits: nothing is pinned before its blocks
   are. It is handed only blocks built from, or checked against, their CIDs. `BlockStore.sync()` syncs the
@@ -280,7 +283,8 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 - `check_disk(nbytes)` raises `StorageFull` when storing `nbytes` would leave less than the disk reserve
   (max(256 MiB, 2% of the filesystem)) free. `max_storage` itself never refuses a fetch: it is enforced by
   eviction once fetches end.
-- `evict() -> set[Cid]` enforce `max_storage` (LRU cached fetches); `gc() -> stats` evicts every cached fetch;
+- `evict() -> set[Cid]` enforce `max_storage` over `allocated_bytes()` (LRU cached fetches; the fetcher's
+  `_make_room` and the node's `_enforce_storage` compare `allocated_bytes()` with it too); `gc() -> stats` evicts every cached fetch;
   both delete unreachable blocks and report targets no longer complete, so the node can withdraw them. Both
   first read, without the lock, the DAG nodes they will walk (`_warm`, filling the `_links` and `_steps`
   memos, its path walk the one `_path_cids` makes under the lock, `_walk_path`; completeness via `dag_blocks`),
@@ -733,7 +737,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `export(target, output)` / `import_archive(path, progress=None)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}`; `import_archive` opens `path` with `O_NONBLOCK` and refuses (ValueError) anything but a regular file, so a FIFO can't hold it (or an import job) |
 | `import_stream(stream, label="(archive upload)", progress=None)` | as `import_archive`, of an archive read from `stream` to its end (`POST /api/import/stream`; `import_archive` opens the file and calls it). `progress` here and in `add_path` is told each read's length (`builder.BuildOptions.progress`, `builder.counted`) and may raise to stop: an add or import job's `Job.read` |
 | `app_add(name)`, `app_ls()`, `app_rm(name)` | `{"name", "created", "token"}` / `[{"name", "created"}]` / `{"released"}`: `AppRegistry` (rnfs/apps.py); `app_rm` revokes the token, calls every feature's `app_removed(name)`, releases every `app:<name>[:<key>]` pin, then deletes the row |
-| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "names", "unexported_names", "announces_held", "clock_offset", "local_servers", "partition", "partition_since", "network", "record_store"}` plus every feature's `status()` fields (traffic, jobs); `identity_hash` is the RNS identity hash (None on offline test nodes); `network` is `_network_status()` (`sizes.estimate()` rounded, `len(sizes)`, `lookups.checks.status()`), `record_store` `records.usage()`: counts in memory, no read of the state database (specification section 11, "Network status") |
+| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "allocated_bytes", "allocation_unit", "names", "unexported_names", "announces_held", "clock_offset", "local_servers", "partition", "partition_since", "network", "record_store"}` plus every feature's `status()` fields (traffic, jobs); `identity_hash` is the RNS identity hash (None on offline test nodes); `network` is `_network_status()` (`sizes.estimate()` rounded, `len(sizes)`, `lookups.checks.status()`), `record_store` `records.usage()`: counts in memory, no read of the state database (specification section 11, "Network status") |
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
 threads, for tests (tests/test_node.py). The request server's backend is `node.backend` (`NodeBackend`).
@@ -1157,7 +1161,7 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `Setting` | `rnfs.config.settings_schema()`'s `name`, `group`, `type`, `choices`, `nullable`, `default`, `unit`, `minimum`, `maximum`, `exclusive_minimum`, `description`, `live`, and `value`, `file`, `overridden`, `pending` (lists as tuples) | the name |
 | `Settings` / `SettingsChange` | `path`, `settings: tuple[Setting]` (`settings["max_jobs"]`, iteration), `file_error`, `warnings` / `path`, `applied`, `restart_required`, `overridden`, `warnings` | — |
 | `Record` | `name: bytes`, `cid`, `sequence`, `age` (seconds since heard, or None) | — |
-| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `names`, `unexported_names`, `announces_held`, `clock_offset`, `local_servers`, `partition`, `partition_since`, `features: dict` (every other field) | — |
+| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `allocated_bytes`, `allocation_unit`, `names`, `unexported_names`, `announces_held`, `clock_offset`, `local_servers`, `partition`, `partition_since`, `features: dict` (every other field) | — |
 | `Collected` / `Verified` | `removed_blocks`, `freed_bytes` / `checked`, `bad: tuple[Cid]` | — |
 | `Exported` / `Imported` | `roots: tuple[Cid]`, `blocks` / and `incomplete` | — |
 | `DenyState` | `entries: tuple[str]`, `lists: tuple[dict]` | — |
@@ -2084,7 +2088,8 @@ Everything in the specification is implemented, with these simplifications and a
   session, then enforces `max_storage`. Its record is made as a gateway fetch's is (`_record_fetch(for_gateway=True)`:
   not a target `roots` provides), since it was fetched to be pinned; a remote pin's quota check that drops the pin
   returns inside the fetch rather than raising, so it records nothing either.
-- `max_storage` is soft. An unpinned fetch evicts other cached fetches (LRU) to make room for each response
+- `max_storage` is soft, and counts the blocks' disk allocation (`Storage.allocated_bytes`), not their bytes. An
+  unpinned fetch evicts other cached fetches (LRU) to make room for each response
   and goes above `max_storage` when nothing is evictable; when its session ends the node evicts again, which
   may evict what it fetched if pins alone fill `max_storage`. Any fetch is refused with `StorageFull` ("not
   enough free disk space") if its remaining size, the range's size, or a response would leave less than

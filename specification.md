@@ -1281,6 +1281,12 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   it isn't provided (the pin is, once complete).
 - When storage exceeds `max_storage`, cached fetches are evicted least recently used first; `gc` evicts them
   all, and `cache rm <cid>` those leading to one CID (a pin of the same content keeps its blocks).
+- Storage, for `max_storage`, is what the blocks take on disk: each block is a file of its own, so it counts as
+  its size rounded up to the allocation unit of the filesystem holding `<rnfs dir>/blocks/` (its fragment or
+  cluster size, at least 4096 bytes, read when the node starts), and an empty block as one unit (rnfs 0.2.0; 0.1.x
+  counted each block's length, and a FAT32 drive's 16–32 KiB clusters made a store of small blocks take several
+  times `max_storage`). Quotas (`follow_quota`, `remote_pin_quota`) and `max_download_size` count bytes of
+  content and blocks, not allocation.
 - `add --no-pin` stores what it adds as a cached fetch of its CID instead of pinning it: evicted least recently
   used like any other, removed by `gc`, never provided under `pinned`, and under `roots` provided while it is
   cached (it counts as a target the user fetched).
@@ -2354,7 +2360,7 @@ Reticulum, the DHT mode and private mode never apply before a restart.
 | `max_upload_rate` | none; half the rate estimate on slow links that have one | An explicit value applies to every `/blocks` response, with or without a rate estimate |
 | `record_budget` | 1 GiB | Disk the provider records stored for others may take, never the free disk the blocks' reserve needs; past it, the storage tiers decide whose records stay (section 6). Replaces 0.1.x's `max_records` (a record count), which a node ignores with a warning |
 | `ban_time` | 1 h | |
-| `max_storage` | 10 GiB | |
+| `max_storage` | 10 GiB | What the blocks take on disk, each rounded up to the filesystem's allocation unit (section 8) |
 | `max_download_size` | none | |
 | `max_output_entries` | 100 000 | |
 | `name_table_size` | 10 000 | Records kept for names this node hasn't resolved through the CLI or API (four times as many sequence floors, section 9) |

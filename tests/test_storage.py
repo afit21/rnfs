@@ -773,7 +773,7 @@ class EvictionTest(StorageTest):
         for built in (first, second, third):
             self.storage.record_fetch(built.cid, [], built.cid)
         self.assertTrue(self.storage.touch(first.cid, []))  # now second is least recently used
-        self.storage.max_storage = 2500
+        self.storage.max_storage = self.storage.allocation_unit * 5 // 2  # each block takes a unit on disk
         lost = self.storage.evict()
         self.assertEqual(lost, {second.cid})
         self.assertEqual(self.storage.cached_targets(), {first.cid, third.cid})
@@ -840,11 +840,12 @@ class EvictionTest(StorageTest):
         new = self.add(b"N" * 1000)
         self.storage.record_fetch(old.cid, [], old.cid)
         self.storage.record_fetch(new.cid, [], new.cid)
-        self.storage.max_storage = 2500
-        self.assertEqual(self.storage.evict(400), set())  # 2000 stored + 400 fit
-        self.assertEqual(self.storage.evict(1000), {old.cid})  # least recently used first
+        unit = self.storage.allocation_unit  # what each block takes on disk
+        self.storage.max_storage = unit * 5 // 2
+        self.assertEqual(self.storage.evict(400), set())  # 2 units stored + 400 fit
+        self.assertEqual(self.storage.evict(unit), {old.cid})  # least recently used first
         self.assertTrue(self.storage.has(new.cid))
-        self.assertLessEqual(self.storage.used_bytes() + 1000, self.storage.max_storage)
+        self.assertLessEqual(self.storage.allocated_bytes() + unit, self.storage.max_storage)
 
     def test_eviction_walks_once_however_many_records_go(self):
         files = [self.add(b"pinned %d" % i) for i in range(500)]
@@ -854,13 +855,14 @@ class EvictionTest(StorageTest):
         for i in range(200):
             built = self.add(b"%d." % i * 100)
             self.storage.record_fetch(built.cid, [], built.cid)
-        self.storage.max_storage = self.storage.used_bytes() - 10_000  # about half the records must go
+        # About half the records must go: each is a block of its own, taking a unit
+        self.storage.max_storage = self.storage.allocated_bytes() - 100 * self.storage.allocation_unit
         visits = []
         real = Storage._children
         with mock.patch.object(Storage, "_children", lambda s, cid: (visits.append(cid), real(s, cid))[1]):
             self.storage.evict()
         self.assertLess(len(visits), 2000)  # once per block, not once per block per evicted record
-        self.assertLessEqual(self.storage.used_bytes(), self.storage.max_storage)
+        self.assertLessEqual(self.storage.allocated_bytes(), self.storage.max_storage)
         self.assertTrue(self.storage.is_complete(pinned.cid))
         self.assertGreater(len(self.storage.cached_fetches()), 50)
 
@@ -962,7 +964,7 @@ class EvictionTest(StorageTest):
             # Touching files[0] leaves files[1] the oldest, past the cap
             self.assertEqual(removed(lambda: self.storage.record_fetch(files[0].cid, [], files[0].cid)),
                              {files[1].cid})
-        self.storage.max_storage = self.storage.used_bytes() - 500
+        self.storage.max_storage = self.storage.allocated_bytes() - 500
         self.assertEqual(removed(self.storage.evict), {files[2].cid})
         stats = {}
         self.assertEqual(removed(lambda: stats.update(self.storage.drop_denied(frozenset({files[3].cid.binary})))),
@@ -989,10 +991,11 @@ class EvictionTest(StorageTest):
         self.assertTrue(changed())  # files[1] is no longer a cached target
         self.storage.evict()
         self.assertFalse(changed())  # under max_storage
-        self.storage.max_storage = 3000
+        unit = self.storage.allocation_unit  # what each block takes on disk
+        self.storage.max_storage = 3 * unit
         self.storage.evict()
         self.assertFalse(changed())  # deleting unreached blocks was enough
-        self.storage.max_storage = 1500
+        self.storage.max_storage = unit * 3 // 2
         self.storage.evict()
         self.assertTrue(changed())
         self.assertEqual(len(self.storage.cached_fetches()), 1)
@@ -1084,6 +1087,51 @@ class EvictionTest(StorageTest):
         self.storage.evict()
         self.assertFalse(self.storage.has(busy.cid))
         self.assertEqual(self.storage.used_bytes(), 0)
+
+
+class AllocationTest(StorageTest):
+    """max_storage counts what the blocks take on disk: each block's size rounded up to the allocation unit."""
+
+    UNIT = 32 * 1024  # a FAT32 cluster
+
+    def setUp(self):
+        """As StorageTest, on a filesystem allocating UNIT bytes at a time."""
+        self.unit = mock.Mock(return_value=self.UNIT)
+        patcher = mock.patch.object(fsutil, "allocation_unit", self.unit)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
+
+    def test_each_block_takes_whole_units(self):
+        lengths = {b"": 0, b"x" * 100: 100, b"y" * self.UNIT: self.UNIT, b"z" * (self.UNIT + 1): self.UNIT + 1,
+                   b"c" * constants.CHUNK_SIZE: constants.CHUNK_SIZE}
+        for data in lengths:
+            self.storage.put(Cid.for_block(RAW, data), data)
+        self.assertEqual(self.storage.allocation_unit, self.UNIT)
+        self.assertEqual(self.storage.used_bytes(), sum(lengths.values()))  # still the blocks' bytes
+        # An empty block is a file too; a 64 KiB chunk takes two clusters exactly
+        expected = (1 + 1 + 1 + 2 + constants.CHUNK_SIZE // self.UNIT) * self.UNIT
+        self.assertEqual(self.storage.allocated_bytes(), expected)
+        # Derived from the sizes kept, after a clean stop and after one that wasn't (every block listed): nothing
+        # is stored for it, so an upgraded store needs no migration
+        self.storage.close()
+        self.assertEqual(self.open().allocated_bytes(), expected)
+        self.assertEqual(self.open().allocated_bytes(), expected)  # the one before was never closed
+        self.assertEqual(self.unit.call_count, 3)  # once a start, never a stat per block
+        self.storage = self.open()
+        self.storage.gc()
+        self.assertEqual((self.storage.used_bytes(), self.storage.allocated_bytes()), (0, 0))
+
+    def test_max_storage_counts_allocation(self):
+        # Ten cached files of 100 bytes: 1,000 bytes, but ten clusters on disk
+        files = [self.add(b"%d" % i * 100) for i in range(10)]
+        for built in files:
+            self.storage.record_fetch(built.cid, [], built.cid)
+        self.storage.max_storage = 100_000  # a hundred times the bytes, three clusters
+        self.storage.evict()
+        self.assertLessEqual(self.storage.allocated_bytes(), self.storage.max_storage)
+        self.assertEqual(self.storage.cached_targets(), {files[8].cid, files[9].cid})  # a third would cross the margin
+        self.assertEqual(self.storage.used_bytes(), 200)
 
 
 class SizeTest(StorageTest):

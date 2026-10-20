@@ -431,7 +431,7 @@ quiet_hours = "22:00-06:00"
 | `announce_interval` | `21600` (6 h) | How often the node and its names announce; keep it ≥ 1 h |
 | `provide_strategy` | `"roots"` | `"roots"` shares pins and every complete download while it's cached (even a `cat` or `stat`), so **anyone can learn what you downloaded**; `"pinned"` shares only pins |
 | `provide_entries` | unset | Also share every file and folder inside your pins under its own CID (not inside downloads). Unset: on, for up to 100,000 of them, oldest pins first; on a slow node only while republishing them would take under 2% of the radio channel (about 40 keys in all on a large network: `rnfs status` says when they're off and why). `true` or `false` overrides it. Each one tells anyone who looks that your node has that file |
-| `max_storage` | 10 GiB | Cached downloads are evicted above this; pins never are. The disk keeps max(256 MiB, 2%) free |
+| `max_storage` | 10 GiB | Cached downloads are evicted above this; pins never are. It counts disk use: each block rounded up to the filesystem's cluster, which on a FAT32 drive (16–32 KiB) makes small files take several times their size (`rnfs status`: `allocated_bytes`). The disk keeps max(256 MiB, 2%) free |
 | `max_download_size` | none | Refuse fetches larger than this |
 | `record_budget` | 1 GiB | Disk the provider records your node stores for others (as a DHT server) may take; when full, your node contacts and publishers seen for days keep their place, and strangers share a small part |
 | `max_jobs` | 2; 1 on slow nodes | Transfers running at once |

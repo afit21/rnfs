@@ -48,7 +48,7 @@ import tarfile
 import time
 from typing import BinaryIO, Callable, Iterator, NamedTuple
 
-from rnfs import constants, log
+from rnfs import constants, fsutil, log
 from rnfs.content import builder, dag, walker
 from rnfs.content.builder import BuildOptions, Built, Put
 from rnfs.content.dag import Entry
@@ -313,10 +313,7 @@ def _place(member: tarfile.TarInfo, tree: _Tree, warn: Callable[[str], None]) ->
 ENTRY_BYTES = 64  # a directory listing's bytes per entry besides its name, at most (a CID, a size, a kind)
 
 
-def allocated(size: int, unit: int) -> int:
-    """What size bytes take on a filesystem allocating unit bytes at a time: rounded up, and one unit for nothing,
-    since an empty file or a directory takes a block file, an inode or a directory record."""
-    return max(-(-size // unit), 1) * unit
+allocated = fsutil.allocated  # what size bytes take, allocated unit bytes at a time (Storage counts blocks so too)
 
 
 class Extent:

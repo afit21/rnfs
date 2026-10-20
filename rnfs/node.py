@@ -1465,7 +1465,7 @@ class RnfsNode:
 
     def _enforce_storage(self):
         """Evict cached fetches over max_storage, withdrawing targets no longer complete."""
-        if self.storage.used_bytes() <= self.config.max_storage:
+        if self.storage.allocated_bytes() <= self.config.max_storage:
             return
         self._make_room(0)
 
@@ -3013,6 +3013,8 @@ class RnfsNode:
                 "provided": len(self.publisher.provided()), **self.publisher.entries_status(),
                 "blocks": self.storage.block_count(),
                 "used_bytes": self.storage.used_bytes(), "max_storage": self.config.max_storage,
+                # What max_storage counts: the blocks' disk allocation, each rounded up to the unit (rnfs 0.2.0)
+                "allocated_bytes": self.storage.allocated_bytes(), "allocation_unit": self.storage.allocation_unit,
                 "names": len(self.names.list()), "unexported_names": self.names.unexported(),
                 **self.names.announce_status(),
                 "local_servers": len(self.local), **self.partition.state(),
