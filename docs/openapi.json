@@ -4041,7 +4041,7 @@
         "type": "apiKey",
         "in": "header",
         "name": "X-Rnfs-App",
-        "description": "An app's name (since 0.2.0): the request is that app's, and `X-Rnfs-Api` carries its token. An app may do everything the CLI may but manage apps; what it pins gets the source `app:<name>` (`app:<name>:<key>` with `X-Rnfs-Pin-Key`)."
+        "description": "An app's name (since 0.2.0): the request is that app's, and `X-Rnfs-Api` carries its token. An app may do everything the CLI may but use the `/api/apps` routes (403 `forbidden`); that is no boundary, since it reads and writes files as the daemon's user (`add`, `get`, `export`) and so can reach the CLI's token: give an app a token only if you would trust it with the CLI. What it pins gets the source `app:<name>` (`app:<name>:<key>` with `X-Rnfs-Pin-Key`)."
       }
     },
     "parameters": {
@@ -4067,7 +4067,7 @@
     },
     "headers": {
       "Proof": {
-        "description": "Answer to `X-Rnfs-Challenge`: hex(HMAC-SHA256(key, \"rnfs api proof <port> <challenge>\")), key being the token, or for a request with `X-Rnfs-App` that app's verifier (hex SHA-256 of \"rnfs app token \" + token). None for an app the daemon doesn't have.",
+        "description": "Answer to `X-Rnfs-Challenge`: hex(HMAC-SHA256(key, \"rnfs api proof <port> <challenge>\")), key being the token, or for a request with `X-Rnfs-App` that app's verifier (hex SHA-256 of \"rnfs app token \" + token). For an app the daemon doesn't have, it is keyed by a value no client knows (HMAC-SHA256 of a per-start secret and the name, since 0.2.0), so the response doesn't say whether the app exists; the client's check then fails.",
         "schema": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"

@@ -114,13 +114,16 @@ Security:
   so another local user listening there while the daemon is down learns neither the token nor a name key being
   imported.
 - App tokens (rnfs.apps; 0.2.0): a request naming an app in `X-Rnfs-App: <name>` passes with that app's token in
-  `X-Rnfs-Api` instead, and only with it (an app's token without its name, or the API token with one, doesn't
-  pass); its proof is keyed by the app's verifier (apiclient.app_proof_key), and none is sent for an app there
-  isn't. ApiHandler.caller() says who called: CLI ("cli") or "app:<name>", which dispatch keeps in principal.
-  An app's token does everything the API token does but manage apps: the /api/apps routes (CLI_ROUTES) answer it
-  403 `forbidden`. The routes that pin or release for the caller (add, add/stream, dir/set, dir/rm, pin/add,
-  pin/rm, import, import/stream, and the pin, add and import jobs) use source "user" for the CLI and
-  "app:<name>" for an app, "app:<name>:<key>" with `X-Rnfs-Pin-Key: <key>` (pin_source; with the CLI's token a
+  `X-Rnfs-Api` instead, and only with it (an app's token without its name, or the API token with one, doesn't pass);
+  its proof is keyed by the app's verifier (apiclient.app_proof_key), and for an app there isn't by an HMAC of a
+  per-start secret and the name (AppRegistry.proof_key), which no client can check: every response, the 403s included,
+  looks the same whether or not the app exists, so the open proof doesn't list the installed apps (REV9).
+  ApiHandler.caller() says who called: CLI ("cli") or "app:<name>", which dispatch keeps in principal. An app's token
+  does everything the API token does but use the /api/apps routes (CLI_ROUTES), which answer it 403 `forbidden`. That
+  doesn't keep an app from managing apps in effect: it reads and writes files as the daemon's user (add, get, export),
+  which reaches api_token (specification section 11). The routes that pin or release for the caller (add, add/stream,
+  dir/set, dir/rm, pin/add, pin/rm, import, import/stream, and the pin, add and import jobs) use source "user" for the
+  CLI and "app:<name>" for an app, "app:<name>:<key>" with `X-Rnfs-Pin-Key: <key>` (pin_source; with the CLI's token a
   pin key is refused, 400): an app's pin rm releases only its own.
 - Errors map to statuses as design.md says (rnfs.errors.STATUSES): ValueError 400, NotFound 404, TooLarge 413,
   Denied 451 (the deny list), InvalidDag 422, Busy 503, StorageFull 507, other errors 500. A 500 is logged as an
@@ -799,8 +802,8 @@ class ApiHandler(TimedHandler):
         return self.caller() is not None
 
     def proof_key(self) -> str | None:
-        """What keys this response's proof: the API token, or (X-Rnfs-App) that app's verifier (rnfs.apps), None
-        for an app there isn't (no proof is sent then)."""
+        """What keys this response's proof: the API token, or (X-Rnfs-App) what AppRegistry.proof_key gives the name,
+        an existing app's or not; None on a node without apps (a stand-in, which has none to hide)."""
         app = self.headers.get(APP_HEADER)
         if app is None:
             return self.token

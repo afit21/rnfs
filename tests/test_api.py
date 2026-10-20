@@ -1111,7 +1111,8 @@ class AppAuthTest(AppTokenTestCase):
 
     def test_proof_for_an_app(self):
         """With X-Rnfs-App the proof is keyed by that app's verifier (app_proof_key of its token), which the daemon
-        has without the token; none for an app there isn't; without the header, by the API token as before."""
+        has without the token; for an app there isn't, by a key no client has (REV9: the answer mustn't say which
+        apps exist, tests/security/test_rev9_app_name_oracle.py); without the header, by the API token as before."""
         from rnfs.apiclient import app_proof_key
         challenge = "0123456789abcdef" * 2
         for name, token in (("wiki", self.wiki), ("notes", self.notes)):
@@ -1121,7 +1122,9 @@ class AppAuthTest(AppTokenTestCase):
         for name in ("other", "Wiki", ""):
             _, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge,
                                                                      "X-Rnfs-App": name}, api=False)
-            self.assertIsNone(headers[cli.PROOF_HEADER], name)
+            self.assertRegex(headers[cli.PROOF_HEADER] or "", "^[0-9a-f]{64}$", name)
+            for key in (self.server.token, app_proof_key(self.wiki), app_proof_key(self.notes)):
+                self.assertNotEqual(headers[cli.PROOF_HEADER], cli.api_proof(key, self.port, challenge), name)
         _, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge}, api=False)
         self.assertEqual(headers[cli.PROOF_HEADER], cli.api_proof(self.server.token, self.port, challenge))
 

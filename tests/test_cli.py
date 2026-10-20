@@ -543,14 +543,14 @@ class AppCommandTest(CliTestCase):
 
     def test_add_prints_the_token_once(self):
         """app add prints only the token on stdout (for scripts) and on stderr that the app can do anything the
-        CLI can but manage apps; the token works as the app's."""
+        CLI can, managing apps included in effect; the token works as the app's."""
         code, out, err = self.run_cli("app", "add", "wiki")
         self.assertEqual(code, 0, err)
         token = out.decode().strip()
         self.assertEqual(out.decode(), token + "\n")
         self.assertTrue(self.node.apps.verify("wiki", token))
         self.assertIn("can do anything this command line can", err)
-        self.assertIn("except manage apps", err)
+        self.assertIn("in effect manage apps too", err)
         self.assertIn("rnfs app rm wiki", err)
 
     def test_add_writes_the_token_to_a_new_private_file(self):

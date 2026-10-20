@@ -172,3 +172,4 @@ A read-only review of 0.2.0 against remote and local attackers, fixed before 0.2
 |---|---|---|---|
 | REV5 | `test_rev5_nomadnet_page_memory.py` | `rnfs/network/nomadnet.py` (`MAX_PAGE_SIZE`, `Transfer.resource_started`, `_outcome`) | `ac38138` |
 | REV6 | `test_rev6_site_upload_render.py` | `rnfs/gateway.py` (`serve_target`, `serve_file`, `file_type`, `SITE_SNIFFED_TYPES`) | `abf8ab0` |
+| REV9 | `test_rev9_app_name_oracle.py`; also `tests/test_api.py` (`test_proof_for_an_app`) | `rnfs/apps.py` (`AppRegistry.proof_key`), `rnfs/api.py` (`ApiHandler.proof_key`, `send_common_headers`) | `284268e` |
