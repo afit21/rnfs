@@ -166,6 +166,68 @@ class ProviderDiscoveryTest(FetcherTest):
         self.fetch_all(built.cid)
         self.assertTrue(self.storage.is_complete(built.cid))
 
+    def search_again_setup(self, slow: bool = False):
+        """A 24-chunk file P1 serves slowly (each request moves the fetch's clock on 30 s) and P2 quickly; the first
+        search finds P1 only, a second would find P2. Returns (the file, the lookups made)."""
+        if slow:
+            self.fetcher = self.make_fetcher(slow=True)
+        built = self.file(os.urandom(24 * CHUNK_SIZE))
+        self.hold(P1)
+        self.hold(P2)
+        now = [1000.0]
+        self.fetcher.clock = lambda: now[0]
+
+        def slow_link(cids):
+            """Served, but 30 s a request."""
+            now[0] += 30
+            return None
+        self.client.behaviour[P1] = slow_link
+        made = []
+
+        def make_lookup(key):
+            """The first search finds P1, any later one P2."""
+            lookup = FakeLookup([[P1]] if not made else [[P2]])
+            made.append(lookup)
+            return lookup
+        self.fetcher.make_lookup = make_lookup
+        return built, made
+
+    def test_a_long_fetch_searches_again_and_uses_what_it_finds(self):
+        """A 30 MB fetch over a 4-hop route ran 29 minutes at 18 KB/s while a node 2 hops away had the file: with fewer
+        providers than max_parallel, a fetch searches again a minute after its last search ended."""
+        built, made = self.search_again_setup()
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertGreaterEqual(len(made), 2)
+        self.assertTrue(self.client.asked(P2))  # the provider the second search found took part of the fetch
+
+    def test_a_slow_node_doesnt_search_again(self):
+        # A search is a minute of airtime on a radio
+        built, made = self.search_again_setup(slow=True)
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(len(made), 1)
+        self.assertEqual(self.client.asked(P2), [])
+
+    def test_searching_again_backs_off(self):
+        """60 s after a search ends, then twice as long each time, up to SEARCH_AGAIN_MAX."""
+        built = self.file(os.urandom(CHUNK_SIZE))
+        with self.fetcher.open(built.cid) as fetch:
+            now = [1000.0]
+            self.fetcher.clock = lambda: now[0]
+            started = []
+            fetch._start_lookup = lambda: started.append(now[0])
+            fetch._searched_at = now[0]
+            for wait in (60, 120, 240, 480, 600, 600):
+                before = len(started)
+                now[0] = fetch._searched_at + wait - 1
+                fetch._search_again()
+                self.assertEqual(len(started), before, wait)  # not yet
+                now[0] += 1
+                fetch._search_again()
+                self.assertEqual(len(started), before + 1, wait)
+                fetch._searched_at = now[0]  # that search ended at once
+
     def test_open_link_nodes_are_asked_first(self):
         built = self.file(os.urandom(3 * CHUNK_SIZE))
         self.hold(P1)

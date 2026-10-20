@@ -2410,6 +2410,11 @@ Everything in the specification is implemented, with these simplifications and a
   its node a provider (if the lookup hasn't already) owning the partial unless another probe's partial got there first,
   and one left unanswered as an older node leaves it (`UNSUPPORTED`) is sent again with `/blocks` by `_handle_event`,
   for what no other probe brought meanwhile.
+- Searching again (0.2.0): `Fetch._search_again`, each pass of `_download`, on a node that isn't slow and without a
+  `from_node`, starts a new lookup (`make_lookup`; the old one's budget is spent) when none runs, fewer than
+  `max_parallel` providers are live, and `_search_wait` has passed since the last `LookupDone` (`_searched_at`):
+  `SEARCH_AGAIN_AFTER` (60 s), doubling to `SEARCH_AGAIN_MAX` (600 s). `_lookups` keeps every search, whose listers
+  `_served` credits; `_lookup` is the latest.
 - Records held here (0.2.0): when `_discover` starts the search it adds, as providers, `Fetcher.held_providers(key)`
   (the node's `ProviderRecords.for_reply`, what its own `/find` answer lists), so a record this node holds names a
   provider at once; the search runs all the same.

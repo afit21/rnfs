@@ -861,7 +861,11 @@ and repeat.
   to disjoint paths when that finds no provider at all (below). The providers of the key that a server holds records
   of, those its own `/find` answer would list, SHOULD be candidates from the start (rnfs 0.2.0), never a reason to
   skip the search: on a slow node a search takes a minute, and on an island (below) the node searching most often
-  holds the local replica itself.
+  holds the local replica itself. A node that isn't slow SHOULD search again during a long fetch while fewer than
+  `max_parallel_providers` providers are usable (rnfs 0.2.0: a minute after the last search ended, the wait doubling
+  up to 10 minutes; not for a fetch from a given node): providers appear as others finish the same fetch, and one may
+  be on a faster route. Measured between cloud nodes, a 30 MB fetch over a 4-hop route ran 29 minutes at 18 KB/s while
+  a node 2 hops away, done in 26 s, provided it. A slow node doesn't, a search costing it a minute of airtime.
 - **Choosing providers.** A node SHOULD rank providers by these keys, in this order:
   1. **Seniority.** Providers that have been in the routing table for over `provider_seniority` come first.
      This key MUST stay first: an attacker can create fresh identities that sit close in hops, or earn a score

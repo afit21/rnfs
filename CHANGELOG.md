@@ -698,6 +698,12 @@ Changed:
   without the figures keep the estimates they had.
 
 Faster:
+- A long fetch looks for more providers. A fetch searched once (again only when every provider had failed), so a
+  slow provider was kept to the end: between cloud nodes a 30 MB fetch over a 4-hop route ran 29 minutes at 18 KB/s,
+  while a node 2 hops away, which had fetched the file in 26 s, provided it from then on. A node that isn't slow now
+  searches again while it has fewer providers than `max_parallel_providers`, a minute after the last search ended and
+  then twice as long each time, up to 10 minutes; what it finds joins the fetch, ranked as any provider. Slow nodes
+  don't (a search is a minute of airtime there), nor do fetches from a given node (`--from`).
 - Fetching something again doesn't look it up again. Nothing was kept between fetches, so once its links had closed
   a gateway reload or a `pin add` after `cat` repeated the lookup (about 13.5 `/find` on a fast node). The nodes
   that served a root are now remembered for 3 hours after they last did (in memory, up to 10 per root and 4,096

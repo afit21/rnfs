@@ -167,6 +167,10 @@ MAX_REMEMBERED = 4096
 # A search that found no provider of a root isn't repeated by a fetch that isn't explicit for this long
 # (Fetcher.unfound); at most MAX_UNFOUND roots are remembered so, the oldest forgotten first
 UNFOUND_FOR = 600
+# Searching again during a long fetch (Fetch._search_again): on a node that isn't slow, with fewer providers usable than
+# max_parallel, a search starts this long after the last one ended, the wait doubling each time up to SEARCH_AGAIN_MAX
+SEARCH_AGAIN_AFTER = 60.0
+SEARCH_AGAIN_MAX = 600.0
 MAX_UNFOUND = 4096
 # Ranges (the module docstring): raw chunks declared this large or larger are fetched in ranges over slow links, and a
 # provider that stalled gets ranges of at most STALLED_RANGE on the wire
@@ -782,6 +786,9 @@ class Fetch:
         self._lookup = None
         self._lookup_running = False
         self._lookup_found = 0  # providers the last lookup run reported
+        self._lookups: list = []  # every search of this fetch, the latest last (their listers earn the credit)
+        self._searched_at: float | None = None  # when the last search ended (the fetch thread's clock)
+        self._search_wait = SEARCH_AGAIN_AFTER  # how long after it the next may start (_search_again)
         self._events: queue.Queue = queue.Queue()
         # provider -> (CIDs asked for, is a probe); kept across _download calls, since a request may outlive one
         self._in_flight: dict[bytes, tuple[list[Cid], bool]] = {}
@@ -1217,6 +1224,7 @@ class Fetch:
             # Requests and lookups have deadlines of their own; this catches whatever hangs regardless
             if self.fetcher.clock() - max(self._progress_at, self._heard_at) > give_up:
                 raise NotFound(f"fetching {self.root} made no progress for {give_up:g}s")
+            self._search_again()
             self._assign(pending, in_flight, outstanding, wanted, budget)
             if not in_flight and not self._lookup_running and not self._waiting_for_busy():
                 if not self._rerun_lookup():
@@ -1249,6 +1257,7 @@ class Fetch:
         elif isinstance(event, LookupDone):
             self._lookup_running = False
             self._lookup_found = event.found
+            self._searched_at = self.fetcher.clock()
             if event.answered and event.found == 0 and not self._providers:
                 self.fetcher.note_unfound(self.root)  # nobody provides it, as far as the DHT knows
         elif isinstance(event, ResultEvent):
@@ -1678,6 +1687,7 @@ class Fetch:
                 log(f"not searching for {self.root} again: a search {ago:.0f}s ago found no provider", LOG_VERBOSE)
                 return
             self._lookup = self.fetcher.make_lookup(self.root.key)
+            self._lookups.append(self._lookup)
             log(f"looking for providers of {self.root}", LOG_VERBOSE)
             self._start_lookup()
             # The records this node holds of the root's key are candidates at once, never a reason to skip the search
@@ -1713,6 +1723,27 @@ class Fetch:
             self._events.put(LookupDone(len(found), answered))
 
         threading.Thread(target=work, name="rnfs-find-providers", daemon=True).start()
+
+    def _search_again(self):
+        """A long fetch looks for more providers: one of them may be nearer, or on a faster route, than those it has
+        (a 30 MB fetch over a 4-hop path at 18 KB/s ran for 29 minutes while a node 2 hops away, which finished the
+        same fetch in 26 s, provided it). On a node that isn't slow (a search is a minute of airtime on a radio),
+        never for a fetch from a given node, while fewer than max_parallel providers are usable and no search runs:
+        SEARCH_AGAIN_AFTER after the last search ended, the wait doubling each time up to SEARCH_AGAIN_MAX. A new
+        lookup (the last one's time budget is spent by then), stopped as the first is once enough providers are known;
+        what it finds joins the fetch, ranked as any provider is."""
+        if (self.fetcher.slow_node or self.from_node is not None or self.closed or self._lookup_running
+                or self._searched_at is None or self._live >= self.fetcher.max_parallel):
+            return
+        now = self.fetcher.clock()
+        if now - self._searched_at < self._search_wait:
+            return
+        self._search_wait = min(2 * self._search_wait, SEARCH_AGAIN_MAX)
+        log(f"still fetching {self.root} from {plural(self._live, 'provider')}: looking for more", LOG_VERBOSE)
+        self._lookup = self.fetcher.make_lookup(self.root.key)
+        self._lookups.append(self._lookup)
+        self._lookup_found = 0
+        self._start_lookup()
 
     def _rerun_lookup(self) -> bool:
         """Every provider failed: search again for a fresh random half, within lookup_timeout. False if not."""
@@ -1752,11 +1783,10 @@ class Fetch:
         scores = self.fetcher.scores
         scores.served(node_id)
         self.fetcher.remember(self.root, node_id)  # asked first when the root is fetched again
-        if self._lookup is None:
-            return
-        for lister in self._lookup.listers(node_id) - self._credited:
-            self._credited.add(lister)
-            scores.useful_answer(lister)
+        for lookup in self._lookups:
+            for lister in lookup.listers(node_id) - self._credited:
+                self._credited.add(lister)
+                scores.useful_answer(lister)
 
     def _fail(self, provider: _Provider, why: str):
         """A provider failed: it isn't used again during this fetch, its score falls, and it is no longer remembered
