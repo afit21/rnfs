@@ -916,6 +916,32 @@ class PersistenceTest(StoreTestCase):
         """A store on self.state."""
         return self.new_store(state_dir=self.state, **settings)
 
+    def test_departed_standings_are_capped_on_disk(self):
+        """Past MAX_DEPARTED standings without records, the hourly pass forgets the excess, fewest refresh days first,
+        and saves; this node's own standing and those of publishers holding records are never forgotten so."""
+        with mock.patch.object(providers, "MAX_DEPARTED", 10):
+            store = self.open(own_id=OWN)
+            publishers = [ident(100 + n) for n in range(30)]
+            for n, publisher in enumerate([OWN, *publishers]):
+                self.assertTrue(store.store(ident(1000 + n), publisher))
+            self.assertTrue(store.store(ident(5000), ident(99)))  # holds a record throughout
+            for days in range(1, 3):
+                self.clock.now += DAY
+                for n, publisher in enumerate([OWN, *publishers[:10 * days]]):
+                    store.store(ident(1000 + n), publisher)
+            for n, publisher in enumerate([OWN, *publishers[:20]]):
+                store.withdraw(ident(1000 + n), publisher)
+            self.clock.now += HOUR
+            store.maintain()
+            store.close()
+            store = self.open(own_id=OWN)
+            self.assertEqual(state_rows(self.state, "SELECT COUNT(*) FROM provider_standing WHERE records = 0"),
+                             [(11,)])  # 10, and this node's
+            self.assertEqual([store.standing(p) is not None for p in publishers[:20]], [True] * 10 + [False] * 10)
+            self.assertEqual(store.standing(OWN)["days"], 2)
+            self.assertEqual(store.standing(ident(99))["records"], 1)
+            self.assertEqual(sum(store.standing(p) is not None for p in publishers[20:]), 10)
+
     def test_round_trip(self):
         """Records, first-seen times and refresh days are saved, and read by the next store."""
         store = self.open(own_id=OWN)

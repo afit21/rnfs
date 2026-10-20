@@ -403,10 +403,13 @@ Each publisher's standing (`_Standing`: first seen, records held, tier, refresh 
 the counts the budget and tiers need: `_tier_records` (records per tier, this node's in a tier of its own, `OWN`)
 and `_publishers`, read from `provider_standing` at load (`SUM ... GROUP BY tier`), and changed with each record
 (`_count_records`). A publisher left without records keeps its standing only if it has refresh days, until a TTL
-after the last (`maintain`'s hourly `_forget_departed`). The tier is worked out when the publisher stores
-(`_tier_of`: `own_id`, then `known(publisher)`, then `EARNED_DAYS` refresh days); a contact added or removed since
-is noticed when the publisher stores, when it is picked to evict from (`_largest` checks and moves it), or by the
-hourly check of those written as Known.
+after the last (`maintain`'s hourly `_forget_departed`), and at most `MAX_DEPARTED` (50,000, about 5 MB) of them:
+right after the hourly pass's save, `_cap_departed` counts them on disk (by `provider_standing_tier`) and forgets the
+excess, fewest refresh days first, then the longest unrefreshed (REV11: they were capped only by the TTL, so
+identities refreshing one record a day later and withdrawing it grew them). The tier is worked out when the
+publisher stores (`_tier_of`: `own_id`, then `known(publisher)`, then `EARNED_DAYS` refresh days); a contact added or
+removed since is noticed when the publisher stores, when it is picked to evict from (`_largest` checks and moves it),
+or by the hourly check of those written as Known.
 
 Room: `_capacity()` is `record_budget` over the bytes a record takes, or the records held at the last measure plus
 the free disk beyond the reserve (`free_space()`; the node passes `shutil.disk_usage` of the state directory less

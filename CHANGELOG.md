@@ -74,6 +74,11 @@ Security:
   Earned and Known storers (a random one outside the `K/2` oldest), and Newcomers keep a tenth of the key: below it
   a Newcomer evicts a random Earned record, past it Newcomers give way first, so a flood of fresh identities holds
   at most that share.
+- **Provider standings without records are capped** (REV11; specification section 6): a publisher left without
+  records keeps its refresh days a week, and nothing else bounded those rows, so identities that each refreshed one
+  record a day later and withdrew it grew the state database (and took room from the record budget, which measures
+  it). At most 50,000 are kept (about 5 MB); past that the hourly pass forgets those with the fewest refresh days
+  first, so Earned publishers that left outlast such a flood.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves

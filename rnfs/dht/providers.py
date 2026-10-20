@@ -72,6 +72,12 @@ TIER_NAMES = ("newcomer", "earned", "known", "own")
 FLOORS = (0.10, 0.60, 0.30)  # by tier: the share of the budget a full store keeps for it
 EARNED_DAYS = 3  # distinct UTC days a publisher must refresh a record it holds on to be Earned
 MAX_DAYS = 1000  # refresh days counted at most (only whether there are EARNED_DAYS matters)
+# Standings kept for publishers left without records at most (beyond it the hourly pass forgets those with the fewest
+# refresh days, the longest unrefreshed first among equals). Each takes about 85-120 bytes of the state database, so
+# 50,000 are about 5 MB, half a percent of the default record budget; uncapped, identities that each refreshed one
+# record a day later and then withdrew it kept a row a week each: within the write budget, a couple of million rows,
+# taking a quarter of the default budget from records. An honest server meets far fewer publishers leaving in a week
+MAX_DEPARTED = 50_000
 NEWCOMER_TTL_FULL = 4.5 * DAY  # while full, a Newcomer's record last stored this long ago counts as expired
 REFRESH_WRITE = 6 * HOUR  # a refresh moving a record's last-stored time by less is not written (TTL: 7 days)
 DEFAULT_RECORD_BUDGET = GIB  # bytes (Config.record_budget's default)
@@ -709,7 +715,8 @@ class ProviderStore:
 
     def _remove(self, key: bytes, publisher: bytes) -> bool:
         """Delete publisher's record for key, if any, and count it gone; a publisher left with none keeps its
-        standing only if it has refresh days to keep (forgotten a TTL after the last). Lock held."""
+        standing only if it has refresh days to keep (forgotten a TTL after the last, or sooner past MAX_DEPARTED such
+        standings). Lock held."""
         if publisher not in self._key_records(key):
             return False
         self._set_record(key, publisher, None)
@@ -1060,17 +1067,22 @@ class ProviderStore:
 
     def maintain(self):
         """The node's periodic pass (every 30 s): expire, hourly forget standings left without records for a TTL
-        and check the Known tier, then save. Raises OSError (StateDbError) if the save fails; the changes are kept
-        for the next one."""
+        and check the Known tier, then save, and hourly forget standings without records past MAX_DEPARTED (saved
+        again). Raises OSError (StateDbError) if a save fails; the changes are kept for the next one."""
         with self._lock:
             now = self._now()
         self._expire(now)
         with self._lock:
-            if now - self._last_hourly >= _HOURLY:
+            hourly = now - self._last_hourly >= _HOURLY
+            if hourly:
                 self._last_hourly = now
                 self._forget_departed(now)
                 self._check_known()
         self.save()
+        if hourly:
+            with self._lock:  # counted on disk, so after the save
+                if self._cap_departed():
+                    self._save()
 
     def _forget_departed(self, now: float):
         """Forget the standing of publishers left without records whose last refresh day is a TTL ago. Lock held."""
@@ -1084,6 +1096,24 @@ class ProviderStore:
             standing = self._get_standing(publisher)
             if standing is not None and standing.records <= 0 and standing.last_day < cutoff:
                 self._forget(publisher)
+
+    def _cap_departed(self) -> int:
+        """Forget the standings of publishers without records past MAX_DEPARTED of them (this node's aside), those with
+        the fewest refresh days first, the longest unrefreshed first among equals, so Earned publishers that left
+        outlast identities with a day or two of refreshes. Counted from the database, so called just after a save.
+        Returns how many were forgotten. Lock held."""
+        excess = self._db.query("SELECT COUNT(*) FROM provider_standing WHERE tier IN (0, 1, 2) AND records = 0"
+                                )[0][0] - MAX_DEPARTED
+        if excess <= 0:
+            return 0
+        forgotten = 0
+        for (publisher,) in self._db.query("SELECT publisher FROM provider_standing WHERE tier IN (0, 1, 2) AND"
+                                           " records = 0 ORDER BY days, last_day, publisher LIMIT ?", (excess,)):
+            standing = self._get_standing(publisher)
+            if publisher != self.own_id and standing is not None and standing.records <= 0:
+                self._forget(publisher)
+                forgotten += 1
+        return forgotten
 
     def _check_known(self):
         """Move publishers written as Known that no longer are (a contact removed) to their tier now. Lock held."""

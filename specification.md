@@ -997,7 +997,10 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
     budget carried over covers its first round to a server; republishing every day or every 3 days is refreshes.
   - A publisher's refresh days are persisted with its first-seen time, and kept `PROVIDER_TTL` after the last
     of them once its last record is gone, so one that was away for a while is still Earned; a publisher that
-    never refreshed a record leaves nothing behind, so a flood of fresh identities grows no state.
+    never refreshed a record leaves nothing behind, so a flood of fresh identities grows no state. rnfs keeps at
+    most 50,000 standings of publishers without records (about 5 MB), forgetting those with the fewest refresh days
+    first, so identities that refreshed a record once and withdrew it can't grow that state either, nor push out
+    Earned publishers that left.
   - A key keeps at most 1000 publishers besides this node, so `/find` replies stay cheap: a new publisher of a
     full key evicts a random record there, never one of the `K/2` oldest records, which replies list first.
     Newcomers keep a share of the key, a tenth of its publishers: a Newcomer evicts an Earned record while
