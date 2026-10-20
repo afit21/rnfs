@@ -293,6 +293,30 @@ INTERNALS = [
                       _source(_rnode(), "self.r_airtime_short = ats/100.0", "self.r_airtime_long = atl/100.0",
                               "self.r_channel_load_short = cus/100.0", "self.r_channel_load_long = cul/100.0"))),
 
+    # Blackholed identities
+    Internal("network/blackhole.py", "Reticulum.get_blackholed_identities() returning Transport.blackholed_identities "
+             "({identity hash: {source, until, reason}}), through a shared instance by the blackholed_identities RPC; "
+             "Destination.hash(identity hash, app, aspects) taking a 16-byte identity hash",
+             lambda: (_source(RNS.Reticulum.get_blackholed_identities,
+                              "rpc_connection.send_bytes(mp.packb({'get': 'blackholed_identities'}))",
+                              "else: return RNS.Transport.blackholed_identities"),
+                      _source(RNS.Reticulum.rpc_loop, "if path == 'blackholed_identities': "
+                              "self.rpc_return(conn, self.get_blackholed_identities())"),
+                      _source(RNS.Transport.blackhole_identity,
+                              "entry = {'source': Transport.identity.hash, 'until': until, 'reason': reason}",
+                              "Transport.blackholed_identities[identity_hash] = entry"),
+                      _true(isinstance(RNS.Transport.blackholed_identities, dict), "not a dict"),
+                      _true(RNS.Destination.hash(bytes(16), "rnfs", "dht")
+                            == RNS.Destination.hash(_identity_with_hash(bytes(16)), "rnfs", "dht"),
+                            "Destination.hash of an identity hash differs from the identity's"))),
+    Internal("network/blackhole.py, network/server.py", "RNS itself tearing down an incoming link that identifies as a "
+             "blackholed identity (Link LINKIDENTIFY, before remote_identified), and dropping its announces "
+             "(Identity.validate_announce)",
+             lambda: (_source(RNS.Link._Link__receive, "if RNS.Reticulum.get_instance().is_blackholed(identity.hash):",
+                              "self.teardown()"),
+                      _source(RNS.Identity.validate_announce,
+                              "if announced_identity.hash in RNS.Transport.blackholed_identities:"))),
+
     # Sealed files
     Internal("content/seal.py", "RNS.Cryptography.hkdf(length, derive_from, salt, context), "
              "AES.AES_256_CBC.encrypt/decrypt(data, key, iv), and Identity.encrypt of a content key being "
@@ -384,6 +408,13 @@ def _destination(app: str, *aspects: str, identity=None, direction=RNS.Destinati
     """A Destination that isn't registered with Transport."""
     with mock.patch.object(RNS.Transport, "register_destination"):
         return RNS.Destination(identity or RNS.Identity(), direction, RNS.Destination.SINGLE, app, *aspects)
+
+
+def _identity_with_hash(identity_hash: bytes):
+    """An object Destination.hash takes as an RNS.Identity whose hash is identity_hash."""
+    identity = RNS.Identity(create_keys=False)
+    identity.hash = identity_hash
+    return identity
 
 
 def _rnode():

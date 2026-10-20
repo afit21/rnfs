@@ -722,6 +722,9 @@ class RequestServer:
         self.stop_event = threading.Event()
         self.wake = threading.Event()
         self.pin_identities = config.remote_pin_set
+        # Identity hashes RNS blackholes (rnfs.network.blackhole.Blackhole.identity_listed, set by the node): requests
+        # on links identified as one are answered False
+        self.blackholed: Callable[[bytes], bool] = lambda identity_hash: False
         self.over_rate = 0  # requests over their link's rate limit, in all (refused or dropped)
         self.over_rate_log = ThrottledLog(OVER_RATE_LOG_INTERVAL, clock)
 
@@ -836,9 +839,9 @@ class RequestServer:
     # Handlers
 
     def _guarded(self, handler):
-        """Wrap handler with the link's rate limit (over it: False, or None, which RNS doesn't answer), the
-        private-mode membership check (False for a non-member), and an answer of False for an unexpected error
-        rather than leaving the requester waiting."""
+        """Wrap handler with the link's rate limit (over it: False, or None, which RNS doesn't answer), False for a
+        link identified as an identity RNS blackholes, the private-mode membership check (False for a non-member), and
+        an answer of False for an unexpected error rather than leaving the requester waiting."""
         def response_generator(path, data, request_id, link_id, remote_identity, requested_at):
             """RNS's six-argument request handler signature."""
             # First, before any parsing: the link's rate limit. None: RNS sends no answer
@@ -847,6 +850,10 @@ class RequestServer:
                 self._over_rate()
                 return False if allowed == REQUEST_REFUSED else None
             try:
+                if remote_identity is not None and self.blackholed(bytes(remote_identity.hash)):
+                    # RNS tears down a link identifying as a blackholed identity; one identified before it was listed
+                    log(f"refused {path} from a blackholed identity", LOG_VERBOSE)
+                    return False
                 if self.config.private and not self._is_member(remote_identity):
                     log(f"refused {path} from a non-member", LOG_VERBOSE)
                     return False

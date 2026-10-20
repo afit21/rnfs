@@ -352,8 +352,9 @@ lock held, since it may block on RNS; the table is checked again once it answers
 `MAX_UNRELIABLE` (4096) nodes, least recently failed forgotten first), `may_retry(node_id)` (due again after
 `AVOID_AFTER` (300 s), doubling per further failure up to `AVOID_MAX` (3600 s); True claims the retry, pushing
 the next one back a further backoff, so concurrent lookups don't all retry it), `remove(node_id)`, `ban(node_id)`,
-`is_banned(node_id)`, `closest(key, count=K, for_reply=False)`,
-`seniority(node_id) -> float | None` (seconds in the table), `join_order()` (the servers a join asks first, before
+`is_banned(node_id)` (also True while `blackholed(node_id)`, an attribute the node sets to
+`Blackhole.node_listed`: `heard` and `answered` refuse such a node too, and nothing of it is saved),
+`closest(key, count=K, for_reply=False)`, `seniority(node_id) -> float | None` (seconds in the table), `join_order()` (the servers a join asks first, before
 the node orders them by score), `is_senior(node_id, min_age)`, `standing(node_id,
 min_age) -> int` (0 senior and healthy, 1 healthy, 2 stale, 3 absent: ranks keepers), `standings(min_age) ->
 dict` (every node's standing now: the keeper query's snapshot from before its lookup), `contains(node_id)`,
@@ -702,6 +703,17 @@ several: `request_path(on_interface=, tag=)` on each with one random tag, then p
 Counters `requests`, `charged`, `joined`, `reused`, `held`, `waited` are for tests and measurements. `stretch()` (1 by
 default; on a slow node `ChannelLoad.stretch`) multiplies `spacing` for each turn and `charge` (`_spacing`, read outside
 the lock; a value that isn't a finite number above 1 counts as 1).
+
+`blackhole.py` (0.2.0) — `Blackhole(reticulum, clock, wall_clock, refresh=REFRESH)`, RNS's identity blackhole as
+the node honours it (spec section 10, "Blackholed identities"), made in `RnfsNode._setup` over `self.reticulum`
+(nothing listed without one). `refresh()` reads `get_blackholed_identities()` (through a shared instance one RPC),
+keeps the identity hashes `listed(entries, now)` takes (16-byte keys whose `until` hasn't passed) and their node IDs
+(`Destination.hash(identity hash, "rnfs", "dht")`, each hashed once while listed), swaps both frozensets whole, and
+returns the node IDs newly listed; a read that fails is logged (throttled) and keeps the last list. The maintenance
+pass (`RnfsNode.maintain`) calls `refresh_if_due()` (every `REFRESH`, 300 s) and removes each newly listed node from
+the routing table. The checks, `node_listed` (`RoutingTable.blackholed`, so `is_banned` everywhere) and
+`identity_listed` (`RequestServer.blackholed`: `_guarded` answers False for a request on a link identified as a
+listed identity, after the rate limit, before private mode's check), read the frozensets only, never RNS.
 
 `channel.py` (0.2.0) — `ChannelLoad(reticulum, clock, poll=POLL)`, a slow node's radios' measured load (spec section 3,
 "Measured airtime"), made in `RnfsNode._start_network` on a slow node only. `load()` reads

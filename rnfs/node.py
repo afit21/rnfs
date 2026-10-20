@@ -68,6 +68,7 @@ from rnfs.names import NameManager, RnsNetwork, key_backup_warning, parse_name
 from rnfs.pin_names import PinNames
 from rnfs.network import guards, nomadnet, rates
 from rnfs.network.announces import DhtAnnounceHandler, DhtAnnouncer, parse_mode
+from rnfs.network.blackhole import Blackhole
 from rnfs.network.channel import ChannelLoad
 from rnfs.network.client import PeerClient
 from rnfs.network.identity import load_or_create_identity, parse_node_id
@@ -579,6 +580,7 @@ class RnfsNode:
         self._path_named = self.links.paths.named
 
         self.server = RequestServer(self.destination, config, self.backend, traffic=self.client.traffic)
+        self.server.blackholed = self.blackhole.identity_listed  # links identified as a blackholed identity: False
         if slow:
             # A slow node paces by its radios' measured load (spec section 3, "Measured airtime"): path requests and
             # publishing rounds spaced further while the channel is busy, /blocks refused while its own airtime is over
@@ -674,6 +676,10 @@ class RnfsNode:
         self._add_store(_StoreParts(close=self._db.close), batched=False)
 
         self.routing = RoutingTable(node_id, config, admit=self._is_member_node if config.private else None)
+        # RNS's identity blackhole (section 10): a listed identity's node ID counts as banned while listed. Read by the
+        # maintenance thread every few minutes (maintain); nothing is listed without Reticulum
+        self.blackhole = Blackhole(lambda: self.reticulum)
+        self.routing.blackholed = self.blackhole.node_listed
         # Loaded from the state database, so a restart rejoins from the servers it knew; saved with the batched stores
         self._add_store(RoutingState(self.routing, config.state_dir))
         # Local scores (section 6): bootstrap nodes seeded; saved with the batched stores
@@ -1508,7 +1514,9 @@ class RnfsNode:
             self._prune_fetched()
 
     def maintain(self, now: float, last: dict) -> None:
-        """One maintenance pass: shared folder, provider records, storage. last holds when each ran."""
+        """One maintenance pass: shared folder, provider records, storage, RNS's blackhole. last holds when each ran."""
+        for node_id in self.blackhole.refresh_if_due():
+            self.routing.remove(node_id)  # and kept out while it is listed (RoutingTable.blackholed)
         if now - last.get("scan", float("-inf")) >= self.config.scan_interval:
             last["scan"] = now
             try:

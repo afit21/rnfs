@@ -142,6 +142,12 @@ Security:
   from the closest up to the first that isn't (its distance scaled to the 10th), so a node that knows few identities,
   on a LoRa island, doesn't underestimate the network instead. Over 300 servers with such a server in every lookup:
   288 -> 743 before, 288 -> 318 now.
+- **RNS's identity blackhole is honoured** (specification section 10, "Blackholed identities"): RNS drops a
+  blackholed identity's announces and paths, but rnfs kept using what it held, so the node stayed in the routing
+  table, was asked in lookups, and its provider records were handed out and fetched from. The node now reads the
+  list (`rnpath -B`, blackhole sources; through rnsd too) every 5 minutes and treats a listed identity's node ID as
+  banned while it is listed (nothing of it is saved: it ends when the identity leaves the list), and answers `False`
+  to every request on a link identified as a listed identity.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves

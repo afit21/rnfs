@@ -2,7 +2,8 @@
 
 Only servers that proved reachable are stored. Full buckets keep their long-lived nodes, so an attacker
 with fresh identities can't take a table over; nodes that stop answering are dropped, and a dropped node
-that comes back soon regains its seniority. Bans (section 10) also live here.
+that comes back soon regains its seniority. Bans (section 10) also live here, and the node IDs of identities RNS
+blackholes count as banned while listed (blackholed).
 
 Lookups also ask the table which nodes are unreliable: those whose last max_failures queries or more all
 failed, in the table or not (a node dropped, or only named in other nodes' replies). Announces don't clear
@@ -95,6 +96,9 @@ class RoutingTable:
         # Node ID -> [failed queries in a row, when it may be retried], for any node; only an answer clears it
         self._unanswered: OrderedDict[bytes, list] = OrderedDict()
         self._lock = threading.RLock()
+        # Node IDs banned for as long as RNS blackholes their identity (rnfs.network.blackhole.Blackhole.node_listed,
+        # set by the node): never blocks, and isn't saved
+        self.blackholed: Callable[[bytes], bool] = lambda node_id: False
 
     @property
     def lock(self) -> threading.RLock:
@@ -175,7 +179,8 @@ class RoutingTable:
                     self._unanswered.pop(node_id, None)
                 now = self.clock()
                 self._prune(now)
-                if self._bans.get(node_id, now) > now:  # banned; an expired ban may be left (see _prune)
+                # Banned (an expired ban may be left: see _prune), or its identity blackholed by RNS
+                if self._bans.get(node_id, now) > now or self.blackholed(node_id):
                     return False
                 bucket = self._buckets[self.bucket_index(node_id)]
                 entry = bucket.get(node_id)
@@ -292,7 +297,10 @@ class RoutingTable:
             self._changed(node_id)
 
     def is_banned(self, node_id: bytes) -> bool:
-        """True while node_id is banned; its announces and provider records are then ignored too."""
+        """True while node_id is banned, or RNS blackholes its identity (blackholed); its announces and provider
+        records are then ignored too."""
+        if self.blackholed(node_id):
+            return True
         with self._lock:
             until = self._bans.get(node_id)
             if until is None:

@@ -1854,6 +1854,17 @@ as is cheap. Rules live in the sections referenced.
 
 RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 
+**Blackholed identities.** RNS (1.5.6) keeps a list of blackholed identities, filled by the instance's operator
+(`rnpath -B`) and by the blackhole lists it subscribes to (`blackhole_sources`), and returns it from
+`Reticulum.get_blackholed_identities` (through a shared instance too, by RPC). RNS itself drops their announces,
+removes the paths to their destinations and tears down an incoming link that identifies as one. A node SHOULD also
+honour it: rnfs reads the list every 5 minutes (an entry whose `until` has passed counts as lifted) and, while an
+identity is listed, treats its node ID (the `rnfs.dht` destination of that identity) as banned (dropped from the
+routing table and kept out of it, left out of lookups, its provider records not handed out or used, never asked by a
+fetch), and answers `False` to every request on a link identified as it (one identified before it was listed, which
+RNS lets be). Unlike a ban, nothing of this is kept: it ends when the identity leaves the list. An unidentified link
+(lookups, downloads) carries no identity, so it is served as any other.
+
 **Privacy** (outside private mode, where every link identifies).
 - Lookups and downloads use unidentified links, so the nodes asked learn only that *some* node wants a key.
 - Publishing uses a separate identified link, never reused.
