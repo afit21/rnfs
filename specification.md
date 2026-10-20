@@ -2010,8 +2010,9 @@ message that call would have reported.
   that the target's stored directories show doesn't exist) MAY be queued again rather than failed (rnfs 0.2.0),
   keeping its blocks as a queued job does, with its `error` and `retry_at`, the time before which it isn't started.
   rnfs tries it again after 10 minutes, the wait doubling up to 6 hours, until 3 days after it first wasn't found
-  (`retry_since`), then fails it. A client following a transfer in the foreground (the CLI without `--background`)
-  cancels such a job and reports its error, so it never waits hours.
+  (`retry_since`), then fails it. A job submitted with `retry` false (`POST /api/jobs`, kept with the job) fails at
+  once instead, as before 0.2.0; the CLI's foreground transfers (without `--background`) are, so a command never
+  waits hours.
 - Jobs MUST be persisted in the state directory, each change saved atomically and durably. When the node starts, jobs that were
   queued or running MUST be queued again. A resumed job MUST NOT fetch again blocks that are still stored.
 - While a job is queued or running, the blocks stored below its root MUST be kept as if pinned, including

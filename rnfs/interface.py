@@ -1248,6 +1248,14 @@ class Names:
         return [Followed.from_dict(entry) for entry in self._owner._backend.name_following()]
 
 
+def _retry(retry: bool) -> dict:
+    """A job submission's retry flag: sent only when False (the default, and what a daemon before rnfs 0.2.0 does).
+    Raises ValueError unless it is a bool, so both classes refuse alike."""
+    if type(retry) is not bool:
+        raise ValueError("retry must be true or false")
+    return {} if retry else {"retry": False}
+
+
 @dataclass(frozen=True)
 class Job:
     """A background transfer (get, pin, export, add or import) the node runs, persists and resumes after a restart:
@@ -1256,7 +1264,7 @@ class Job:
     has a path (and an add its options) instead of a target; an add of a NomadNet link has that link (nomadnet)
     instead of a path. source is what a pin, add or import job pins with ("user", or the app's that queued it).
     retry_at is when a get, pin or export job queued again because its content wasn't found is tried again (None
-    otherwise; error says why), retry_since when it first wasn't found."""
+    otherwise; error says why), retry_since when it first wasn't found; retry False: it was submitted not to be."""
 
     id: str
     kind: str
@@ -1286,12 +1294,13 @@ class Job:
     eta: float | None = None
     retry_at: float | None = None
     retry_since: float | None = None
+    retry: bool = True
     _owner: Rnfs | None = field(default=None, repr=False, compare=False)
 
     FIELDS = ("id", "kind", "target", "output", "sealed_name", "fallback_dht", "path", "options", "no_extract",
               "source", "nomadnet", "state", "created", "started",
               "finished", "error", "result", "runs", "total_bytes", "done_bytes", "blocks", "blocks_total",
-              "downloaded_bytes", "rate", "eta", "retry_at", "retry_since")
+              "downloaded_bytes", "rate", "eta", "retry_at", "retry_since", "retry")
 
     @classmethod
     def from_dict(cls, data: dict, owner: Rnfs | None = None) -> "Job":
@@ -1346,22 +1355,23 @@ class Jobs:
         self._owner = owner
 
     def get(self, target, output, *, from_node=None, sealed_name: bool = False, fallback_dht: bool = False,
-            on_progress=None, no_extract: bool = False) -> Job:
+            on_progress=None, no_extract: bool = False, retry: bool = True) -> Job:
         """Fetch target and write it to output (which must not exist) as a job. sealed_name writes a sealed
         file this node opens under its sealed name in output's directory (a sealed folder unpacked: under the
         name of the directory written); fallback_dht retries by DHT discovery if from_node fails; no_extract
-        writes a sealed folder as its tar instead of unpacking it. on_progress(job) as Job.watch. Raises
-        ValueError (output exists or in use), Busy."""
+        writes a sealed folder as its tar instead of unpacking it. on_progress(job) as Job.watch. retry (rnfs 0.2.0):
+        if its content isn't found, the job is queued again to be tried later (retry_at), for up to 3 days; False
+        fails it at once. Raises ValueError (output exists or in use), Busy."""
         return self._submit("get", target, _abspath(output), from_node, on_progress, sealed_name=sealed_name,
-                            fallback_dht=fallback_dht, no_extract=no_extract)
+                            fallback_dht=fallback_dht, no_extract=no_extract, **_retry(retry))
 
-    def pin(self, target, *, on_progress=None) -> Job:
-        """Fetch target completely and pin it "user", as a job."""
-        return self._submit("pin", target, None, None, on_progress)
+    def pin(self, target, *, on_progress=None, retry: bool = True) -> Job:
+        """Fetch target completely and pin it "user", as a job (retry as get's)."""
+        return self._submit("pin", target, None, None, on_progress, **_retry(retry))
 
-    def export(self, target, output, *, on_progress=None) -> Job:
-        """Write an archive of target to output (which must not exist), as a job."""
-        return self._submit("export", target, _abspath(output), None, on_progress)
+    def export(self, target, output, *, on_progress=None, retry: bool = True) -> Job:
+        """Write an archive of target to output (which must not exist), as a job (retry as get's)."""
+        return self._submit("export", target, _abspath(output), None, on_progress, **_retry(retry))
 
     def add(self, path, *, wrap: bool = False, pin: bool = True, only_hash: bool = False,
             to: list[str] | None = None, to_self: bool = False, seal_name: bool = True, chunker: str | None = None,

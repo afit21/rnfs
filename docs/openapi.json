@@ -2024,6 +2024,10 @@
                     "type": "boolean",
                     "description": "get: a sealed folder is written as its tar."
                   },
+                  "retry": {
+                    "type": "boolean",
+                    "description": "get, pin, export (rnfs 0.2.0): if no provider can supply its content, queue the job again to be tried later (`retry_at`), for up to 3 days (default true); false fails it at once, as 0.1.6 did."
+                  },
                   "path": {
                     "type": "string",
                     "description": "add, import: an absolute path on the daemon's machine (it must exist: 404)."
@@ -5201,6 +5205,10 @@
           "retry_since": {
             "type": "number",
             "description": "Present while it waits to be tried again: when its content first wasn't found (Unix time). It is tried for up to 3 days from then."
+          },
+          "retry": {
+            "const": false,
+            "description": "Present when it was submitted with `retry` false."
           }
         },
         "required": [

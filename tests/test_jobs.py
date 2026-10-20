@@ -220,6 +220,17 @@ class JobsTest(JobsBase):
         self.assertIn("no provider", job["error"])
         self.assertIsNone(self.jobs._job(job["id"]).protection)
 
+    def test_retry_false_fails_as_before(self):
+        """A job submitted with retry false fails at once when its content isn't found, and keeps the flag in its
+        record; retry must be a boolean."""
+        missing = str(Cid.for_block(RAW, b"not waited for"))
+        job = self.finished(self.jobs.submit("pin", missing, retry=False)["id"])
+        self.assertEqual((job["state"], job["retry_at"], job["retry"]), ("failed", None, False))
+        self.assertIn("no provider", job["error"])
+        self.assertIs(self.saved()[0]["retry"], False)
+        with self.assertRaises(ValueError):
+            self.jobs.submit("pin", missing, retry="no")
+
     def test_a_path_that_does_not_exist_fails_at_once(self):
         """A get of a path its directory shows doesn't exist fails without waiting: trying again can't help."""
         os.makedirs(self.out("tree"))
@@ -719,8 +730,13 @@ class CliTest(ApiBase):
         code, _, err = self.run_cli("get", missing, "-o", self.out("nothing"))
         self.assertEqual(code, 1)
         self.assertIn("no provider", err)
-        # Queued again to be tried later, which a foreground command doesn't wait for: it cancels the job
-        self.assertEqual(self.jobs.list()[-1]["state"], "cancelled")
+        # A foreground command submits with retry false: the job fails as in 0.1.6 rather than waiting
+        last = self.jobs.list()[-1]
+        self.assertEqual((last["state"], last["retry_at"], last["retry"]), ("failed", None, False))
+        code, out, _ = self.run_cli("pin", "add", missing, "--background")
+        self.assertEqual(code, 0)
+        job = self.jobs.get(out.strip())
+        self.assertNotIn("retry", job)  # --background: the default, waiting when not found
 
     def test_get_without_output_takes_a_safe_sealed_name(self):
         cid = self.share(b"sealed stand-in")

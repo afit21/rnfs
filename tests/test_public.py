@@ -539,6 +539,12 @@ class PublicTests:
         self.assertIn("no provider", waiting.error)
         self.assertIsNotNone(waiting.retry_since)
         self.assertEqual(waiting.cancel().state, "cancelled")
+        # retry=False: it fails at once, as before rnfs 0.2.0
+        failed = self.rnfs.jobs.pin(Cid.for_block(RAW, b"nobody has this either"), retry=False).wait(10)
+        self.assertEqual((failed.state, failed.retry, failed.retry_at), ("failed", False, None))
+        self.assertIn("no provider", failed.error)
+        with self.assertRaises(ValueError):
+            self.rnfs.jobs.pin(Cid.for_block(RAW, b"x"), retry=0)
 
     def test_deny(self):
         """The deny list: add, list, remove, and malformed entries."""

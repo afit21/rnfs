@@ -47,8 +47,9 @@ or import job; `rnfs jobs` lists, shows, waits for, cancels and clears jobs.
   show doesn't exist) is queued again rather than failed, keeping its protection, to start no sooner than its
   retry_at (rnfs.retry: 10 minutes, doubling up to 6 hours, for up to 3 days after it first wasn't found; then it
   fails as before). Its error says why it waits; retry_since is when it was first not found. The rnfs-job-retry
-  thread starts the jobs due (RETRY_POLL). A foreground transfer (run_transfer) doesn't wait: the CLI cancels a job
-  it follows once it is queued again, and fails with its error, as before 0.2.0.
+  thread starts the jobs due (RETRY_POLL). A job submitted with retry false (kept in its record) fails at once
+  instead, as before 0.2.0: the CLI's foreground transfers (run_transfer) are, so a command or script never waits
+  hours; --background jobs aren't.
 - Finished jobs (done, failed, cancelled) are kept for `rnfs jobs`, at most max_finished_jobs, but each
   for at least FINISHED_GRACE: a CLI following a fast job must still find it once it ends.
 - Job threads are daemon threads, so they never hold up the process; stop() asks running fetches to stop
@@ -119,8 +120,9 @@ class Job:
     def __init__(self, job_id: str, kind: str, target: str | None, output: str | None = None,
                  from_node: str | None = None, created: float | None = None, sealed_name: bool = False,
                  fallback_dht: bool = False, path: str | None = None, options: dict | None = None,
-                 no_extract: bool = False, source: str = USER, nomadnet: str | None = None):
-        """A queued job; from_node is a node ID in hex. sealed_name, fallback_dht and no_extract are for get jobs;
+                 no_extract: bool = False, source: str = USER, nomadnet: str | None = None, retry: bool = True):
+        """A queued job; from_node is a node ID in hex. retry: a get, pin or export whose content isn't found is
+        queued again to be tried later (False: it fails, as before rnfs 0.2.0). sealed_name, fallback_dht and no_extract are for get jobs;
         path (and for add, options: ADD_OPTIONS) for add and import jobs, which have no target; source the pin
         source of a pin, add or import job (user, or the app's whose token queued it); an add job may have a NomadNet
         link (nomadnet) instead of a path."""
@@ -136,6 +138,7 @@ class Job:
         self.options = options  # an add job's add_path options (only those set)
         self.source = source  # what a pin, add or import job pins with: kept so a resumed job pins the same
         self.nomadnet = nomadnet  # an add job's NomadNet link, which it adds instead of a path
+        self.retry = retry  # queued again when its content isn't found (rnfs.retry)
         self.state = QUEUED
         self.created = time.time() if created is None else created
         self.started: float | None = None  # when the latest run started
@@ -280,8 +283,9 @@ class Job:
     def to_record(self) -> dict:
         """The job as saved (a running job is saved as such, and queued again when loaded). path and options
         only for the kinds that have them (add, import), no_extract only when set, source only when it isn't "user"
-        (an app's), nomadnet only for an add of a NomadNet link, and retry_at and retry_since only while it waits
-        to be tried again, so the record of every other job is as 0.1.6 saved it."""
+        (an app's), nomadnet only for an add of a NomadNet link, retry only when false, and retry_at and
+        retry_since only while it waits to be tried again, so the record of every other job is as 0.1.6 saved
+        it."""
         record = {"id": self.id, "kind": self.kind, "target": self.target, "output": self.output,
                   "from": self.from_node, "sealed_name": self.sealed_name, "fallback_dht": self.fallback_dht}
         if self.no_extract:
@@ -292,6 +296,8 @@ class Job:
             record["source"] = self.source
         if self.nomadnet is not None:
             record["nomadnet"] = self.nomadnet
+        if not self.retry:
+            record["retry"] = False
         if self.retry_since is not None:
             record.update(retry_at=self.retry_at, retry_since=self.retry_since)
         record.update({"state": self.state, "created": self.created, "started": self.started,
@@ -313,11 +319,11 @@ class Job:
             raise ValueError("bad kind or state")
         sealed_name, fallback_dht = record.get("sealed_name", False), record.get("fallback_dht", False)
         path, options, no_extract = record.get("path"), record.get("options"), record.get("no_extract", False)
-        source, nomadnet = record.get("source", USER), record.get("nomadnet")
+        source, nomadnet, retry = record.get("source", USER), record.get("nomadnet"), record.get("retry", True)
         check_job_params(kind, target, output, from_node, sealed_name, fallback_dht, path, options, no_extract,
-                         source, nomadnet=nomadnet)
+                         source, nomadnet=nomadnet, retry=retry)
         job = cls(job_id, kind, target, output, from_node, _number(record.get("created"), time.time()),
-                  sealed_name, fallback_dht, path, options, no_extract, source, nomadnet=nomadnet)
+                  sealed_name, fallback_dht, path, options, no_extract, source, nomadnet=nomadnet, retry=retry)
         job.state = state
         job.started = _number(record.get("started"), None)
         job.finished = _number(record.get("finished"), None)
@@ -362,17 +368,20 @@ def _capped(result: dict) -> dict:
 
 
 def check_job_params(kind: str, target, output, from_node, sealed_name=False, fallback_dht=False, path=None,
-                     options=None, no_extract=False, source=USER, nomadnet=None):
+                     options=None, no_extract=False, source=USER, nomadnet=None, retry=True):
     """Raise ValueError unless these fit a job of kind: for get, pin and export a well-formed target, an absolute
     output path for get and export (none for pin), and from (a node ID in hex), sealed_name, fallback_dht and
     no_extract (booleans) only for get; for add and import an absolute path and neither target nor output, and options
     (check_add_options) only for add; source "user", or for pin, add and import an app's (app:<name>[:<key>]); an add
-    may have a NomadNet link (nomadnet, as written) instead of a path."""
+    may have a NomadNet link (nomadnet, as written) instead of a path; retry is a boolean (any kind: it only
+    changes a get's, pin's or export's)."""
     from rnfs import nomadnet as nomadnet_links
     from rnfs.content import walker  # validates the root CID and every path name
     from rnfs.content.storage import app_of
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {', '.join(KINDS)}")
+    if type(retry) is not bool:
+        raise ValueError("retry must be true or false")
     if source != USER and (kind not in PINNING_KINDS or app_of(source) is None):
         raise ValueError(f"a {kind} job can't pin with source {source!r}")
     if nomadnet is not None:
@@ -708,11 +717,12 @@ class JobsFeature(Feature):
 
     def _retries(self, job: Job, error: Exception) -> bool:
         """Whether a run that failed with error is tried again later: a get, pin or export whose content no provider
-        could supply (NotFound), unless the job was cancelled, the node is stopping, its path is known not to exist
+        could supply (NotFound), unless it was submitted with retry false, the job was cancelled, the node is stopping, its path is known not to exist
         (_absent_path) or rnfs.retry.RETRY_FOR has passed since it first wasn't found. Sets its retry_at (and
         retry_since, the first time)."""
         from rnfs.errors import NotFound, Unsupported
-        if (job.kind not in RETRYING_KINDS or not isinstance(error, NotFound) or isinstance(error, Unsupported)
+        if (not job.retry or job.kind not in RETRYING_KINDS or not isinstance(error, NotFound)
+                or isinstance(error, Unsupported)
                 or job.cancel_requested or self._stop_event.is_set() or self._absent_path(job.target)):
             return False
         now = time.time()
@@ -862,7 +872,7 @@ class JobsFeature(Feature):
     def submit(self, kind: str, target: str | None = None, output: str | None = None, from_node: str | None = None,
                sealed_name: bool = False, fallback_dht: bool = False, path: str | None = None,
                options: dict | None = None, no_extract: bool = False, source: str = USER,
-               nomadnet: str | None = None) -> dict:
+               nomadnet: str | None = None, retry: bool = True) -> dict:
         """Queue a job; its dict. Raises ValueError for bad parameters or an output in use, NotFound for an add's
         or import's path that doesn't exist, Busy when full.
 
@@ -870,7 +880,8 @@ class JobsFeature(Feature):
         by DHT discovery if from_node fails; no_extract writes a sealed folder as its tar. For add and import:
         path, and for add options (ADD_OPTIONS); or for add a NomadNet link (nomadnet) instead of a path, with
         NOMADNET_OPTIONS among its options too. For pin, add and import: source, what they pin with ("user", or the
-        app's that queued it, which removing the app cancels: app_removed).
+        app's that queued it, which removing the app cancels: app_removed). retry False: a get, pin or export whose
+        content isn't found fails rather than being queued again (rnfs.retry).
         """
         from rnfs.errors import Busy, NotFound
         contacts = self.dependency("contacts")
@@ -878,7 +889,7 @@ class JobsFeature(Feature):
             # `alice/docs`: a name contact's nick becomes the CID its name points at now (rnfs.features.contacts)
             target = contacts.expand_target(target)
         check_job_params(kind, target, output, from_node, sealed_name, fallback_dht, path, options, no_extract,
-                         source, nomadnet=nomadnet)
+                         source, nomadnet=nomadnet, retry=retry)
         if output is not None and os.path.lexists(output):
             raise ValueError(f"{output} already exists")
         if path is not None and not os.path.lexists(path):
@@ -898,7 +909,8 @@ class JobsFeature(Feature):
             while job_id in self._jobs:
                 job_id = secrets.token_hex(4)
             job = Job(job_id, kind, target, output, from_node, sealed_name=sealed_name, fallback_dht=fallback_dht,
-                      path=path, options=options, no_extract=no_extract, source=source, nomadnet=nomadnet)
+                      path=path, options=options, no_extract=no_extract, source=source, nomadnet=nomadnet,
+                      retry=retry)
             job.stop_event = self._stop_event
             job.on_progress = self._publish
             job.position = self._position
@@ -1049,8 +1061,8 @@ def _feature(handler) -> JobsFeature:
 
 
 def api_start(handler):
-    """POST /api/jobs {"kind", "target", "output", "from", "sealed_name", "fallback_dht", "no_extract"} for get,
-    pin and export; {"kind": "add", "path" or "nomadnet", and POST /api/add's options} or {"kind": "import",
+    """POST /api/jobs {"kind", "target", "output", "from", "sealed_name", "fallback_dht", "no_extract", "retry"} for
+    get, pin and export; {"kind": "add", "path" or "nomadnet", and POST /api/add's options} or {"kind": "import",
     "path"}: queue a job; the job. A pin, add or import job pins with the caller's source (handler.pin_source:
     user, or an app's)."""
     from rnfs import api
@@ -1079,6 +1091,8 @@ def api_start(handler):
     flags = {name: body.get(name, False) for name in ("sealed_name", "fallback_dht")}  # checked by submit
     if "no_extract" in body:
         flags["no_extract"] = body["no_extract"]  # checked by submit too
+    if "retry" in body:
+        flags["retry"] = body["retry"]  # checked by submit too
     handler.send_json(200, _feature(handler).submit(kind, target, output, from_node, **flags,
                                                     **(source if kind == "pin" else {})))
 
@@ -1278,8 +1292,7 @@ def follow(api, job_id: str, cancel_on_interrupt: bool) -> dict:
     """Poll a job until it ends, with a progress line if stderr is a terminal; the finished job.
 
     Ctrl+C cancels the job if cancel_on_interrupt (a foreground transfer), else just stops waiting; both
-    exit with status 130. A foreground transfer queued again because its content wasn't found (its retry_at) is
-    cancelled too, and returned with its error: a command or script doesn't wait hours for it (--background does).
+    exit with status 130.
     """
     line = ProgressLine() if sys.stderr.isatty() else None
     try:
@@ -1287,8 +1300,6 @@ def follow(api, job_id: str, cancel_on_interrupt: bool) -> dict:
             job = api.get("/api/jobs/get", id=job_id, wait=POLL_TTY if line else POLL_QUIET)
             if job["state"] in FINISHED:
                 return job
-            if cancel_on_interrupt and job["state"] == QUEUED and job.get("retry_at") is not None:
-                return {**api.post("/api/jobs/cancel", id=job_id), "error": job.get("error")}
             if line:
                 line.show(printable(format_progress(job)))
     except KeyboardInterrupt:
@@ -1322,6 +1333,10 @@ def run_transfer(args, fields: dict, fallback) -> dict | None:
         if getattr(args, "background", False):
             cli.fail("this daemon can't run background jobs")
         return fallback(api)
+    if not getattr(args, "background", False) and fields.get("kind") in RETRYING_KINDS:
+        # In the foreground, content not found fails the command as before rnfs 0.2.0 rather than waiting hours
+        # (a daemon before 0.2.0 ignores the field: it never waits)
+        fields = {**fields, "retry": False}
     job = api.post("/api/jobs", **fields)
     if getattr(args, "background", False):
         # Everything the daemon sends is escaped before it reaches the terminal, its job IDs too
