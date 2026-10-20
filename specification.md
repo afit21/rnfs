@@ -1543,7 +1543,10 @@ link in about a third of the airtime.
   cluster size, at least 4096 bytes, read when the node starts), and an empty block as one unit (rnfs 0.2.0; 0.1.x
   counted each block's length, and a FAT32 drive's 16–32 KiB clusters made a store of small blocks take several
   times `max_storage`). Quotas (`follow_quota`, `remote_pin_quota`) and `max_download_size` count bytes of
-  content and blocks, not allocation.
+  content and blocks, not allocation, so what they report means the same as in 0.1.x. Content of many tiny blocks
+  therefore takes more disk than its quota counts: up to about 80 times at 4 KiB units, and more on FAT32's
+  clusters. What bounds it is the disk reserve, checked at every response; a quota is for an identity or name
+  trusted that far.
 - `add --no-pin` stores what it adds as a cached fetch of its CID instead of pinning it: evicted least recently
   used like any other, removed by `gc`, never provided under `pinned`, and under `roots` provided while it is
   cached (it counts as a target the user fetched).
