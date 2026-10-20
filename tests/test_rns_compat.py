@@ -293,6 +293,13 @@ INTERNALS = [
                       _source(_rnode(), "self.r_airtime_short = ats/100.0", "self.r_airtime_long = atl/100.0",
                               "self.r_channel_load_short = cus/100.0", "self.r_channel_load_long = cul/100.0"))),
 
+    Internal("network/paths.py", "Transport.PATH_REQUEST_TIMEOUT, RNS's own wait for a path (the shortest "
+             "candidate_wait), and await_path blocking until the path is there or the timeout passes",
+             lambda: (_true(RNS.Transport.PATH_REQUEST_TIMEOUT == paths.PATH_REQUEST_TIMEOUT,
+                            "PATH_REQUEST_TIMEOUT changed"),
+                      _source(RNS.Transport.await_path, "while not Transport.has_path(destination_hash) and time.time() "
+                              "< timeout: time.sleep(0.05)", "return Transport.has_path(destination_hash)"))),
+
     # Why a link closed
     Internal("network/links.py, network/client.py", "Link.teardown_reason naming the end that closed a link by its "
              "role: teardown() sets INITIATOR_CLOSED at the opener (DESTINATION_CLOSED at the other end), a LINKCLOSE "

@@ -387,17 +387,19 @@ class LinkPool:
         with self.lock:
             return node_id in self.closed_by
 
-    def await_path(self, node_id: bytes) -> bool:
-        """Wait up to path_timeout for a path to node_id, requesting one in its turn if RNS has none (as opening a link
-        would): True once there is one. A lookup asks it before a query, to see how many hops the path takes
-        (rnfs.mesh.SlowPaths).
+    def await_path(self, node_id: bytes, timeout: float | None = None) -> bool:
+        """Wait up to timeout (path_timeout if None) for a path to node_id, requesting one in its turn if RNS has none
+        (as opening a link would): True once there is one. A lookup asks it before a query, to see how many hops the
+        path takes (rnfs.mesh.SlowPaths), on a node that isn't slow for PathRequests.candidate_wait. A wait shorter
+        than path_timeout isn't measured for it.
         """
         if RNS.Transport.has_path(node_id):
             return True
+        wait = self.config.path_timeout if timeout is None else timeout
         log(f"requesting a path to {node_name(node_id)}", LOG_VERBOSE)
-        if self.paths.await_path(node_id, self.config.path_timeout, cancel=self.stop_event):
+        if self.paths.await_path(node_id, wait, cancel=self.stop_event, measure=wait >= self.config.path_timeout):
             return True
-        log(f"no path to {node_name(node_id)} after {self.config.path_timeout:g}s")
+        log(f"no path to {node_name(node_id)} after {wait:g}s")
         return False
 
     def open_identified(self, node_id: bytes) -> PeerLink | None:

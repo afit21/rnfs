@@ -1043,9 +1043,17 @@ class RnfsNode:
         again before a link is opened). False if no path came (the query fails as it would have); None to ask it."""
         if self.paths.hops(node_id) is not None:
             return None  # ranked with its path known
-        if not self.client.await_path(node_id):
+        # A lookup has other candidates: once path-response times are measured, waited for as long as 95% of them took
+        # (at least RNS's 15 s) rather than path_timeout (spec section 3, "Path requests"). Only on a node that isn't
+        # slow: a slow node's lookups don't check paths
+        if not self.client.await_path(node_id, self._candidate_wait()):
             return False
         return True if self.slow_paths(node_id) else None
+
+    def _candidate_wait(self) -> float:
+        """How long a lookup's path check waits for a path (PathRequests.candidate_wait; path_timeout without one)."""
+        paths = getattr(self.links, "paths", None)
+        return self.config.path_timeout if paths is None else paths.candidate_wait(self.config.path_timeout)
 
     def _pace_fallback(self) -> float:
         """Slow nodes: a search's fallback is paced like the publisher's lookups (Publisher.pace_lookups)."""

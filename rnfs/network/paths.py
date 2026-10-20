@@ -39,6 +39,12 @@ resolution too. A node therefore paces its own:
   on_interface as not for normal use, but sending a path request filters interfaces by nothing else (no interface
   mode applies to a request going out: Transport._outbound), so it is safe on every mode; interfaces a request can't
   leave by (offline, not outgoing, local, a parent of spawned ones) are never chosen.
+- **Path-response times** (candidate_wait): the time from each request this node sent to its answer (the path, or the
+  identity it carries), over waits as long as path_timeout, the last MAX_SAMPLES of them. Once MIN_SAMPLES are
+  measured, a lookup's path check on a node that isn't slow waits their 95th percentile, at least RNS's
+  PATH_REQUEST_TIMEOUT (15 s) and at most path_timeout, instead of path_timeout; such shortened waits aren't measured,
+  so they can't pull the figure down to their own length. Everything else (names, links to a known or named target,
+  stores, fetches, a slow node's lookups) waits path_timeout.
 - lacked(destination): whether the last wait for its path (or identity) ended without it, so a query that failed
   for want of a path can be told from one whose link failed (partition mode leaves the former out,
   rnfs.dht.local.PartitionMode).
@@ -49,7 +55,7 @@ import math
 import os
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Callable
 
 import RNS
@@ -64,6 +70,10 @@ PATH_REQUEST_MI = 20  # RNS.Transport.PATH_REQUEST_MI: nothing is sent again for
 POLL = 0.1  # seconds between checks while waiting for a turn or an identity
 HINT_LIFE = 300.0  # seconds a node named by a /find reply keeps its scope for its path request
 MAX_TRACKED = 4096  # destinations each table (requests sent, paths lacked, scopes) remembers at most
+PATH_REQUEST_TIMEOUT = 15  # RNS.Transport.PATH_REQUEST_TIMEOUT: RNS's own wait for a path, the shortest candidate_wait
+MIN_SAMPLES = 20  # path-response times measured before candidate_wait shortens anything
+MAX_SAMPLES = 100  # the most recent path-response times kept
+PERCENTILE = 0.95  # candidate_wait waits as long as this share of the path responses measured took
 
 
 def _rns_transport():
@@ -139,6 +149,7 @@ class PathRequests:
         self._lacked: OrderedDict[bytes, None] = OrderedDict()  # destinations whose last wait found no path
         self._named: OrderedDict[bytes, tuple[bytes, float]] = OrderedDict()  # node -> (who named it, when)
         self._failure_log = ThrottledLog()
+        self._responses: deque[float] = deque(maxlen=MAX_SAMPLES)  # seconds from a request to its answer
         # Counts, for tests and measurements
         self.requests = 0  # path requests sent (one scoped to several interfaces counts once)
         self.charged = 0  # links that failed to establish, each a request RNS sends by itself
@@ -150,27 +161,40 @@ class PathRequests:
 
     # Waiting for a path or an identity
 
-    def await_path(self, destination: bytes, timeout: float, cancel: threading.Event | None = None) -> bool:
+    def await_path(self, destination: bytes, timeout: float, cancel: threading.Event | None = None,
+                   measure: bool = True) -> bool:
         """Wait for a path to destination, requesting one in its turn if RNS has none: True once there is one. timeout
         (path_timeout) counts from when the request is sent; cancel, once set, ends a wait for a turn or another
-        caller's request (False)."""
+        caller's request (False). measure: the answer's time counts towards candidate_wait (not for a shortened
+        wait)."""
         transport = self._transport()
         if transport.has_path(destination):
             self._settle(destination, True)
             return True
         found = self._wait(destination, transport, lambda: bool(transport.has_path(destination)), timeout, cancel,
-                           rns_wait=True)
+                           rns_wait=True, measure=measure)
         self._settle(destination, found)
         return found
 
     def await_known(self, destination: bytes, known: Callable[[], bool], timeout: float,
-                    cancel: threading.Event | None = None) -> bool:
+                    cancel: threading.Event | None = None, measure: bool = True) -> bool:
         """Request a path to destination in its turn (its answer carries the identity) and wait until known() (polled
         every POLL) holds: True if it did within timeout of the request. For a node RNS has a path to but no identity
         for; as await_path otherwise."""
-        found = self._wait(destination, self._transport(), known, timeout, cancel, rns_wait=False)
+        found = self._wait(destination, self._transport(), known, timeout, cancel, rns_wait=False, measure=measure)
         self._settle(destination, found)
         return found
+
+    def candidate_wait(self, path_timeout: float) -> float:
+        """How long a lookup's path check on a node that isn't slow waits for a path: path_timeout until MIN_SAMPLES
+        path-response times are measured, then the PERCENTILE of the last MAX_SAMPLES, within PATH_REQUEST_TIMEOUT and
+        path_timeout."""
+        with self._lock:
+            samples = sorted(self._responses)
+        if len(samples) < MIN_SAMPLES:
+            return path_timeout
+        measured = samples[min(len(samples) - 1, math.ceil(PERCENTILE * len(samples)) - 1)]
+        return min(path_timeout, max(PATH_REQUEST_TIMEOUT, measured))
 
     def send(self, destination: bytes, cancel: threading.Event | None = None) -> bool:
         """Request a path to destination in its turn on every interface, without waiting for the answer (names: the
@@ -211,7 +235,7 @@ class PathRequests:
     # Internals
 
     def _wait(self, destination: bytes, transport, ready: Callable[[], bool], timeout: float,
-              cancel: threading.Event | None, rns_wait: bool) -> bool:
+              cancel: threading.Event | None, rns_wait: bool, measure: bool = True) -> bool:
         """The wait of await_path (rns_wait: RNS's await_path waits for the path once the turn comes) or await_known,
         joining a wait already running for destination."""
         with self._lock:
@@ -229,15 +253,16 @@ class PathRequests:
                     return False
             return bool(ready())
         try:
-            return self._own_wait(destination, transport, ready, timeout, cancel, rns_wait)
+            return self._own_wait(destination, transport, ready, timeout, cancel, rns_wait, measure)
         finally:
             with self._lock:
                 self._waits.pop(destination, None)
             event.set()
 
     def _own_wait(self, destination: bytes, transport, ready: Callable[[], bool], timeout: float,
-                  cancel: threading.Event | None, rns_wait: bool) -> bool:
-        """Request destination's path in its turn (unless one was requested within PATH_REQUEST_MI) and wait."""
+                  cancel: threading.Event | None, rns_wait: bool, measure: bool) -> bool:
+        """Request destination's path in its turn (unless one was requested within PATH_REQUEST_MI) and wait. The time
+        from the request sent to its answer is recorded for candidate_wait if measure."""
         with self._lock:
             last = self._sent.get(destination)
             recent = last is not None and 0 <= self.clock() - last < PATH_REQUEST_MI
@@ -249,16 +274,22 @@ class PathRequests:
             return bool(ready())
         interfaces = self._scope(destination, transport)
         self._note_sent(destination)
+        sent_at = self.clock()
         if rns_wait and len(interfaces) <= 1:
             options = {"on_interface": interfaces[0]} if interfaces else {}
-            return bool(transport.await_path(destination, timeout=timeout, **options))
-        if interfaces:
-            tag = os.urandom(16)  # one request, as a broadcast is: every copy carries the same tag
-            for interface in interfaces:
-                transport.request_path(destination, on_interface=interface, tag=tag)
+            found = bool(transport.await_path(destination, timeout=timeout, **options))
         else:
-            transport.request_path(destination)
-        return self._poll(ready, timeout, cancel)
+            if interfaces:
+                tag = os.urandom(16)  # one request, as a broadcast is: every copy carries the same tag
+                for interface in interfaces:
+                    transport.request_path(destination, on_interface=interface, tag=tag)
+            else:
+                transport.request_path(destination)
+            found = self._poll(ready, timeout, cancel)
+        if found and measure:
+            with self._lock:
+                self._responses.append(max(0.0, self.clock() - sent_at))
+        return found
 
     def _take_turn(self, destination: bytes, ready: Callable[[], bool], cancel: threading.Event | None) -> bool:
         """Wait for a turn to request destination's path: True when it may go, False if ready() held meanwhile (no

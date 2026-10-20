@@ -105,9 +105,10 @@ class PeerClient:
         open, its request left to finish. Never cancels a Resource: closing the link stops it (section 3)."""
         return self.links.close_unless_used(node_id, own)
 
-    def await_path(self, node_id: bytes) -> bool:
-        """Wait for a path to node_id, requesting one if RNS has none: True once there is one (LinkPool.await_path)."""
-        return self.links.await_path(node_id)
+    def await_path(self, node_id: bytes, timeout: float | None = None) -> bool:
+        """Wait up to timeout (path_timeout if None) for a path to node_id, requesting one if RNS has none: True once
+        there is one (LinkPool.await_path)."""
+        return self.links.await_path(node_id, timeout)
 
     # /find
 

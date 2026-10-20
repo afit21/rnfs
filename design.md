@@ -705,6 +705,11 @@ request can leave by (`_sendable`: `OUT`, `online`, not `detached`, no `spawned_
 nor in `local_client_interfaces`); a spawned interface (a `parent_interface`) widens to every sendable interface of that
 parent. A scope covering every sendable interface is no scope. One interface: RNS's `await_path(on_interface=)`;
 several: `request_path(on_interface=, tag=)` on each with one random tag, then polled. `scoped` counts scoped requests.
+`_own_wait` records, for a request it sent and saw answered, the seconds from sending to the answer in `_responses` (a
+deque of `MAX_SAMPLES`, 100) unless `measure` is false (`await_path`, `await_known`); `candidate_wait(path_timeout)` is
+path_timeout below `MIN_SAMPLES` (20), else the `PERCENTILE` (0.95) of them within `PATH_REQUEST_TIMEOUT` (15 s, RNS's)
+and path_timeout. `LinkPool.await_path(node_id, timeout=None)` passes `measure` only for a wait of at least
+path_timeout; the node's `_path_check` (fast nodes' lookups only) asks it with `_candidate_wait()`.
 Counters `requests`, `charged`, `joined`, `reused`, `held`, `waited` are for tests and measurements. `stretch()` (1 by
 default; on a slow node `ChannelLoad.stretch`) multiplies `spacing` for each turn and `charge` (`_spacing`, read outside
 the lock; a value that isn't a finite number above 1 counts as 1).

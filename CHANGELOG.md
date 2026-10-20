@@ -630,6 +630,10 @@ Changed:
   peers count as one interface), so a gateway's lookups no longer send requests for internet nodes over its radio.
   A node named over a slow interface, joins, names, providers and links to known nodes ask on every interface, and
   nothing changes through a shared instance.
+- Shorter path waits for lookup candidates on nodes that aren't slow: a node measures how long its path requests take
+  to be answered, and once 20 are measured a lookup's path check waits their 95th percentile, at least RNS's own 15 s,
+  instead of `path_timeout` (30 s): a candidate whose path doesn't come costs half as long, as the lookup has others
+  to ask. Names, nodes the user names, stores, fetches, joins and slow nodes still wait `path_timeout`.
 - A server closing a link (RNS's `DESTINATION_CLOSED`: no room for another incoming link, or going away) is a
   refusal, not a failure: a lookup's `/find` on such a link no longer counts against the server in the routing table,
   its score or partition mode (a partition probe it ends counts as reaching the outside), and a `/blocks` provider

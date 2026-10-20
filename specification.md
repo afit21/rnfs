@@ -144,6 +144,12 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   destination runs at a time (RNS's `Transport.await_path` doesn't join concurrent callers; later callers wait for
   it), and nothing is sent again for a destination within `PATH_REQUEST_MI` of its last request, RNS's own included: a
   caller then waits `path_timeout` for the answer still on its way.
+- A lookup has other candidates, so a node that isn't slow MAY wait less than `path_timeout` for a candidate's path.
+  rnfs measures how long its path requests take to be answered (from the request sent to the path, or the identity
+  its answer carries; the last 100 answered, of waits as long as `path_timeout`), and once 20 are measured a lookup's
+  path check waits their 95th percentile, at least RNS's own `PATH_REQUEST_TIMEOUT` (15 s) and at most `path_timeout`;
+  those shorter waits aren't measured, so they can't pull the figure down to their own length. Everything else waits
+  `path_timeout`: names, a node the user or a remote pin names, stores, fetches, joins, and every wait on a slow node.
 - In the topology simulation (docs/simulations/topology, section 11; 1,000 and 3,000 servers) the pacing keeps a fast
   node that starts for the first time from tripping its hub's interface (peak estimate 1.5 a second): none of its
   ~45 requests is dropped (7–10 were at a hub taking 2–10 ms a packet), and no such node has 3 failed queries in a
@@ -2512,7 +2518,7 @@ Reticulum, the DHT mode and private mode never apply before a restart.
 | `stall_timeout` | 120 s | A response with no progress for this long is cancelled and refunded |
 | `blocks_cooldown` | 300 s | A link (and its identity) whose response made no progress is refused `/blocks` this long |
 | `lookup_timeout` | 10 min | |
-| `path_timeout` | 30 s | Waiting for an RNS path, from when the path request is sent (a wait for its turn, section 3, isn't counted) |
+| `path_timeout` | 30 s | Waiting for an RNS path, from when the path request is sent (a wait for its turn, section 3, isn't counted); a lookup's path check on a node that isn't slow waits less once path-response times are measured (section 3) |
 | `max_failures` | 3 | Unanswered queries in a row before a node is dropped; busy refusals in a row before a provider fails |
 | `link_idle_timeout` | 5 min | |
 | `max_incoming_links` | 128 | |
