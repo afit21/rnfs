@@ -411,7 +411,8 @@ class Publisher:
                  make_lookup: Callable[[bytes], object], slow_node: bool = False, state_dir: str | None = None,
                  cached_eligible: Callable[[], set[Cid]] = set, clock: Callable[[], float] = time.time,
                  retry_interval: float = RETRY_INTERVAL, generation: Callable[[], object] | None = None,
-                 bitrate: float | None = None, known_servers: Callable[[], int] = lambda: 0):
+                 bitrate: float | None = None, known_servers: Callable[[], int] = lambda: 0,
+                 lookups_at_once: int | None = None):
         """Publisher for own_id. providers is the ProviderStore (to record ourselves), client the PeerClient.
 
         make_lookup(key) returns a dht.lookup.Lookup; cached_eligible() returns the cached targets the
@@ -420,6 +421,8 @@ class Publisher:
         list and the key sources' keys are as at the last one (without it, every refresh recomputes). bitrate (the
         slowest interface's, bits/s; None if unknown) and known_servers() (the routing table's size, a lower bound
         of the network's) decide whether a slow node provides entries by default (republish_airtime).
+        lookups_at_once is how many region lookups a round runs at once on a node that isn't slow (PUBLISH_LOOKUPS if
+        None; 1 makes a round's outcome independent of thread timing, for tests that measure placement).
         """
         self.own_id = own_id
         self.config = config
@@ -434,6 +437,7 @@ class Publisher:
         self.generation = generation
         self.bitrate = bitrate
         self.known_servers = known_servers
+        self.lookups_at_once = PUBLISH_LOOKUPS if lookups_at_once is None else max(1, lookups_at_once)
         self._lock = threading.RLock()
         self._wake = threading.Event()
         self._provided: frozenset[ProvidedItem] = frozenset()
@@ -1244,7 +1248,7 @@ class Publisher:
         lookups, widened ones included (None: no limit). Called without the lock: refresh() may run meanwhile.
 
         should_stop() is checked before each lookup starts; one running isn't interrupted. Slow nodes (and a
-        single item) look up one at a time; other nodes run up to PUBLISH_LOOKUPS at once on
+        single item) look up one at a time; other nodes run up to lookups_at_once at once on
         rnfs-publish-lookup threads. A lookup that raises starts no more; the exception is raised once those
         running have finished, ending the round as it would one at a time.
         """
@@ -1255,21 +1259,21 @@ class Publisher:
             region = find_region(self.make_lookup(key), key, self.own_id, lambda bits: sweep.members(key, bits))
             self._widen(sweep, region, sweep.cover(region), limit)
 
-        if self.slow_node or len(due) < 2 or PUBLISH_LOOKUPS < 2:
+        if self.slow_node or len(due) < 2 or self.lookups_at_once < 2:
             while (limit is None or sweep.lookups < limit) and not should_stop():
                 key = sweep.take()
                 if key is None:
                     break
                 look_up(key)
         else:
-            self._sweep_at_once(sweep, look_up, should_stop)
+            self._sweep_at_once(sweep, look_up, should_stop, self.lookups_at_once)
         if sweep.regions:
             self._region_bits = sweep.estimate
         return sweep
 
     @staticmethod
-    def _sweep_at_once(sweep: Sweep, look_up: Callable[[bytes], None], should_stop: Callable[[], bool]):
-        """Run sweep's lookups PUBLISH_LOOKUPS at once (_sweep), raising the first exception one raised."""
+    def _sweep_at_once(sweep: Sweep, look_up: Callable[[bytes], None], should_stop: Callable[[], bool], count: int):
+        """Run sweep's lookups count at once (_sweep), raising the first exception one raised."""
         ended: list[BaseException | None] = []  # None once stopped, else the exception a lookup raised
 
         def work():
@@ -1294,7 +1298,7 @@ class Publisher:
                     return
 
         threads = [threading.Thread(target=work, name="rnfs-publish-lookup", daemon=True)
-                   for _ in range(PUBLISH_LOOKUPS)]
+                   for _ in range(count)]
         for thread in threads:
             thread.start()
         for thread in threads:
