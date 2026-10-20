@@ -347,25 +347,50 @@ per lookup. A query that failed because its path request was dropped counts as t
 by publishing. All local; no wire change.
 
 * Spec section 3 describes RNS's path-request limits, as it does the 2% announce cap
-* One node-wide budget for path requests: lookups, link opens, name resolves, keeper queries, NomadNet adds and
-  in-core LXMF while it remains. Requests are spaced at least 1 s apart, so RNS's estimate stays under 1.5 a
-  second, below a new interface's 3 with room for other traffic. A request waiting for the budget is not a
-  failure, and its time doesn't count towards `path_timeout`
-* While a lookup waits for the budget, it queries the next candidates with a known path instead of idling. This
-  revisits "preferring nodes with a known path", not adopted above when a path request cost only airtime
-* A query that failed for want of a path doesn't count towards partition mode: during a real partition paths to
-  off-island servers stay in RNS's table and fail as links, and announce silence detects the rest. It still
-  counts in the routing table, where a wrongly dropped node regains its seniority within 2 × `announce_interval`
-* Re-run the topology simulation with the limit modelled, before the slow nodes' larger budget and sweep
-  providing ship: path requests a publish round and a join send, and how often each limit trips at a gateway and
-  a public hub
+* One node-wide budget for path requests: lookups, link opens, name resolves, keeper queries and NomadNet adds.
+  Requests are spaced at least 1 s apart, so RNS's estimate at the next hop's interface for this node (a hub's
+  spawned interface) stays under 1.5 a second, below a new interface's 3 with room for other traffic. A request
+  waiting for the budget is not a failure, and its time doesn't count towards `path_timeout`. On a shared radio
+  channel the gateway's interface counts every node's requests, so spacing can't keep it under the limit there;
+  that is harmless for rnfs, as a limited request is still answered when the path is known
+* Not adopted: while a lookup waits for the budget, querying the next candidates with a known path. Measured
+  neutral (topology study section 11: slow nodes' requests are seconds apart anyway, and a fresh fast node's
+  lookups hit their budget of 3 a path whatever they ask meanwhile)
+* A query that failed for want of a path doesn't count towards partition mode. Each off-island server's first
+  failure in a real partition is a link failure (a node that isn't a transport node then expires the path and asks
+  again, so later queries fail for want of one), so detection still works: measured, partition mode comes 2–14 s
+  later (75 → 78 s, 131 → 145 s), and every partitioned publisher still enters it. It still counts in the routing
+  table, where a wrongly dropped node regains its seniority within 2 × `announce_interval`. The rule is needed
+  whatever the limit does: island relays in RNS's default `full` mode never forward a request for a path they
+  don't have, and with path failures counted 65–72% of island publish rounds enter partition mode on a connected
+  network
+* Re-run the topology simulation with the limit modelled (done: `docs/simulations/topology/RESULTS.md` section 11;
+  the model of RNS's limit agrees with RNS's own `Interface` code on all 657,231 evaluations checked). With 1,000 /
+  3,000 servers:
+
+  | | RNS 1.5.6, as built | with 1 s pacing |
+  |---|---|---|
+  | path requests: island publish round (10 region lookups) / fast node's join + first round after first start | 54 / 67; about 41–46 | the same |
+  | gateway LoRa interface at 1 kbit/s: trips an hour | 0 (estimate peaks at 2.5/s) | 0 |
+  | gateway at 5.6 kbit/s: trips an hour, steady / island-wide cold start | 0.05–0.07 / 0.9 | 0 / 0.9 |
+  | public hub: trips of a first-time fast node's interface | 1 (about 43 s) | 0 (peaks at 1.5/s) |
+  | hub: that node's requests dropped (hub at 0.5 / 2 / 10 ms a packet) | 0 / 7–8 / 10 | 0 |
+  | hub: first-time joins with 3 failures in a row (partition mode on a gateway) | 58–68% | 0% |
+  | fast node's first publish round | 7 s (22–25 s with drops) | 41–45 s |
+
+  Established nodes send almost no path requests. 1 s is the spacing: requests s apart peak at an estimate of
+  1.5 / s, so 0.5 s gives exactly 3.0 (no margin) and 2 s doubles the wait for nothing measurable. The slow
+  nodes' budget of 10 a lookup buys little beyond one hop of the gateway unless the island's transport nodes
+  forward path requests (`gateway`, `access_point` or `roaming` mode, or `recursive_prs`): the documentation for
+  island operators says so
 * Count the path requests RNS sends by itself: after every link that fails to establish, RNS expires the path and
   requests it again on every interface (RNS 1.5.6 `Transport.py` ~697–720, and rnsd for a local client's link
   ~880–955), up to 2 a second, so a failed link costs one request of the budget. `Transport.await_path` doesn't
   join concurrent callers and `LinkPool._recall` asks again: one wait per destination at a time, nothing re-sent
-  within RNS's `PATH_REQUEST_MI` (20 s). The busiest interface's `outgoing_pr_frequency` and `pr_burst_active`
-  (`get_interface_stats`, through rnsd too) are a ceiling the budget also respects, as they count other
-  applications' requests
+  within RNS's `PATH_REQUEST_MI` (20 s). The busiest interface's `outgoing_pr_frequency` (`get_interface_stats`,
+  through rnsd too) is a ceiling the budget also respects, as it counts other applications' requests. Not
+  `pr_burst_active`: it comes from other nodes' requests, so on a shared channel every node waits on the same
+  signal and resumes together; measured, it raised a cold start's trips from 0.9 to 9.8 an hour
 * Spec section 6 (or Appendix A) says what announces carry and why provider records aren't announced: servers
   are found from `rnfs.dht` announces and names live in their own, but a 1 kbit/s channel's 2% allowance (about
   1,150 announces a day) covers node presence for about 290 nodes, not an announce for each CID
@@ -761,6 +786,15 @@ rnfs already uses most of what RNS 1.5.6 offers an application. Worth adopting, 
   (latency-driven: I2P looks like LoRa)
 
 ## Scale (to do)
+
+* Sweep regions sized by servers that answered. `sweep.find_region` takes a region's prefix from the 10th closest
+  server its lookup found, answered or not; on an island that result is padded with island servers far from the
+  key, so a region covers about 5.5 due keys and their records land on 3.7 / 2.2 of their 10 closest (1,000 /
+  3,000 servers), against 7.0 / 6.6 with one lookup per key (topology study section 11.3, item 6). A node's
+  first round after its first start is worse: one padded lookup covers most due keys, which land on 0.5 / 0.2 of
+  their 10 closest. The prefix comes from the 10th closest server that answered, never shorter than the network
+  size estimate implies (log2 of servers ÷ `K`, less a margin), and a first round with no size estimate yet covers
+  one key a lookup. Measure island and backbone placement with the real `Sweep` before and after
 
 * The publisher's state on disk. It keeps every provided key's last publish and servers in memory, about 1.4 KB
   a key (measured): about 1.5–2M keys on a 4 GB Pi. Kept in the state database as provider records are, read per
