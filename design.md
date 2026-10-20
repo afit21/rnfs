@@ -457,7 +457,7 @@ the bytes a record takes, `capacity` `_capacity()` rounded down, each tier's `sh
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
 `Lookup(key, start_nodes, query, own_id, alpha, beta, k, timeout, is_known, on_answer, on_failure, exclude, report,
 unreliable, may_retry, max_queries, on_useful, size, seniors, claim, taken, on_complete, unknowns, slow_path,
-check_path, first, allowed)` with `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. Besides
+check_path, first, allowed, named)` with `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. Besides
 completion and the deadline, a run (`_iterate`) ends once it has sent `max_queries` (`MAX_QUERIES`, 8 × K) queries and
 their answers are in ("query cap"), or after `STALL_WINDOWS` (3) × max(alpha, beta) answers in a row that leave the bit
 length of the beta-th closest known distance (`_reach`) unchanged ("no progress"). A run ranks its nodes by `tier()`,
@@ -471,7 +471,10 @@ instead of an answer, and the run gives the query back (`queried`, `sent`, `in_f
 ranks again, so it is asked at once (unchecked) only if it still ranks among the nodes to query; False counts as a
 failed query, not sent. An unreliable node that distance alone would rank within the query window is asked again when
 `may_retry` says so, as a query beyond `alpha` (`retrying`) that the run waits for only if the node comes to rank within
-the window by `rank` (it is then counted in flight). `is_known(id)` says whether RNS knows its identity; at most
+the window by `rank` (it is then counted in flight). `named(id, by)` (the node's `PathRequests.named`, given by
+`_wired_lookup` once Reticulum runs) is told by `_send`, before a query to a node charged to the unknown-ID budget
+(`_allowed_unknown`), which node's answer first named it (`_named_by`, kept across runs and by `ask`). `is_known(id)`
+says whether RNS knows its identity; at most
 `unknowns` unknown IDs are tried per lookup (`allow_unknown(id)`, also used by the fetcher for provider IDs; `alpha` if
 not given, never fewer). `listing_nodes()` is the nodes that have answered with at least one provider, and
 `listers(provider)` those that listed a given provider, so the keeper search can tell who vouches for its candidates
@@ -671,7 +674,14 @@ At its turn a request goes unless `busiest_pr_frequency(get_interface_stats())` 
 reserves the next turn, for `CEILING_HOLD` (15 s) at most. `_waits` keeps one owner per destination; later callers
 wait on its event (polling `ready()`). `_sent` (an `OrderedDict`, at most `MAX_TRACKED`, older than `PATH_REQUEST_MI`
 forgotten) makes a wait within `PATH_REQUEST_MI` of the last request poll for `timeout` without sending.
-`lacked(destination)`: the last `await_path` or `await_known` for it ended without (`_lacked`, at most `MAX_TRACKED`). Counters
+`lacked(destination)`: the last `await_path` or `await_known` for it ended without (`_lacked`, at most `MAX_TRACKED`).
+`named(node_id, by)` keeps a scope for node_id's next request (`_named`, `HINT_LIFE`, 300 s; popped by the request).
+`_scope` turns it into interfaces only with the node's own instance (`is_connected_to_shared_instance` false): the
+`next_hop_interface` of the path to `by`, if it is among the interfaces a request can leave by (`_sendable`: `OUT`,
+`online`, not `detached`, no `spawned_interfaces`, not a local interface type nor in `local_client_interfaces`); a
+spawned interface (a `parent_interface`) widens to every sendable interface of that parent. A scope covering every
+sendable interface is no scope. One interface: RNS's `await_path(on_interface=)`; several: `request_path(on_interface=,
+tag=)` on each with one random tag, then polled. `scoped` counts scoped requests. Counters
 `requests`, `charged`, `joined`, `reused`, `held`, `waited` are for tests and measurements.
 
 `announces.py` — `DhtAnnouncer(destination, config, needs_reach=None)` sets `app_data` to the mode and runs the

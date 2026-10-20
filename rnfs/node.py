@@ -575,6 +575,7 @@ class RnfsNode:
         self._scan_paths = self.paths.scan
         # Partition mode leaves out queries that failed for want of a path
         self._path_lacked = self.links.paths.lacked
+        self._path_named = self.links.paths.named
 
         self.server = RequestServer(self.destination, config, self.backend, traffic=self.client.traffic)
         self.announcer = DhtAnnouncer(self.destination, config, needs_reach=self._needs_reach)
@@ -684,6 +685,8 @@ class RnfsNode:
         self._scan_paths: Callable[[int | None], dict[bytes, PathInfo]] = lambda max_hops: {}
         # Whether the last path request for a node went unanswered (PathRequests.lacked, once Reticulum runs)
         self._path_lacked: Callable[[bytes], bool] = lambda node_id: False
+        # Scopes the path request for a node a /find reply named (PathRequests.named, once Reticulum runs)
+        self._path_named: Callable[[bytes, bytes], object] | None = None
         self._scanned_at: float | None = None  # monotonic time of the last scan
         # Partition mode: fed only on a node with local servers (local_on), so never entered on another. Failures of
         # servers it knows ask for a probe, which wakes the local-servers thread to send it (_run_local)
@@ -999,10 +1002,15 @@ class RnfsNode:
     def _wired_lookup(self, key: bytes, start: list[bytes], **options) -> Lookup:
         """A Lookup for key from start leaving out banned nodes, with options (Lookups' checks and paths). On a node
         that isn't slow, servers behind a slow path rank after the rest (section 6): searches and publishing only,
-        not the join's lookups (which fill the routing table, as it always was)."""
+        not the join's lookups (which fill the routing table, as it always was). Once Reticulum runs, the path request
+        for a node a reply named goes only where the path to the node that named it goes (named; not the join's either).
+        """
         if not self.slow:
             options.setdefault("slow_path", self.slow_paths)
             options.setdefault("check_path", self._check_path)
+        if self._path_named is not None:
+            # A node a reply named is asked for its path where the path to the node that named it goes (spec section 3)
+            options.setdefault("named", self._path_named)
         if self.local_on:
             # Partition mode (section 6, "LoRa islands"): local servers only, also for a lookup running when it begins
             options.setdefault("allowed", self.partition.allows)

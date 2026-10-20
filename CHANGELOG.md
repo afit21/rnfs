@@ -585,6 +585,10 @@ Changed:
   requests over its limit, so a node with local servers could enter partition mode on a connected network (in the
   topology simulation 65–72% of island publish rounds with `full` relays). A real partition is still detected, a
   few seconds later (the first failure for each server is a link failure).
+- Path requests only where the node can be: with its own RNS instance, a node asks for the path to a node a `/find`
+  reply named only on the interface its path to the replying node uses (a hub's or an AutoInterface's peers count as
+  one interface), so a gateway's lookups no longer send requests for internet nodes over its radio. Joins, names,
+  providers and links to known nodes ask on every interface, and nothing changes through a shared instance.
 
 Faster:
 - Range reads (`cat`, the gateway, sealed reads) size their window by the providers' links: they fetched 32 chunks

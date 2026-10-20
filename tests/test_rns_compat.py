@@ -233,6 +233,27 @@ INTERNALS = [
                               "ifstats['outgoing_pr_frequency'] = interface.outgoing_pr_frequency()",
                               "ifstats['type'] = str(type(interface).__name__)",
                               "ifstats['status'] = interface.online"))),
+    Internal("network/paths.py", "request_path(destination_hash, on_interface, tag) sending on that interface alone "
+             "(the packet's attached_interface, the only filter _outbound applies to a path request going out), as RNS "
+             "itself forwards a local client's request; await_path(on_interface=); next_hop_interface giving the path "
+             "table entry's interface; Transport.interfaces and local_client_interfaces; an Interface's OUT, online, "
+             "detached, parent_interface and spawned_interfaces",
+             lambda: (_params(RNS.Transport.request_path, "destination_hash", "on_interface", "tag"),
+                      _params(RNS.Transport.await_path, "on_interface"),
+                      _source(RNS.Transport.request_path, "attached_interface = on_interface",
+                              "packet.is_outbound_pr = True"),
+                      _source(RNS.Transport._outbound,
+                              "if packet.attached_interface: potential_interfaces = [packet.attached_interface]",
+                              "if packet.attached_interface != None and interface != packet.attached_interface: "
+                              "continue"),
+                      _source(RNS.Transport.path_request,
+                              "Transport.request_path(destination_hash, interface, tag = request_tag)"),
+                      _source(RNS.Transport.next_hop_interface,
+                              "return Transport.path_table[destination_hash][IDX_PT_RVCD_IF]"),
+                      _has(RNS.Transport, "interfaces", "local_client_interfaces"),
+                      _assigns(RNS.Interfaces.Interface.Interface.__init__, "online", "detached", "parent_interface",
+                               "spawned_interfaces"),
+                      _has(RNS.Interfaces.Interface.Interface, "OUT"))),
 
     # Sealed files
     Internal("content/seal.py", "RNS.Cryptography.hkdf(length, derive_from, salt, context), "

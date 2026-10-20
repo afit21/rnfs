@@ -5,6 +5,7 @@ without a path."""
 import threading
 import types
 import unittest
+from unittest import mock
 
 from rnfs.network import paths
 from tests.fakes.log import quiet_log
@@ -208,6 +209,105 @@ class BudgetTest(unittest.TestCase):
         self.budget._reticulum = lambda: None
         self.assertTrue(self.budget.await_path(B, 30))
         self.assertEqual(self.times(), [0, 1])
+
+
+class FakeInterface:
+    """An RNS interface as scoping reads it."""
+
+    def __init__(self, name, parent=None, online=True, out=True):
+        """An interface called name, spawned by parent if given."""
+        self.name, self.parent_interface, self.online, self.OUT = name, parent, online, out
+        self.spawned_interfaces = None
+
+
+class LocalClientInterface(FakeInterface):
+    """Named as RNS's interface to a shared instance's client is."""
+
+
+class ScopeTest(unittest.TestCase):
+    """The path request for a node a /find reply named goes only where the path to the node that named it goes."""
+
+    def setUp(self):
+        """A node with its own RNS instance: a LoRa radio, a TCP client interface, and a hub (a TCP server) with two
+        clients connected, in virtual time."""
+        self.clock = FakeClock()
+        self.transport = FakeTransport(self.clock)
+        self.sent_on: list[tuple[bytes, object, object]] = []
+        record = self.transport.request_path
+
+        def request_path(destination, on_interface=None, tag=None):
+            """Record where each request went and its tag."""
+            self.sent_on.append((destination, on_interface, tag))
+            record(destination, on_interface, tag)
+        self.transport.request_path = request_path
+        self.lora, self.tcp = FakeInterface("LoRa"), FakeInterface("TCP")
+        self.server = FakeInterface("hub")
+        self.server.spawned_interfaces = [object()]  # a parent: its own sending does nothing
+        self.clients = [FakeInterface(f"client {n}", parent=self.server) for n in range(2)]
+        self.transport.interfaces = [self.lora, self.tcp, self.server, *self.clients]
+        self.transport.local_client_interfaces = []
+        self.next_hops = {A: self.tcp, B: self.clients[1]}
+        self.transport.next_hop_interface = self.next_hops.get
+        self.reticulum = types.SimpleNamespace(is_connected_to_shared_instance=False,
+                                               get_interface_stats=lambda: stats())
+
+        def sleep(seconds):
+            """Advance virtual time."""
+            self.clock.now += seconds
+        self.budget = paths.PathRequests(transport=lambda: self.transport, reticulum=lambda: self.reticulum,
+                                         clock=self.clock, sleep=sleep)
+
+    def interfaces(self, destination) -> list:
+        """The interfaces destination's path requests went on (None: every interface)."""
+        return [interface for sent, interface, _ in self.sent_on if sent == destination]
+
+    def test_named_by_a_node_over_tcp_is_asked_over_tcp_only(self):
+        self.budget.named(C, A)
+        self.assertTrue(self.budget.await_path(C, 30))
+        self.assertEqual(self.interfaces(C), [self.tcp])
+        self.assertEqual(self.budget.scoped, 1)
+
+    def test_a_spawned_interface_stands_for_its_parents(self):
+        self.transport.answer = lambda destination: False
+        self.budget.named(A, B)  # a node one of the hub's clients named
+        self.assertFalse(self.budget.await_path(A, 1))
+        self.assertEqual(self.interfaces(A), self.clients)  # every client, not the radio nor the TCP interface
+        tags = {tag for sent, _, tag in self.sent_on if sent == A}
+        self.assertEqual(len(tags), 1)  # one request, as a broadcast is
+        self.assertIsNotNone(tags.pop())
+
+    def test_every_interface_otherwise(self):
+        cases = {
+            "not named": lambda: None,
+            "named long ago": lambda: (self.budget.named(C, A), setattr(self.clock, "now", self.clock.now + 301)),
+            "path to the namer unknown": lambda: self.budget.named(C, bytes(16)),
+            "through a shared instance": lambda: (self.budget.named(C, A), setattr(
+                self.reticulum, "is_connected_to_shared_instance", True)),
+            "interface offline": lambda: (self.budget.named(C, A), setattr(self.tcp, "online", False)),
+            "interface not outgoing": lambda: (self.budget.named(C, A), setattr(self.tcp, "OUT", False)),
+            "interface gone": lambda: (self.budget.named(C, A), self.transport.interfaces.remove(self.tcp)),
+            "a local interface": lambda: (self.budget.named(C, A), self.next_hops.update({A: LocalClientInterface(
+                "local")}), self.transport.interfaces.append(self.next_hops[A])),
+            "the only interface": lambda: (self.budget.named(C, A), setattr(self.transport, "interfaces", [self.tcp])),
+            "RNS failing": lambda: (self.budget.named(C, A), setattr(self.transport, "next_hop_interface",
+                                                                     lambda node_id: 1 / 0)),
+        }
+        for case, prepare in cases.items():
+            with self.subTest(case):
+                self.setUp()
+                prepare()
+                with mock.patch("rnfs.network.paths.log"):
+                    self.assertTrue(self.budget.await_path(C, 30))
+                self.assertEqual(self.interfaces(C), [None])
+                self.assertEqual(self.budget.scoped, 0)
+
+    def test_a_scope_is_used_once(self):
+        self.budget.named(C, A)
+        self.transport.answer = lambda destination: False
+        self.assertFalse(self.budget.await_path(C, 1))
+        self.clock.now += paths.PATH_REQUEST_MI
+        self.assertFalse(self.budget.await_path(C, 1))  # asked again: on every interface
+        self.assertEqual(self.interfaces(C), [self.tcp, None])
 
 
 class BusiestTest(unittest.TestCase):

@@ -150,6 +150,20 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   radio channel the gateway's interface counts every node's requests, so pacing can't keep it under the limit in an
   island-wide cold start on faster LoRa; that is harmless for rnfs, as a limited request is still answered when the
   gateway has the path. Established nodes send almost none: they have every path from announces.
+- **Path requests only where the node can be.** A path request with no interface given goes out on every interface
+  (`Transport.request_path`), so a node with a LoRa and a TCP interface would send its lookups' requests for internet
+  nodes over its radio too. A node running its own RNS instance SHOULD send the path request for a node a `/find` reply
+  named, whose identity it doesn't know, only on the interface its path to the replying node uses
+  (`Transport.next_hop_interface`, `request_path(on_interface=...)`; rnfs: searches' and publishing's lookups, not the
+  join's). An interface RNS spawned (a hub's interface for one client, an AutoInterface's for one peer) stands for all
+  its parent's: the request goes on each of them with one tag, as RNS itself forwards a local client's request. A
+  lookup has other candidates, so a miss isn't asked again on every interface. Joins, names, providers and links to
+  known IDs ask on every interface. Through a shared instance nothing changes: the instance forwards a client's request
+  on all its interfaces (`Transport.path_request`), so scoping it there would need an RNS change. RNS documents
+  `on_interface` as not for normal use, but in RNS 1.5.6 an outgoing path request is filtered by nothing else (no
+  interface mode applies to it, `Transport._outbound`), so it behaves alike on every mode; an interface a request can't
+  leave by (offline, not outgoing, a local interface, a parent of spawned ones) is never chosen, and the request then
+  goes on every interface.
 
 **Links.**
 - Requests to a node share one outgoing link, opened on demand and closed after `link_idle_timeout` without

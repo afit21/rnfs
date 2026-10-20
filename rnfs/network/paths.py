@@ -23,6 +23,17 @@ resolution too. A node therefore paces its own:
 - **A link that fails to establish costs a turn** (charge): RNS then expires the path and requests it again by itself
   (RNS 1.5.6 Transport.jobs, and rnsd for its local clients' links), which also counts as a request for its
   destination.
+- **Scoping** (named): with its own RNS instance, the path request for a node a /find reply named (its identity
+  unknown) goes only on the interface the path to the node that named it uses (Transport.next_hop_interface,
+  request_path's on_interface), so an internet node's lookups don't flood its radio with requests for internet nodes.
+  A spawned interface (a hub's interface for one client, an AutoInterface's for one peer) stands for its parent's
+  spawned interfaces: the request goes on each of them with one tag, as RNS itself forwards a local client's request
+  interface by interface. A lookup has other candidates, so a miss isn't asked again elsewhere. Joins, names and links
+  to known IDs ask on every interface. Through a shared instance nothing is scoped: the instance forwards a client's
+  request on all its interfaces (Transport.path_request), so scoping there needs an RNS change. RNS documents
+  on_interface as not for normal use, but sending a path request filters interfaces by nothing else (no interface
+  mode applies to a request going out: Transport._outbound), so it is safe on every mode; interfaces a request can't
+  leave by (offline, not outgoing, local, a parent of spawned ones) are never chosen.
 - lacked(destination): whether the last wait for its path (or identity) ended without it, so a query that failed
   for want of a path can be told from one whose link failed (partition mode leaves the former out,
   rnfs.dht.local.PartitionMode).
@@ -30,6 +41,7 @@ resolution too. A node therefore paces its own:
 Blocking: never call it from an RNS callback thread.
 """
 import math
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -45,7 +57,8 @@ CEILING = 1.5  # path requests a second the busiest interface may already be sen
 CEILING_HOLD = 15.0  # seconds the ceiling holds a request back at most (RNS's IC_BURST_HOLD: a limit lasts that long)
 PATH_REQUEST_MI = 20  # RNS.Transport.PATH_REQUEST_MI: nothing is sent again for a destination within it
 POLL = 0.1  # seconds between checks while waiting for a turn or an identity
-MAX_TRACKED = 4096  # destinations each table (requests sent, paths lacked) remembers at most
+HINT_LIFE = 300.0  # seconds a node named by a /find reply keeps its scope for its path request
+MAX_TRACKED = 4096  # destinations each table (requests sent, paths lacked, scopes) remembers at most
 
 
 def _rns_transport():
@@ -77,6 +90,15 @@ def busiest_pr_frequency(stats) -> float:
     return busiest
 
 
+def _sendable(interface, transport) -> bool:
+    """True if a path request can go out on interface itself: online, outgoing, not detached, not local (to or of a
+    shared instance, or a local client's) and not a parent of spawned interfaces (whose own sending does nothing)."""
+    return (bool(getattr(interface, "OUT", False)) and bool(getattr(interface, "online", False))
+            and not getattr(interface, "detached", False) and not getattr(interface, "spawned_interfaces", None)
+            and type(interface).__name__ not in LOCAL_INTERFACE_TYPES
+            and not any(interface is local for local in (getattr(transport, "local_client_interfaces", None) or ())))
+
+
 class PathRequests:
     """A node's path requests under one budget (see the module docstring). Thread-safe.
 
@@ -97,13 +119,15 @@ class PathRequests:
         self._waits: dict[bytes, threading.Event] = {}  # destination -> set when its owner's wait ends
         self._sent: OrderedDict[bytes, float] = OrderedDict()  # destination -> when last requested, oldest first
         self._lacked: OrderedDict[bytes, None] = OrderedDict()  # destinations whose last wait found no path
+        self._named: OrderedDict[bytes, tuple[bytes, float]] = OrderedDict()  # node -> (who named it, when)
         self._failure_log = ThrottledLog()
         # Counts, for tests and measurements
-        self.requests = 0  # path requests sent
+        self.requests = 0  # path requests sent (one scoped to several interfaces counts once)
         self.charged = 0  # links that failed to establish, each a request RNS sends by itself
         self.joined = 0  # waits that joined another caller's for the same destination
         self.reused = 0  # waits within PATH_REQUEST_MI of the destination's last request, which sent nothing
         self.held = 0  # requests the ceiling held back at least once
+        self.scoped = 0  # requests sent on only some interfaces
         self.waited = 0.0  # seconds spent waiting for turns, in all
 
     # Waiting for a path or an identity
@@ -151,6 +175,15 @@ class PathRequests:
             self._remember_sent(destination, now)
             self.charged += 1
 
+    def named(self, node_id: bytes, by: bytes):
+        """node_id, whose identity isn't known, was named in by's /find reply: its next path request, if sent within
+        HINT_LIFE, goes only where the path to by goes (see the module docstring)."""
+        with self._lock:
+            self._named[node_id] = (by, self.clock())
+            self._named.move_to_end(node_id)
+            while len(self._named) > MAX_TRACKED:
+                self._named.popitem(last=False)
+
     def lacked(self, destination: bytes) -> bool:
         """True if the last wait for destination's path (or identity) ended without it."""
         with self._lock:
@@ -195,10 +228,17 @@ class PathRequests:
             return self._poll(ready, timeout, cancel)  # its answer may still be on its way
         if not self._take_turn(destination, ready, cancel):
             return bool(ready())
+        interfaces = self._scope(destination, transport)
         self._note_sent(destination)
-        if rns_wait:
-            return bool(transport.await_path(destination, timeout=timeout))
-        transport.request_path(destination)
+        if rns_wait and len(interfaces) <= 1:
+            options = {"on_interface": interfaces[0]} if interfaces else {}
+            return bool(transport.await_path(destination, timeout=timeout, **options))
+        if interfaces:
+            tag = os.urandom(16)  # one request, as a broadcast is: every copy carries the same tag
+            for interface in interfaces:
+                transport.request_path(destination, on_interface=interface, tag=tag)
+        else:
+            transport.request_path(destination)
         return self._poll(ready, timeout, cancel)
 
     def _take_turn(self, destination: bytes, ready: Callable[[], bool], cancel: threading.Event | None) -> bool:
@@ -243,6 +283,34 @@ class PathRequests:
         except Exception as e:  # noqa: BLE001 - RNS internals or the instance's RPC: no ceiling then; logged
             self._failure_log(f"couldn't read the interfaces' path request rates: {e!r}", LOG_WARNING)
             return False
+
+    def _scope(self, destination: bytes, transport) -> list:
+        """The interfaces destination's path request goes on: [] for every interface (no scope, a shared instance, or
+        the scope covering every interface anyway), else those of the path to the node that named it."""
+        with self._lock:
+            hint = self._named.pop(destination, None)
+        if hint is None or not 0 <= self.clock() - hint[1] <= HINT_LIFE:
+            return []
+        try:
+            reticulum = self._reticulum()
+            # Through a shared instance, the instance forwards the request on all its interfaces: nothing to scope
+            if reticulum is None or getattr(reticulum, "is_connected_to_shared_instance", True):
+                return []
+            interface = transport.next_hop_interface(hint[0])
+            usable = [candidate for candidate in list(transport.interfaces) if _sendable(candidate, transport)]
+            if interface is None or not any(candidate is interface for candidate in usable):
+                return []
+            parent = getattr(interface, "parent_interface", None)
+            chosen = [interface] if parent is None else [
+                candidate for candidate in usable if getattr(candidate, "parent_interface", None) is parent]
+        except Exception as e:  # noqa: BLE001 - RNS internals: asked on every interface then; logged
+            self._failure_log(f"couldn't read the interface of the path to {node_name(hint[0])}: {e!r}", LOG_WARNING)
+            return []
+        if len(chosen) == len(usable):
+            return []
+        with self._lock:
+            self.scoped += 1
+        return chosen
 
     def _poll(self, ready: Callable[[], bool], timeout: float, cancel: threading.Event | None) -> bool:
         """Wait up to timeout for ready() (checked every POLL): True once it holds."""
