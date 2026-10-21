@@ -853,8 +853,7 @@ Fixed:
   closed before answering (a busy 0.1.6 node evicts the link first, as it doesn't count the unanswered `/range` as a
   request) recorded the node as answering `/range`, a record never checked again, so every later fetch from it over a
   slow link waited out its silences as lost requests and failed it. Only an answer, a refusal, a response started or
-  a malformed answer show a handler now; and a node recorded as answering that leaves one wholly unanswered isn't
-  known any more, so a record made in error is learnt afresh (a 0.2.0 node's next answer restores it).
+  a malformed answer show a handler now.
 - **A partial block the disk fails no longer loops** (REL-6): a `/range` whose bytes couldn't be written (a full or
   read-only disk) left the partial empty but counted as progress, so the fetch asked for the same first range for
   ever, a whole range of airtime each time over LoRa. That, or a partial that can't be read back, now has the block

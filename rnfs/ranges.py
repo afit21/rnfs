@@ -334,10 +334,6 @@ class Ranges:
                 log(f"{node_name(node_id)} left /range unanswered once (a second time in a row would mark it as not "
                     "answering): asking it with /blocks for now", LOG_VERBOSE)
             return peer_client.BlocksResult(peer_client.UNSUPPORTED, unsent=[cid], reason="no answer to /range")
-        if result.silent:
-            # Known to answer, yet nothing at all came back: a lost packet, or a record made in error (an older node,
-            # REL-5). Not known again, so the next silence is counted as an older node's; this one is retried as lost
-            self.support.silent(node_id)
         # What only a /range handler gives: an answer, a refusal, a response started, a malformed answer. Not a link
         # closed by the other end (before the request was sent, or as a busy older node evicts a link it sees idle)
         if result.status == peer_client.OK or result.reason in ("busy", "cancelled", "malformed response"):

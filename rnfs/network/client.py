@@ -366,9 +366,7 @@ class PeerClient:
             return RangeResult(BUSY, reason="closed")
         if not exchange.answered:
             # Nothing at all came back, the link up: not an answer that started and failed on the way
-            # (or closed here for it, Exchange.went_dead: nothing at all came back on it meanwhile)
-            silent = exchange.went_dead or (peer.is_active() and exchange.receipt is not None
-                                            and exchange.response_started is None)
+            silent = peer.is_active() and exchange.receipt is not None and exchange.response_started is None
             log(f"no answer from {name} to /range", LOG_VERBOSE)
             return RangeResult(LOST if self._lost(peer, exchange) else FAILED, silent=silent, reason="no answer")
         if exchange.response is False:

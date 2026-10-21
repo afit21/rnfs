@@ -255,18 +255,11 @@ class RangesFetchTest(unittest.TestCase):
         self.client.no_range.add(P1)
         result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
         self.assertEqual(result.status, peer_client.LOST)
-        # Not known any more (REL-5): a record made in error, of an older node, is learnt afresh by the next silence
-        self.assertIsNone(self.ranges.support.answers(P1))
+        # Still known to answer (REL-5's records are only ever made by a /range handler's answer): on a lossy path
+        # two lost ranges in a row must not turn a 0.2.0 node into one asked whole with /blocks, which fails more there
+        self.assertIs(self.ranges.support.answers(P1), True)
         result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
-        self.assertEqual(result.status, peer_client.UNSUPPORTED)
-        self.assertIs(self.ranges.support.answers(P1), False)
-        # A 0.2.0 node's lost packet costs no more: its next answer makes it known again
-        self.client.no_range.discard(P1)
-        self.ranges.support.record(P1, True)
-        self.client.no_range.add(P1)
-        self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
-        self.client.no_range.discard(P1)
-        self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
+        self.assertEqual(result.status, peer_client.LOST)
         self.assertIs(self.ranges.support.answers(P1), True)
 
     def test_a_link_closed_before_an_answer_doesnt_show_a_range_handler(self):
