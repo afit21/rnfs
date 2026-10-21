@@ -91,6 +91,10 @@ Security:
   though neither row is then written. One identity looping over its own 27 records spent the budget other publishers'
   new records need, while writing almost nothing, and every other Newcomer's new record was refused (an Earned one's
   too, from an Earned attacker). The row a withdrawal spent is now given back when it is undone.
+- **A keeper can't make this node keep and serve a name below the sequence it knows** (REL-14): the keeper store's
+  rollback check, and the sequence a keeper query checks answers against, left out the name floor (the highest
+  sequence of a name resolved before, kept after its record left the table). A lying keeper's old, validly signed
+  record of such a name, once kept, was served onward by this node. The floor counts now.
 - **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
   may be no larger than `max_download_size` and the free space above the disk reserve; each Resource segment may
   decompress to one segment, and must follow the sequence an honest sender keeps (same original hash and total,

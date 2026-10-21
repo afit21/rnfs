@@ -1421,6 +1421,17 @@ class NameManager:
         with self._lock:
             return self._record(_check_name(name), touch=False)
 
+    def known_sequence(self, name: bytes) -> int | None:
+        """The highest sequence this node knows of name: its record's, or the floor's of a name it resolved before
+        (whose record may have left the table), whichever is higher; None if neither (REL-14)."""
+        with self._lock:
+            name = _check_name(name)
+            record = self._record(name, touch=False)
+            known = [record.sequence] if record is not None else []
+            if name not in self._held and name in self._floor:
+                known.append(self._floor[name][0])
+            return max(known, default=None)
+
     # Sequence rules; callers hold the lock
 
     def _record(self, name: bytes, touch: bool) -> Record | None:
