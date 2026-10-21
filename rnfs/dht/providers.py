@@ -60,7 +60,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable
 
 from rnfs import statedb
-from rnfs.constants import DAY, GIB, HOUR, K, PROVIDER_TTL
+from rnfs.constants import DAY, GIB, HOUR, ID_LENGTH, K, PROVIDER_TTL
 from rnfs.dht.recent import RecentCounts
 from rnfs.dht.routing import check_id, is_id
 from rnfs.log import LOG_ERROR, LOG_WARNING, log
@@ -72,6 +72,7 @@ TIER_NAMES = ("newcomer", "earned", "known", "own")
 FLOORS = (0.10, 0.60, 0.30)  # by tier: the share of the budget a full store keeps for it
 EARNED_DAYS = 3  # distinct UTC days a publisher must refresh a record it holds on to be Earned
 MAX_DAYS = 1000  # refresh days counted at most (only whether there are EARNED_DAYS matters)
+MAX_STANDING_RECORDS = 2 ** 40  # records a standing may say a publisher holds: far past any store (about 180 TB)
 # Standings kept for publishers left without records at most (beyond it the hourly pass forgets those with the fewest
 # refresh days, the longest unrefreshed first among equals). Each takes about 85-120 bytes of the state database, so
 # 50,000 are about 5 MB, half a percent of the default record budget; uncapped, identities that each refreshed one
@@ -110,13 +111,43 @@ RECORD_BYTES_ESTIMATE = 180
 _EXPIRE_INTERVAL = 60  # when full, a store sweeps for expired records at most this often (seconds)
 _HOURLY = HOUR  # how often maintain() forgets old standings and checks the Known tier
 _STORED, _REFUSED, _FULL = "stored", "refused", "full"  # what _store did
+# A provider_records row whose key isn't an ID (a damaged page, or a hand edit: the store never writes one, and no
+# /find can reach it) is left where it is, never read by the passes that list rows rather than read a key's: a key of
+# another type met there broke the log line naming it, and the sorted save of the rows changed
+_KEY_IS_ID = f"typeof(key) = 'blob' AND length(key) = {ID_LENGTH}"
 # Expiry passes (_sweep): rows (last stored, key, publisher) last stored at or before a time, in that order, and the
 # row value continuing after the last row read. Records past the TTL; and Newcomers' records, while full
-_EXPIRED = ("SELECT last_stored, key, publisher FROM provider_records WHERE last_stored <= ?",
+_EXPIRED = (f"SELECT last_stored, key, publisher FROM provider_records WHERE last_stored <= ? AND {_KEY_IS_ID}",
             "(last_stored, key, publisher)")
 _NEWCOMERS_EXPIRED = ("SELECT r.last_stored, r.key, r.publisher FROM provider_records r"
-                      " JOIN provider_standing s ON s.publisher = r.publisher WHERE r.last_stored <= ? AND s.tier = 0",
+                      " JOIN provider_standing s ON s.publisher = r.publisher WHERE r.last_stored <= ? AND s.tier = 0"
+                      f" AND typeof(r.key) = 'blob' AND length(r.key) = {ID_LENGTH}",
                       "(r.last_stored, r.key, r.publisher)")
+
+
+def _sound_standing(table: str = "provider_standing") -> str:
+    """The SQL condition that a provider_standing row (of table, its name or alias) is one the store can use: a
+    publisher ID, and records, days and last_day integers in range (its tier is read leniently: _tier). Any other
+    (damaged, or edited by hand) counts as no standing, as a missing row does: it is left out of the counts, its
+    publisher's records are deleted as they are met, and so is the row itself once read (_get_standing). Unchecked,
+    a days or records that wasn't an integer stopped the start (TypeError), and records summing past 2^63 too."""
+    return (f"typeof({table}.publisher) = 'blob' AND length({table}.publisher) = {ID_LENGTH}"
+            f" AND typeof({table}.records) = 'integer' AND {table}.records BETWEEN 0 AND {MAX_STANDING_RECORDS}"
+            f" AND typeof({table}.days) = 'integer' AND {table}.days BETWEEN 0 AND {MAX_DAYS}"
+            f" AND typeof({table}.last_day) = 'integer'")
+
+
+def _row_order(row: tuple):
+    """The order rows are written in (_write): by their first column, a key or a publisher, as the tables keep them.
+    A damaged row being deleted may have one of another type, put after the rest, so no two types are compared."""
+    first = row[0]
+    return (0, first) if isinstance(first, bytes) else (1, repr(first))
+
+
+def _shown(key) -> str:
+    """A key or publisher read from the state database, for a log line: its hex digits, or its repr if it isn't
+    bytes (a damaged row's)."""
+    return key.hex() if isinstance(key, bytes) else repr(key)
 
 
 def _never(node_id: bytes) -> bool:
@@ -587,7 +618,7 @@ class ProviderStore:
         for start in range(0, len(unknown), 500):  # SQLite's variable limit is 999 in older versions
             chunk = unknown[start:start + 500]
             days.update(self._db.query(f"SELECT publisher, days FROM provider_standing WHERE publisher IN "
-                                       f"({', '.join('?' * len(chunk))})", chunk))
+                                       f"({', '.join('?' * len(chunk))}) AND {_sound_standing()}", chunk))
         return {publisher: KNOWN if self.known(publisher) else EARNED if days.get(publisher, 0) >= EARNED_DAYS
                 else NEWCOMER for publisher in publishers}
 
@@ -658,8 +689,9 @@ class ProviderStore:
         records = {}
         bad = []
         for publisher, first, last, has_standing in self._db.query(
-                "SELECT r.publisher, r.first_stored, r.last_stored, s.publisher IS NOT NULL FROM provider_records r"
-                " LEFT JOIN provider_standing s ON s.publisher = r.publisher WHERE r.key = ?", (key,)):
+                f"SELECT r.publisher, r.first_stored, r.last_stored, s.publisher IS NOT NULL AND {_sound_standing('s')}"
+                " FROM provider_records r LEFT JOIN provider_standing s ON s.publisher = r.publisher WHERE r.key = ?",
+                (key,)):
             if publisher in changed:
                 continue  # as changed below (a bad row read before: deleted by the next save)
             first, last = _number(first), _number(last)
@@ -671,7 +703,7 @@ class ProviderStore:
         self._cache[key] = records
         self._cache_rows += len(records)
         for publisher, has_standing in bad:
-            log(f"providers: ignoring a malformed record of {key.hex()} in the state database", LOG_WARNING)
+            log(f"providers: ignoring a malformed record of {_shown(key)} in the state database", LOG_WARNING)
             self._mark(key, publisher, None)
             if has_standing and is_id(publisher):
                 self._uncount(publisher)  # counted in its standing
@@ -686,13 +718,19 @@ class ProviderStore:
             return self._standings[publisher]
         while len(self._standings) >= STANDING_CACHE:
             self._standings.popitem(last=False)
-        rows = self._db.query("SELECT s.records, s.tier, s.days, s.last_day, p.first_seen FROM provider_standing s"
-                              " LEFT JOIN provider_publishers p ON p.publisher = s.publisher WHERE s.publisher = ?",
-                              (publisher,))
+        rows = self._db.query(f"SELECT s.records, s.tier, s.days, s.last_day, p.first_seen, {_sound_standing('s')}"
+                              " FROM provider_standing s LEFT JOIN provider_publishers p ON p.publisher = s.publisher"
+                              " WHERE s.publisher = ?", (publisher,))
         if not rows:
             self._standings[publisher] = None
             return None
-        records, tier, days, last_day, first_seen = rows[0]
+        records, tier, days, last_day, first_seen, sound = rows[0]
+        if not sound:  # damaged: none (_sound_standing), and deleted with its first-seen time by the next save
+            log(f"providers: ignoring the malformed standing of {_shown(publisher)} in the state database", LOG_WARNING)
+            self._pin_standing(publisher, None)
+            self._dirty_standing.add(publisher)
+            self._dirty_seen.add(publisher)
+            return None
         seen = _number(first_seen)
         standing = _Standing(self._latest if seen is None else seen, records, _tier(tier), days, last_day)
         self._standings[publisher] = standing
@@ -913,11 +951,12 @@ class ProviderStore:
             if rows:
                 last = rows[-1]
                 more = self._db.query("SELECT records, publisher FROM provider_standing WHERE tier = ? AND records > 0"
-                                      " AND (records, publisher) < (?, ?) ORDER BY records DESC, publisher DESC"
-                                      " LIMIT 64", (tier, *last))
+                                      f" AND {_sound_standing()} AND (records, publisher) < (?, ?)"
+                                      " ORDER BY records DESC, publisher DESC LIMIT 64", (tier, *last))
             else:
                 more = self._db.query("SELECT records, publisher FROM provider_standing WHERE tier = ? AND records > 0"
-                                      " ORDER BY records DESC, publisher DESC LIMIT 64", (tier,))
+                                      f" AND {_sound_standing()} ORDER BY records DESC, publisher DESC LIMIT 64",
+                                      (tier,))
             if len(more) < 64:
                 state["done"] = True
             rows.extend(more)
@@ -929,11 +968,11 @@ class ProviderStore:
         while True:
             if after is None:
                 rows = self._db.query("SELECT last_stored, key FROM provider_records WHERE publisher = ?"
-                                      " ORDER BY last_stored, key LIMIT 32", (publisher,))
+                                      f" AND {_KEY_IS_ID} ORDER BY last_stored, key LIMIT 32", (publisher,))
             else:
                 rows = self._db.query("SELECT last_stored, key FROM provider_records WHERE publisher = ?"
-                                      " AND (last_stored, key) > (?, ?) ORDER BY last_stored, key LIMIT 32",
-                                      (publisher, *after))
+                                      f" AND {_KEY_IS_ID} AND (last_stored, key) > (?, ?) ORDER BY last_stored, key"
+                                      " LIMIT 32", (publisher, *after))
             for last, key in rows:
                 after = last, key
                 if publisher in self._dirty.get(key, ()):
@@ -1064,8 +1103,8 @@ class ProviderStore:
         more. Lock held."""
         late = [(key, publisher) for key, changed in self._dirty.items() for publisher, record in changed.items()
                 if record is not None and max(record) > now]
-        late += self._db.query("SELECT key, publisher FROM provider_records WHERE last_stored > ? OR first_stored > ?",
-                               (now, now))
+        late += self._db.query("SELECT key, publisher FROM provider_records WHERE (last_stored > ? OR first_stored > ?)"
+                               f" AND {_KEY_IS_ID}", (now, now))
         for key, publisher in late:
             record = self._key_records(key).get(publisher)
             if record is not None and max(record) > now:
@@ -1306,7 +1345,7 @@ class ProviderStore:
             else:
                 seen.append((publisher, standing.first_seen))
         for rows in (stored, removed, standings, gone, seen, unseen):
-            rows.sort(key=lambda row: row[0])  # in key order, as the tables are: fewer pages touched
+            rows.sort(key=_row_order)  # in key order, as the tables are: fewer pages touched
         with self._db.transaction() as tx:
             tx.executemany("DELETE FROM provider_records WHERE key = ? AND publisher = ?", removed)
             tx.executemany("INSERT OR REPLACE INTO provider_records (key, publisher, first_stored, last_stored, pooled)"
@@ -1352,9 +1391,10 @@ class ProviderStore:
         and measure. Nothing is read per record: records are read per key as they are needed."""
         now = self._now()
         for tier, records, holders in self._db.query(
-                "SELECT tier, SUM(records), SUM(records > 0) FROM provider_standing GROUP BY tier"):
-            self._tier_records[_tier(tier)] += records or 0
-            self._publishers += holders or 0
+                f"SELECT tier, TOTAL(records), TOTAL(records > 0) FROM provider_standing WHERE {_sound_standing()}"
+                " GROUP BY tier"):
+            self._tier_records[_tier(tier)] += int(records)
+            self._publishers += int(holders)
         # This node's records, and those of an earlier identity (or of 0.1.x's tables) now an ordinary publisher's
         listed = {publisher for (publisher,) in self._db.query(
             "SELECT publisher FROM provider_standing WHERE tier = ?", (OWN,))}
@@ -1414,7 +1454,7 @@ class ProviderStore:
             for publisher, standing in self._standings.items():
                 written = standings.get(publisher)
                 check((written and written.row()) == (standing and standing.row()),
-                      f"{publisher.hex()}'s cached standing")
+                      f"{_shown(publisher)}'s cached standing")  # a damaged row's, read, may be of any type
             check(len(self._standings) <= STANDING_CACHE, "the standing cache is over its size")
             held: dict[bytes, int] = {}
             for _, publisher in records:

@@ -1124,6 +1124,56 @@ class PersistenceTest(StoreTestCase):
         self.assertEqual(saved(self.state), held(loaded))
         self.assertEqual(list(saved(self.state)["records"]), [(KEY, ident(1))])
 
+    def test_rows_whose_key_isnt_an_id_are_never_read(self):
+        """Rows whose key isn't an ID (text, an integer or a real: a damaged page or a hand edit, which no /find can
+        reach) are left as they are: neither the load's clamp of a future time nor expiry reads them. They broke the
+        log line naming a malformed record's key (the node didn't start) and the save of the rows changed (keys of
+        mixed types sorted, so nothing was saved again); the rest load, expire and save as ever."""
+        store = self.open()
+        store.store(KEY, ident(1))
+        store.save()
+        store.close()
+        now = self.clock.now
+        bad = {("text key", ident(9)): (now, now + DAY, 0),  # in the future (clamped at load), and no standing
+               (0, ident(1)): (now, now, 0), (0.5, ident(1)): (now, now, 0)}
+        for (key, publisher), row in bad.items():
+            state_execute(self.state, "INSERT INTO provider_records (key, publisher, first_stored, last_stored, pooled)"
+                          " VALUES (?, ?, ?, ?, ?)", (key, publisher, *row))
+        loaded = self.open()
+        self.assertEqual(loaded.providers(KEY), [ident(1)])
+        self.clock.now += PROVIDER_TTL + DAY  # every record expires
+        loaded.maintain()
+        self.assertEqual(loaded.record_count(), 0)
+        self.assertEqual(saved(self.state)["records"], bad)
+        self.assertEqual(saved(self.state)["standing"], {})
+        loaded.close()  # the rows left over have no standing: not a store _check_consistency can check
+
+    def test_standings_that_dont_parse_are_none(self):
+        """A standing whose days, records or publisher isn't an integer (or an ID) in range is none, as a missing one
+        is: left out of the counts, its records deleted as they are met and itself by the next save. Unchecked, a
+        days that wasn't a number raised TypeError working out the tier, records summing past 2^63 stopped the load
+        (SQLite's integer overflow), and a publisher of another type broke the sorted save."""
+        store = self.open()
+        store.store(KEY, ident(1))
+        store.store(ident(5), ident(2))
+        store.save()
+        store.close()
+        state_execute(self.state, "UPDATE provider_standing SET days = 'x' WHERE publisher = ?", (ident(1),))
+        state_execute(self.state, "UPDATE provider_standing SET records = ? WHERE publisher = ?",
+                      (2 ** 63 - 1, ident(2)))
+        for row in ((5, 0, 0, 0, 0), (ident(4), 0, 0, 1, 0)):  # left without records long ago: forgotten hourly
+            state_execute(self.state, "INSERT INTO provider_standing VALUES (?, ?, ?, ?, ?)", row)
+        loaded = self.open()
+        self.assertEqual((loaded.record_count(), loaded.publisher_count()), (0, 0))
+        self.assertEqual((loaded.standing(ident(1)), loaded.standing(ident(2))), (None, None))
+        self.assertEqual((loaded.providers(KEY), loaded.providers(ident(5))), ([], []))
+        self.assertTrue(loaded.store(KEY, ident(3)))
+        loaded.maintain()
+        self.assertEqual(saved(self.state), {"publishers": {ident(3): self.clock.now},
+                                             "records": {(KEY, ident(3)): (self.clock.now, self.clock.now, 0)},
+                                             "standing": {ident(3): (1, 0, 0, int(self.clock.now // DAY))},
+                                             "departed": {}, "evicted": {}})
+
     def test_corrupt_legacy_file_starts_empty(self):
         """providers.json that isn't JSON is moved aside, and the store starts empty."""
         write_legacy(self.state, "providers.json", text="{not json")
