@@ -361,6 +361,13 @@ class TransactionTest(StateDbTest):
         self.assertEqual(statedb.load(text), value)
         self.assertIn("é \U0001f600", text)
 
+    def test_load_refuses_text_nested_too_deeply_as_damage(self):
+        """Text nested deeper than json can parse (a damaged row: dump() never writes it) raises ValueError, which
+        the stores handle as a row that isn't JSON, not RecursionError, which none catches."""
+        for text in ("[" * 100000, "[" * 100000 + "]" * 100000, '{"a":' * 100000):
+            with self.subTest(text=text[:5]), self.assertRaises(ValueError):
+                statedb.load(text)
+
 
 class RowStoreTest(StateDbTest):
     """RowStore, on the contacts table (nick -> (kind, id)), and the other store helpers."""
@@ -653,6 +660,16 @@ class MigrateTest(StateDbTest):
                 self.assertFalse(os.path.exists(path))
                 self.assertEqual(state_rows(self.state, "SELECT * FROM migrated"), [])
         self.assertTrue(os.path.exists(os.path.join(self.state, "test.json.damaged.2")))
+
+    def test_file_nested_too_deeply_is_moved_aside(self):
+        """A file nested deeper than json can parse is damage, moved to .damaged like one that isn't JSON, rather
+        than a RecursionError that stops every start."""
+        path = write_legacy(self.state, "test.json", text="[" * 100000 + "]" * 100000)
+        with mock.patch.object(statedb, "log") as log:
+            self.connect(TEST_LEGACY).close()
+        self.assertTrue(os.path.exists(path + ".damaged"))
+        self.assertEqual(state_rows(self.state, "SELECT * FROM migrated"), [])
+        self.assertTrue(any("nested too deeply" in call.args[0] for call in log.call_args_list))
 
     @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks")
     def test_unreadable_file_stops_startup_unless_allowed(self):

@@ -375,8 +375,13 @@ def dump(value) -> str:
 
 
 def load(text: str):
-    """The value dump() wrote. Raises ValueError (or TypeError) if text isn't JSON."""
-    return json.loads(text)
+    """The value dump() wrote. Raises ValueError (or TypeError) if text isn't JSON, or is nested too deeply to parse."""
+    try:
+        return json.loads(text)
+    except RecursionError:
+        # Nested deeper than json can parse (about 10,000 levels): no dump() wrote that, so it is damage, which every
+        # caller handles as the ValueError of text that isn't JSON
+        raise ValueError("JSON nested too deeply to parse") from None
 
 
 def set_meta(tx, store: str, key: str, value):
@@ -989,6 +994,8 @@ def read_json(path: str, shape: Callable[[object], bool] | None = None):
         return None
     except ValueError as e:
         problem = str(e)
+    except RecursionError:  # nested deeper than json can parse (about 10,000 levels): damage too
+        problem = "nested too deeply to parse"
     except OSError:
         if not os.path.isdir(path):  # Windows reports opening a directory as PermissionError
             raise

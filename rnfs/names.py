@@ -242,6 +242,8 @@ def read_names(path: str, shape=None):
         return None
     except (OSError, ValueError) as e:
         raise RnfsError(f"could not read {path}: {e}") from None
+    except RecursionError:  # nested deeper than json can parse (about 10,000 levels): not JSON this can read either
+        raise RnfsError(f"could not read {path}: it is nested too deeply to parse") from None
     if not isinstance(value, dict):  # null too, which rnfs 0.1.4 refused as malformed
         raise RnfsError(f"malformed {path}: not an object")
     return value

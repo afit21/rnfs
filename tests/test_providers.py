@@ -1130,6 +1130,13 @@ class PersistenceTest(StoreTestCase):
         self.assertEqual(self.open().record_count(), 0)
         self.assertTrue(os.path.exists(os.path.join(self.state, "providers.json.damaged")))
 
+    def test_legacy_file_nested_too_deeply_starts_empty(self):
+        """providers.json nested deeper than json can parse is moved aside the same way, not a RecursionError that
+        stops the start."""
+        write_legacy(self.state, "providers.json", text="[" * 100000 + "]" * 100000)
+        self.assertEqual(self.open().record_count(), 0)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "providers.json.damaged")))
+
     def test_random_operations_are_saved_and_loaded_exactly(self):
         """Many random stores, refreshes over days, withdrawals, batches, expiries, retains and saves (some failing)
         with the budget, its tiers and the key cap at work: a store loaded from the tables holds exactly what the

@@ -88,6 +88,15 @@ class PinNamesStoreTest(unittest.TestCase):
         self.assertEqual((names.get(self.cid), names.get(self.other)), (None, "ok"))
         self.assertEqual(self.rows(), {self.other: '"ok"'})
 
+    def test_rows_nested_too_deeply_are_deleted(self):
+        """A name or label nested deeper than json can parse is a damaged row like any other: skipped and deleted,
+        not a RecursionError that stops the node's start."""
+        self.open().record(self.other, "ok")
+        state_execute(self.dir, "INSERT INTO pin_names (cid, name) VALUES (?, ?)", (self.cid.binary, "[" * 100000))
+        names = self.open()
+        self.assertEqual((names.get(self.cid), names.get(self.other)), (None, "ok"))
+        self.assertEqual(self.rows(), {self.other: '"ok"'})
+
     def test_failed_save_is_written_with_the_next_change(self):
         """A change whose commit failed stays in memory, as before, and is saved with the next change."""
         names = self.open()

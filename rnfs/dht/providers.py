@@ -189,6 +189,9 @@ def read_records(path: str, shape=None):
     except ValueError as e:
         statedb.set_aside(path, str(e))
         return None
+    except RecursionError:  # nested deeper than json can parse (about 10,000 levels): damage too
+        statedb.set_aside(path, "nested too deeply to parse")
+        return None
     except OSError as e:
         if os.path.isdir(path):  # Windows reports opening a directory as PermissionError
             statedb.set_aside(path, "it is a directory")

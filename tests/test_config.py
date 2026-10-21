@@ -132,6 +132,13 @@ class LoadTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=text):
                 self.load(text)
 
+    def test_file_nested_too_deeply_is_refused_as_invalid_toml(self):
+        """rnfs.toml nested deeper than tomllib can parse (a few hundred levels) is refused as one that isn't TOML is,
+        with a ValueError naming it, which the CLI shows as an error rather than a RecursionError's traceback."""
+        with self.assertRaises(ValueError) as caught:
+            self.load("bootstrap_nodes = " + "[" * 1000 + "]" * 1000 + "\n")
+        self.assertIn("rnfs.toml isn't valid TOML: it is nested too deeply", str(caught.exception))
+
     def test_valid_file(self):
         config = self.load(f'private = true\nmembers = ["{ID}"]\nslow_bitrate = 50000\nstall_timeout = 90.5\n'
                            'max_storage = 1_000_000\n', api_port=9000)

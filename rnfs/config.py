@@ -509,13 +509,17 @@ def read_settings_file(path: str) -> tuple[bytes | None, list[str]]:
 
 def parse_settings(data: bytes | None, path: str = SETTINGS_FILE) -> dict:
     """The values rnfs.toml's bytes data set ({} for None), not yet checked. Raises ValueError (naming path) if
-    they aren't UTF-8 TOML."""
+    they aren't UTF-8 TOML, or are nested too deeply to parse."""
     if data is None:
         return {}
     try:
         return tomllib.loads(data.decode("utf-8"))
     except ValueError as e:  # UnicodeDecodeError and tomllib.TOMLDecodeError are ValueErrors
         raise ValueError(f"{path} isn't valid TOML: {e}") from None
+    except RecursionError:
+        # tomllib recurses per nested array or table, so a few hundred levels exhaust Python's stack: no setting nests
+        # at all, so the file is as unusable as one that isn't TOML, and is said so rather than shown as a traceback
+        raise ValueError(f"{path} isn't valid TOML: it is nested too deeply to parse") from None
 
 
 # The schema
@@ -621,7 +625,10 @@ def edit_settings(text: str, changes: dict) -> str:
     extent is found by _statement_extent and parsed once. Raises ValueError if text isn't flat TOML or a value
     can't be written (toml_value).
     """
-    tomllib.loads(text)  # TOMLDecodeError (a ValueError) here: every statement below is complete
+    try:
+        tomllib.loads(text)  # TOMLDecodeError (a ValueError) here: every statement below is complete
+    except RecursionError:  # as parse_settings: no setting nests, and a statement below can't nest deeper
+        raise ValueError("rnfs.toml isn't valid TOML: it is nested too deeply to parse") from None
     first_line = text.split("\n", 1)[0]
     newline = "\r\n" if first_line.endswith("\r") and len(first_line) < len(text) else "\n"
     out: list[str] = []

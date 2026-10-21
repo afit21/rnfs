@@ -219,6 +219,16 @@ class NamesFileTest(FileTests, MigrateNamesTest):
         for table in ("names_published", "names_held", "migrated"):
             self.assertEqual(self.rows(f"SELECT * FROM {table}"), [])
 
+    def test_file_nested_too_deeply_stops_startup(self):
+        """A names.json nested deeper than json can parse is refused as one that isn't JSON is (RnfsError, the file
+        left as it is), not with a RecursionError."""
+        text = "[" * 100000
+        path = write_legacy(self.state, self.FILE, text=text)
+        with self.assertRaisesRegex(RnfsError, "nested too deeply"):
+            self.manager()
+        with open(path, encoding="utf-8") as f:
+            self.assertTrue(f.read() == text)  # assertEqual would print all of it on a failure
+
     def database_files(self) -> list[str]:
         """The state database's files in the state directory."""
         return [entry for entry in os.listdir(self.state) if entry.startswith(statedb.DB_FILE)]

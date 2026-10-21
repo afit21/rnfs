@@ -199,8 +199,8 @@ class EditTest(unittest.TestCase):
                 settings.toml_value(value)
 
     def test_refuses_what_isnt_flat_toml(self):
-        for text in ("[table]\na = 1\n", "a = \n", "a = 1\n[t]\n"):
-            with self.subTest(text=text), self.assertRaises(ValueError):
+        for text in ("[table]\na = 1\n", "a = \n", "a = 1\n[t]\n", "a = " + "[" * 1000 + "]" * 1000 + "\n"):
+            with self.subTest(text=text[:10]), self.assertRaises(ValueError):
                 settings.edit_settings(text, {"beta": 4})
 
     def test_dotted_keys_and_inline_tables(self):
@@ -754,6 +754,8 @@ class ParsingTest(unittest.TestCase):
                             ("two words", "two words"), ("1\nbeta = 4", "1\nbeta = 4"), ("", ""), ("1_000", 1000)):
             with self.subTest(text=text):
                 self.assertEqual(feature_module.parse_value(text), value)
+        nested = "[" * 1000 + "]" * 1000  # deeper than tomllib can parse: not a TOML value, so taken as text
+        self.assertEqual(feature_module.parse_value(nested), nested)
 
     def test_parser(self):
         parser = cli.build_parser()

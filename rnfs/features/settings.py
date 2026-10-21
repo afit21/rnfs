@@ -322,7 +322,7 @@ def parse_value(text: str):
     import tomllib
     try:
         parsed = tomllib.loads(f"value = {text}")
-    except tomllib.TOMLDecodeError:
+    except (tomllib.TOMLDecodeError, RecursionError):  # nested too deeply for tomllib: no setting's value either
         return text
     if parsed.keys() != {"value"} or isinstance(parsed["value"], (datetime.date, datetime.time, dict)):
         return text
