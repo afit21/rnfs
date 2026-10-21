@@ -1363,6 +1363,21 @@ class FailedPinnedFetchTest(NodeTest):
         with fetcher.observing(_CancelAfter(blocks)), self.assertRaises(fetcher.Cancelled):
             call()
 
+    def test_a_gets_total_is_known_before_its_first_chunk(self):
+        """Telling whether the file is sealed reads its first chunk: the job's total comes first, from the root."""
+        events = []
+
+        class Recorder(fetcher.Observer):
+            def total(self, size):
+                events.append(("total", size))
+
+            def block(self, cid, length, downloaded):
+                events.append(("chunk" if cid.is_raw else "node", length))
+        with fetcher.observing(Recorder()):
+            self.b.get(str(self.cid), os.path.join(self.tmp.name, "out"))
+        self.assertEqual(events[0], ("node", events[0][1]))  # the root
+        self.assertEqual(events[1], ("total", len(self.data)))
+
     def test_a_failed_pin_add_resumes_from_what_it_got(self):
         """pin add cut short keeps its blocks as a cached fetch of the target, not provided as the user's download;
         the next pin add downloads only the rest, and the record stays as cache."""

@@ -2032,6 +2032,10 @@ class RnfsNode:
                 # Its verified size is what writing it out takes, however few blocks it is made of; what is
                 # still to be fetched is stored first, on the same disk if the blocks are there
                 content = fetch.size_of(expect)
+                if fetch.observer is not None:
+                    # A job's total from here on: telling whether it is sealed reads its first chunk, which over a
+                    # slow link takes minutes before fetch_dag would say
+                    fetch.observer.total(content)
                 to_fetch = 0 if self.storage.is_complete(expect.cid) else \
                     max(0, content - self.storage.dag_bytes(expect.cid))
                 _check_free_space(output, content, self.config.blocks_dir, to_fetch)

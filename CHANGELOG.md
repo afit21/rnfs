@@ -810,7 +810,9 @@ Fixed:
 - **A job's progress counts a block as its ranges arrive**: `rnfs jobs` and the job's progress events counted a
   block only once it was whole. Over LoRa, where a 64 KB chunk comes in `/range` responses over two minutes, a job
   resumed after a restart showed `0 B/s  ETA ?` for 90 s while 56 KB of its next chunk had arrived. The bytes each
-  range brings now count towards `done_bytes` and the rate, once each.
+  range brings now count towards `done_bytes` and the rate, once each. A `get` job also showed "finding the target"
+  until its first chunk was whole (it reads the file's start to tell whether it is sealed): its size, known from the
+  root, is now its total at once.
 - A node attached to a shared instance whose `rnsd` restarted logged a warning with a traceback each time it read
   the radios' load meanwhile (the RPC refused). That is now a verbose line; other failures to read the stats stay
   warnings. The node itself carries on through the restart, as before (tested on the laptop: a fetch over LoRa
