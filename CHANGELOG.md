@@ -81,6 +81,11 @@ Security:
   inode), so on a case-insensitive disk (macOS: `~/.RNFS/api_token`) or through a bind mount an app could add the
   CLI's token, the node identity or a name key and read it back. The file's directories are now compared by device and
   inode too, up to the rnfs dir's `files/`.
+- **Gateway documents are revalidated, not cached as immutable** (REL-9, specification section 11): every `/rnfs/`
+  response was `immutable` for a year, though its Content-Security-Policy follows `gateway_scripts`, so a page cached
+  while scripts were allowed kept running them in the browser after they were turned off. HTML, SVG, other XML, PDF
+  and listings now carry `Cache-Control: public, no-cache` (the browser keeps them and asks again, a `304` from the
+  node), and a `304` carries no `Cache-Control`. Other files stay immutable.
 - **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
   may be no larger than `max_download_size` and the free space above the disk reserve; each Resource segment may
   decompress to one segment, and must follow the sequence an honest sender keeps (same original hash and total,

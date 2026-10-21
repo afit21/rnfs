@@ -20,8 +20,11 @@ Behaviour:
   Single byte ranges (206, 416, Accept-Ranges; If-Range honoured); several ranges get the whole file.
 - Directories: without a trailing slash, 301 to the slash form; with one, index.html if present, else
   an HTML-escaped listing with percent-encoded links.
-- /rnfs/ responses carry ETag "<cid>" and "Cache-Control: public, max-age=31536000, immutable";
-  If-None-Match answers 304. /name/ responses are mutable and carry neither.
+- /rnfs/ responses carry ETag "<cid>" and "Cache-Control: public, max-age=31536000, immutable", but those that
+  render as documents (DOCUMENT_TYPES and listings) "public, no-cache": their headers (the CSP, which gateway_scripts
+  sets) are the node's policy, not the content's, and must reach a browser's cached copy (REL-9);
+  If-None-Match answers 304, without Cache-Control (what the browser stored stays). /name/ responses are mutable and
+  carry neither.
 - Every response, errors and redirects included, carries X-Content-Type-Options: nosniff and the spec's
   sandboxing Content-Security-Policy. With gateway_scripts off, allow-scripts and 'unsafe-eval' are
   dropped and script-src 'none' added, so no script runs even if a browser ignores the sandbox.
@@ -97,6 +100,10 @@ SITE_DOMAINS = {"rnfs": "rnfs.localhost", "name": "name.localhost"}  # site kind
 HOST_REFUSED = ("Host header must be 127.0.0.1:<port> or localhost:<port>, or <k + base36 CID>.rnfs.localhost:<port> "
                 "or <name>.name.localhost:<port>")
 IMMUTABLE = "public, max-age=31536000, immutable"
+REVALIDATE = "public, no-cache"  # a document's, by CID too: kept, but asked again (a 304) before each use
+# Types a browser renders as a document, which the CSP governs: never cached as immutable (REL-9)
+DOCUMENT_TYPES = frozenset({"text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
+                            "application/pdf"})
 RETRY_AFTER = "10"  # seconds a limited request should wait before retrying
 SNIFF_SIZE = 512  # bytes read to guess a type, as in the WHATWG MIME sniffing standard
 NAME_CACHE_TIME = 60.0
@@ -208,6 +215,15 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None | str:
     if start >= size:
         return "unsatisfiable"
     return start, min(int(last), size - 1) if last else size - 1
+
+
+def for_type(cache: dict, content_type: str) -> dict:
+    """cache's headers for a response of content_type: a document's (DOCUMENT_TYPES, any +xml) revalidated rather
+    than immutable, so a change of the node's policy (gateway_scripts' CSP) reaches a browser's copy (REL-9)."""
+    base = content_type.split(";", 1)[0].strip().lower()
+    if cache.get("Cache-Control") == IMMUTABLE and (base in DOCUMENT_TYPES or base.endswith("+xml")):
+        return {**cache, "Cache-Control": REVALIDATE}
+    return cache
 
 
 def etag_matches(header: str | None, etag: str) -> bool:
@@ -669,11 +685,11 @@ class GatewayHandler(TimedHandler):
         return cid
 
     def send_not_modified(self, cid: str):
-        """304 for a cached immutable response."""
+        """304 for a cached response by CID. No Cache-Control: a 304 updates the headers it carries, and the stored
+        response's (immutable, or a document's no-cache) is right; its CSP, current, does reach the stored copy."""
         log(f"gateway: {cid} not modified", LOG_DEBUG)
         self.send_response(304)
         self.send_header("ETag", f'"{cid}"')
-        self.send_header("Cache-Control", IMMUTABLE)
         self.end_headers()
 
     def redirect_to_slash(self, location: str):
@@ -691,7 +707,8 @@ class GatewayHandler(TimedHandler):
                 log(f"gateway: serving {index_target}", LOG_DEBUG)
                 return self.serve_file(index_target, entry["size"], INDEX, cache, passive_only=self.site is not None)
         log(f"gateway: listing {target} ({len(entries)} entries)", LOG_DEBUG)
-        self.send_body(200, "text/html; charset=utf-8", listing_html(title, entries, has_parent), cache)
+        self.send_body(200, "text/html; charset=utf-8", listing_html(title, entries, has_parent),
+                       for_type(cache, "text/html"))
 
     def serve_file(self, target: str, size: int, filename: str | None, cache: dict, passive_only: bool = False):
         """Serve a file, or the requested byte range of it; passive_only: sniff only to SITE_SNIFFED_TYPES."""
@@ -704,7 +721,7 @@ class GatewayHandler(TimedHandler):
         # A web page's HEAD or later range reads the first bytes too: its type mustn't depend on what is stored
         content_type = self.file_type(target, size, filename, self.limited() or (
             self.command != "HEAD" and (byte_range is None or byte_range[0] == 0)), passive_only)
-        headers = {"Accept-Ranges": "bytes", **cache}
+        headers = {"Accept-Ranges": "bytes", **for_type(cache, content_type)}
         if self.param("filename"):
             # On a site, a link naming a file x.html mustn't make it render in the site's origin (REV6)
             disposition = "inline" if self.site is None else "attachment"

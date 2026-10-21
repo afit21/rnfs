@@ -2374,7 +2374,10 @@ gateway can never reach the API.
     name only and sniff a file inside their DAG only to passive types (above).
   - Range requests for one `bytes=` range are supported; another or malformed `Range` header is ignored and
     the whole file sent.
-  - `/rnfs/` responses carry `ETag: "<cid>"` and `Cache-Control: immutable`.
+  - `/rnfs/` responses carry `ETag: "<cid>"` and `Cache-Control: immutable`, except those a browser renders as a
+    document (HTML, XHTML, SVG and other XML, PDF, and listings), which carry `Cache-Control: public, no-cache`: their
+    headers, the CSP above all, are this node's policy (`gateway_scripts`), not the content's, and a change must
+    reach a cached copy (rnfs 0.2.0, REL-9). A `304` carries no `Cache-Control`, keeping what the browser stored.
   - Sealed files are served as `application/octet-stream`, whatever their name says, and never decrypted;
     the gateway reads a file's first bytes to recognise them. The user's own `HEAD`, or range not starting
     at byte 0, uses those bytes (to recognise a sealed file, or to sniff) only if they are already stored,
