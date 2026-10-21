@@ -203,3 +203,37 @@ All on LoRa at 3.52 kbit/s (SF9, 250 kHz), the PC with its backbone, the laptop 
   providers are used, and such a request counts as lost. Again with new files: 53 KB in 164 s to the PC, 100 KB in
   259 s to the laptop, at the same time, bytes identical.
 - **Internet to island:** Montreal fetched a 12 KB file only the laptop held, over the PC's radio, in 65 s.
+
+## Release audit (October 21)
+
+Before 0.2.0: reviews of every subsystem, new fuzzers, and a soak of the cloud nodes, then the LoRa scenarios again on
+the fixed build. The findings are REL-1 to REL-19 in CHANGELOG.md (the attacks also in `tests/security/README.md`).
+
+- **Soak:** a random file of 20 KB to 2 MB added on one development node every minute or two and fetched by
+  another, or by a 0.1.6 node, its bytes compared. It found:
+  - REL-12: a provider refused for a minute after a large response, as its upload cap had been set from a rate
+    estimate small `/range` responses left low, and the requester failed it.
+  - REL-19: a route that cut every 64 KiB response from Montreal at the same point, three times in a row, failing
+    the provider, where ranges would come through.
+  - The CLI telling a starting daemon's user there was no API token.
+  Of the rest:
+  - Most failures were fetches 20 s after the add, before the publisher's records were out. Its publish lookup
+    waited up to 24 s on a server that didn't answer, more often just after every node restarted at once. Asked
+    again a minute later, they succeeded.
+  - The others were the route between Montreal and Sydney, which lost most of what crossed it: whole responses,
+    and ranges too.
+- **LoRa at 3.52 kbit/s, on the fixed build:**
+  - Fetches both ways at once (139 s and 339 s).
+  - SIGKILL during a fetch, then a resume with nothing left behind (REL-10).
+  - Cancel.
+  - A gateway byte range: 206, the right bytes.
+  - `rnsd` restarted under the daemon, with no warnings logged (d5779bf).
+  - A remote pin, done in 70 s.
+  - A second round, on the final build, passed the same way (155 s and 257 s both ways, a remote pin in 50 s) but for
+    the gateway range: its search ran 600 s, curl's limit, and found no provider. The same far server cost 217 s
+    twice, and three others failed meanwhile.
+  - One finding was left as is. A search from the laptop asked internet servers within 3 hops first, as its local
+    servers: every path from the laptop goes through the PC, the known single-gateway case. Two of its three query
+    slots then waited 127 s and 217 s on servers that never answered, one of them 34 hops away by RNS's path. Letting
+    a query that has waited long give up its slot while its answer still counts would speed such searches; it
+    changes the lookup, so it is left for after 0.2.0.
