@@ -14,6 +14,10 @@ Where the IDs come from:
 - **0.1.5 audit** (CONT, DHT, API, FEAT, NET and SUP): `0.1.5-audit.md`, fixed in 0.1.6 (`0.1.6-plan.md`).
 - **0.2.0 review** (REV): a read-only review of 0.2.0, fixed before 0.2.0 was released; the findings and how each
   was built are the roadmap's "Security fixes from the 0.2.0 review".
+- **0.2.0 release audit** (REL): reviews of every subsystem against remote, content and local attackers, fuzzing,
+  and a soak of the cloud nodes, after the hardware tests of October 2026, fixed before 0.2.0 was released. The
+  findings that aren't attacks (REL-5, 6, 7, 10, 11, 12 and 16) are in CHANGELOG.md, with their tests outside this
+  directory; the rest are below.
 - **No ID:** tests from an earlier review or from the security tooling, listed under the subsystem they guard.
 
 Test modules are in this directory unless a path says otherwise. A commit marked "(test)" only added or updated
@@ -190,3 +194,17 @@ the roadmap's "Security fixes from the 0.2.0 review".
 | REV9 | `test_rev9_app_name_oracle.py`; also `tests/test_api.py` (`test_proof_for_an_app`) | `rnfs/apps.py` (`AppRegistry.proof_key`), `rnfs/api.py` (`ApiHandler.proof_key`, `send_common_headers`) | `284268e` |
 | REV10 | `test_rev10_sealed_unpack.py`; also `tests/test_tar_stream.py` (`test_scan_counts_allocation_units`, scan_tar agreeing with build_tar), `tests/test_fsutil.py` (`AllocationUnitTest`) | `rnfs/node_content.py` (`unpack_sealed`, `_check_unpack_space`, `_unpacking`, `collect_unpack_leftovers`), `rnfs/content/tarstream.py` (`scan_tar`, `Extent`), `rnfs/fsutil.py` (`allocation_unit`), `rnfs/node.py` (`_setup`) | `76b5af4` |
 | REV11 | `test_rev11_standings_cap.py`; also `tests/test_providers.py` (`test_departed_standings_are_capped_on_disk`) | `rnfs/dht/providers.py` (`ProviderStore._cap_departed`, `maintain`, `MAX_DEPARTED`) | `f5dd6e8` |
+
+## 0.2.0 release audit (REL)
+
+| ID | Test modules | Code guarded | Fix commits |
+|---|---|---|---|
+| REL-1 | `test_rel1_alternating_unreachable.py` | `rnfs/fetcher.py` (`Fetch._handle`: the lost count and the unreachable retry) | `1a34a69` |
+| REL-2 | `test_rel2_unserved_displacement.py` | `rnfs/network/server.py` (`RequestServer._serve`, `Backend.serves`), `rnfs/node.py` (`NodeBackend.serves`) | `4288e10` |
+| REL-3 | `test_rel3_request_shape.py` | `rnfs/network/guards.py` (`guarded_handle_request`, `install`) | `744e8cb` |
+| REL-4 | `test_rel4_negative_tar_size.py` | `rnfs/content/tarstream.py` (the `Header` class: `_proc_member`, `fromtarfile`) | `3849a43` |
+| REL-8 | `test_rev1_add_rnfs_dir.py` (`test_a_file_in_another_name_for_the_rnfs_dir_is_refused`) | `rnfs/content/shared_folder.py` (`add_refused_reason`, `_reached_otherwise`) | `61b67c3` |
+| REL-9 | `test_rel9_gateway_document_cache.py` | `rnfs/gateway.py` (`for_type`, `DOCUMENT_TYPES`, `send_not_modified`) | `3c84f4a` |
+| REL-13 | `test_rel13_withdraw_restore_budget.py` | `rnfs/dht/providers.py` (`ProviderStore._withdraw`, `_store`, `_WriteBudget.refund`) | `e216954` |
+| REL-14 | `test_rel14_keeper_below_floor.py` | `rnfs/names.py` (`NameManager.known_sequence`), `rnfs/features/keepers.py` (`_store`, `_known_sequence`) | `29b95b4` |
+| REL-15 | `test_rel15_clockskew_flood.py` | `rnfs/clockskew.py` (`ClockSkew._sample`, `_estimate`), `rnfs/node.py` (`_announced`) | `6d01750` |

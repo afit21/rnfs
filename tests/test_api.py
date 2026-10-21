@@ -189,7 +189,7 @@ class FakeNode:
             self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid, "size": len(data), "warnings": []}
 
-    def get(self, target, output, from_node=None, raw=False, no_extract=False):  # nothing is sealed here, so raw
+    def get(self, target, output, from_node=None, raw=False, no_extract=False, temporary=None):  # nothing is sealed here, so raw
         # and no_extract change nothing
         self.record("get", target, output, from_node=from_node, **self._given("get", raw=raw, no_extract=no_extract))
         cid = self._resolve(target)

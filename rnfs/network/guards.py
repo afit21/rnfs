@@ -384,6 +384,7 @@ def install(scope: str | None = None):
         original = _wrap(RNS.Link, "handle_request", guarded_handle_request)
         if original is not None:
             _original_handle_request = original
+            guarded_handle_request.__wrapped__ = original  # what it wraps, for inspect (as functools.wraps marks it)
 
 
 def installed() -> bool:
