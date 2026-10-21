@@ -329,6 +329,12 @@ class ApiTest(SettingsBase):
         self.assertEqual(self.setting("quiet_hours")["file"], "22:00:00")
         self.assertIsNotNone(body["file_error"])
 
+    def test_set_on_a_file_with_a_byte_order_mark(self):
+        self.write("\ufeffmax_storage = 100\n")
+        self.set({"max_storage": 5_000_000})
+        with open(self.toml, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "max_storage = 5000000\n")  # no mark written back
+
     def test_set_writes_and_keeps_the_rest(self):
         self.write('# my node\n'
                    '\n'

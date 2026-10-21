@@ -109,7 +109,7 @@ class SettingsFeature(Feature):
                 raise ValueError(f"invalid settings: {e}") from None
             # Retired settings the file still holds
             warnings = [*warnings, *candidate.warnings]
-            text = settings.edit_settings(data.decode("utf-8") if data is not None else "", changes)
+            text = settings.edit_settings(data.decode("utf-8-sig") if data is not None else "", changes)
             new_data = text.encode("utf-8")
             if settings.parse_settings(new_data, path) != values:  # not expected: edit_settings checks each step
                 raise ValueError("rnfs.toml can't be rewritten without changing other settings; edit it by hand")

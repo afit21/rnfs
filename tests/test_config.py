@@ -145,6 +145,11 @@ class LoadTest(unittest.TestCase):
             self.load("bootstrap_nodes = " + "[" * 1000 + "]" * 1000 + "\n")
         self.assertIn("rnfs.toml isn't valid TOML: it is nested too deeply", str(caught.exception))
 
+    def test_a_byte_order_mark_is_no_reason_to_refuse_the_file(self):
+        """Some Windows editors start a UTF-8 file with one."""
+        config = self.load("\ufeffprivate = true\n")
+        self.assertTrue(config.private)
+
     def test_valid_file(self):
         config = self.load(f'private = true\nmembers = ["{ID}"]\nslow_bitrate = 50000\nstall_timeout = 90.5\n'
                            'max_storage = 1_000_000\n', api_port=9000)

@@ -522,7 +522,8 @@ def parse_settings(data: bytes | None, path: str = SETTINGS_FILE) -> dict:
     if data is None:
         return {}
     try:
-        return tomllib.loads(data.decode("utf-8"))
+        # utf-8-sig: a byte-order mark at the start, as some Windows editors save, is no reason to refuse the file
+        return tomllib.loads(data.decode("utf-8-sig"))
     except ValueError as e:  # UnicodeDecodeError and tomllib.TOMLDecodeError are ValueErrors
         raise ValueError(f"{path} isn't valid TOML: {e}") from None
     except RecursionError:

@@ -922,6 +922,8 @@ Fixed:
 - `announce_interval`, `republish_interval` and `scan_interval` had to be only above 0, so a typo such as
   `announce_interval = 1e-300` would have announced in a loop, flooding a radio channel. They are now at least 60 s,
   10 minutes and 1 s.
+- An `rnfs.toml` starting with a UTF-8 byte-order mark, as some Windows editors save it, was refused as invalid TOML:
+  it is read, and `config set` writes it back without the mark.
 - A fetch running for days kept every search it made again (one each 10 minutes that found its providers again):
   it now keeps its first and the latest 8.
 - **A stalled response no longer fails the other requests on its link** (REL-7): closing the link for it failed a
