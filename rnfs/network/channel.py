@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from rnfs.log import LOG_WARNING, ThrottledLog
+from rnfs.log import LOG_VERBOSE, LOG_WARNING, ThrottledLog
 from rnfs.network.rates import LOCAL_INTERFACE_TYPES
 
 POLL = 15.0  # seconds a reading of the interface stats is used for (an RNode's short figures span 15 s)
@@ -119,7 +119,12 @@ class ChannelLoad:
         try:
             reticulum = self._reticulum()
             load = UNKNOWN if reticulum is None else measured_load(reticulum.get_interface_stats())
-        except Exception as e:  # noqa: BLE001 - RNS internals or the instance's RPC: nothing known then; logged
+        except (OSError, EOFError) as e:
+            # The shared instance's RPC refused or cut: its rnsd restarting, most often, which needs no traceback
+            self._failure_log(f"couldn't read the radios' airtime and channel load from the shared instance: {e!r}",
+                              LOG_VERBOSE)
+            load = UNKNOWN
+        except Exception as e:  # noqa: BLE001 - RNS internals: nothing known then; logged
             self._failure_log(f"couldn't read the radios' airtime and channel load: {e!r}", LOG_WARNING)
             load = UNKNOWN
         with self._lock:

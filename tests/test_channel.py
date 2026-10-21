@@ -120,6 +120,20 @@ class ChannelLoadTest(unittest.TestCase):
         self.assertEqual((self.load.stretch(), self.load.over_budget(), self.load.airtime_share()), (1.0, False, None))
         self.assertEqual(channel.ChannelLoad(lambda: None, clock=self.clock).load(), channel.UNKNOWN)
 
+    def test_a_shared_instance_restarting_is_logged_without_a_warning(self):
+        """Its rnsd restarting refuses the RPC for a while: expected, so not a warning (with a traceback); anything
+        else is."""
+        logged = []
+        self.load._failure_log = lambda message, level: logged.append(level)
+
+        def refused():
+            raise ConnectionRefusedError(111, "Connection refused")
+        for failure, level in ((refused, channel.LOG_VERBOSE), (lambda: 1 / 0, channel.LOG_WARNING)):
+            self.reticulum.get_interface_stats = failure
+            self.clock.now += channel.POLL
+            self.assertEqual(self.load.load(), channel.UNKNOWN)
+            self.assertEqual(logged.pop(), level)
+
 
 class PathSpacingTest(unittest.TestCase):
     """A slow node's path requests are spaced further apart while its channel is busy."""

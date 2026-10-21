@@ -811,6 +811,10 @@ Fixed:
   block only once it was whole. Over LoRa, where a 64 KB chunk comes in `/range` responses over two minutes, a job
   resumed after a restart showed `0 B/s  ETA ?` for 90 s while 56 KB of its next chunk had arrived. The bytes each
   range brings now count towards `done_bytes` and the rate, once each.
+- A node attached to a shared instance whose `rnsd` restarted logged a warning with a traceback each time it read
+  the radios' load meanwhile (the RPC refused). That is now a verbose line; other failures to read the stats stay
+  warnings. The node itself carries on through the restart, as before (tested on the laptop: a fetch over LoRa
+  12 s after `rnsd` came back).
 
 ## 0.1.6
 

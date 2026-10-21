@@ -60,7 +60,7 @@ from typing import Callable
 
 import RNS
 
-from rnfs.log import LOG_DEBUG, LOG_WARNING, ThrottledLog, log, node_name
+from rnfs.log import LOG_DEBUG, LOG_VERBOSE, LOG_WARNING, ThrottledLog, log, node_name
 from rnfs.network.rates import LOCAL_INTERFACE_TYPES
 
 SPACING = 1.0  # seconds between two path requests of a node
@@ -340,7 +340,12 @@ class PathRequests:
             if reticulum is None:
                 return False
             return busiest_pr_frequency(reticulum.get_interface_stats()) > CEILING
-        except Exception as e:  # noqa: BLE001 - RNS internals or the instance's RPC: no ceiling then; logged
+        except (OSError, EOFError) as e:
+            # The shared instance's RPC refused or cut: its rnsd restarting, most often, which needs no traceback
+            self._failure_log(f"couldn't read the interfaces' path request rates from the shared instance: {e!r}",
+                              LOG_VERBOSE)
+            return False
+        except Exception as e:  # noqa: BLE001 - RNS internals: no ceiling then; logged
             self._failure_log(f"couldn't read the interfaces' path request rates: {e!r}", LOG_WARNING)
             return False
 
