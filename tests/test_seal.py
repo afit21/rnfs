@@ -402,7 +402,9 @@ class NodeSealTest(unittest.TestCase):
 
         with fetcher.observing(Watch()):
             self.b.get(cid, os.path.join(self.tmp.name, "watched"))
-        self.assertEqual(totals, [self.b.info(cid)["stored_size"]])
+        # node.get tells it from the root, open_sealed again (for cat, which reads ranges): the same either way
+        self.assertTrue(totals)
+        self.assertEqual(set(totals), {self.b.info(cid)["stored_size"]})
 
     def test_tampered_blocks_are_reported(self):
         data = os.urandom(2 * SEGMENT_SIZE)

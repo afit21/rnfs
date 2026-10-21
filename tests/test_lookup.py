@@ -928,7 +928,7 @@ class FindProvidersTest(LookupTestCase):
         self.assertEqual(lookup.late_providers(), [])  # nothing came late yet
         release.set()
         late = []
-        wait_for(lambda: late.extend(lookup.late_providers()) or late)
+        wait_for(lambda: late.extend(lookup.late_providers()) or late, what="the straggler's late answer")
         self.assertEqual(late, [ident(0x7777)])
         self.assertEqual(lookup.listers(ident(0x7777)), {straggler})
         self.assertEqual(lookup.late_providers(), [])  # reported once
