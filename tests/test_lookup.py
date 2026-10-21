@@ -7,6 +7,7 @@ from unittest import mock
 
 from rnfs.config import Config
 from rnfs.constants import ID_LENGTH, K
+from rnfs.dht import lookup as lookup_module
 from rnfs.dht.lookup import FIRST, MAX_QUERIES, SLOW_PATH, STALL_WINDOWS, UNRELIABLE, Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import AVOID_AFTER, RoutingTable, distance
@@ -482,12 +483,14 @@ class PatienceTest(LookupTestCase):
             if node_id == slow:
                 gate.wait(5)
             return query(node_id, key)
-        lookup = Lookup(self.key, self.dead + self.alive, slowly, ident(0), timeout=5, poll_interval=0.05,
+        lookup = Lookup(self.key, self.dead + self.alive, slowly, ident(0), timeout=10, poll_interval=0.05,
                         patience=0.2)
-        threading.Timer(0.6, gate.set).start()
+        # Answered at 1 s: past patience, well within the hold (patched to 20 x 0.2 s), however slow the machine
+        threading.Timer(1.0, gate.set).start()
         started = time.monotonic()
-        self.assertEqual(lookup.find_providers(lambda provider: None), [ident(0x7777)])
-        self.assertLess(time.monotonic() - started, 3)
+        with mock.patch.object(lookup_module, "HOLD_PATIENCE", 20):
+            self.assertEqual(lookup.find_providers(lambda provider: None), [ident(0x7777)])
+        self.assertLess(time.monotonic() - started, 4)
         self.assertIn(lookup.ended, ("complete", "no node left to ask"))
 
 

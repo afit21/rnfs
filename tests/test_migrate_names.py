@@ -222,9 +222,11 @@ class NamesFileTest(FileTests, MigrateNamesTest):
     def test_file_nested_too_deeply_stops_startup(self):
         """A names.json nested deeper than json can parse is refused as one that isn't JSON is (RnfsError, the file
         left as it is), not with a RecursionError."""
-        text = "[" * 100000
+        text = "[[]]"
         path = write_legacy(self.state, self.FILE, text=text)
-        with self.assertRaisesRegex(RnfsError, "nested too deeply"):
+        # How a json that can't parse that deep fails (3.11-3.13; 3.14's parses about 100,000 levels)
+        with mock.patch("json.load", side_effect=RecursionError("deep")), \
+                self.assertRaisesRegex(RnfsError, "nested too deeply"):
             self.manager()
         with open(path, encoding="utf-8") as f:
             self.assertTrue(f.read() == text)  # assertEqual would print all of it on a failure

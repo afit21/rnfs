@@ -386,8 +386,14 @@ class TransactionTest(StateDbTest):
         """Text nested deeper than json can parse (a damaged row: dump() never writes it) raises ValueError, which
         the stores handle as a row that isn't JSON, not RecursionError, which none catches."""
         for text in ("[" * 100000, "[" * 100000 + "]" * 100000, '{"a":' * 100000):
-            with self.subTest(text=text[:5]), self.assertRaises(ValueError):
-                statedb.load(text)
+            with self.subTest(text=text[:5]):
+                try:
+                    statedb.load(text)  # Python 3.14's json parses this deep: a value, which the row checks judge
+                except ValueError:
+                    pass  # and not a RecursionError, which nothing catches
+        # As a json that can't go this deep raises (3.11-3.13): taken for damage
+        with mock.patch("json.loads", side_effect=RecursionError("too deep")), self.assertRaises(ValueError):
+            statedb.load("[[]]")
 
 
 class RowStoreTest(StateDbTest):
@@ -685,8 +691,9 @@ class MigrateTest(StateDbTest):
     def test_file_nested_too_deeply_is_moved_aside(self):
         """A file nested deeper than json can parse is damage, moved to .damaged like one that isn't JSON, rather
         than a RecursionError that stops every start."""
-        path = write_legacy(self.state, "test.json", text="[" * 100000 + "]" * 100000)
-        with mock.patch.object(statedb, "log") as log:
+        path = write_legacy(self.state, "test.json", text="[[]]")
+        # How a json that can't parse that deep fails (3.11-3.13; 3.14's parses about 100,000 levels)
+        with mock.patch.object(statedb, "log") as log, mock.patch("json.load", side_effect=RecursionError("deep")):
             self.connect(TEST_LEGACY).close()
         self.assertTrue(os.path.exists(path + ".damaged"))
         self.assertEqual(state_rows(self.state, "SELECT * FROM migrated"), [])

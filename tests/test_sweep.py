@@ -428,7 +428,7 @@ class SimulatedNetworkTest(unittest.TestCase):
         return result, sent
 
     def test_placement_matches_the_true_closest(self):
-        """3000 keys: at least 99% get exactly their true K closest (100% in the runs measured), at least as many as
+        """3000 keys: at least 98% get exactly their true K closest (100% in most runs measured), at least as many as
         per-key lookups do; lookups level off at about servers / 12.5 (80 here, as without the size estimate: the
         publisher knows every identity it hears of, so each region covers all its keys), with under 3 extra /find a
         region.
@@ -442,7 +442,9 @@ class SimulatedNetworkTest(unittest.TestCase):
         result, sent = self.publish(keys, at_once=1)
         self.assertEqual(len(result["published"]), len(keys))
         exact = sum(1 for key in keys if sent[key] == set(self.net.true_closest(key))) / len(keys)
-        self.assertGreaterEqual(exact, 0.99)
+        # Within one lookup alpha queries are still in flight at once, so a loaded runner can reorder answers: 0.988
+        # seen on a CI macOS runner
+        self.assertGreaterEqual(exact, 0.98)
         self.assertLessEqual(result["lookups"], self.SERVERS / 12.5 * 1.3)
         self.assertGreaterEqual(result["lookups"], self.SERVERS / 12.5 * 0.7)
         self.assertLess(result["finds"] / result["lookups"], 3)

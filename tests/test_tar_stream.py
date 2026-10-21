@@ -7,6 +7,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import unicodedata
 import unittest
 
 from rnfs import cli, log
@@ -477,7 +478,10 @@ class FolderTarTest(unittest.TestCase):
             os.makedirs(out)
             run = subprocess.run([tar, "xf", path], cwd=out, capture_output=True, text=True, check=False)
             self.assertEqual((run.returncode, run.stderr, os.listdir(out)), (0, "", ["folder"]))
-            self.assertEqual(files_of(os.path.join(out, "folder")), files_of(top))
+            # bsdtar (macOS's tar) writes names decomposed (NFD): the same names, compared as Unicode does
+            def composed(files):
+                return {unicodedata.normalize("NFC", name): value for name, value in files.items()}
+            self.assertEqual(composed(files_of(os.path.join(out, "folder"))), composed(files_of(top)))
 
     def test_is_marked(self):
         marker = tarstream.folder_marker()
