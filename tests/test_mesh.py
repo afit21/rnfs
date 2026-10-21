@@ -570,6 +570,12 @@ class AirtimePolicyTest(unittest.TestCase):
         minute[0] = 7 * 60
         self.assertIsNone(policy.refusal(["any"]))
 
+    def test_quiet_hours_take_ascii_digits_only(self):
+        self.assertEqual(mesh.parse_quiet_hours("22:00-06:30"), [(22 * 60, 6 * 60 + 30)])
+        for text in ("\u0662\u0662:00-06:00", "22:\u0660\u0660-06:00"):  # Arabic-Indic digits, which isdigit() takes
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                mesh.parse_quiet_hours(text)
+
     def test_budget_limit(self):
         clock = FakeClock()
         policy = mesh.AirtimePolicy(Config(upload_budget=100 * KIB), clock)

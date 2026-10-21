@@ -163,6 +163,7 @@ MAX_KEY_BODY = 64 * 1024  # an RNS identity file is 64 bytes
 CHALLENGE = re.compile(r"[0-9a-f]{32}")  # what the CLI sends in X-Rnfs-Challenge
 CLI = "cli"  # ApiHandler.caller() for the CLI's token (api_token); an app's is "app:<name>"
 CHUNK_SIZE_LINE = re.compile(rb"[0-9A-Fa-f]{1,16}")  # a chunk size: hex digits only (no 0x, +, _ or spaces)
+DECIMAL = re.compile(r"[0-9]{1,18}")  # an integer parameter or Content-Length: ASCII digits, below 2**63
 MAX_TRAILER_LINES = 32
 MAX_WATCH_NAMES = 64  # names one GET /api/name/watch may list
 MAX_WATCH_WAITERS = 4  # GET /api/name/watch calls waiting at once
@@ -271,13 +272,12 @@ def parse_int(text, name: str, default: int | None) -> int | None:
     """A non-negative integer parameter, or default when absent. Raises ValueError."""
     if text is None or text == "":
         return default
-    try:
-        value = int(text)
-    except (TypeError, ValueError):
-        raise ValueError(f"{name} must be an integer") from None
-    if value < 0:
-        raise ValueError(f"{name} must not be negative")
-    return value
+    # ASCII digits only, at most 18 (below 2**63): int() also takes "1_0", " 7 ", "+7" and other scripts' digits
+    if not isinstance(text, str) or not DECIMAL.fullmatch(text):
+        if isinstance(text, str) and text.startswith("-") and DECIMAL.fullmatch(text[1:]):
+            raise ValueError(f"{name} must not be negative")
+        raise ValueError(f"{name} must be an integer")
+    return int(text)
 
 
 def parse_nomadnet(text) -> str:
@@ -848,7 +848,8 @@ class ApiHandler(TimedHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_common_headers()
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
     def send_error_json(self, status: int, message: str, code: str, headers: dict | None = None):
         """Send {"error": message, "code": code} with the given status."""
@@ -860,7 +861,8 @@ class ApiHandler(TimedHandler):
             self.send_header(name, value)
         self.send_common_headers()
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != "HEAD":  # an answer to HEAD has the headers only (the 405 every HEAD gets)
+            self.wfile.write(data)
 
     def send_bytes(self, data: bytes):
         """Send data as an application/octet-stream response."""
@@ -992,12 +994,14 @@ class ApiHandler(TimedHandler):
         length = self.headers.get("Content-Length")
         if length is None:
             raise ApiRequestError(411, "Content-Length or chunked encoding required", "length_required")
-        try:
-            size = int(length)
-        except ValueError:
-            raise ApiRequestError(411, "invalid Content-Length", "length_required") from None
-        if size < 0:
-            raise ApiRequestError(400, "invalid Content-Length", "bad_request")
+        length = length.strip(" \t")
+        if not DECIMAL.fullmatch(length):
+            # Negative, or 2**63 and more (which overflowed the body reader's reads): 400, as a negative one was; not
+            # ASCII digits at all (int() also takes "1_0" and other scripts' digits): 411, as before
+            numeric = length.lstrip("-").isascii() and length.lstrip("-").isdigit()
+            raise (ApiRequestError(400, "invalid Content-Length", "bad_request") if numeric
+                   else ApiRequestError(411, "invalid Content-Length", "length_required"))
+        size = int(length)
         return BodyReader(self.rfile, size, chunked=False)
 
     def stream_reader(self) -> BodyReader:

@@ -497,6 +497,19 @@ def raw_request(port, method, path, body=None, headers=None, host="default"):
         connection.close()
 
 
+class ParseIntTest(unittest.TestCase):
+    """api.parse_int takes ASCII digits only, as a query parameter is written: int() also takes others."""
+
+    def test_only_plain_digits(self):
+        from rnfs.api import parse_int
+        self.assertEqual((parse_int("12", "n", None), parse_int("", "n", 7), parse_int(None, "n", 7)), (12, 7, 7))
+        for text in ("1_0", " 7 ", "+7", "\u0661\u0662", "7.0", "1e3", str(2 ** 63)):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "must be an integer"):
+                parse_int(text, "n", None)
+        with self.assertRaisesRegex(ValueError, "must not be negative"):
+            parse_int("-3", "n", None)
+
+
 class ApiTestCase(unittest.TestCase):
     """Base: an ApiServer on a free port for a FakeNode."""
 
@@ -632,6 +645,15 @@ class SecurityTest(ApiTestCase):
             self.assertTrue(data.startswith(b"HTTP/1.0 400 "), (line, data[:80]))
             self.assert_api_headers(data)
 
+    def test_head_is_answered_without_a_body(self):
+        """HEAD is refused (405) with the headers only: a body after them would be read as the next response."""
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+            sock.sendall(f"HEAD /api/status HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n\r\n".encode())
+            data, _ = read_until_closed(sock)
+        head, _, rest = data.partition(b"\r\n\r\n")
+        self.assertTrue(head.startswith(b"HTTP/1.0 405 "), head[:60])
+        self.assertEqual(rest, b"")
+
     def test_http_server_errors_carry_the_headers(self):
         """http.server's own error pages (501 for an unknown method, 414, 431) carry no-store and nosniff, as the
         API's own responses do, each once."""
@@ -731,6 +753,9 @@ class EndpointTest(ApiTestCase):
         self.assertEqual(self.call("POST", "/api/add/stream", b"x", {"Content-Length": "abc"})[0], 411)
         self.assertEqual(self.call("POST", "/api/add/stream")[0], 411)
         self.assertEqual(self.call("POST", "/api/add/stream", b"x", {"Content-Length": "-1"})[0], 400)
+        for length in ("1_0", "+1", "0x10"):  # what int() takes (but 0x) and a Content-Length isn't
+            self.assertEqual(self.call("POST", "/api/add/stream", b"x", {"Content-Length": length})[0], 411, length)
+        self.assertEqual(self.call("POST", "/api/add/stream", b"x", {"Content-Length": str(2 ** 63)})[0], 400)
         self.assertEqual(self.call("POST", "/api/add/stream", b"zz\r\nab", {"Transfer-Encoding": "chunked"})[0], 400)
 
     def test_short_upload_is_rejected(self):

@@ -379,7 +379,8 @@ def parse_quiet_hours(text: str) -> list[tuple[int, int]]:
 def _minute(text: str) -> int:
     """Minutes since midnight of "HH:MM". Raises ValueError."""
     hours, minutes = text.strip().split(":")
-    if not (hours.isdigit() and minutes.isdigit() and len(minutes) == 2 and 1 <= len(hours) <= 2):
+    if not (hours.isascii() and minutes.isascii() and hours.isdigit() and minutes.isdigit() and len(minutes) == 2
+            and 1 <= len(hours) <= 2):  # isdigit alone takes other scripts' digits
         raise ValueError(text)
     hour, minute = int(hours), int(minutes)
     if hour > 23 or minute > 59:

@@ -928,6 +928,11 @@ Fixed:
   10 minutes and 1 s.
 - An `rnfs.toml` starting with a UTF-8 byte-order mark, as some Windows editors save it, was refused as invalid TOML:
   it is read, and `config set` writes it back without the mark.
+- The API answered `HEAD` (always refused, 405) with a JSON body after the headers, which a client reads as the start
+  of the next response: now the headers only.
+- The API's integer parameters, a request's `Content-Length` and `quiet_hours` took whatever Python's `int()` takes:
+  `1_0`, `+7`, spaces, other scripts' digits. Only ASCII digits are taken now, and a `Content-Length` of 2**63 or more,
+  which overflowed the body reader, is refused (400, as a negative one is; one that isn't a number stays 411).
 - A fetch running for days kept every search it made again (one each 10 minutes that found its providers again):
   it now keeps its first and the latest 8.
 - **A stalled response no longer fails the other requests on its link** (REL-7): closing the link for it failed a
