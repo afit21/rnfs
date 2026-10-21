@@ -862,6 +862,9 @@ Fixed:
   without a real-time clock still had the time it booted with gave up at its next try once NTP had stepped the
   clock days on, as if it had been retried for 3 days. A try more than 6 hours after it was due (that, or the node
   off) no longer counts the time between.
+- While a daemon was starting (minutes on a small node as RNS's transport starts), the CLI said "no API token …: is
+  the daemon running?", as the token is written once the API is up: it now says the daemon is starting, as it does
+  once the token is there and the port isn't yet.
 - A fetch running for days kept every search it made again (one each 10 minutes that found its providers again):
   it now keeps its first and the latest 8.
 - **A stalled response no longer fails the other requests on its link** (REL-7): closing the link for it failed a

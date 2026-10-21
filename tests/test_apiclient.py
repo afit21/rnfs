@@ -937,6 +937,23 @@ class ErrorTest(ClientTestCase):
         self.assertIn("no API token", str(raised.exception))
         self.assertEqual(self.node.called("gc"), [])
 
+    def test_no_token_file_while_the_daemon_starts(self):
+        """The daemon writes its token once its API is up: while a process holds the rnfs dir (a slow start, minutes
+        on a small node as RNS's transport starts), a request is told the daemon is starting, not to start one."""
+        os.unlink(self.token_file)
+        holder = hold_lock(os.path.join(self.tmp, "daemon.lock"))
+        try:
+            with self.assertRaises(apiclient.DaemonStarting) as raised:
+                self.api.post("/api/gc")
+            self.assertEqual(raised.exception.pid, holder.pid)
+        finally:
+            holder.stdin.close()
+            holder.wait(30)
+            holder.stdout.close()
+        with self.assertRaises(TokenError):  # nobody holds it: as before
+            self.api.post("/api/gc")
+        self.assertEqual(self.node.called("gc"), [])
+
     @unittest.skipUnless(POSIX_MODES, "Unix permissions")
     def test_token_readable_by_others(self):
         """A token file others can read isn't trusted: TokenError."""

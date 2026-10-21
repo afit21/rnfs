@@ -629,10 +629,7 @@ class ApiConnection:
             if isinstance(e, ConnectionRefusedError):
                 holder = dir_holder(self.rnfs_dir)
                 if holder is not None:
-                    raise DaemonStarting(f"the daemon (process {holder}) is starting: it holds {self.rnfs_dir} but "
-                                         f"doesn't answer on API port {self.port} yet; try again in a moment. If "
-                                         f"this lasts, process {holder} may be stopping, or be an app's own rnfs "
-                                         f"node, which has no API", holder) from None
+                    raise self._starting(holder) from None
                 raise DaemonNotRunning(f"no daemon is running on API port {self.port}. Start one with: rnfs daemon") \
                     from None
             if isinstance(e, TimeoutError) and connection.timeout is not None:  # else the system's (ETIMEDOUT)
@@ -641,6 +638,12 @@ class ApiConnection:
             if isinstance(e, (http.client.HTTPException, ConnectionError)):
                 raise ConnectionFailed(f"the daemon dropped the connection ({e!r}); see its log") from None
             raise ConnectionFailed(f"can't reach the daemon on API port {self.port}: {e}") from None
+
+    def _starting(self, holder: int) -> "DaemonStarting":
+        """The error while process holder holds the rnfs dir but its API isn't up yet."""
+        return DaemonStarting(f"the daemon (process {holder}) is starting: it holds {self.rnfs_dir} but doesn't "
+                              f"answer on API port {self.port} yet; try again in a moment. If this lasts, process "
+                              f"{holder} may be stopping, or be an app's own rnfs node, which has no API", holder)
 
     def _raise_for(self, response: http.client.HTTPResponse, data: bytes | None = None) -> http.client.HTTPResponse:
         """response if it succeeded; else raise the ApiError for its status (error_for, the one mapping), with the
@@ -667,7 +670,15 @@ class ApiConnection:
         wrote a new one). A daemon that closes the connection anyway gets nothing more: ConnectionFailed (one
         before 0.1.5, which always does, was refused by check_daemon already). A token given (token=) is never
         read again."""
-        token = self._given_token or self.token or read_token(self.token_file, self.app)
+        try:
+            token = self._given_token or self.token or read_token(self.token_file, self.app)
+        except TokenError:
+            # The daemon writes its token once its API is up: a slow start (minutes, as RNS's transport starts on a
+            # small node) is starting, not "is the daemon running?"
+            holder = dir_holder(self.rnfs_dir) if self.app is None and not os.path.lexists(self.token_file) else None
+            if holder is not None:
+                raise self._starting(holder) from None
+            raise
         try:
             self.verify_daemon(token, connection)
         except AuthFailed:
