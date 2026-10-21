@@ -76,6 +76,11 @@ Security:
 - **A tar member of negative size is refused by rnfs itself** (REL-4): Python's tarfile parses a negative size from
   a base-256 field or a pax `size=` record, and only interpreters with its own offset check (3.12.3 and later fixes)
   refused such a stream; rnfs supports 3.11. Sealed folders and tar adds now refuse it on every interpreter.
+- **A file in the rnfs dir can't be added through another name for it** (REL-8, completing REV1): the check that `add`
+  refuses the rnfs dir compared paths, and a file added as the add's root isn't walked (the walks skip the rnfs dir by
+  inode), so on a case-insensitive disk (macOS: `~/.RNFS/api_token`) or through a bind mount an app could add the
+  CLI's token, the node identity or a name key and read it back. The file's directories are now compared by device and
+  inode too, up to the rnfs dir's `files/`.
 - **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
   may be no larger than `max_download_size` and the free space above the disk reserve; each Resource segment may
   decompress to one segment, and must follow the sequence an honest sender keeps (same original hash and total,

@@ -159,7 +159,38 @@ def add_refused_reason(path: str, rnfs_dir: str) -> str | None:
     root = os.path.realpath(rnfs_dir)
     if fsutil.is_below(real, root) and not fsutil.is_below(real, os.path.realpath(os.path.join(root, "files"))):
         return f"it is inside {root}, where rnfs keeps its token and settings (only its files/ may be added)"
-    return None
+    return _reached_otherwise(real, root)
+
+
+def _reached_otherwise(real: str, root: str) -> str | None:
+    """Why real, which the path checks passed, is still inside the rnfs dir root, or None: one of its directories,
+    nearest first, is the rnfs dir or one of its PRIVATE_SUBDIRS by device and inode before any is its files/. Another
+    name for the same directory, which a path compare misses, gets there: a case variant on a case-insensitive disk
+    (macOS: `~/.RNFS/api_token`), or a bind mount (REL-8; the walks skip such directories, but a file added as the root
+    of an add isn't walked)."""
+    private = private_dirs(root)
+    try:
+        st = os.stat(os.path.join(root, "files"))
+        shared = (st.st_dev, st.st_ino) if st.st_ino != 0 else None
+    except (OSError, ValueError):
+        shared = None
+    current = real
+    while True:
+        try:
+            st = os.stat(current)
+        except (OSError, ValueError):
+            st = None
+        if st is not None and st.st_ino != 0 and stat.S_ISDIR(st.st_mode):
+            found = (st.st_dev, st.st_ino)
+            if found == shared:
+                return None
+            if found in private:
+                return (f"it is inside {root} (by another name for it), where rnfs keeps its token, keys and settings "
+                        "(only its files/ may be added)")
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
 
 
 def private_dirs(rnfs_dir: str) -> frozenset[builder.DirId]:

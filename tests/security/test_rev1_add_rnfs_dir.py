@@ -181,6 +181,23 @@ class AddRnfsDirTest(unittest.TestCase):
             self.assert_refused(bind)
             self.assert_refused(bind, to_self=True)
 
+    def test_a_file_in_another_name_for_the_rnfs_dir_is_refused(self):
+        """REL-8: a case variant of the rnfs dir on a case-insensitive disk (macOS: ~/.RNFS/api_token) or a bind mount of
+        it passed the path check, and a file added as the add's root isn't walked, so an app could add the CLI's token
+        (or the node identity, or a name key) and cat it. Its directories are compared by inode too."""
+        bind = self.bind_of(self.root, "srv", "RNFS")
+        with self.bound(bind, self.root):
+            self.assert_refused(os.path.join(bind, "api_token"))
+        names = self.bind_of(self.config.names_dir, "srv", "NAMES")
+        with self.bound(names, self.config.names_dir):
+            self.assert_refused(os.path.join(names, "0" * 32 + ".key"))
+
+    def test_a_file_in_another_name_for_files_may_be_added(self):
+        shared = os.path.join(self.tmp.name, "srv", "FILES")
+        self.write(os.path.join(shared, "a.txt"), SHARED)
+        with self.bound(shared, os.path.join(self.root, "files")):
+            self.node.add_path(os.path.join(shared, "a.txt"))
+
     def test_a_sealed_folder_skips_a_bind_mount(self):
         bind = self.bind_of(self.root, "srv", "mnt")
         self.write(os.path.join(self.tmp.name, "srv", "b.txt"), SHARED)
