@@ -95,6 +95,10 @@ Security:
   rollback check, and the sequence a keeper query checks answers against, left out the name floor (the highest
   sequence of a name resolved before, kept after its record left the table). A lying keeper's old, validly signed
   record of such a name, once kept, was served onward by this node. The floor counts now.
+- **A flood of fresh identities can't set the clock-offset estimate** (REL-15, specification section 9): it was the
+  median of the 128 senders heard most recently, so 128 announces of fresh identities emitted 2 h ahead pushed every
+  honest sender out, and the node warned that its correct clock was 2 h behind. Once 5 senior servers were heard the
+  estimate is theirs alone, and the table forgets other senders first.
 - **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
   may be no larger than `max_download_size` and the free space above the disk reserve; each Resource segment may
   decompress to one segment, and must follow the sequence an honest sender keeps (same original hash and total,

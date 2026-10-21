@@ -1302,7 +1302,9 @@ class RnfsNode:
         announce cache, which a shared instance's client doesn't write and whose packet hash a path answer passed on
         as an announce doesn't match. It is a sample of the clock's offset too (NameManager.clock_skew)."""
         emitted = RnsNetwork().emitted_time(node_id)
-        self.names.clock_skew.node_announced(node_id, emitted)
+        first = self.first_seen.first_heard(node_id)
+        senior = first is not None and time.time() - first >= self.config.provider_seniority
+        self.names.clock_skew.node_announced(node_id, emitted, senior)
         traffic = getattr(self.client, "traffic", None)
         if traffic is not None and traffic.announced(node_id, emitted):
             self._fresh_announce(node_id)

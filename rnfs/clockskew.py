@@ -6,7 +6,9 @@ was emitted moments ago, so its emission time less the time it arrived is the se
 less the delay on the way. The estimate is the median of that over the senders heard recently, one value each (its
 least delayed announce in the window), so a few wrong or lying clocks don't move it: they need more than half of the
 senders. A node with many names has one clock, so names' announces count for fewer senders than nodes' do, except
-to make up the MIN_SENDERS an estimate needs.
+to make up the MIN_SENDERS an estimate needs. Fresh identities are free, so once MIN_SENDERS senior servers (first
+heard provider_seniority ago, by the announce first-seen log) were heard within the window the estimate is theirs
+alone, and a full table forgets other senders first: a flood of fresh identities can't set it (REL-15).
 
 Late announces and replayed old ones can only make this node's clock look ahead, never behind, and RNS delivers
 many late: it holds the announces arriving on an interface that just came up (a laptop waking, a node starting)
@@ -26,7 +28,7 @@ from collections import OrderedDict
 WARN_OFFSET = 300.0  # seconds: an estimate further behind than this is reported as a warning
 CLEAR_OFFSET = 240.0  # ... and once warned, one back within this is reported as fixed (not again at each sample)
 MIN_SENDERS = 5  # distinct senders heard within the window before there is an estimate
-MAX_SENDERS = 128  # senders kept per kind (nodes, names), the least recently heard forgotten first
+MAX_SENDERS = 128  # senders kept per kind (nodes, names), the least recently heard forgotten first (not senior first)
 
 
 def duration_text(seconds: float) -> str:
@@ -71,15 +73,16 @@ class ClockSkew:
         self._names: OrderedDict[bytes, list] = OrderedDict()
         self._warned = False
 
-    def node_announced(self, node_id: bytes, emitted) -> None:
-        """An rnfs.dht announce of node_id, emitted at emitted (None if unknown), arrived live (not a path response)."""
-        self._sample(self._nodes, node_id, emitted)
+    def node_announced(self, node_id: bytes, emitted, senior: bool = False) -> None:
+        """An rnfs.dht announce of node_id, emitted at emitted (None if unknown), arrived live (not a path response);
+        senior: node_id is a senior server (the first-seen log heard it first provider_seniority ago)."""
+        self._sample(self._nodes, node_id, emitted, senior)
 
     def name_announced(self, name: bytes, emitted) -> None:
         """An rnfs.name announce of name, emitted at emitted (None if unknown), arrived live, unasked."""
         self._sample(self._names, name, emitted)
 
-    def _sample(self, senders: OrderedDict, sender: bytes, emitted):
+    def _sample(self, senders: OrderedDict, sender: bytes, emitted, senior: bool = False):
         """Keep sender's sample, then report it if the estimate passed WARN_OFFSET (or came back)."""
         if type(emitted) not in (int, float) or not math.isfinite(emitted) or emitted <= 0:
             return
@@ -90,10 +93,17 @@ class ClockSkew:
             entry = senders.get(sender)
             # Its least delayed announce in the window: delays only ever make a clock look ahead
             if entry is None or now - entry[1] > self.window or value >= entry[0]:
-                senders[sender] = [value, now]
+                senders[sender] = [value, now, senior]
+            else:
+                entry[2] = senior
             senders.move_to_end(sender)
             while len(senders) > MAX_SENDERS:
-                senders.popitem(last=False)
+                # The least recently heard that isn't senior: a flood of fresh identities pushes out only its own
+                victim = next((key for key, kept in senders.items() if not kept[2]), None)
+                if victim is None:
+                    senders.popitem(last=False)
+                else:
+                    del senders[victim]
             offset, count = self._estimate(now)
             message = None
             # Only behind: ahead can't be told from announces delivered late (the module's docstring)
@@ -111,14 +121,18 @@ class ClockSkew:
 
     def _estimate(self, now: float) -> tuple[float | None, int]:
         """(offset, senders) as estimate() gives them, at monotonic time now. Lock held."""
-        nodes = [value for value, at in self._nodes.values() if now - at <= self.window]
-        names = sorted(((at, value) for value, at in self._names.values() if now - at <= self.window), reverse=True)
+        seniors = [value for value, at, senior in self._nodes.values() if senior and now - at <= self.window]
+        base = self._clock() - now  # the wall time at monotonic 0, as the clock says now
+        if len(seniors) >= MIN_SENDERS:
+            return statistics.median(seniors) - base, len(seniors)
+        nodes = [value for value, at, _ in self._nodes.values() if now - at <= self.window]
+        names = sorted(((at, value) for value, at, _ in self._names.values() if now - at <= self.window),
+                       reverse=True)
         # Names count for fewer senders than nodes, or for as many as make up MIN_SENDERS
         names = [value for _, value in names[:max(len(nodes) - 1, MIN_SENDERS - len(nodes), 0)]]
         values = nodes + names
         if len(values) < MIN_SENDERS:
             return None, len(values)
-        base = self._clock() - now  # the wall time at monotonic 0, as the clock says now
         return statistics.median(values) - base, len(values)
 
     def estimate(self) -> tuple[float | None, int]:

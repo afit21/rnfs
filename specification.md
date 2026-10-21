@@ -1793,7 +1793,9 @@ interfaces, 6 hours on roaming ones).
   and names' announces, not path responses, and not those of names it is resolving, which a shared instance may
   pass on as announces): per sender its least delayed announce over 2 × `announce_interval`, and the median over
   senders, so that a few wrong or lying clocks can't move it. A node publishing many names has one clock, so
-  names count for fewer senders than nodes do, except to make up the 5 an estimate needs. Late and replayed
+  names count for fewer senders than nodes do, except to make up the 5 an estimate needs. Fresh identities are
+  free, so once 5 senior servers (first heard `provider_seniority` ago) were heard, the median is theirs alone, and
+  a bounded table of senders forgets the others first (rnfs 0.2.0, REL-15). Late and replayed
   announces can only make the clock look ahead, never behind, and RNS delivers many announces late (it holds those
   arriving on an interface that just came up, and transport nodes queue announces past their 2% cap), so a clock
   that looks ahead can't be told from late announces. A node SHOULD therefore report only a clock that looks behind,
