@@ -86,6 +86,11 @@ Security:
   while scripts were allowed kept running them in the browser after they were turned off. HTML, SVG, other XML, PDF
   and listings now carry `Cache-Control: public, no-cache` (the browser keeps them and asks again, a `304` from the
   node), and a `304` carries no `Cache-Control`. Other files stay immutable.
+- **Withdrawing and restoring the same records spends no write budget** (REL-13, completing REV2): a withdrawal
+  spent a row of the provider write budget and a restore before the next save spent nothing but gave nothing back,
+  though neither row is then written. One identity looping over its own 27 records spent the budget other publishers'
+  new records need, while writing almost nothing, and every other Newcomer's new record was refused (an Earned one's
+  too, from an Earned attacker). The row a withdrawal spent is now given back when it is undone.
 - **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
   may be no larger than `max_download_size` and the free space above the disk reserve; each Resource segment may
   decompress to one segment, and must follow the sequence an honest sender keeps (same original hash and total,

@@ -19,7 +19,7 @@ publishers, unused budget carried over for WRITE_CARRY windows. Past it, others'
 full store); withdrawals spend what is left but are never refused, and refreshes cost nothing. Every record inserted
 is deleted at most once, so the rows written stay within twice the budget, whatever a publisher sends. A withdrawal
 followed by a store of the same key and publisher before the next save is a refresh: the record comes back with its
-first-stored time (_withdrawn), spending nothing.
+first-stored time (_withdrawn), and the row the withdrawal spent is given back (REL-13): neither is written.
 
 Room is local policy (spec section 6). Records may take record_budget bytes of the state database, measured as its
 pages in use over the records held (so it counts their indexes, B-tree overhead and the database's other state), and
@@ -264,14 +264,19 @@ class _WriteBudget:
         self._refill()
         return any(self.left[pool] >= 1 for pool in self._pools(tier))
 
-    def spend(self, tier: int) -> bool:
-        """Spend a row from tier's pools, if one is left; False if none is."""
+    def spend(self, tier: int) -> int | None:
+        """Spend a row from tier's pools, if one is left: the pool it came from, or None if none is left."""
         self._refill()
         for pool in self._pools(tier):
             if self.left[pool] >= 1:
                 self.left[pool] -= 1
-                return True
-        return False
+                return pool
+        return None
+
+    def refund(self, pool: int):
+        """Give back a row spent from pool that won't be written after all (a withdrawal undone before the save)."""
+        self._refill()
+        self.left[pool] = min(WRITE_CARRY * self.per_window[pool], self.left[pool] + 1)
 
 
 class _Standing:
@@ -328,6 +333,8 @@ class ProviderStore:
         # Records withdrawn since the last save, (key, publisher) -> (first stored, last stored): one stored again
         # before then is a refresh. Each is a deleted row in _dirty, so they are bounded with it
         self._withdrawn: dict[tuple[bytes, bytes], tuple[float, float]] = {}
+        # The write-budget pool each of those withdrawals spent from: given back if it is undone (REL-13)
+        self._withdraw_spent: dict[tuple[bytes, bytes], int] = {}
         self._writes = None if write_budget is None else _WriteBudget(write_budget, monotonic)
         # Records of the keys used most recently, as the database has them with _dirty's changes: key -> publisher ->
         # (first stored, last stored), least recently used first, at most CACHE_ROWS rows of CACHE_KEYS keys
@@ -426,7 +433,9 @@ class ProviderStore:
         if publisher != self.own_id:
             self._withdrawn[(key, publisher)] = record
             if self._writes is not None:
-                self._writes.spend(tier)
+                pool = self._writes.spend(tier)
+                if pool is not None:
+                    self._withdraw_spent[(key, publisher)] = pool
         return True
 
     def _refuse(self, publisher: bytes, result: str) -> str:
@@ -473,8 +482,9 @@ class ProviderStore:
             return self._refuse(publisher, _FULL)
         # Withdrawn since the last save: a refresh of that record rather than a new one
         restored = self._withdrawn.pop((key, publisher), None) if record is None else None
+        spent = self._withdraw_spent.pop((key, publisher), None) if restored is not None else None
         if restored is not None and now - restored[1] >= self.ttl:
-            restored = None
+            restored = None  # expired meanwhile: stored as a new record, its withdrawal written too
         victim = None
         tier = OWN
         if publisher != self.own_id:
@@ -503,6 +513,10 @@ class ProviderStore:
             first, last = restored
             self._add(key, publisher, now, (first, last if abs(now - last) <= REFRESH_WRITE else now))
             self._refreshed_on(publisher, now)
+            if spent is not None and self._writes is not None:
+                # The withdrawal won't be written now: its row is given back, so a loop of withdrawals and restores
+                # can't spend the budget others' new records need while writing nothing (REL-13)
+                self._writes.refund(spent)
         if self._save_due():
             self._try_save()
         return _STORED
@@ -1303,6 +1317,7 @@ class ProviderStore:
         self._dirty_count = 0
         self._dirty_by_publisher.clear()
         self._withdrawn.clear()
+        self._withdraw_spent.clear()
         self._dirty_standing.clear()
         self._dirty_seen.clear()
         # The changed standings are what the database has now: cached as any other, the most recently used
