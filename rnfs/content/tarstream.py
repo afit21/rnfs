@@ -241,6 +241,28 @@ class _Tree:
         return build(self.root)
 
 
+class _Ending:
+    """A stream for tarfile that raises once it has been read at its end a few times: tarfile's stream mode skips a
+    member it isn't asked for by reading its declared size, and at the end of the input it reads nothing for ever, so
+    one header declaring 2**88 bytes (base-256) held the reader for good (REL-17)."""
+
+    EMPTY_READS = 16  # more than tarfile makes at the end of a valid stream
+
+    def __init__(self, stream: BinaryIO):
+        """Read through stream."""
+        self.stream = stream
+        self.empty = 0
+
+    def read(self, size: int = -1) -> bytes:
+        """stream.read(size); tarfile.ReadError once it has given nothing EMPTY_READS times."""
+        data = self.stream.read(size)
+        if not data:
+            self.empty += 1
+            if self.empty > self.EMPTY_READS:
+                raise tarfile.ReadError("the stream ended inside a tar member")
+        return data
+
+
 def build_tar(stream: BinaryIO, put: Put, warn: Callable[[str], None], max_entries: int,
               options: BuildOptions | None = None, wrap: str | None = None) -> Built:
     """Build the directory a tar stream holds (the module docstring's rules), wrapped as the entry wrap if given;
@@ -254,7 +276,7 @@ def build_tar(stream: BinaryIO, put: Put, warn: Callable[[str], None], max_entri
         dag.check_name(wrap)  # before reading a possibly large stream
     tree = _Tree(max_entries)
     try:
-        archive = tarfile.open(fileobj=stream, mode="r|", tarinfo=_header_class(), encoding="utf-8",
+        archive = tarfile.open(fileobj=_Ending(stream), mode="r|", tarinfo=_header_class(), encoding="utf-8",
                                errors="surrogateescape")
         with archive:
             while (member := archive.next()) is not None:
@@ -266,7 +288,7 @@ def build_tar(stream: BinaryIO, put: Put, warn: Callable[[str], None], max_entri
             while data := archive.fileobj.read(COPY_SIZE):
                 if data.count(0) != len(data):
                     raise ValueError("not a valid tar stream: data after its end (a damaged header?)")
-    except tarfile.TarError as e:
+    except (tarfile.TarError, OverflowError) as e:  # a size beyond what a seek takes (REL-17)
         raise ValueError(f"not a valid tar stream: {e}") from None
     built = tree.build(put)
     return builder.wrap(wrap, built, put) if wrap is not None else built
@@ -395,7 +417,7 @@ def scan_tar(stream: BinaryIO, max_entries: int) -> Extent:
             while data := stream.read(COPY_SIZE):
                 if data.count(0) != len(data):
                     raise ValueError("not a valid tar stream: data after its end (a damaged header?)")
-    except tarfile.TarError as e:
+    except (tarfile.TarError, OverflowError) as e:  # a size beyond what a seek takes (REL-17)
         raise ValueError(f"not a valid tar stream: {e}") from None
     return Extent(sizes, tree.root)
 

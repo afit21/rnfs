@@ -521,7 +521,8 @@ class AirtimePolicy:
 def validate(config):
     """Raise ValueError for invalid mesh settings (called by Config.validate)."""
     budget = config.upload_budget
-    if budget is not None and (not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0):
+    # At most 64 bits, as rnfs.toml holds: a larger one passed, and the token bucket's float of it raised (REL-17)
+    if budget is not None and (not isinstance(budget, int) or isinstance(budget, bool) or not 0 < budget < 2 ** 63):
         raise ValueError("upload_budget must be a positive number of bytes per hour, or unset")
     for name in ("serve_interfaces", "no_serve_interfaces", "local_interfaces"):
         value = getattr(config, name)

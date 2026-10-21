@@ -205,6 +205,7 @@ the roadmap's "Security fixes from the 0.2.0 review".
 | REL-4 | `test_rel4_negative_tar_size.py` | `rnfs/content/tarstream.py` (the `Header` class: `_proc_member`, `fromtarfile`) | `3849a43` |
 | REL-8 | `test_rev1_add_rnfs_dir.py` (`test_a_file_in_another_name_for_the_rnfs_dir_is_refused`) | `rnfs/content/shared_folder.py` (`add_refused_reason`, `_reached_otherwise`) | `61b67c3` |
 | REL-9 | `test_rel9_gateway_document_cache.py` | `rnfs/gateway.py` (`for_type`, `DOCUMENT_TYPES`, `send_not_modified`) | `3c84f4a` |
+| REL-17 | `test_rel17_fuzz_findings.py` | `rnfs/gateway.py` (`type_from_name`, `respond_error`, `redirect_to_slash`), `rnfs/api.py` (`parse_request`, the JSON body), `rnfs/config.py` (`_is_number`, the whole-number checks), `rnfs/mesh.py` (`validate`), `rnfs/content/tarstream.py` (`_Ending`, `build_tar`, `scan_tar`) | (this commit) |
 | REL-13 | `test_rel13_withdraw_restore_budget.py` | `rnfs/dht/providers.py` (`ProviderStore._withdraw`, `_store`, `_WriteBudget.refund`) | `e216954` |
 | REL-14 | `test_rel14_keeper_below_floor.py` | `rnfs/names.py` (`NameManager.known_sequence`), `rnfs/features/keepers.py` (`_store`, `_known_sequence`) | `29b95b4` |
 | REL-15 | `test_rel15_clockskew_flood.py` | `rnfs/clockskew.py` (`ClockSkew._sample`, `_estimate`), `rnfs/node.py` (`_announced`) | `6d01750` |

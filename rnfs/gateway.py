@@ -104,6 +104,7 @@ REVALIDATE = "public, no-cache"  # a document's, by CID too: kept, but asked aga
 # Types a browser renders as a document, which the CSP governs: never cached as immutable (REL-9)
 DOCUMENT_TYPES = frozenset({"text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
                             "application/pdf"})
+LOCATION_SAFE = "".join(chr(code) for code in range(0x21, 0x7f))  # what a Location keeps as it is: printable ASCII
 RETRY_AFTER = "10"  # seconds a limited request should wait before retrying
 SNIFF_SIZE = 512  # bytes read to guess a type, as in the WHATWG MIME sniffing standard
 NAME_CACHE_TIME = 60.0
@@ -146,9 +147,16 @@ def type_from_name(name: str | None) -> str | None:
     if not name:
         return None
     dot = name.rfind(".")
-    if dot > 0 and name[dot:].lower() in EXTRA_TYPES:
-        return EXTRA_TYPES[name[dot:].lower()]
-    return mimetypes.guess_type(name, strict=False)[0]
+    if dot <= 0:
+        return None
+    extension = name[dot:].lower()
+    if extension in EXTRA_TYPES:
+        return EXTRA_TYPES[extension]
+    if not extension[1:].isascii() or not extension[1:].isalnum():
+        return None
+    # By the extension alone: guess_type of the whole name takes a data: URL's media type as it is written, so
+    # ?filename=data:<anything>, set any Content-Type, control characters included (REL-17)
+    return mimetypes.guess_type("file" + extension, strict=False)[0]
 
 
 def sniff(head: bytes) -> str:
@@ -550,6 +558,8 @@ class GatewayHandler(TimedHandler):
         """Send an error, unless a response is already under way (then the connection is just closed)."""
         if self.headers_sent:
             return
+        # A status line or headers buffered by a response that failed before end_headers: not sent before this one
+        self._headers_buffer = []
         try:
             self.send_text(status, message, headers)
         except OSError:
@@ -693,7 +703,9 @@ class GatewayHandler(TimedHandler):
         self.end_headers()
 
     def redirect_to_slash(self, location: str):
-        """301 from a directory path without a trailing slash to location, its slash form."""
+        """301 from a directory path without a trailing slash to location, its slash form: anything but printable
+        ASCII in it (the request's query, as sent) percent-encoded, so no control character reaches a header (REL-17)."""
+        location = quote(location, safe=LOCATION_SAFE)
         self.send_text(301, f"see {location}", {"Location": location})
 
     def serve_directory(self, target: str, title: str, has_parent: bool, cache: dict):

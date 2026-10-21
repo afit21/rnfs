@@ -155,8 +155,11 @@ MAX_TOML_INT = 2 ** 63 - 1  # TOML integers are 64-bit signed
 
 
 def _is_number(value) -> bool:
-    """True if value is a finite int or float; not a bool, which Python counts as an int."""
-    return type(value) in (int, float) and math.isfinite(value)
+    """True if value is a finite float or an int TOML can hold (64-bit); not a bool, which Python counts as an int. A
+    larger int made math.isfinite raise OverflowError (REL-17): an API or embedded setting got that, not ValueError."""
+    if type(value) is int:
+        return -MAX_TOML_INT - 1 <= value <= MAX_TOML_INT
+    return type(value) is float and math.isfinite(value)
 
 
 @dataclass
@@ -372,12 +375,12 @@ class Config:
         """
         for name, (minimum, maximum) in WHOLE_NUMBERS.items():
             value = getattr(self, name)
-            if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
+            if type(value) is not int or value < minimum or value > (maximum if maximum is not None else MAX_TOML_INT):
                 limits = f"{minimum}-{maximum}" if maximum is not None else f"at least {minimum}"
                 raise ValueError(f"{name} must be a whole number, {limits}")
         for name, minimum in OPTIONAL_WHOLE_NUMBERS.items():
             value = getattr(self, name)
-            if value is not None and (type(value) is not int or value < minimum):
+            if value is not None and (type(value) is not int or not minimum <= value <= MAX_TOML_INT):
                 raise ValueError(f"{name} must be a whole number of at least {minimum}, or unset")
         unset = " (or unset)"
         for name in RATES:

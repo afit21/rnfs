@@ -99,6 +99,16 @@ Security:
   median of the 128 senders heard most recently, so 128 announces of fresh identities emitted 2 h ahead pushed every
   honest sender out, and the node warned that its correct clock was 2 h behind. Once 5 senior servers were heard the
   estimate is theirs alone, and the table forgets other senders first.
+- **What fuzzing the gateway, the API, settings and tar streams found** (REL-17): a web page could set any
+  Content-Type, control characters included, with the gateway's `?filename=data:<type>,` (the type is now taken from
+  the name's extension alone, and a failed response's buffered status line is dropped rather than sent before the
+  error's); a control character in a request's query reached a redirect's `Location` (percent-encoded now); a request
+  line of four words ending `HTTP/0.9` was answered without a status line or headers (refused as HTTP/0.9 is); a
+  deeply nested JSON body answered 500 (400 now); a whole number past 64 bits in a setting raised `OverflowError`, and
+  `upload_budget = 10**400` passed validation, then stopped the node starting (settings hold 64-bit numbers, as
+  rnfs.toml does); and a tar member refused by name but declaring 2**88 bytes held a tar add's reader for good, as
+  tarfile skips it by reading its size and reads nothing for ever at the end (refused as an invalid tar now). Nothing
+  a remote node sends reached any of these.
 - **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
   may be no larger than `max_download_size` and the free space above the disk reserve; each Resource segment may
   decompress to one segment, and must follow the sequence an honest sender keeps (same original hash and total,

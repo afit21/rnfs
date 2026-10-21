@@ -409,7 +409,9 @@ class TimedHandler(BaseHTTPRequestHandler):
         """Parse the request line and headers, refusing HTTP/0.9 (a request line without a version, or with
         HTTP/0.9), so every response here is HTTP/1.x with its headers. False if refused or malformed."""
         words = str(self.raw_requestline, "iso-8859-1").split()
-        if len(words) == 2 or (len(words) == 3 and words[2] == "HTTP/0.9"):
+        # Any line ending HTTP/0.9: http.server takes the version from the last word before it counts them, so a
+        # malformed "GET / x HTTP/0.9" was answered without a status line or headers (REL-17)
+        if len(words) == 2 or (len(words) >= 3 and words[-1] == "HTTP/0.9"):
             self.command = None
             self.requestline = str(self.raw_requestline, "iso-8859-1").rstrip("\r\n")
             self.request_version = self.default_request_version
@@ -1025,7 +1027,7 @@ class ApiHandler(TimedHandler):
             return {}
         try:
             body = json.loads(data)
-        except ValueError:
+        except (ValueError, RecursionError):  # nested deeper than the parser goes: not a request rnfs takes (REL-17)
             raise ValueError("request body must be JSON") from None
         if not isinstance(body, dict):
             raise ValueError("request body must be a JSON object")
