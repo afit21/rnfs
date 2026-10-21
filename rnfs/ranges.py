@@ -352,7 +352,7 @@ class Ranges:
             return peer_client.BlocksResult(result.status, unsent=[cid], reason=result.reason)
         if result.missing:
             self.partials.forget(partial)
-            return peer_client.BlocksResult(peer_client.OK, missing=[cid], elapsed=result.elapsed)
+            return peer_client.BlocksResult(peer_client.OK, missing=[cid], elapsed=result.elapsed, reneged=bool(held))
         ratio = len(result.data) / result.wire if result.compressed and result.wire else None
         if result.bad or result.block is not None:
             self.partials.forget(partial)

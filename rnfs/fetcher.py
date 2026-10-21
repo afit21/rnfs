@@ -1900,6 +1900,11 @@ class Fetch:
         if result.status == peer_client.OK:
             provider.busy = 0
             if result.missing:
+                if result.reneged:
+                    # It sent ranges of the block, then said it doesn't hold it: a block's airtime spent for nothing,
+                    # which only a block not matching its CID otherwise costs. Scored so (not banned: content
+                    # unpinned and collected while it was sent does it too), so it isn't asked first again
+                    self.fetcher.scores.bad_block(node_id)
                 self._fail(provider, f"doesn't have {plural(len(result.missing), 'block')} of the root it advertised")
             elif result.blocks or result.partial:
                 for cid in result.partial:

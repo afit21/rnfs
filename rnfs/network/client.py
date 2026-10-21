@@ -40,6 +40,7 @@ class BlocksResult:
     status: str
     blocks: dict[Cid, bytes] = field(default_factory=dict)
     missing: list[Cid] = field(default_factory=list)  # answered None: not held or not served
+    reneged: bool = False  # missing a block it had sent ranges of (rnfs.ranges): the airtime of those ranges wasted
     unsent: list[Cid] = field(default_factory=list)  # not answered: cut by the batch size or budget, or not OK
     bad: list[Cid] = field(default_factory=list)  # blocks that didn't match their CID: ban the provider
     reason: str = ""  # why the request stalled or failed, for logs

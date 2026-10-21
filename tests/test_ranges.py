@@ -361,7 +361,10 @@ class RangesFetchTest(unittest.TestCase):
         self.client.holdings[P1] = {}
         result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
         self.assertEqual(result.missing, [cid])
+        self.assertTrue(result.reneged)  # it had sent ranges of it
         self.assertEqual(self.ranges.partials.count(), 0)
+        result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
+        self.assertEqual((result.missing, result.reneged), ([cid], False))  # nothing sent of it before: an honest None
 
 
 if __name__ == "__main__":

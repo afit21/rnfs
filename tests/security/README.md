@@ -209,3 +209,4 @@ the roadmap's "Security fixes from the 0.2.0 review".
 | REL-13 | `test_rel13_withdraw_restore_budget.py` | `rnfs/dht/providers.py` (`ProviderStore._withdraw`, `_store`, `_WriteBudget.refund`) | `e216954` |
 | REL-14 | `test_rel14_keeper_below_floor.py` | `rnfs/names.py` (`NameManager.known_sequence`), `rnfs/features/keepers.py` (`_store`, `_known_sequence`) | `29b95b4` |
 | REL-15 | `test_rel15_clockskew_flood.py` | `rnfs/clockskew.py` (`ClockSkew._sample`, `_estimate`), `rnfs/node.py` (`_announced`) | `6d01750` |
+| REL-20 | `test_rel20_range_renege.py` | `rnfs/ranges.py` (`Ranges._fetch`: `BlocksResult.reneged`), `rnfs/fetcher.py` (`Fetch._handle`) | (this commit) |

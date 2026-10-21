@@ -109,6 +109,10 @@ Security:
   rnfs.toml does); and a tar member refused by name but declaring 2**88 bytes held a tar add's reader for good, as
   tarfile skips it by reading its size and reads nothing for ever at the end (refused as an invalid tar now). Nothing
   a remote node sends reached any of these.
+- **A `/range` provider that disowns a block it was sending is scored as one that sent a bad block** (REL-20): it could
+  send ranges of a block, checked only once whole, then answer that it doesn't hold it, so the airtime was spent and it
+  failed only for that fetch, free to do the same in the next. Its score now falls by what a block not matching its CID
+  costs; it isn't banned, as content unpinned and collected while it was sent does the same.
 - **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
   may be no larger than `max_download_size` and the free space above the disk reserve; each Resource segment may
   decompress to one segment, and must follow the sequence an honest sender keeps (same original hash and total,
