@@ -23,6 +23,7 @@ from tests.test_node import A_ID, B_ID, IDENTITY, NodeTest
 
 N1, N2, N3 = bytes([1] * 16), bytes([2] * 16), bytes([3] * 16)
 OTHER_IDENTITY = bytes([0x77] * 16)
+DAY = 86400.0
 HOUR = 3600.0
 
 _saved_loglevel = RNS.loglevel
@@ -391,6 +392,15 @@ class RetryScheduleTest(unittest.TestCase):
         self.assertLessEqual(waits[-1], 6 * HOUR)
         self.assertEqual(now, since + retry.RETRY_FOR)
         self.assertEqual(len(waits), 17)
+
+    def test_time_not_spent_waiting_doesnt_count(self):
+        """REL-11: a try more than LATE after it was due (the node off, or a Pi's clock stepped forward by NTP from the
+        time it booted with) doesn't count the time between towards the 3 days."""
+        self.assertEqual(retry.counted_since(0.0, 700.0, 600.0), 0.0)  # on time
+        self.assertEqual(retry.counted_since(0.0, 4 * DAY, None), 0.0)  # no try was due
+        since = retry.counted_since(0.0, 4 * DAY + 600, 600.0)
+        self.assertEqual(since, 4 * DAY)
+        self.assertEqual(retry.next_retry(since, 4 * DAY + 600), 4 * DAY + 600 + 1200)  # its second wait
 
     def test_a_long_try_or_a_stop_counts(self):
         """The time a try took, or the node spent stopped, counts towards the wait and the 3 days."""

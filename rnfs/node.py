@@ -77,7 +77,7 @@ from rnfs.network.links import LinkPool
 from rnfs.network.server import RequestServer
 from rnfs.publisher import Publisher
 from rnfs.remote_pins import DROPPED, FETCHING, PINNED, REFUSED, RELEASED, WAITING
-from rnfs.retry import RETRY_FOR, next_retry
+from rnfs.retry import RETRY_FOR, counted_since, next_retry
 
 RECORDS_INTERVAL = 30.0  # seconds between passes over the provider records (expiry), each saving their changes
 STATE_SAVE_INTERVAL = 30.0  # seconds between saves of cache records, fetched targets and invalid roots, when changed
@@ -2874,7 +2874,8 @@ class RnfsNode:
         with self._lock:
             if (source, cid) in self._remote_released:
                 return False
-            since = self._remote_retry.get((source, cid), (None, now))[1]
+            due, since = self._remote_retry.get((source, cid), (None, now))
+            since = counted_since(since, now, due)
             retry_at = next_retry(since, now)
             if retry_at is not None:
                 self._remote_retry[(source, cid)] = (retry_at, since)

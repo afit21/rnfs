@@ -858,6 +858,10 @@ Fixed:
   beside the output (`.rnfs-get-<random>.partial`, up to the download's size, there for a sealed file's whole fetch),
   which nothing removed after a crash. A get job's write-out is now named after the job
   (`.rnfs-job-<id>.write.partial`), and the run that resumes it removes it, as it does the job's partial output.
+- **A clock stepped forward doesn't end a retry** (REL-11): a job or remote pin first not found while a Raspberry Pi
+  without a real-time clock still had the time it booted with gave up at its next try once NTP had stepped the
+  clock days on, as if it had been retried for 3 days. A try more than 6 hours after it was due (that, or the node
+  off) no longer counts the time between.
 - **A stalled response no longer fails the other requests on its link** (REL-7): closing the link for it failed a
   request waiting for its slot (another fetch from the same provider, which then failed the provider) and a `/find`
   in progress on it. The link is closed only if nothing else uses it, and a request that wasn't sent because its link

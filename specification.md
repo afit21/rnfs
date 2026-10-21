@@ -1659,7 +1659,10 @@ changed by other users, who could replace the folder with another.
 - A pin whose content can't be found (no provider could supply it) isn't dropped at once (rnfs 0.2.0): it waits and
   is tried again after 10 minutes, the wait doubling up to 6 hours, until 3 days after it was first not found;
   then it is dropped (`not_found`). What a try fetched is kept as a cached fetch (above). Pins accepted after it
-  are fetched meanwhile, a release ends the wait at once, and the waits are kept across a restart.
+  are fetched meanwhile, a release ends the wait at once, and the waits are kept across a restart. Only time spent
+  waiting counts towards the 3 days: a try that comes more than 6 hours after it was due (the node was off, or the
+  clock stepped forward, as a Raspberry Pi's does when NTP corrects the time it booted with) moves the first failure
+  on by the excess (REL-11).
 - `rnfs pin remote add|rm <node ID> <cid>` sends these requests over an identified link; `rnfs pin remote ls`
   shows their status (below, and section 11).
 - **Status** (rnfs 0.2.0; local only: `/pin` and every other message are unchanged).
@@ -2455,7 +2458,7 @@ message that call would have reported.
   job MAY then be queued again rather than failed (but not for a path that the target's stored directories show
   doesn't exist), keeping its blocks as a queued job does, with its `error` and `retry_at`, the time before which it
   isn't started. rnfs tries it again after 10 minutes, the wait doubling up to 6 hours, until 3 days after it first
-  wasn't found (`retry_since`), then fails it. The default stays 0.1.6's so that an app polling its job sees it
+  wasn't found (`retry_since`, moved on as for remote pins when a try comes more than 6 hours late), then fails it. The default stays 0.1.6's so that an app polling its job sees it
   fail rather than stay queued for days; the CLI's `--background` transfers opt in, as they run unattended, and its
   foreground ones don't, so a command never waits hours.
 - Jobs MUST be persisted in the state directory, each change saved atomically and durably. When the node starts, jobs that were

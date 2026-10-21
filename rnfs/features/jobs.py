@@ -73,7 +73,7 @@ from typing import Callable
 
 from rnfs import ids
 from rnfs.constants import PARTIAL_SUFFIX
-from rnfs.retry import next_retry
+from rnfs.retry import counted_since, next_retry
 from rnfs.features import Feature, _common
 from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_WARNING
 from rnfs.fsutil import printable
@@ -149,6 +149,7 @@ class Job:
         # Queued again because its content wasn't found (rnfs.retry): when it may start, and when it first wasn't
         self.retry_at: float | None = None
         self.retry_since: float | None = None
+        self.retry_due: float | None = None  # when this run was due, if it is a retry (rnfs.retry.counted_since)
         self.runs = 0  # runs started, counting resumes after a restart
         self.total_bytes: int | None = None  # verified content size, once the target's block is checked
         self.done_bytes = 0  # content bytes stored of it, whether downloaded or already stored
@@ -257,7 +258,7 @@ class Job:
         with self._lock:
             self.state = RUNNING
             self.started = time.time()
-            self.retry_at = None
+            self.retry_due, self.retry_at = self.retry_at, None
             self.runs += 1
             self.done_bytes = self.blocks = self.downloaded_bytes = self._moved = 0
             self._seen = set()
@@ -746,7 +747,8 @@ class JobsFeature(Feature):
                 or job.cancel_requested or self._stop_event.is_set() or self._absent_path(job.target)):
             return False
         now = time.time()
-        since = job.retry_since if job.retry_since is not None else now
+        # Only the time waited counts: not a clock stepped forward, or the node off, since this run was due (REL-11)
+        since = counted_since(job.retry_since, now, job.retry_due) if job.retry_since is not None else now
         retry_at = next_retry(since, now)
         if retry_at is None:
             return False

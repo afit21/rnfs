@@ -223,6 +223,22 @@ class JobsTest(JobsBase):
         self.assertIn("no provider", job["error"])
         self.assertIsNone(self.jobs._job(job["id"]).protection)
 
+    def test_a_clock_stepped_forward_doesnt_end_the_retries(self):
+        """REL-11: a job first not found while a Pi without a real-time clock still had the time it booted with, then
+        tried again once NTP had stepped the clock four days on, gave up as if it had been retried for three days."""
+        from rnfs.errors import NotFound
+        feature = self.b.feature("jobs")
+        job = jobs.Job("0123abcd", "get", str(Cid.for_block(RAW, b"x")), self.out("stepped"), retry=True)
+        stale = 1_790_000_000.0
+        error = NotFound("no provider found")
+        with mock.patch.object(jobs.time, "time", lambda: stale + 30):
+            job.begin_run()
+            self.assertTrue(feature._retries(job, error))
+        with mock.patch.object(jobs.time, "time", lambda: stale + 4 * 86400):
+            job.begin_run()  # its retry, run as soon as the stepped clock showed it due
+            self.assertTrue(feature._retries(job, error))
+        self.assertGreater(job.retry_since, stale + 3 * 86400)
+
     def test_without_retry_fails_as_in_0_1_6(self):
         """A get, pin or export job submitted without retry (or with retry false) fails at once when its content
         isn't found, as in 0.1.6: failed, with the error the equivalent call reports, and a record with no retry
