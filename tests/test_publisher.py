@@ -654,6 +654,17 @@ class PublisherTest(PublisherCase):
         self.assertEqual(self.saved(), self.held(publisher))
         self.assertEqual(set(self.saved()["published"]), {str(a), str(b)})
 
+    def test_malformed_item_list_of_a_cut_short_round_is_skipped(self):
+        """A cut-short round's item list (publish_stores) holding an item that doesn't parse is malformed whole, and
+        so are the servers' rows indexing it: skipped, and the rows deleted. The bad item, kept in the list, was a
+        server's row's to index, raising out of the load (the node didn't start)."""
+        self.publisher.close()
+        for row in ((b"", self.clock.now, b"\x00"), (N3, self.clock.now, struct.pack(">I", 0))):  # item 0: b""
+            state_execute(self.state, "INSERT INTO publish_stores (node, at, items) VALUES (?, ?, ?)", row)
+        publisher = self.make_publisher()
+        self.assertEqual(state_rows(self.state, "SELECT COUNT(*) FROM publish_stores"), [(0,)])
+        self.assertEqual((self.saved()["earlier"], publisher._withdrawals), ({}, {}))
+
     def test_times_clamped_and_earlier_nodes_expired_at_load_are_saved(self):
         """A last-published time in the future is brought back to now when the publisher loads, at once, and so is
         its due time; earlier nodes past PROVIDER_TTL are left out as rows are read, and go when the row is next

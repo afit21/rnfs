@@ -731,11 +731,14 @@ class Publisher:
                 if not isinstance(node, bytes) or not isinstance(items, bytes):
                     raise ValueError(f"not a store: {node!r}")
                 if node == b"":
-                    listed, i = [], 0
+                    # Read whole before it is the round's list: a malformed item, kept, was a server's row's to index
+                    # (raising out of the load, so the node didn't start); with none, the servers' rows are malformed
+                    listed, parsed, i = [], [], 0
                     while i < len(items):
-                        listed.append(items[i + 1:i + 1 + items[i]])
-                        _from_id(listed[-1])
+                        parsed.append(items[i + 1:i + 1 + items[i]])
+                        _from_id(parsed[-1])
                         i += 1 + items[i]
+                    listed = parsed
                     continue
                 if len(node) != ID_LENGTH or len(items) % 4:
                     raise ValueError(f"not a store: {node!r}")
