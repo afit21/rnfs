@@ -914,6 +914,12 @@ class NameManager:
                 self._save()  # its entry is dropped only once its pin is released
             return set(gone)
 
+    def key_gone(self, alias: str) -> bool:
+        """True if alias has no key file at all (deleted by hand, or never made); False for one there that can't be
+        read, which keeps its pins and syncs."""
+        with self._lock:
+            return alias not in self._keys and alias not in self._unreadable
+
     def reconcile_pins(self, pins: dict[Cid, set[str]]):
         """Make the name pins (pins: every pin and its sources, as storage.pins() gives them) match the saved
         records, once the node is set up: release_gone(), then pin each recorded target that lacks its name's pin

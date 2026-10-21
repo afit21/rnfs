@@ -105,6 +105,20 @@ class NameSyncTest(unittest.TestCase):
         self.assertEqual(self.state()["published_at"], self.wall.now)
         self.assertEqual(self.node.storage.pins()[Cid.parse(cid)], {PIN_SOURCE_PREFIX + "site"})
 
+    def test_a_sync_of_a_name_whose_key_was_deleted_stops(self):
+        """REL-16: a key deleted by hand released its name's pins at the next start, but its sync stayed, paused: a new,
+        unrelated name made under the alias later got the old folder published to it."""
+        self.synced()
+        self.node.stop()
+        os.remove(os.path.join(self.tmp.name, "node", "names", "site"))  # the key, deleted by hand
+        self.node = self.make_node()
+        self.assertEqual(self.node.name_syncs(), [])
+        self.node.name_create("site")  # a name for something else
+        self.write("index.html", b"<h1>edited</h1>")
+        self.tick()
+        self.tick(SETTLE_TIME)
+        self.assertIsNone(self.target())
+
     def test_fastcdc_is_the_chunker(self):
         """A synced folder's files are cut with FastCDC: the root is the folder's FastCDC CID, not the fixed one."""
         self.write("big.bin", os.urandom(600_000))

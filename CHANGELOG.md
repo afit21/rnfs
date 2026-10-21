@@ -883,6 +883,10 @@ Fixed:
   between two cloud nodes, Madrid refused the next for 57 s, and the requester, pacing by the 8 s, failed it after
   three refusals, and the fetch failed (found by a soak of random fetches between the cloud nodes). Once a
   response under the default cap concludes, the next may start twice the time it took after it started.
+- **A name sync stops when its name's key is deleted by hand** (REL-16): the key's pins were released at the next
+  start but its sync stayed, paused, and a new, unrelated name later made or imported under the alias got the old
+  folder published to it at the folder's next change. Such a sync is now dropped at the start, with a warning; one
+  whose key file is there but can't be read is kept, as its pins are.
 - A fetch running for days kept every search it made again (one each 10 minutes that found its providers again):
   it now keeps its first and the latest 8.
 - **A stalled response no longer fails the other requests on its link** (REL-7): closing the link for it failed a

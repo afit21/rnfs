@@ -869,6 +869,12 @@ class RnfsNode:
         # Releasing a deleted name key's pin recomputes what is provided, so it waits for the features too; and
         # name pins are made to match the names state, which a crash inside a publish can leave them disagreeing with
         self.names.reconcile_pins(self.storage.pins())
+        # A folder synced to a name whose key was deleted by hand stops syncing: kept, it would publish the folder to
+        # whatever name is made or imported under that alias later (REL-16)
+        for alias in [entry["alias"] for entry in self.folder_syncs.list()]:
+            if self.names.key_gone(alias):
+                log(f"name key {alias} is gone; no longer syncing a folder to it", LOG_WARNING)
+                self.folder_syncs.remove(alias)
         # Sealed-folder unpacks running (node_content._unpacking); once every pin is in place, the decrypted blocks
         # of one the process died in are deleted, before anything is served
         self._unpacks = 0
