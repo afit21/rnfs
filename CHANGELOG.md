@@ -69,6 +69,10 @@ Security:
   whether it serves anything requested. One ~100-byte request for a made-up CID from a fresh link cancelled an honest
   slow-link download, and repeating it broke every one. Such a request is now answered at once, with the same answer
   as before, without a slot.
+- **A request of the wrong shape is dropped before RNS indexes it** (REL-3): RNS reads a request as
+  `[time, path hash, data]` unchecked, so one whose plaintext was an int, a short list or had a list as its path
+  raised on RNS's request thread, a traceback in the log for every such packet, before rnfs's per-link rate limit
+  saw it. The guards now drop it with a throttled verbose line; no handler could have served it.
 - **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
   may be no larger than `max_download_size` and the free space above the disk reserve; each Resource segment may
   decompress to one segment, and must follow the sequence an honest sender keeps (same original hash and total,

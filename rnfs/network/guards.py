@@ -91,6 +91,7 @@ _compress_limit = None  # Resource.AUTO_COMPRESS_MAX_SIZE before a PROCESS insta
 _original_accept = None
 _original_response_resource_concluded = None
 _original_receive = None
+_original_handle_request = None
 _unsupported_reported = False  # the error for an RNS whose advertisements lack t and d, logged once per process
 _ABSENT = object()
 
@@ -320,6 +321,18 @@ def guarded_receive(link, packet):
     return _original_receive(link, packet)
 
 
+def guarded_handle_request(link, request_id, unpacked_request):
+    """RNS.Link.handle_request, but dropping (quietly, throttled) a request that isn't [requested_at, path_hash, data]
+    with a bytes path hash: RNS indexes it unchecked on its request thread, so another shape (an int, a short list, a
+    list as the path) raised there, a traceback in the log for each packet, before any rnfs check (REL-3). No handler
+    can serve such a request, so nothing else changes."""
+    if not (isinstance(unpacked_request, (list, tuple)) and len(unpacked_request) == 3
+            and isinstance(unpacked_request[1], bytes)):
+        _log_unexpected_request("dropped a request that isn't [time, path hash, data]", LOG_VERBOSE)
+        return None
+    return _original_handle_request(link, request_id, unpacked_request)
+
+
 def _wrapped(owner, name: str, guard) -> bool:
     """True if owner.name (set on owner itself, plain or as a staticmethod) is guard."""
     current = owner.__dict__.get(name)
@@ -336,7 +349,7 @@ def _wrap(owner, name: str, guard, staticmethod_: bool = False):
 
 
 def install(scope: str | None = None):
-    """Wrap RNS.Resource.accept, Link.response_resource_concluded and Link.receive with the guards. Idempotent;
+    """Wrap RNS.Resource.accept, Link.response_resource_concluded, Link.receive and Link.handle_request with the guards. Idempotent;
     called by the node, RequestServer and LinkPool.
 
     scope is PROCESS (the daemon: the advertisement checks cover every link, and RNS's process-wide
@@ -344,7 +357,8 @@ def install(scope: str | None = None):
     embedded node: rnfs.dht links only, and the limit is left as the host program has it, or put back if a
     PROCESS install changed it); None keeps the scope already set (PROCESS at first).
     """
-    global _original_accept, _original_response_resource_concluded, _original_receive, _scope, _compress_limit
+    global _original_accept, _original_response_resource_concluded, _original_receive, _original_handle_request
+    global _scope, _compress_limit
     with _lock:
         if scope is not None:
             if scope not in (PROCESS, DHT):
@@ -367,13 +381,17 @@ def install(scope: str | None = None):
         original = _wrap(RNS.Link, "receive", guarded_receive)
         if original is not None:
             _original_receive = original
+        original = _wrap(RNS.Link, "handle_request", guarded_handle_request)
+        if original is not None:
+            _original_handle_request = original
 
 
 def installed() -> bool:
     """True if the guards are in place."""
     return (_wrapped(RNS.Resource, "accept", guarded_accept)
             and _wrapped(RNS.Link, "response_resource_concluded", guarded_response_resource_concluded)
-            and _wrapped(RNS.Link, "receive", guarded_receive))
+            and _wrapped(RNS.Link, "receive", guarded_receive)
+            and _wrapped(RNS.Link, "handle_request", guarded_handle_request))
 
 
 # Half-open incoming links
