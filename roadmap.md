@@ -626,9 +626,9 @@ until the wrapper's first release; the owner decided to remove it in 0.2.0 witho
   to another user stops the start. The library raises `DaemonStarting`, a `DaemonNotRunning`, while the daemon starts.
   On a desktop NVMe disk with a warm cache, opening 1M small blocks took 1.2 s after a clean stop (5.4 s in 0.1.6; 7.2 s
   after an unclean stop), and the first start, which moves 0.1.6's flat layout, took 74 s. Adding blocks costs one
-  directory sync per subdirectory written (16 at a time), +40% for a 64 MiB add (1.02 → 1.41 s). Not measured yet: a
-  Raspberry Pi's SD card (`tests/bench_startup.py`, `tests/bench_block_writes.py`), the Windows paths, and FAT32 with
-  the private-directory checks.
+  directory sync per subdirectory written (16 at a time), +40% for a 64 MiB add (1.02 → 1.41 s). Not measured: the
+  Windows paths, and FAT32 with the private-directory checks (Raspberry Pi SD-card numbers aren't planned for a
+  release; `tests/bench_startup.py` and `tests/bench_block_writes.py` say how to take them).
 
 ## Network status (implemented)
 

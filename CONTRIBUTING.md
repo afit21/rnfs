@@ -236,8 +236,8 @@ Steps:
 - [ ] Every security fix has its `tests/security/test_<id>_*.py` regression test, and `tests/security/README.md`
       lists it.
 - [ ] CI runs every `RNFS_E2E` module. Lint passes.
-- [ ] Before and after numbers for the performance changes (a desktop NVMe disk and a Raspberry Pi SD card),
-      recorded in CHANGELOG.md.
+- [ ] Before and after numbers for the performance changes, on a desktop disk, recorded in CHANGELOG.md
+      (Raspberry Pi SD-card numbers aren't a release requirement).
 - [ ] specification.md updated for every change in behaviour, with its version and compatibility note at the top.
 - [ ] design.md updated for every change in how things work.
 - [ ] CHANGELOG.md's entry states whether the wire format or CIDs changed ("no wire-format or CID changes"),

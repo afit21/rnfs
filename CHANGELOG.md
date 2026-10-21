@@ -674,7 +674,7 @@ Changed:
   syncs each subdirectory written to (up to 1,024, 16 at a time) where it synced one directory. Adding 64 MiB
   (1,029 blocks) to a new store on a desktop NVMe disk: 1.02 → 1.41 s; a tree of 1,024 8 KiB files 0.95 → 1.43 s;
   fetching them (each block synced on its own) unchanged at about 13.5 s (`tests/bench_block_writes.py`,
-  `today`, median of 3). Raspberry Pi SD-card numbers are still to be measured.
+  `today`, median of 3).
 - `max_storage` counts what blocks take on disk: each block is a file of its own, so its size rounded up to the
   filesystem's block or cluster (read once at the start: at least 4 KiB, 16–32 KiB on a FAT32 USB drive), not its
   length. On FAT32 a store of small files took several times `max_storage`: 2,000 notes of 200 B–8 KB are 4.1 MiB
@@ -772,8 +772,7 @@ Faster:
   of them 0.50 → 0.13 s after a clean stop (0.65 s after an unclean one), a million 5.4 → 1.2 s (7.2 s after an
   unclean one: 1,024 directories listed and the table compared). The first start, moving them out of 0.1.6's flat
   layout, took 4.2 s and 74 s. A cold cache and a slow disk should gain more, as the table is one file read in
-  order: Raspberry Pi SD-card numbers are still to be measured (`tests/bench_startup.py`, `--cold` for a cache
-  dropped as after a reboot).
+  order (`tests/bench_startup.py`, `--cold` for a cache dropped as after a reboot).
 - A start works out what the node provides faster, before the API answers. Its first refresh walked every pin's
   DAG for the blocks the node serves, then read the folders of each of the user's own pins again for the files and
   folders it provides (`provide_entries`); they now come from the first walk. That walk no longer remembers every
@@ -798,7 +797,7 @@ Faster:
   index); bytes written per round 55–83 KB → 0.8–0.95 KB a key (SQLite's WAL and checkpoints: rows are written in
   key order, and an item's row once a round instead of at each save). A first round of 1M keys took 20 rounds of
   50,000 and 175 region lookups, against one round of 157 (the same with the network size estimate given, as a
-  node's regions are sized: 176 and 159). Raspberry Pi SD-card numbers are still to be measured.
+  node's regions are sized: 176 and 159).
 - An answer that comes back before RNS has registered its request is no longer lost. RNS registers a request only
   after sending it and drops an answer it can't match, so on a fast link with a busy process (about 1 request in
   800 with 16 at once over local TCP and the CPU busy) the request waited out RNS's whole timeout, 11 s at least,
