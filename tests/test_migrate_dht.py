@@ -140,6 +140,21 @@ class ProvidersTest(MigrateTest):
         write_legacy(self.state, self.NAME, value)
         self.assertEqual(self.load()["standing"][P4], (2, 0, 0, DAY_T))
 
+    def test_infinite_times_import_and_are_clamped_by_the_load(self):
+        """Infinite times (Infinity, or a number past float's range such as 1e400) are imported, each such publisher a
+        Newcomer (infinity minus infinity is NaN: the standing's tier was NULL, failing NOT NULL and every start),
+        and the store's load clamps them to now as it does any time in the future."""
+        inf = float("inf")
+        value = {"version": 1, "publishers": {P1.hex(): inf, P2.hex(): "1e400"},
+                 "records": [[K1.hex(), P1.hex(), inf, inf, 0], [K1.hex(), P2.hex(), "1e400", "1e400", 0]]}
+        write_legacy(self.state, self.NAME, value)
+        now = T + 10
+        self.assertEqual(self.load(), {"publishers": {P1: now, P2: now},
+                                       "records": {(K1, P1): (now, now, 0), (K1, P2): (now, now, 0)},
+                                       "standing": {P1: (1, 0, 0, DAY_T), P2: (1, 0, 0, DAY_T)},
+                                       "departed": {}, "evicted": {}})
+        self.assertEqual(self.migrated(), [(2,)])
+
     def test_what_any_load_drops_is_left_out(self):
         """NaN times, IDs of the wrong length and a repeated record (the first stored is kept) aren't imported;
         expired records and those of a publisher without a first-seen time (so no standing) are, and the store drops

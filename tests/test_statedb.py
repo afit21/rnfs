@@ -149,6 +149,27 @@ class OpenTest(StateDbTest):
             (b"c", "LXMF:" + address), (b"c", "lxmf:" + address.upper()), (b"c", "follow:" + address),
             (b"d", "app:lxmf:" + address)})
 
+    def test_infinite_provider_times_upgrade_as_newcomers(self):
+        """The 0.2.0 step "providers_on_disk" builds a standing for a publisher whose times 0.1.x kept infinite (a
+        damaged providers.json): infinity minus infinity is NaN, which is Newcomer, not a NULL tier failing NOT NULL
+        and every start with it. Finite times get the standing they always did."""
+        step = next(number for number, (label, _) in enumerate(statedb.SCHEMA) if label == "providers_on_disk")
+        inf, now, day = float("inf"), 1_700_000_000.0, 86400
+        publishers = [bytes([n]) * 16 for n in range(1, 4)]
+        with mock.patch.object(statedb, "SCHEMA", statedb.SCHEMA[:step]):
+            db = statedb.connect(self.state)
+            with db.transaction() as tx:
+                tx.executemany("INSERT INTO provider_publishers VALUES (?, ?)",
+                               zip(publishers, (inf, now - 5 * day, now - 5 * day), strict=True))
+                tx.executemany("INSERT INTO provider_records VALUES (?, ?, ?, ?, 0)", [
+                    (b"\xaa" * 16, publishers[0], now, inf), (b"\xaa" * 16, publishers[1], inf, inf),
+                    (b"\xaa" * 16, publishers[2], now - 5 * day, now)])
+            db.close()
+        db = self.connect()
+        self.assertEqual(db.query("SELECT publisher, records, tier, days FROM provider_standing ORDER BY publisher"),
+                         [(publishers[0], 1, 0, 0), (publishers[1], 1, 0, 0), (publishers[2], 1, 1, 3)])
+        self.assertEqual(db.query("PRAGMA user_version"), [(len(statedb.SCHEMA),)])
+
     def test_released_steps_are_unchanged(self):
         """The steps 0.1.5 released are exactly as released (statedb.SCHEMA's comment): new steps are appended."""
         released = statedb.SCHEMA[:RELEASED_0_1_5_STEPS]

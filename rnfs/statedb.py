@@ -60,13 +60,16 @@ Step = str | Callable[[object], None]
 # outside 0.1.x's newcomer pool that it refreshed a day or more after storing it, else Newcomer (tier 0, days 0). 0.1.x
 # counted no refresh days; that is the nearest it kept to them, and keeps publishers that have been refreshing for
 # days from being treated as strangers by the first flood after the upgrade. last_day is the UTC day of its latest
-# store. A schema step and the import of providers.json both run it: never change it (a new step gets a new one)
+# store. Infinite times (0.1.x kept those of a damaged or hand-edited providers.json) are left for the store's load to
+# clamp, but infinity minus infinity is NaN, which SQLite reads as NULL: COALESCE makes an earned it can't decide
+# Newcomer, as a NULL tier would fail NOT NULL and every start with it; it changes nothing for finite times.
+# A schema step and the import of providers.json both run it: never change it once released (a new step gets a new one)
 PROVIDER_STANDING = (
     "INSERT INTO provider_standing (publisher, records, tier, days, last_day)"
     " SELECT publisher, records, earned, 3 * earned, last_day FROM ("
     "SELECT r.publisher AS publisher, COUNT(*) AS records,"
-    " (MAX(r.last_stored) - MIN(p.first_seen) >= 259200"
-    " AND MAX(r.pooled = 0 AND r.last_stored - r.first_stored >= 86400)) AS earned,"
+    " COALESCE(MAX(r.last_stored) - MIN(p.first_seen) >= 259200"
+    " AND MAX(r.pooled = 0 AND r.last_stored - r.first_stored >= 86400), 0) AS earned,"
     " CAST(MAX(r.last_stored) / 86400 AS INTEGER) AS last_day"
     " FROM provider_records r JOIN provider_publishers p ON p.publisher = r.publisher GROUP BY r.publisher)")
 
