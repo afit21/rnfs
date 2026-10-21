@@ -3,6 +3,7 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from rnfs import ranges, statedb
 from rnfs.constants import DAY, KIB
@@ -285,6 +286,20 @@ class RangesFetchTest(unittest.TestCase):
             self.ranges.support.records.pop(P1, None)  # not known
             self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
             self.assertIs(self.ranges.support.answers(P1), True)
+
+    def test_a_partial_the_disk_fails_falls_back_to_blocks(self):
+        """REL-6: a range that couldn't be written (a full or read-only disk), or a partial that couldn't be read back,
+        had the fetch ask for the same first range for ever, each taken as progress. /blocks is asked instead."""
+        cid, block = raw(os.urandom(40 * KIB))
+        self.client.holdings[P1] = {cid: block}
+        with mock.patch.object(ranges.Partials, "append", return_value=False):
+            result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
+        self.assertEqual((result.status, result.unsent, result.partial), (peer_client.UNSUPPORTED, [cid], {}))
+        result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
+        self.assertEqual(result.partial, {cid: 16 * KIB})
+        with mock.patch.object(ranges.Partials, "read", lambda partials, partial: partials.reset(partial) or b""):
+            result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
+        self.assertEqual(result.status, peer_client.UNSUPPORTED)
 
     def test_a_partial_in_use_falls_back_to_blocks(self):
         cid, block = raw(os.urandom(20 * KIB))

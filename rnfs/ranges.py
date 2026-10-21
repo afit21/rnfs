@@ -306,7 +306,13 @@ class Ranges:
         """fetch(), with partial held."""
         if block_size is not None and partial.size is not None and partial.size != block_size:
             self.partials.reset(partial)  # not the block its parent declares: start again (the answer is checked)
+        had = partial.length
         held = self.partials.read(partial)
+        if had and not held:
+            # Held, but its file couldn't be read back whole (logged): asked whole with /blocks for the rest of the
+            # fetch, rather than the same first range again each time the disk fails it (REL-6)
+            return peer_client.BlocksResult(peer_client.UNSUPPORTED, unsent=[cid],
+                                            reason="couldn't read the partial block back")
         known = block_size if block_size is not None else partial.size
         if known is not None and len(held) >= known:
             self.partials.reset(partial)
@@ -353,7 +359,9 @@ class Ranges:
         if compress and not result.compressed:
             partial.compress = False  # it doesn't compress (or the provider's budget is spent): ask the rest raw
         if not self.partials.append(partial, result.size, result.data):
-            return peer_client.BlocksResult(peer_client.OK, partial={cid: 0}, elapsed=result.elapsed, ratio=ratio)
+            # Not kept (logged: a full or read-only disk): asked whole with /blocks for the rest of the fetch. Taken as
+            # progress, an empty partial had the fetch ask for the same first range for ever (REL-6)
+            return peer_client.BlocksResult(peer_client.UNSUPPORTED, unsent=[cid], reason="couldn't keep the partial block")
         log(f"{node_name(node_id)} sent {size(len(result.data))} of {cid}"
             + (f" in {size(result.wire)}" if result.compressed else "")
             + f": {size(partial.length)} of {size(result.size)} held", LOG_VERBOSE)
