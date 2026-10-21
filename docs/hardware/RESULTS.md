@@ -180,3 +180,26 @@ agents ran feature and packaging tests meanwhile.
   walk collects) and decoded without the canonical re-encode (an equivalent shortest-header check); on a synthetic
   565k-block store the first refresh went from 6.26 s to 3.81 s and 177.6 MB to 159.5 MB at its peak.
 
+
+## Third round (October 21)
+
+All on LoRa at 3.52 kbit/s (SF9, 250 kHz), the PC with its backbone, the laptop on the radio only.
+
+- **Resume after a crash:** the laptop's daemon, SIGKILLed 46% into a background `get` of 140 KB, listed every stored
+  block on start, resumed the job and finished it, bytes identical. It showed `0 B/s  ETA ?` for 90 s meanwhile, with
+  56 KB of its next chunk in hand: a job's progress counted a block only once whole, and a `get` didn't know its
+  total until the sealed check had read the first chunk. Fixed (`6ca2a04`, `2458391`): the same fetch now steps
+  46%, 74%, 93% as ranges arrive.
+- **`rnsd` restarted under a running daemon:** the node carried on (a fetch 12 s after `rnsd` was back), but logged a
+  warning with a traceback each time it read the radios' load meanwhile; now a verbose line (`d5779bf`).
+- **Cancel:** `rnfs jobs cancel` partway through a chunk ended the job at once and closed the link; the PC's
+  response stopped with it.
+- **Gateway range:** `curl -H 'Range: bytes=250000-251999'` on the laptop's gateway for a 300 KB file held only by
+  the PC: `206`, the right 2,000 bytes in 83 s, one chunk of six fetched.
+- **Both ways at once:** the PC and the laptop each fetching the other's new file failed both ways. The PC's search
+  completed 29 ms before the laptop (one hop away, but ranked last behind a slow path) answered with itself as
+  provider; the answer was dropped. The laptop's only provider was failed by one lost `/range`: the link, silent
+  meanwhile, was closed for it, and that counted as a failure, not a loss. Fixed (`51e07a2`): late answers'
+  providers are used, and such a request counts as lost. Again with new files: 53 KB in 164 s to the PC, 100 KB in
+  259 s to the laptop, at the same time, bytes identical.
+- **Internet to island:** Montreal fetched a 12 KB file only the laptop held, over the PC's radio, in 65 s.
