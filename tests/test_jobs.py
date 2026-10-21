@@ -412,6 +412,9 @@ class JobsTest(JobsBase):
         os.makedirs(os.path.join(partial, "sub"))
         with open(os.path.join(partial, "sub", "f.txt"), "wb") as f:
             f.write(b"wh")
+        # and its write-out, under way beside it (REL-10: node.get's own temporary name was random, so it stayed)
+        written = os.path.join(self.tmp.name, ".rnfs-job-0123abcd.write.partial")
+        os.makedirs(os.path.join(written, "sub"))
         b2 = self.make_node("b", B_ID)
         b2.routing.heard(A_ID)
         manager = b2.feature("jobs")
@@ -421,6 +424,9 @@ class JobsTest(JobsBase):
         with open(os.path.join(output, "sub", "f.txt"), "rb") as f:
             self.assertEqual(f.read(), b"whole")
         self.assertFalse(os.path.lexists(partial))
+        self.assertFalse(os.path.lexists(written))
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), sorted(set(os.listdir(self.tmp.name)) - {
+            name for name in os.listdir(self.tmp.name) if name.startswith(".rnfs-")}))  # nothing else left
 
     def sealed_get(self, name):
         """A stand-in for node.get writing a sealed file this node opened, whose sealed name is name."""

@@ -854,6 +854,10 @@ Fixed:
   read-only disk) left the partial empty but counted as progress, so the fetch asked for the same first range for
   ever, a whole range of airtime each time over LoRa. That, or a partial that can't be read back, now has the block
   asked whole with `/blocks` for the rest of the fetch.
+- **A crash during a get job's write-out leaves nothing behind** (REL-10): `node.get` wrote under a random hidden name
+  beside the output (`.rnfs-get-<random>.partial`, up to the download's size, there for a sealed file's whole fetch),
+  which nothing removed after a crash. A get job's write-out is now named after the job
+  (`.rnfs-job-<id>.write.partial`), and the run that resumes it removes it, as it does the job's partial output.
 - **A stalled response no longer fails the other requests on its link** (REL-7): closing the link for it failed a
   request waiting for its slot (another fetch from the same provider, which then failed the provider) and a `/find`
   in progress on it. The link is closed only if nothing else uses it, and a request that wasn't sent because its link

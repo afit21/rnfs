@@ -816,6 +816,7 @@ class JobsFeature(Feature):
         from rnfs import fsutil
         partial = partial_path(job)
         remove_partial(partial)  # what an interrupted earlier run (or a crash) left
+        remove_partial(write_path(job))  # and what its write-out had under way (REL-10)
         try:
             result = self._fetch_to(job, partial)
             output = job.output
@@ -842,6 +843,7 @@ class JobsFeature(Feature):
         from rnfs.errors import Denied, RnfsError, StorageFull, TooLarge
         from_node = bytes.fromhex(job.from_node) if job.from_node else None
         options = {"no_extract": True} if job.no_extract else {}
+        options["temporary"] = write_path(job)
         try:
             return self.node.get(job.target, path, from_node=from_node, **options)
         except RnfsError as e:
@@ -1068,6 +1070,12 @@ def _answer_progress(job: Job):
 def partial_path(job: Job) -> str:
     """Where a get job writes before renaming to its output: hidden, beside it, named by the job's ID."""
     return os.path.join(os.path.dirname(job.output), f".rnfs-job-{job.id}{PARTIAL_SUFFIX}")
+
+
+def write_path(job: Job) -> str:
+    """Where node.get writes a get job's target before renaming it to the job's partial path: named by the job's ID
+    too, so a run resuming it after a crash finds and removes what the crashed one left."""
+    return os.path.join(os.path.dirname(job.output), f".rnfs-job-{job.id}.write{PARTIAL_SUFFIX}")
 
 
 def remove_partial(path: str):

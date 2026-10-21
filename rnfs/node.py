@@ -2018,17 +2018,19 @@ class RnfsNode:
         return walker.parse_target(target)
 
     def get(self, target: str, output: str, from_node: bytes | None = None, raw: bool = False,
-            no_extract: bool = False) -> dict:
+            no_extract: bool = False, temporary: str | None = None) -> dict:
         """Fetch a file or directory and write it to output, which must not exist. A sealed file this node
         can open is decrypted, unless raw; a sealed folder (a sealed .tar starting with the sealed-folder marker,
-        node_content.is_sealed_folder) is unpacked to a directory, unless no_extract (node_content.get_sealed)."""
+        node_content.is_sealed_folder) is unpacked to a directory, unless no_extract (node_content.get_sealed).
+        temporary is where it is written before the rename, beside output: a get job names it after itself, so
+        the run that resumes it after a crash removes what this one left (REL-10); by default, a random name."""
         root, names = self._parse_target(target)
         if os.path.lexists(output):
             raise ValueError(f"{output} already exists")
         # Written under a temporary name beside output and renamed once complete, so a failed or interrupted
         # write-out never leaves a partial output under the name the user asked for
-        partial = os.path.join(os.path.dirname(os.path.abspath(output)),
-                               f".rnfs-get-{secrets.token_hex(8)}{PARTIAL_SUFFIX}")
+        partial = temporary if temporary is not None else os.path.join(
+            os.path.dirname(os.path.abspath(output)), f".rnfs-get-{secrets.token_hex(8)}{PARTIAL_SUFFIX}")
         created: list[walker.Identity] = []  # a directory output's identity, once write_out has made it
         try:
             with self._fetching(root, names, from_node) as fetch:
