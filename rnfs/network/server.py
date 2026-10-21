@@ -116,6 +116,10 @@ class Backend(Protocol):
         """The stored length of the block served_block(cid) would return, or None if it isn't served (or isn't
         known). Lets /blocks stop at the block over its budget unread."""
 
+    def serves(self, cid: Cid) -> bool:
+        """True if served_block(cid) may return a block (it is provided and not denied), False if it can't: asked
+        before a request takes a response slot, so one for nothing served displaces no other response (REL-2)."""
+
     def remote_pin(self, identity_hash: bytes, cid: Cid, pin: bool) -> bool:
         """Accept (True) or refuse a /pin from the identity with this 16-byte hash."""
 
@@ -1009,7 +1013,13 @@ class RequestServer:
             served = sum(1 for entry in entries if entry is not None)
             return (protocol.encode_blocks_response(entries), served > 0,
                     f"{plural(served, 'block')} of {len(cids)} requested")
-        return self._serve(BLOCKS_PATH, link_id, request_id, remote_identity, max_bytes, build)
+
+        def unserved():
+            """The answer if no block asked for is served (each None), else None."""
+            if any(self.backend.serves(cid) for cid in cids):
+                return None
+            return protocol.encode_blocks_response([None] * len(cids))
+        return self._serve(BLOCKS_PATH, link_id, request_id, remote_identity, max_bytes, build, unserved)
 
     def _handle_range(self, path, data, request_id, link_id, remote_identity):
         """Answer /range (rnfs 0.2.0) as /blocks is answered (_serve): a byte range of one served block, sent whole as
@@ -1036,15 +1046,18 @@ class RequestServer:
             what = f"{size(len(data))} of {cid} from byte {offset}" + (
                 f" (bz2: {size(len(payload))})" if encoding == RANGE_BZ2 else "")
             return protocol.encode_range_response(len(block), encoding, payload), True, what
-        return self._serve(RANGE_PATH, link_id, request_id, remote_identity, max_bytes, build)
+        return self._serve(RANGE_PATH, link_id, request_id, remote_identity, max_bytes, build,
+                           lambda: None if self.backend.serves(cid) else [])
 
     def _serve(self, path: str, link_id: bytes, request_id: bytes, remote_identity, max_bytes: int,
-               build: Callable[[int], tuple]):
+               build: Callable[[int], tuple], unserved: Callable[[], object]):
         """Answer a /blocks or /range request within the per-link limit, the response pools, upload pacing and the
         budget: one path for both, so /range counts against everything /blocks does (section 7).
 
         build(limit) makes the response once every check has passed, given the budget for blocks after the first
         served one: (body, whether it carries blocks, what it is, for the log). A body of False refuses the request.
+        unserved() is the answer when nothing asked for is served (None if something is): sent at once, as one
+        packet, without a response slot, so a request for nothing can't displace a response in progress (REL-2).
         """
         link = self._find_link(link_id)
         if link is None:
@@ -1066,6 +1079,10 @@ class RequestServer:
         response = None
         handed_over = False
         try:
+            nothing = unserved()
+            if nothing is not None:
+                log(f"{path}: sending nothing: none of what was asked for is served", LOG_VERBOSE)
+                return nothing
             # Refusals come first and at once: pacing, then the pools; only an accepted request waits
             wait = self.pacer.wait_time(link_id)
             if wait > MAX_PACING_WAIT:

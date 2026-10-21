@@ -574,6 +574,10 @@ class E2EBackend:
         """The served block for cid, if any."""
         return self.blocks.get(cid)
 
+    def serves(self, cid):
+        """Whether a block is served for cid."""
+        return cid in self.blocks
+
     def remote_pin(self, identity_hash, cid, pin):
         """Accept or refuse a remote pin."""
         return False

@@ -363,6 +363,10 @@ class FakeBackend:
         """The served block for cid, if any."""
         return self.blocks.get(cid)
 
+    def serves(self, cid):
+        """Whether a block is served for cid."""
+        return cid in self.blocks
+
     def served_block_size(self, cid):
         """Not known: the server reads each block to size it."""
         return None

@@ -64,6 +64,11 @@ Security:
   (lost) re-armed the retry, so a provider whose results alternated the two, as a node ignoring link requests and
   answering every other path request gets, never failed, and its fetch, thread and searches lived as long as it
   liked. Only an answer, or an outright failure, resets the lost count now.
+- **A request for nothing served can't cancel a download** (REL-2, specification section 3): a `/blocks` or `/range`
+  request took a response slot, displacing a response in progress when the pool was full, before the node asked
+  whether it serves anything requested. One ~100-byte request for a made-up CID from a fresh link cancelled an honest
+  slow-link download, and repeating it broke every one. Such a request is now answered at once, with the same answer
+  as before, without a slot.
 - **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
   may be no larger than `max_download_size` and the free space above the disk reserve; each Resource segment may
   decompress to one segment, and must follow the sequence an honest sender keeps (same original hash and total,

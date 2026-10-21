@@ -500,6 +500,10 @@ class NodeBackend:
             return None
         return self.node.storage.block_size(cid)
 
+    def serves(self, cid: Cid) -> bool:
+        """True if served_block(cid) may return a block: provided and not denied (held is checked when it's read)."""
+        return not self.node.deny.denies(cid) and self.node.publisher.serves(cid)
+
     def remote_pin(self, identity_hash: bytes, cid: Cid, pin: bool) -> bool:
         """Accept a /pin from an allowed identity (the server checked remote_pin_identities)."""
         return self.node.remote_pin(identity_hash, cid, pin)

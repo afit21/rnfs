@@ -289,6 +289,9 @@ registered (rnfs: `links.EarlyResponses`), or the request waits out RNS's timeou
     leaves the radio. The grace is never derived from `link.rtt`, which the requester controls. The floor is
     `unmeasured_bitrate / 8` bytes/s, or a small fraction of the interface's bitrate (if known) for a directly
     connected requester.
+  - A request for which nothing asked for is served is answered at once (each entry `None`; `[]` for `/range`)
+    without taking a slot, so it displaces nothing (rnfs 0.2.0, REL-2: one ~100-byte request for a made-up CID
+    cancelled an honest LoRa download).
   - When a pool is full, a new `/blocks` request displaces one of the pool's responses, never one on its own
     link: the response making least progress among those that are unprotected (past their grace and below the
     floor); else, if the newcomer's receiving interface holds no slot in the pool, the oldest response with
