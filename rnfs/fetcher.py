@@ -535,7 +535,7 @@ class _Walk:
 class _Provider:
     """What a fetch knows about one provider."""
 
-    __slots__ = ("node_id", "order", "busy", "busy_until", "stalls", "lost", "failed", "path", "pacing_until",
+    __slots__ = ("node_id", "order", "busy", "busy_until", "stalls", "cut", "lost", "failed", "path", "pacing_until",
                  "pacing_retry", "ratio", "no_ranges", "unreached")
 
     def __init__(self, node_id: bytes, order: int, path: mesh.PathInfo = mesh.NO_PATH):
@@ -546,6 +546,9 @@ class _Provider:
         self.busy = 0  # busy refusals in a row
         self.busy_until = 0.0
         self.stalls = 0
+        # Responses that stopped arriving partway (BUSY "cancelled"): over a route that breaks large transfers at the
+        # same point each time, asked in ranges after, as after a stall (REL-19)
+        self.cut = 0
         self.lost = 0  # requests unanswered in a row the way a lossy link loses them (peer_client.LOST)
         self.failed = False
         self.pacing_until = 0.0  # until then, a refusal is most likely the responder's upload pacing...
@@ -1423,7 +1426,7 @@ class Fetch:
         held of from provider. Never to a node known not to answer /range."""
         if provider.no_ranges:
             return None
-        return self._plan(provider.node_id, provider.path, cid, wanted, provider.stalls, provider.ratio)
+        return self._plan(provider.node_id, provider.path, cid, wanted, provider.stalls + provider.cut, provider.ratio)
 
     def _plan(self, node_id: bytes, path: mesh.PathInfo, cid: Cid, wanted: dict[Cid, list[Expect]], stalls: int = 0,
               ratio: float = 1.0) -> RangePlan | None:
@@ -1917,6 +1920,9 @@ class Fetch:
             provider.busy_until = now + provider.pacing_retry
         elif result.status == peer_client.BUSY:
             provider.busy += 1
+            if result.reason == "cancelled":
+                provider.cut += 1  # the next is asked in ranges (_range_plan): between cloud nodes a route cut every
+                # 64 KiB response from one provider at the same point (52 of 64 KiB), three times in a row
             if provider.busy >= self.config.max_failures:
                 self._fail(provider, f"busy {provider.busy} times in a row")
             else:

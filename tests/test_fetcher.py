@@ -1312,6 +1312,36 @@ class RangeTransferTest(FetcherTest):
         self.assertTrue(all(not compress and max_bytes <= fetcher_module.STALLED_RANGE
                             for _, max_bytes, compress in asked))
 
+    def test_a_provider_whose_responses_are_cut_gets_ranges(self):
+        """REL-19: between cloud nodes one route cut every 64 KiB /blocks response from a provider at the same point;
+        each counted as busy, and the provider failed after three, though ranges would have come through."""
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        chunk = self.chunks(built)[0].cid
+        self.hold(P1)
+
+        ranging = []
+
+        def cut(cids):
+            """Any /blocks with the chunk stops arriving partway (FakeClient asks this for a range too: not cut)."""
+            if ranging:
+                ranging.clear()
+                return None
+            if chunk in cids:
+                return BlocksResult(BUSY, unsent=list(cids), reason="cancelled")
+            return None
+
+        def range_of(cid, offset, max_bytes, compress):
+            """A range comes through: served as FakeClient serves it."""
+            ranging.append(cid)
+        self.client.behaviour[P1] = cut
+        self.client.range_behaviour[P1] = range_of
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        asked = self.ranges_of(P1, chunk)
+        self.assertTrue(asked)
+        self.assertTrue(all(max_bytes <= fetcher_module.STALLED_RANGE for _, max_bytes, _ in asked))
+
     def test_a_block_held_in_part_is_left_to_its_provider(self):
         self.config.max_parallel_providers = 2
         self.fetcher = self.make_fetcher()

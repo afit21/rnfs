@@ -897,6 +897,10 @@ Fixed:
   start but its sync stayed, paused, and a new, unrelated name later made or imported under the alias got the old
   folder published to it at the folder's next change. Such a sync is now dropped at the start, with a warning; one
   whose key file is there but can't be read is kept, as its pins are.
+- **A provider whose responses a route cuts is asked in ranges** (REL-19): between cloud nodes, one route cut every
+  64 KiB `/blocks` response from Montreal at the same point (52 of 64 KiB); each counted as the provider being busy,
+  and after three the fetch failed it, though ranges, half a chunk each, would have come through. A response that
+  stopped arriving partway now has the next request of that provider made in ranges, as after a stall.
 - A fetch running for days kept every search it made again (one each 10 minutes that found its providers again):
   it now keeps its first and the latest 8.
 - **A stalled response no longer fails the other requests on its link** (REL-7): closing the link for it failed a
