@@ -1719,7 +1719,10 @@ off their node. Nothing on the wire changes.
   served or provided (a file of several chunks is still served chunk by chunk, by `/blocks` and by the gateway's
   `?format=raw` of each block's CID): deny the CID for that. The first time a node refuses a file by its hash it
   logs a notice naming the command that does (`rnfs deny add <file cid>`). A file of one block has its content's hash as its CID's digest,
-  so either entry stops it; a sealed file matches by its sealed bytes, as stored, not by what it decrypts to.
+  so either entry stops it, and the hash entry then denies that block as its CID entry would: also where it is a
+  chunk of another file (rnfs 0.2.0). That matters only for content as common as an empty file or a chunk of zeros,
+  whose entry denies every folder holding one; a sealed file matches by its sealed bytes, as stored, not by what it
+  decrypts to.
 - Hashing a file reads every occurrence of content its DAG repeats, so a few small blocks can declare a file of
   2^56 bytes. While there are file-hash entries, a file whose hash isn't known yet and whose declared size is
   more than 16 times the bytes of its distinct chunks plus 64 MiB (`DENY_HASH_RATIO`, `DENY_HASH_SLACK`,
