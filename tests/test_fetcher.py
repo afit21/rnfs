@@ -228,6 +228,15 @@ class ProviderDiscoveryTest(FetcherTest):
                 fetch._search_again()
                 self.assertEqual(len(started), before + 1, wait)
                 fetch._searched_at = now[0]  # that search ended at once
+            # A fetch of days keeps its first search and the latest few, not one a 10 minutes
+            first = fetch._lookups[0]
+            for _ in range(3 * fetcher_module.SEARCHES_KEPT):
+                now[0] = fetch._searched_at + fetcher_module.SEARCH_AGAIN_MAX
+                fetch._search_again()
+                fetch._searched_at = now[0]
+            self.assertEqual(len(fetch._lookups), 1 + fetcher_module.SEARCHES_KEPT)
+            self.assertIs(fetch._lookups[0], first)
+            self.assertIs(fetch._lookups[-1], fetch._lookup)
 
     def test_a_provider_unreachable_once_is_asked_again(self):
         """Over LoRa the one provider of a file was out of reach for a minute (its rnsd restarting): failed at its

@@ -862,6 +862,8 @@ Fixed:
   without a real-time clock still had the time it booted with gave up at its next try once NTP had stepped the
   clock days on, as if it had been retried for 3 days. A try more than 6 hours after it was due (that, or the node
   off) no longer counts the time between.
+- A fetch running for days kept every search it made again (one each 10 minutes that found its providers again):
+  it now keeps its first and the latest 8.
 - **A stalled response no longer fails the other requests on its link** (REL-7): closing the link for it failed a
   request waiting for its slot (another fetch from the same provider, which then failed the provider) and a `/find`
   in progress on it. The link is closed only if nothing else uses it, and a request that wasn't sent because its link

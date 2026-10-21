@@ -172,6 +172,7 @@ UNFOUND_FOR = 600
 # max_parallel, a search starts this long after the last one ended, the wait doubling each time up to SEARCH_AGAIN_MAX
 SEARCH_AGAIN_AFTER = 60.0
 SEARCH_AGAIN_MAX = 600.0
+SEARCHES_KEPT = 8  # the later searches of a fetch kept besides its first, for crediting the nodes that listed providers
 # A provider no path was found to is asked again this long after, and fails only if it is unreachable again then: on a
 # radio a node is out of reach for a minute when its rnsd restarts or a path request is lost
 UNREACHABLE_RETRY = 60.0
@@ -1758,6 +1759,10 @@ class Fetch:
         log(f"still fetching {self.root} from {plural(self._live, 'provider')}: looking for more", LOG_VERBOSE)
         self._lookup = self.fetcher.make_lookup(self.root.key)
         self._lookups.append(self._lookup)
+        if len(self._lookups) > 1 + SEARCHES_KEPT:
+            # The first (whose budget the others share) and the latest: a fetch of days searches every 10 minutes,
+            # and one finding the same providers again would otherwise be kept for its whole life
+            del self._lookups[1]
         self._lookup_found = 0
         self._start_lookup()
 
