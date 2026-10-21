@@ -59,6 +59,11 @@ Upgrade notes:
   `provide_entries = false` to keep 0.1.6's behaviour.
 
 Security:
+- **A provider can't keep a fetch alive for ever by alternating unreachable and unestablished links** (REL-1): a "no
+  path" result (retried once, a minute later) reset the count of lost requests, and a link that didn't establish
+  (lost) re-armed the retry, so a provider whose results alternated the two, as a node ignoring link requests and
+  answering every other path request gets, never failed, and its fetch, thread and searches lived as long as it
+  liked. Only an answer, or an outright failure, resets the lost count now.
 - **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
   may be no larger than `max_download_size` and the free space above the disk reserve; each Resource segment may
   decompress to one segment, and must follow the sequence an honest sender keeps (same original hash and total,

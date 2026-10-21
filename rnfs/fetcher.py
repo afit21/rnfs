@@ -1881,8 +1881,10 @@ class Fetch:
         if provider is None or provider.failed or not counted:
             return
         now = self.fetcher.clock()
-        if result.status != peer_client.LOST:
-            provider.lost = 0  # it answered (or failed outright)
+        if result.status != peer_client.LOST and result.reason != "unreachable":
+            # It answered (or failed outright). Not a missing path, whose retry a lost request otherwise re-arms: a
+            # provider whose results alternate the two would never fail, and its fetch would never end (REL-1)
+            provider.lost = 0
         if result.ratio is not None:
             provider.ratio = min(max(result.ratio, 1.0), ranges.MAX_RATIO)
         if result.reason != "unreachable":
