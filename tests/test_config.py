@@ -6,7 +6,7 @@ from types import MappingProxyType
 from unittest import mock
 
 from rnfs import config as config_module
-from rnfs.config import DURATIONS, MAX_DURATION, OPTIONAL, Config
+from rnfs.config import DURATIONS, MAX_DURATION, MIN_DURATIONS, OPTIONAL, Config
 
 ID = "ab" * 16
 
@@ -81,7 +81,13 @@ class ValidateTest(unittest.TestCase):
                 self.assert_invalid(**{name: 0})
             elif name not in OPTIONAL:
                 Config(**{name: 0}).validate()
-            Config(**{name: 1.5}).validate()
+            least = MIN_DURATIONS.get(name)
+            if least is None:
+                Config(**{name: 1.5}).validate()
+            else:  # how often something is sent: not so often a typo floods the channel
+                self.assert_invalid(**{name: least - 0.001})
+                self.assert_invalid(**{name: 1e-300})
+                Config(**{name: least}).validate()
         Config(link_idle_timeout=MAX_DURATION).validate()
         Config(republish_interval=None).validate()
 

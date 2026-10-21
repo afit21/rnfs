@@ -38,6 +38,9 @@ DURATIONS = {  # seconds: name → True if it must be above 0 (else 0 is allowed
     "blocks_cooldown": False, "lookup_timeout": True, "path_timeout": True, "link_idle_timeout": True,
     "ban_time": False, "scan_interval": True,
 }
+# The least a duration that sets how often something is sent (or a folder read) may be: 1e-300 passed "above 0", and a
+# typo would have announced or republished in a loop, flooding a radio channel
+MIN_DURATIONS = {"announce_interval": 60.0, "republish_interval": 600.0, "scan_interval": 1.0}
 OPTIONAL = ("republish_interval", "max_upload_rate")  # these may also be unset (None)
 # Some durations are waited on, and Windows can wait at most ~49 days at once (threading.TIMEOUT_MAX)
 MAX_DURATION = 30 * DAY
@@ -391,6 +394,12 @@ class Config:
             value = getattr(self, name)
             if value is None and name in OPTIONAL:
                 continue
+            least = MIN_DURATIONS.get(name)
+            if least is not None:
+                if not _is_number(value) or value < least or value > MAX_DURATION:
+                    raise ValueError(f"{name} must be a number of seconds, at least {least:g} and at most "
+                                     f"{MAX_DURATION}{unset if name in OPTIONAL else ''}")
+                continue
             if not _is_number(value) or value < 0 or (positive and value == 0) or value > MAX_DURATION:
                 raise ValueError(f"{name} must be a number of seconds, {'above' if positive else 'at least'} 0 "
                                  f"and at most {MAX_DURATION}{unset if name in OPTIONAL else ''}")
@@ -558,6 +567,8 @@ def _schema_entry(f, group: str) -> dict:
         minimum = OPTIONAL_WHOLE_NUMBERS[name]
     elif name in RATES:
         minimum, exclusive = 0, True
+    elif name in MIN_DURATIONS:
+        minimum, maximum = MIN_DURATIONS[name], MAX_DURATION
     elif name in DURATIONS:
         minimum, maximum, exclusive = 0, MAX_DURATION, DURATIONS[name]
     elif name in FEATURE_LIMITS:

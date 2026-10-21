@@ -2689,8 +2689,8 @@ Reticulum, the DHT mode and private mode never apply before a restart.
 | `dht_mode` | `server` | `server` or `client` (section 6) |
 | `alpha` | 3; 1 on slow nodes | Parallel lookup queries. IPFS: 10 |
 | `beta` | 3 | Closest nodes that must answer before a lookup is complete. IPFS: 3 |
-| `republish_interval` | 24 h; 3 days on slow nodes | MUST be < `PROVIDER_TTL / 2` |
-| `announce_interval` | 6 h | SHOULD NOT be under 1 h (RNS's per-destination announce rate limit) |
+| `republish_interval` | 24 h; 3 days on slow nodes | MUST be < `PROVIDER_TTL / 2`; rnfs refuses under 10 min |
+| `announce_interval` | 6 h | SHOULD NOT be under 1 h (RNS's per-destination announce rate limit); rnfs refuses under 60 s |
 | `startup_announce_delay` | 30 s | Second announce after startup |
 | `max_parallel_providers` | 3; 1 on slow nodes | |
 | `provider_seniority` | 1 day | Providers (and keepers) in the routing table this long are tried first |
@@ -2716,7 +2716,7 @@ Reticulum, the DHT mode and private mode never apply before a restart.
 | `remote_pin_identities` | empty | Identities allowed to send `/pin` |
 | `private` | off | Private mode (section 3) |
 | `members` | empty | Private mode's member identities |
-| `scan_interval` | 60 s | Shared folder, and folders synced to names (section 9) |
+| `scan_interval` | 60 s | Shared folder, and folders synced to names (section 9); at least 1 s |
 | `provide_strategy` | `auto` | `roots` (pins and complete cached downloads), `pinned` (pins only), or `auto`: `pinned` on a slow node, `roots` on others |
 | `provide_entries` | unset: on, up to `provide_entries_max` entry keys; on slow nodes only while republishing stays under 2% of the channel | Also provide every file and folder inside the user's own complete pins (section 6: not remote pins or followed names'). `true` or `false` overrides the default either way |
 | `provide_entries_max` | 100,000 | Entry keys `provide_entries` provides at most: pins oldest first, each pin's entries all or none (section 6). 0: none |
