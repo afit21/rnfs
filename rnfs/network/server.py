@@ -714,6 +714,18 @@ class UploadPacer:
         with self.lock:
             self.next_start[link_id] = self.clock() + size * 8 / cap
 
+    def concluded(self, link_id: bytes, started: float, now: float):
+        """A response under the default cap, started at started, has concluded now: the next may start
+        UPLOAD_CAP_DIVISOR times the time it took after it started, if that is sooner than its estimate allowed. The cap
+        is half the link's rate, and the estimate it was set with may be far below what the link carried: one read
+        from small /range responses, where RNS's measurement is mostly its ramp-up, held a fast link's next response
+        back a minute after a 327 KB one took 8 s, and the requester, pacing by the time it took, failed the provider
+        (REL-12)."""
+        at = started + rates.UPLOAD_CAP_DIVISOR * max(0.0, now - started)
+        with self.lock:
+            if link_id in self.next_start and at < self.next_start[link_id]:
+                self.next_start[link_id] = at
+
     def wait_time(self, link_id: bytes) -> float:
         """Seconds until the next response on link_id may start."""
         with self.lock:
@@ -1393,6 +1405,8 @@ class RequestServer:
         status = getattr(resource, "status", None)
         if first and status == RNS.Resource.COMPLETE:
             self.rates.record(response.link_id, response.size, self._expected_rate(link))
+            if self.config.max_upload_rate is None:
+                self.pacer.concluded(response.link_id, response.started, self.clock())
         elif first and status == RNS.Resource.REJECTED and not self._made_progress(response, resource):
             # Turned down at its advertisement or cancelled by its requester (on RNS 1.5.6 both arrive as
             # REJECTED) before a quarter of it was sent: no honest 0.1.5 fetcher does that, it closes the link.

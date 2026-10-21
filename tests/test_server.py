@@ -786,6 +786,28 @@ class RequestServerTest(unittest.TestCase):
         self.assertEqual(len(sleeps), 1)
         self.assertAlmostEqual(sleeps[0], wait)
 
+    def test_the_default_caps_wait_follows_the_time_a_response_took(self):
+        """REL-12: the default cap (half a slow link's rate) set the next response's start from the estimate it had,
+        which small /range responses had left far below what the link carries: a fast link's next response was held
+        back a minute after one took 8 s, and the requester, pacing by the time it took, failed the provider. Once the
+        response concludes, the next may start twice the time it took after it started, if that is sooner."""
+        link = self.connect(b"a", mtu=1500, mdu=1400)
+        self.server.rates.record(link.link_id, 64 * KIB, 80_000)  # read low: below slow_bitrate, so capped
+        with mock.patch.object(self.server, "_pace", lambda response, wait: None):
+            self.assertNotEqual(self.blocks(link, [self.big[0][0]]), False)
+        estimated = self.server.pacer.wait_time(link.link_id)
+        self.assertGreater(estimated, 20)  # ~100 KiB at 40 kbit/s
+        self.clock.now += 4  # it took 4 s: the link carries 200 kbit/s
+        self.send(link).complete()
+        self.assertAlmostEqual(self.server.pacer.wait_time(link.link_id), 4.0)  # 2 × 4 s after it started
+        explicit = self.make_server(Config(max_upload_rate=40_000)) or self.server  # an explicit cap stands as set
+        link = self.connect(b"b", mtu=1500, mdu=1400)
+        with mock.patch.object(explicit, "_pace", lambda response, wait: None):
+            self.assertNotEqual(self.blocks(link, [self.big[0][0]]), False)
+        self.clock.now += 4
+        self.send(link).complete()
+        self.assertGreater(explicit.pacer.wait_time(link.link_id), 15)
+
     def test_pacing_bound_ignores_the_link_rtt(self):
         """The requester can inflate the RTT RNS reports, so it doesn't lengthen how long a response is held."""
         link = self.connect(b"a")

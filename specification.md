@@ -379,7 +379,10 @@ registered (rnfs: `links.EarlyResponses`), or the request waits out RNS's timeou
   MTU every response may be one); the default, half the rate estimate on slow links, applies once the link has
   one. RNS paces a Resource by its receiver, so the cap is applied between responses: the response budget uses
   the lower of the rate estimate and `max_upload_rate`, and the next response on that link starts no sooner
-  than `bytes × 8 / max_upload_rate` seconds after the previous one started.
+  than `bytes × 8 / max_upload_rate` seconds after the previous one started. Under the default cap, once a response
+  has concluded, the next may start twice the time it took after it started if that is sooner (rnfs 0.2.0, REL-12):
+  the estimate it was capped by may be far below what the link carries (one read from small responses, where RNS's
+  measurement is mostly its ramp-up), and the requester paces by the time the response took (below).
   - A responder holds an accepted request back for this at most 5.625 s (half of RNS's request timeout
     without RTT, 1.125 × `RNS.Resource.RESPONSE_MAX_GRACE_TIME` (10 s), so the requester doesn't give up
     meanwhile; not RTT-based, since the requester can inflate the RTT), and refuses it at once if it would

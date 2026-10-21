@@ -865,6 +865,12 @@ Fixed:
 - While a daemon was starting (minutes on a small node as RNS's transport starts), the CLI said "no API token …: is
   the daemon running?", as the token is written once the API is up: it now says the daemon is starting, as it does
   once the token is there and the port isn't yet.
+- **A fast link's provider no longer refuses for a minute after a large response** (REL-12): the default upload cap
+  set when the next response may start from the link's rate estimate, which small `/range` responses had left below
+  `slow_bitrate` (RNS's measurement of a small transfer is mostly its ramp-up). After a 327 KB response that took 8 s
+  between two cloud nodes, Madrid refused the next for 57 s, and the requester, pacing by the 8 s, failed it after
+  three refusals, and the fetch failed (found by a soak of random fetches between the cloud nodes). Once a
+  response under the default cap concludes, the next may start twice the time it took after it started.
 - A fetch running for days kept every search it made again (one each 10 minutes that found its providers again):
   it now keeps its first and the latest 8.
 - **A stalled response no longer fails the other requests on its link** (REL-7): closing the link for it failed a
