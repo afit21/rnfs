@@ -872,6 +872,13 @@ and repeat.
   up to 10 minutes; not for a fetch from a given node): providers appear as others finish the same fetch, and one may
   be on a faster route. Measured between cloud nodes, a 30 MB fetch over a 4-hop route ran 29 minutes at 18 KB/s while
   a node 2 hops away, done in 26 s, provided it. A slow node doesn't, a search costing it a minute of airtime.
+  A search's query unanswered after a patience time (rnfs 0.2.0: 15 s, 45 s on a slow node) SHOULD stop holding one of
+  the `alpha` places and rank with the unreliable nodes until it answers, its answer still used: RNS gives a server it
+  has a long path to the whole of its link establishment timeout, 217 s for one 34 hops away, and over LoRa two such
+  servers held a search 6 minutes while the node that knew the provider waited to be asked. A search that has found
+  no provider still waits for those queries, up to 3 × the patience after each was sent, as one may hold the only
+  record. Finding the closest nodes, for publishing, doesn't do this: where records are stored matters more than how
+  soon.
   A run completes with queries still out (to nodes no longer among the `beta` closest, often behind a slow path,
   which rank last); the providers an answer lists that comes after its run ended SHOULD still be used, once the
   search's runs are over (rnfs 0.2.0). Over LoRa the provider itself, one hop away on the radio, answered 29 ms after

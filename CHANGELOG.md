@@ -925,6 +925,14 @@ Fixed:
   request waiting for its slot (another fetch from the same provider, which then failed the provider) and a `/find`
   in progress on it. The link is closed only if nothing else uses it, and a request that wasn't sent because its link
   closed meanwhile counts as lost, asked again on a new link.
+- **A search isn't held for minutes by servers that don't answer** (specification section 6, Finding providers):
+  RNS gives a server it has a long path to the whole of its link establishment timeout, and on a LoRa island two
+  servers, one 34 hops away by RNS's path, held two of a search's three query places 127 and 217 s each; the node
+  that knew the provider was asked only after them, 6 minutes in, and a gateway request in a later round ran out its
+  600 s. A search's query unanswered after 15 s (45 s on a slow node) now gives up its place, ranked with the
+  unreliable until it answers, and its answer still counts. A search that has found nobody still waits for such
+  queries, up to 3 times as long after each was sent, as one may hold the only record. Finding the closest nodes,
+  for publishing, is unchanged.
 - **A provider named by an answer that came after its lookup ended is used** (spec section 6, Finding providers): a
   lookup completes once the closest nodes by rank have answered, with queries still out, and their answers' providers
   were dropped. Over LoRa the PC searched for a file the laptop had just added: the laptop, one hop away on the radio

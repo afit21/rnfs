@@ -421,6 +421,76 @@ class UnknownIdTest(LookupTestCase):
         self.assertTrue(lookup.allow_unknown(ident(9)))
 
 
+class PatienceTest(LookupTestCase):
+    """A query unanswered past patience stops holding an alpha place and ranks with the unreliable: over LoRa two
+    servers RNS had long paths to held a search 6 minutes, each for its link's whole establishment timeout."""
+
+    def setUp(self):
+        """The two servers closest to the key never answer; three more beyond them do."""
+        super().setUp()
+        self.net = self.network()
+        self.key = ident(0x1000)
+        self.dead = [ident(0x1001), ident(0x1002)]
+        self.alive = [ident(0x1010), ident(0x1020), ident(0x1030)]
+        everyone = self.dead + self.alive
+        for n in everyone:
+            self.net.add(n, knows=[m for m in everyone if m != n])
+        self.net.hang.update(self.dead)
+
+    def run_search(self, patience):
+        """find_providers from every server, alpha 3, with patience; (how it ended, seconds it took)."""
+        lookup = self.lookup(self.net, self.key, self.dead + self.alive, timeout=3, alpha=3, beta=3,
+                             patience=patience)
+        started = time.monotonic()
+        lookup.find_providers(lambda provider: None)
+        return lookup.ended, time.monotonic() - started
+
+    def test_servers_that_dont_answer_dont_hold_a_search(self):
+        """It asks the others meanwhile, and once nobody holds a record, waits for them only HOLD_PATIENCE times
+        patience, not its whole time."""
+        ended, took = self.run_search(0.2)
+        self.assertEqual(ended, "complete")
+        self.assertLess(took, 1.5)
+        self.assertTrue(set(self.alive) <= set(self.net.queried))
+
+    def test_a_search_that_found_providers_waits_for_nobody_slow(self):
+        self.net.nodes[self.alive[0]].store.store(self.key, ident(0x7777))
+        ended, took = self.run_search(0.2)
+        self.assertEqual(ended, "complete")
+        self.assertLess(took, 0.6)  # within HOLD_PATIENCE x patience: it didn't wait for them
+
+    def test_without_patience_it_waits_for_them(self):
+        ended, took = self.run_search(None)
+        self.assertEqual(ended, "out of time")
+        self.assertGreaterEqual(took, 2.9)
+
+    def test_finding_the_closest_waits_for_them(self):
+        """For publishing, where records are stored matters more than how soon: patience doesn't apply."""
+        lookup = self.lookup(self.net, self.key, self.dead + self.alive, timeout=1, patience=0.2)
+        lookup.find_closest()
+        self.assertEqual(lookup.ended, "out of time")
+
+    def test_an_answer_after_patience_still_gives_its_providers(self):
+        """A server slow to answer, not dead, holding the only record: a search that has found nobody waits for it
+        before it ends, so its provider still comes."""
+        self.net.hang.clear()
+        slow, gate = self.dead[0], threading.Event()
+        self.net.nodes[slow].store.store(self.key, ident(0x7777))
+        query = self.net.query
+
+        def slowly(node_id, key):
+            if node_id == slow:
+                gate.wait(5)
+            return query(node_id, key)
+        lookup = Lookup(self.key, self.dead + self.alive, slowly, ident(0), timeout=5, poll_interval=0.05,
+                        patience=0.2)
+        threading.Timer(0.6, gate.set).start()
+        started = time.monotonic()
+        self.assertEqual(lookup.find_providers(lambda provider: None), [ident(0x7777)])
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertIn(lookup.ended, ("complete", "no node left to ask"))
+
+
 class UnreliableNodeTest(LookupTestCase):
     """Nodes whose queries keep failing are asked last, and a retry of one is never waited for."""
 

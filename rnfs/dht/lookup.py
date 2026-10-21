@@ -70,6 +70,12 @@ UNRELIABLE = 2  # unreliable (the routing table's) and not answered
 _POLL_INTERVAL = 0.5  # seconds between should_stop() checks while waiting for replies
 MAX_QUERIES = 8 * K  # queries a run sends at most (section 6)
 STALL_WINDOWS = 3  # a run ends after this many query windows of answers in a row that bring the key no nearer
+# A search's query unanswered this long gives up its place among the alpha in flight, and ranks with the unreliable
+# until it answers (its answer still counts): a server RNS has a long path to holds a slot for its link's whole establishment
+# timeout, 217 s for one 34 hops away, and two such servers held a LoRa island's search 6 minutes (Lookup.patience)
+PATIENCE_FAST = 15.0  # seconds, on a node that isn't slow: an honest answer takes 0.1-5 s between cloud nodes
+PATIENCE_SLOW = 45.0  # ... and on a slow node, where a link and an answer over the radio take 10-40 s
+HOLD_PATIENCE = 3  # a search that found nobody waits this many times patience for a server slow to answer
 _FAR = ID_LENGTH * 8 + 1  # _reach with fewer than beta nodes known: farther than any distance
 _STOP = object()  # queued by stop() to wake the waiting caller
 _SLOWER = object()  # a worker's outcome: check_path found the node's path slow, so it wasn't asked
@@ -160,8 +166,10 @@ class Lookup:
                  slow_path: Callable[[bytes], bool] = _never,
                  check_path: Callable[[bytes], bool | None] | None = None, first: Iterable[bytes] = (),
                  allowed: Callable[[bytes], bool] = _always,
-                 named: Callable[[bytes, bytes], object] = _unnamed):
-        """A lookup for key; nothing is sent until find_closest() or find_providers() runs it."""
+                 named: Callable[[bytes, bytes], object] = _unnamed, patience: float | None = None):
+        """A lookup for key; nothing is sent until find_closest() or find_providers() runs it. patience: seconds after
+        which a find_providers query unanswered stops holding one of the alpha places (PATIENCE_FAST, PATIENCE_SLOW;
+        None: never)."""
         self.key = key
         self.query = query
         self.own_id = own_id
@@ -189,6 +197,7 @@ class Lookup:
         self.check_path = check_path
         self.allowed = allowed
         self.named = named
+        self.patience = patience
         self._named_by: dict[bytes, bytes] = {}  # node -> the node whose answer first named it, in any run
         self._slow: dict[bytes, bool] = {}  # slow_path's answers, asked once per node (and check_path's True)
         self._checked: set[bytes] = set()  # nodes check_path was asked about
@@ -461,6 +470,13 @@ class Lookup:
         queried: set[bytes] = set()
         answered: set[bytes] = set()
         retrying: set[bytes] = set()  # unreliable nodes asked again on top of alpha, which nothing waits for
+        asked_at: dict[bytes, float] = {}  # node -> when its query (one of the alpha) was sent, until it is answered
+        # A search's (find_providers): finding the closest, for publishing, waits for the slow as before, as where
+        # records are stored matters more than how soon; a search's late answers still give their providers
+        # (late_providers)
+        patience = self.patience if on_provider is not None else None
+        lagged = 0  # queries that stopped holding a place for want of patience (they joined retrying)
+        lagging: dict[bytes, float] = {}  # those still unanswered -> when they were sent
         extras: set[bytes] = set()  # nodes asked only because the senior rule or the density check required them
         passed: set[bytes] = set()  # unreliable nodes whose retry wasn't due (or needs a path request)
         found: list[bytes] = []
@@ -512,12 +528,29 @@ class Lookup:
                 break
             ranked = sorted(known, key=rank)
             needed = required() if checks else []
-            if ranked and all(node_id in answered for node_id in ranked[:self.beta] + needed):
+            # A search that has found nobody waits for its servers slow to answer before it ends, up to HOLD_PATIENCE
+            # times patience after each was asked: they no longer hold its other queries back, but one may hold the
+            # only record. One that answers later still gives its providers (late_providers)
+            holding = (not found and not self._reported and patience is not None
+                       and any(self.clock() - at < HOLD_PATIENCE * patience for at in lagging.values()))
+            if ranked and all(node_id in answered for node_id in ranked[:self.beta] + needed) and not holding:
                 why = "complete"
                 break  # the beta closest known nodes, and those the checks need, have all answered: complete
             if stalled >= STALL_WINDOWS * window:
                 why = "no progress"
                 break  # nodes keep answering, but the closest known come no nearer
+            if patience is not None:
+                now = self.clock()
+                for node_id in [n for n, at in asked_at.items() if now - at >= patience]:
+                    # Unanswered past patience: on top of alpha now, as a retry is, and ranked with the unreliable, so
+                    # it is waited for again (just below) only while the lookup knows no better nodes to ask
+                    lagging[node_id] = asked_at.pop(node_id)
+                    retrying.add(node_id)
+                    doubtful.add(node_id)
+                    in_flight -= 1
+                    lagged += 1
+                if lagged:
+                    ranked = sorted(known, key=rank)
             for node_id in ranked[:window]:
                 if node_id in retrying:  # a retry the lookup now needs: waited for like any query
                     retrying.discard(node_id)
@@ -550,6 +583,7 @@ class Lookup:
                 if check:
                     self._checked.add(node_id)
                 self._send(node_id, results, check=check)
+                asked_at[node_id] = self.clock()
                 sent += 1
                 self.sent += 1
                 in_flight += 1
@@ -571,7 +605,7 @@ class Lookup:
                     self._send(node_id, results)
                 else:
                     passed.add(node_id)
-            if in_flight == 0:
+            if in_flight == 0 and not holding:
                 if sent >= self.max_queries:
                     why = "query cap"
                     break  # sent all it may, and every answer waited for is in
@@ -589,6 +623,8 @@ class Lookup:
             if item is _STOP:
                 continue
             node_id, reply = item
+            asked_at.pop(node_id, None)
+            lagging.pop(node_id, None)
             if node_id in retrying:
                 retrying.discard(node_id)
             else:
@@ -649,6 +685,7 @@ class Lookup:
         self.report(f"lookup for {self.key.hex()}: {why} after {self.clock() - started:.1f}s; asked {len(queried)}, "
                     f"{len(answered)} answered, {failed} failed, {in_flight} still out"
                     + (f", retried {retried} unreliable ({len(retrying)} still out)" if retried else "")
+                    + (f", {lagged} slow to answer let others be asked" if lagged else "")
                     + (f", {len(extras)} for the senior rule and the density check" if extras else "")
                     + ("; dense near the key" if self.dense else "")
                     + (f"; {len(found)} new providers" if on_provider is not None else ""))

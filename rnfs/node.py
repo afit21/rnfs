@@ -52,7 +52,7 @@ from rnfs.content.storage import (FOLDER, REMOTE_PREFIX, USER, Storage, app_of, 
 from rnfs.dht.density import SizeEstimate
 from rnfs.dht.firstseen import FirstSeenLog
 from rnfs.dht.local import SCAN_INTERVAL, LocalServers, PartitionMode, first_count, judge_all
-from rnfs.dht.lookup import Lookup
+from rnfs.dht.lookup import PATIENCE_FAST, PATIENCE_SLOW, Lookup
 from rnfs.dht.lookups import (DISJOINT_PATHS, SLOW_DISJOINT_PATHS, SLOW_PUBLISH_UNKNOWNS, SLOW_SEARCH_UNKNOWNS, Lookups,
                               Search)
 from rnfs.dht.providers import ProviderStore
@@ -1219,7 +1219,8 @@ class RnfsNode:
                       is_known=self._is_known,
                       on_answer=self._answered, on_failure=self._query_failed, exclude=exclude,
                       report=lambda text: log(text, LOG_DEBUG), unreliable=self.routing.unreliable,
-                      may_retry=self.routing.may_retry, on_useful=self.scores.useful_answer, **options)
+                      may_retry=self.routing.may_retry, on_useful=self.scores.useful_answer,
+                      patience=PATIENCE_SLOW if self.slow else PATIENCE_FAST, **options)
 
     def _answered(self, node_id: bytes):
         """A node answered /find, proving it is a reachable server."""
