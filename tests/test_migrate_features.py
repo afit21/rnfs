@@ -322,6 +322,17 @@ class LogTests:
                 self.assertEqual(self.load()[2], expected)
                 self.assertEqual(self.rows()[-1], ("next_id", expected))
 
+    def test_next_id_below_one_is_malformed(self):
+        """A next id below 1, as no record's id is, counts as missing (the records' next, or 1): one below -2^63
+        doesn't fit SQLite's integers, and stopped every start."""
+        statedb.connect(self.state).close()
+        for saved in (-2 ** 63 - 1, -2 ** 63, -5, 0):
+            with self.subTest(saved=saved):
+                forget_import(self.state, self.FILE)
+                write_legacy(self.state, self.FILE, text=written({"next_id": saved, "messages": []}))
+                self.assertEqual(self.load()[2], 1)
+                self.assertEqual(self.rows()[-1], ("next_id", 1))
+
     def test_limits_apply(self):
         """Past the box's limit (and the inbox's byte bound) the oldest records are dropped, as rnfs 0.1.4 did
         at load; that leaves the box clean."""

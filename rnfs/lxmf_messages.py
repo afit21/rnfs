@@ -55,8 +55,10 @@ def records(entries: list, limit: int, max_bytes: int | None, valid) -> tuple[li
 
 
 def next_id(saved, entries: list[dict]) -> int:
-    """The id the next record gets: the saved next id (if it is an int that fits), past every record's."""
-    return max([saved if type(saved) is int and saved <= MAX_ID else 1] + [e["id"] + 1 for e in entries])
+    """The id the next record gets: the saved next id (if it is an int from 1 to MAX_ID, as records' ids are), past
+    every record's. Any other is malformed and counts as missing: one below -2^63 (a hand edit) can't be stored in
+    SQLite's integers, and stopped the import, so every start."""
+    return max([saved if type(saved) is int and 1 <= saved <= MAX_ID else 1] + [e["id"] + 1 for e in entries])
 
 
 def _str_or_none(value) -> bool:
