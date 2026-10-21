@@ -536,7 +536,7 @@ A NomadNet link (`rnfs add e166ecdbc405bcc9762b6767617fc949:/page/index.mu`) is 
 it now and added like a file, with the link shown in `pin ls`; run it again for a newer snapshot. The same options
 apply, and `--name N` wraps it under that name. Requests are anonymous; `--identify` identifies with rnfs's own
 NomadNet identity (`storage/nomadnet_identity`, not your node's) for pages the node serves only to identities it
-lists. A local file whose name looks like such a link is added as `./NAME`.
+lists: `rnfs status` shows its hash (`nomadnet_identity_hash`), for the node's operator to list. A local file whose name looks like such a link is added as `./NAME`.
 
 `get` without `-o` uses the target's name only if it is a safe file name (printable, not starting with `.`),
 otherwise its CID, and writes under a temporary name until the transfer is complete. It decrypts sealed files

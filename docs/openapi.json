@@ -5210,6 +5210,18 @@
           "retry": {
             "const": true,
             "description": "Present when it was submitted with `retry` true."
+          },
+          "providers": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "While it runs (rnfs 0.2.0): the providers its fetch uses, not failed. Null before it has any, while not running, and for add and import jobs."
+          },
+          "searching": {
+            "type": "boolean",
+            "description": "While it runs (rnfs 0.2.0): true while its fetch searches the DHT for providers, which takes minutes on a radio before any byte arrives. False otherwise."
           }
         },
         "required": [
@@ -5234,7 +5246,9 @@
           "downloaded_bytes",
           "rate",
           "eta",
-          "retry_at"
+          "retry_at",
+          "providers",
+          "searching"
         ],
         "description": "A background job (the jobs feature; specification section 11, Background jobs)."
       },
@@ -5326,6 +5340,18 @@
               "null"
             ],
             "description": "When a job queued again because its content wasn't found is tried again (Unix time)."
+          },
+          "providers": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "The providers its fetch uses, while running (rnfs 0.2.0)."
+          },
+          "searching": {
+            "type": "boolean",
+            "description": "Whether its fetch is searching for providers, while running (rnfs 0.2.0). A search beginning or ending is published at once."
           }
         },
         "required": [
@@ -6451,6 +6477,14 @@
             ],
             "description": "The RNS identity hash, hex: the value other nodes list in `members` and `remote_pin_identities`."
           },
+          "nomadnet_identity_hash": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{32}$",
+            "description": "The hash, hex, of the identity an add of a NomadNet link with `identify` identifies to the NomadNet node with (`storage/nomadnet_identity`, made at the first status if there is none, never the node's own): the value a NomadNet node's operator lists for pages it serves only to the identities it lists. Null if it can't be read or written. Since rnfs 0.2.0."
+          },
           "dht_mode": {
             "type": "string",
             "enum": [
@@ -6567,6 +6601,7 @@
           "version",
           "node_id",
           "identity_hash",
+          "nomadnet_identity_hash",
           "dht_mode",
           "slow",
           "private",

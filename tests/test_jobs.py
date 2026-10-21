@@ -878,6 +878,10 @@ class ParsingAndFormattingTest(unittest.TestCase):
         self.assertEqual(jobs.format_progress({"state": "queued"}), "queued")
         self.assertEqual(jobs.format_progress({"state": "running", "total_bytes": None, "blocks": 1, "rate": None}),
                          "finding the target: 1 block, -/s")
+        self.assertEqual(jobs.format_progress({"state": "running", "total_bytes": None, "blocks": 0, "rate": None,
+                                               "providers": 0, "searching": True}), "looking for providers")
+        self.assertEqual(jobs.format_progress({"state": "running", "total_bytes": None, "blocks": 1, "rate": None,
+                                               "providers": 1, "searching": True}), "finding the target: 1 block, -/s")
         line = jobs.format_progress({"state": "running", "total_bytes": 1_000_000, "done_bytes": 450_000,
                                      "rate": 1200.0, "eta": 458.0}, width=10)
         self.assertEqual(line, "[####------]  45%  450 KB of 1.00 MB  1.20 KB/s  ETA 7m38s")
@@ -1153,6 +1157,28 @@ class LocalJobsTest(JobsBase):
         self.assertEqual(len(told), 2)  # at 101.0 and 102.0 (begin_run counts as the running event)
         self.assertEqual(job.event()["done_bytes"], 10_000)
         self.assertEqual(job.event()["job_kind"], "add")
+
+    def test_providers_and_search_shown_while_running(self):
+        """A fetch's providers and search show while the job runs; a search beginning or ending is told at once (a
+        search is minutes on a radio, with nothing else to tell), a change of providers at most once a second."""
+        job = jobs.Job("0123abcd", "get", "x", "/o")
+        self.assertEqual((job.to_dict()["providers"], job.to_dict()["searching"]), (None, False))
+        told = []
+        job.on_progress = lambda job: told.append((job.event()["providers"], job.event()["searching"]))
+        clock = [100.0]
+        with mock.patch.object(jobs.time, "monotonic", lambda: clock[0]):
+            job.begin_run()
+            job.providers(0, True)  # within the second after the running event, told all the same
+            job.providers(1, True)  # a provider found: not within the second
+            clock[0] += 0.5
+            job.providers(1, False)
+            self.assertEqual(told, [(0, True), (1, False)])
+            self.assertEqual((job.to_dict()["providers"], job.to_dict()["searching"]), (1, False))
+            job.state = jobs.DONE
+            self.assertEqual((job.to_dict()["providers"], job.to_dict()["searching"]), (None, False))
+            job.providers(2, True)
+            job.begin_run()  # a new run starts afresh
+            self.assertEqual((job.fetch_providers, job.searching), (None, False))
 
 
 class LocalJobsApiTest(ApiBase):

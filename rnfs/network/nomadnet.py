@@ -380,8 +380,8 @@ def fetch(target: nomadnet.NomadnetLink, config, directory: str, identity=None, 
             snapshot = _request(link, target, config, directory, max_size, progress, stop_event, early)
         if _not_allowed(snapshot):
             _remove(snapshot.path)
-            how = ("its identity (storage/nomadnet_identity) isn't on the list" if identity is not None
-                   else "with --identify, if it lists rnfs's NomadNet identity")
+            how = (f"its identity {identity.hash.hex()} (storage/nomadnet_identity) isn't on the list"
+                   if identity is not None else "with --identify, if it lists rnfs's NomadNet identity")
             raise NotFound(f"NomadNet node {node_name(target.destination)} answered {target.path} with \"Request "
                            f"Not Allowed\": it serves it only to the identities it lists ({how})")
         return snapshot

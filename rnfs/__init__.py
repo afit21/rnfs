@@ -18,6 +18,7 @@ api.py       local HTTP API; gateway.py the HTTP gateway
 debuglog.py  the debug log file (debug_log)
 cli.py       command line: run a daemon, or talk to one through its API
 interface.py, objects.py, embedded.py, remote.py: the public API (rnfs.Node, rnfs.Client)
+uris.py      rnfs: links (rnfs.Link, parse_uri, format_uri) and the LXMF link map (encode_field, decode_field)
 """
 
 __version__ = "0.1.6"
@@ -41,6 +42,8 @@ _EXPORTS = {
     **{name: "rnfs.apiclient" for name in ("ApiError", "DaemonNotRunning", "DaemonStarting", "ConnectionFailed",
                                            "TokenError", "AuthFailed", "SettingsError", "BadRequest", "ServerError",
                                            "NoSuchEndpoint")},
+    # rnfs: links and the LXMF link map (specification section 13), the contract of LXMF apps and other clients
+    **{name: "rnfs.uris" for name in ("Link", "parse_uri", "format_uri", "encode_field", "decode_field")},
 }
 __all__ = ["API_STATUS", "__version__", *_EXPORTS]
 

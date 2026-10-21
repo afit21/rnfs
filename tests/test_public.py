@@ -1428,7 +1428,8 @@ class ObjectsTest(unittest.TestCase):
                       objects.Record(OTHER, cid, 2, 1.5), objects.Collected(1, 2), objects.Verified(3, (cid,)),
                       objects.Exported((cid,), 1), objects.Imported((cid,), (), 1), objects.DenyState(("a",), ()),
                       objects.Status("0.1.4", B_ID, None, "client", features={"jobs_running": 0}),
-                      objects.Status("0.2.0", B_ID, network={"size_estimate": 1240, "size_samples": 16},
+                      objects.Status("0.2.0", B_ID, nomadnet_identity_hash=bytes(range(16)),
+                                     network={"size_estimate": 1240, "size_samples": 16},
                                      record_store={"full": True, "tiers": {"newcomer": {"records": 3}}}),
                       objects.Peer(A_ID, "server", True, 12.5, False, 2, "TCP", 1e6, True, 800.0, 1.7e9, None,
                                    False, 1, 2, 3, 4, 5, 6, 7, 1.6e9, 0.25, 1.7e9, True),
@@ -1469,6 +1470,9 @@ class ImportTest(unittest.TestCase):
         code = ("import sys, rnfs; rnfs.Client(port=1); rnfs.Cid, rnfs.Record, rnfs.NotFound, rnfs.ApiError, "
                 "rnfs.Job, rnfs.File, rnfs.SealError, rnfs.NotRecipient, rnfs.BlockMismatch, rnfs.Peer, "
                 "rnfs.Contact, rnfs.Contacts; "
+                # A link with a path checks its names with the DAG's rule, whose module (rnfs.content.dag) loads RNS
+                "link = rnfs.parse_uri('rnfs:' + str(rnfs.Cid.raw_of_digest(bytes(32))) + '/a/b'); "
+                "rnfs.decode_field(rnfs.encode_field([link])); "
                 "print(any(m == 'RNS' or m.startswith('RNS.') for m in sys.modules))")
         self.assertEqual(self.run_python(code), "False")
 
@@ -1487,6 +1491,9 @@ class ImportTest(unittest.TestCase):
         self.assertIs(rnfs.NotRecipient, seal.NotRecipient)
         self.assertIs(rnfs.BlockMismatch, blockstore.BlockMismatch)
         self.assertIs(rnfs.Client, remote.Client)
+        from rnfs import uris
+        self.assertIs(rnfs.Link, uris.Link)
+        self.assertIs(rnfs.parse_uri, uris.parse_uri)
         self.assertIn("Node", dir(rnfs))
         with self.assertRaises(AttributeError):
             rnfs.NoSuchThing

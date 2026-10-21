@@ -123,8 +123,9 @@ is asked with /blocks for the rest of the fetch, the block at once, without coun
 (peer_client.UNSUPPORTED; a probe likewise, asked again with /blocks); two such silences in a row, in one fetch or several, record the node as not answering /range
 (rnfs.ranges.RangeSupport).
 
-Within `with observing(observer):`, every fetch the thread opens reports its total size and each block it
-meets to the Observer, and raises Cancelled once observer.cancelled() is true (background jobs use this).
+Within `with observing(observer):`, every fetch the thread opens reports its total size, each block it meets, and
+how many providers it uses and whether it is searching for more (Fetch._report_providers) to the Observer, and raises
+Cancelled once observer.cancelled() is true (background jobs use this).
 """
 import os
 import queue
@@ -273,6 +274,10 @@ class Observer:
 
     def partial(self, cid: Cid, held: int):
         """Part of a block not yet met arrived with /range: held bytes of it are held now, from one provider."""
+
+    def providers(self, count: int, searching: bool):
+        """The fetch now uses count providers (not failed), and is searching for providers or not: told when either
+        changes, so a job can say it is still looking (a search takes minutes on a radio) and from how many."""
 
     def cancelled(self) -> bool:
         """True makes the fetch raise Cancelled at its next step (checked at least every POLL seconds)."""
@@ -794,6 +799,7 @@ class Fetch:
         self._protection = None
         self._providers: dict[bytes, _Provider] = {}
         self._live = 0  # providers not failed; read by the lookup thread, so kept as a plain counter
+        self._reported: tuple[int, bool] | None = None  # what the observer was last told (_report_providers)
         self._probed = from_node is not None  # open links are only asked when the DHT may be used
         self._lookup = None
         self._lookup_running = False
@@ -1270,6 +1276,7 @@ class Fetch:
             self._add_provider(event.node_id)
         elif isinstance(event, LookupDone):
             self._lookup_running = False
+            self._report_providers()
             self._lookup_found = event.found
             self._searched_at = self.fetcher.clock()
             if event.found == 0 and len(self._lookups) > 1 and self._lookups[-1] is self._lookup:
@@ -1720,6 +1727,7 @@ class Fetch:
     def _start_lookup(self):
         """Run find_providers on a thread of its own; providers and its end arrive as events."""
         self._lookup_running = True
+        self._report_providers()
         lookup = self._lookup
 
         def should_stop() -> bool:
@@ -1802,7 +1810,16 @@ class Fetch:
         """Start using node_id as a provider, after those found before it."""
         provider = self._providers[node_id] = _Provider(node_id, len(self._providers), self._path(node_id))
         self._live += 1
+        self._report_providers()
         return provider
+
+    def _report_providers(self):
+        """Tell the observer the providers in use and whether a search runs, if either changed since it was last told
+        (on the fetch thread, which alone changes them)."""
+        state = (self._live, self._lookup_running)
+        if self.observer is not None and state != self._reported:
+            self._reported = state
+            self.observer.providers(*state)
 
     def _served(self, node_id: bytes):
         """node_id delivered verified blocks: its score rises, and so, once per fetch, do those of the nodes whose
@@ -1825,6 +1842,7 @@ class Fetch:
             for cid in [cid for cid, owner in self._owners.items() if owner == provider.node_id]:
                 del self._owners[cid]  # left to the others now (its partials stay, for a later fetch)
             self._live -= 1
+            self._report_providers()
             log(f"provider {node_name(provider.node_id)} failed for {self.root}: {why}", LOG_VERBOSE)
 
     def _handle(self, node_id: bytes, cids: list[Cid], result, probe: bool, wanted: dict, children: dict,

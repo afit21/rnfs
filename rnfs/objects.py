@@ -244,6 +244,9 @@ class Status(_Object):
     # "publishers", "own_records", "tiers": {"known"|"earned"|"newcomer": {"records", "share", "floor",
     # "refused_hour", "refused_day", "evicted_hour", "evicted_day"}}}
     record_store: dict | None = None
+    # What `add --identify` identifies to NomadNet nodes as, for a page's operator to list (rnfs 0.2.0); after the
+    # others, so they keep their places for a caller giving them by position
+    nomadnet_identity_hash: bytes | None = _field(_hex, None)
     features: dict = field(default_factory=dict, repr=False, metadata={"json": False})
 
     def to_dict(self) -> dict:

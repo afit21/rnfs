@@ -107,6 +107,7 @@ class NomadnetTest(unittest.TestCase):
         import RNS
         identity = RNS.Identity.from_file(identity_path)
         self.assertNotEqual(identity.hash.hex(), daemon.status()["identity_hash"])  # never the node's identity
+        self.assertEqual(daemon.status()["nomadnet_identity_hash"], identity.hash.hex())  # what the operator lists
         with open(os.path.join(self.pages, "secret.mu.allowed"), "w", encoding="ascii") as f:
             f.write(identity.hash.hex() + "\n")
         self.assertEqual(daemon.out("add", self.link("/page/secret.mu"), "--identify"), self.local_cid(SECRET))

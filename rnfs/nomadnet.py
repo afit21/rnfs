@@ -11,10 +11,11 @@ bytes, never as an error: an add recognises it (is_not_allowed) and fails rather
 import re
 from typing import NamedTuple
 
+from rnfs.entry_names import is_valid_name  # an entry name, as the DAG has it
+
 APP_NAME, ASPECT = "nomadnetwork", "node"  # the destination NomadNet nodes serve pages and files on
 PAGE, FILE = "page", "file"
 MAX_PATH_LENGTH = 1024  # characters of a link's path; NomadNet sends only its hash, but rnfs keeps it as the origin
-MAX_NAME_BYTES = 255  # an entry name's longest UTF-8 form (rnfs.content.dag.check_name, which imports RNS)
 
 _LINK = re.compile(r"([0-9A-Fa-f]{32}):(/(page|file)/.*)", re.DOTALL)
 
@@ -71,17 +72,6 @@ def parse(text) -> NomadnetLink:
         if not is_valid_name(name):
             raise ValueError(f"NomadNet path {path!r} has an empty, . or .. component")
     return NomadnetLink(bytes.fromhex(match.group(1)), path)
-
-
-def is_valid_name(name) -> bool:
-    """True if name is a valid entry name, as rnfs.content.dag.check_name has it: 1 to MAX_NAME_BYTES bytes of
-    UTF-8, no / or NUL, not . or ..; kept here so the CLI parses links without loading RNS."""
-    if not isinstance(name, str) or "/" in name or "\0" in name or name in (".", ".."):
-        return False
-    try:
-        return 1 <= len(name.encode("utf-8")) <= MAX_NAME_BYTES
-    except UnicodeEncodeError:
-        return False
 
 
 def snapshot_name(link: NomadnetLink, sent_name=None) -> str:

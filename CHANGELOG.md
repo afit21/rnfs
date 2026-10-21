@@ -324,6 +324,9 @@ Added, for apps:
   `stats()`, `contacts.*`, `names.keep/unkeep/kept` and `names.follow/unfollow/following`, with objects (`Peer`,
   `Stats`, `Contact`, `Kept`, `Followed`); `jobs.add` and `jobs.import_archive`; and the additions above (events,
   capabilities, pin labels, the cache, settings, streams). A Node raises what a Client gets back.
+- **rnfs links in the library:** `rnfs.Link`, `rnfs.parse_uri`, `rnfs.format_uri`, and the LXMF link map's
+  `rnfs.encode_field` and `rnfs.decode_field` (spec section 13), for an LXMF app and other clients that carry rnfs
+  links, so they need no internal module (`rnfs/uris.py`). They need no node and load no RNS.
 - **Starting:** while a daemon opens its block store, before its API listens, `rnfs status` and the other commands
   say it is starting, naming its process, rather than that no daemon is running; the library raises
   `DaemonStarting` (`.pid`), a `DaemonNotRunning`, so code catching that is unchanged. Told by the rnfs dir's
@@ -364,8 +367,10 @@ Added:
   it like a file, pinned `user` (with an app's token, that app's source) with the link as its origin in `pin ls`; the
   usual `add` options apply (`--no-pin`, `--wrap`, `--name`, `--to`, `--chunker`, `--only-hash`, `--background`), and it
   runs as an `add` job with progress. Each run takes a new snapshot. The link is anonymous unless `--identify`, which
-  identifies with an identity of its own (`storage/nomadnet_identity`, made on first use), never the node's. A page the
-  node answers with its "Request Not Allowed" page fails rather than being pinned. A local file named like such a link
+  identifies with an identity of its own (`storage/nomadnet_identity`, made on first use), never the node's; `rnfs
+  status` (`GET /api/status`, `Status`) shows its hash, `nomadnet_identity_hash`, for the NomadNet node's operator to
+  list, making it if there is none yet. A page the node answers with its "Request Not Allowed" page fails rather than
+  being pinned, naming that hash when the add identified. A local file named like such a link
   is added as `./<name>`. `POST /api/add` takes `nomadnet` (with `name` and `identify`) instead of `path`, as do add
   jobs (`POST /api/jobs`); capability `add_nomadnet`; `rnfs.Node`/`rnfs.Client` `add_nomadnet()` and
   `jobs.add_nomadnet()`. Request data (a page's fields or `var_` values) isn't supported.
@@ -712,6 +717,11 @@ Changed:
   shows it waiting. Not for a path its directory shows doesn't exist. Retrying is opt-in: the API's default is
   0.1.6's, failing at once, so an app polling its job still sees it fail rather than stay queued for days. `rnfs
   get`, `pin add` and `export` with `--background` opt in; in the foreground they still fail at once.
+- **A running job says whether it is still looking for providers:** on a radio a search takes minutes before any
+  byte arrives, and a job showed only that it was running. A job now has `providers` (how many its fetch uses; null
+  before it has any, and for add and import jobs) and `searching` (true while its fetch searches the DHT), in
+  `GET /api/jobs`, its `job` events (a search beginning or ending is published at once) and the library's `Job`;
+  `rnfs get` and `rnfs jobs` show "looking for providers" until one is found, and `rnfs jobs show` the providers.
 - Path requests are paced node-wide: since RNS 1.2.5 every interface limits the path requests arriving on it (3 a
   second while it is under 2 hours old, as a hub's interface for a newly connected client is), and a fresh node's
   join and first publish round sent dozens at once, so its hub dropped some and the queries failed after
@@ -811,6 +821,9 @@ Faster:
   (NomadNet's "Request Not Allowed" among them) could be lost the same way and the add fail.
 
 Fixed:
+- **`rnfs.Client` no longer loads RNS for an `rnfs:` target with a path:** checking the path's names imported the DAG
+  module, which loads RNS's bundled msgpack and so all of RNS. The name rule now has a module of its own
+  (`rnfs/entry_names.py`), which the DAG, `rnfs:` links and NomadNet links share.
 - **`cache rm` counts only the cached fetch's own blocks as its own**: blocks nothing used before (an add just
   unpinned) are collected with it, and were all counted as the first CID's: on a cloud node a 435 B cached file
   "removed 670 blocks, freed 42973080 bytes". They are counted apart, as `unreferenced_blocks` and

@@ -154,6 +154,29 @@ class ProviderDiscoveryTest(FetcherTest):
         self.assertEqual(len(self.lookups), 1)
         self.assertEqual(self.client.asked(P1)[0], built.cid)
 
+    def test_the_observer_is_told_the_providers_in_use_and_the_search(self):
+        """What a job shows: searching before any provider is known (minutes on a radio), each provider found, and the
+        search's end."""
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P1)
+        self.hold(P2)
+        self.runs.append([P1, P2])
+        for node_id in (P1, P2):
+            self.client.behaviour[node_id] = lambda cids: time.sleep(0.2)  # served once the search's end is handled
+        told = []
+
+        class Recorder(fetcher_module.Observer):
+            def providers(self, count, searching):
+                told.append((count, searching))
+        with fetcher_module.observing(Recorder()):
+            self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(told, [(0, True), (1, True), (2, True), (2, False)])
+        told.clear()
+        with fetcher_module.observing(Recorder()):
+            self.fetch_all(built.cid, from_node=P1)
+        self.assertEqual(told, [(1, False)])  # a fetch from a given node doesn't search
+
     def test_a_failing_record_store_leaves_it_to_the_search(self):
         built = self.file(os.urandom(CHUNK_SIZE))
         self.hold(P2)

@@ -165,7 +165,7 @@ class FetchFlowTest(unittest.TestCase):
         self.link.teardown.assert_called()
 
     def test_identified_refusal_is_retried_once(self):
-        identity = object()
+        identity = mock.Mock(hash=bytes(range(16)))
         self.answers = [nomadnet.NOT_ALLOWED, PAGE_BYTES]
         snapshot = self.fetch(identity)
         with open(snapshot.path, "rb") as f:
@@ -175,6 +175,7 @@ class FetchFlowTest(unittest.TestCase):
         with self.assertRaises(NotFound) as caught:
             self.fetch(identity)
         self.assertIn("nomadnet_identity", str(caught.exception))
+        self.assertIn(bytes(range(16)).hex(), str(caught.exception))  # the hash to ask the node's operator to list
 
     def test_pages_pass(self):
         for page in (PAGE_BYTES, b"", nomadnet.NOT_ALLOWED * 5):
@@ -328,6 +329,16 @@ class NodeAddTest(NodeTest):
         self.assertNotEqual(identity.hash, node_identity.hash)  # never the node's
         self.a.add_nomadnet(PAGE, identify=True)
         self.assertEqual(self.fake.calls[-1]["identity"].hash, identity.hash)  # the same each time
+        self.assertEqual(self.a.status()["nomadnet_identity_hash"], identity.hash.hex())
+
+    def test_status_makes_the_identity_to_list_before_the_first_identified_add(self):
+        path = nomadnet_identity_path(self.a.config)
+        listed = self.a.status()["nomadnet_identity_hash"]
+        self.assertTrue(os.path.isfile(path))
+        self.assertNotEqual(listed, load_or_create_identity(self.a.config.identity_path).hash.hex())
+        self.assertEqual(self.a.status()["nomadnet_identity_hash"], listed)
+        self.a.add_nomadnet(PAGE, identify=True)
+        self.assertEqual(self.fake.calls[-1]["identity"].hash.hex(), listed)
 
     def test_leftover_copies_removed_at_start(self):
         state = os.path.join(self.tmp.name, "restarted", "state")

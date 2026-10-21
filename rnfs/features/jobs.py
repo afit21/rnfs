@@ -25,7 +25,9 @@ or import job; `rnfs jobs` lists, shows, waits for, cancels and clears jobs.
 - Every change of a job's state (queued, running, done, failed, cancelled, and forgotten: "removed") and, at
   most once a second (EVENT_INTERVAL), a running job's progress is published as a "job" event (rnfs.events) with
   the job's state and progress fields (Job.event; the job's kind as "job_kind", an event's "kind" being "job"),
-  not its result: a client fetches the job for that.
+  not its result: a client fetches the job for that. Progress includes, while it runs, how many providers its fetch
+  uses (providers) and whether it is searching for more (searching: rnfs.fetcher.Observer.providers); a search
+  beginning or ending is published at once, like a state change.
 - Jobs are saved in the state database's jobs table (rnfs.statedb), durably, at every state change and with
   the node's periodic saves (keeping a running job's progress recent); each save writes only the jobs changed
   since the last. At startup, jobs that were queued or running are queued again and resume where they
@@ -105,7 +107,7 @@ RETRYING_KINDS = frozenset({"get", "pin", "export"})  # queued again when their 
 # A "job" event's fields (rnfs.events): what changes, not the result (clients fetch the job for that); "kind" is
 # sent as "job_kind", since an event's own "kind" is "job"
 EVENT_FIELDS = ("id", "kind", "state", "error", "total_bytes", "done_bytes", "blocks", "blocks_total",
-                "downloaded_bytes", "rate", "eta", "retry_at")
+                "downloaded_bytes", "rate", "eta", "retry_at", "providers", "searching")
 _JOB_ID = re.compile(r"[0-9a-f]{8}")
 _NODE_ID = ids.HEX16_LOWER  # a saved job's from_node, as bytes.hex() writes it (a row that fails is deleted)
 
@@ -156,6 +158,10 @@ class Job:
         self.blocks = 0  # distinct blocks met this run
         self.blocks_total: int | None = None  # blocks of the target's DAG, known once it is complete
         self.downloaded_bytes = 0  # bytes downloaded this run (DAG nodes too), for the rate
+        # The latest fetch of this run (rnfs.fetcher.Observer.providers): its providers in use, None before it has
+        # any or for an add or import, and whether it is searching for more; not saved
+        self.fetch_providers: int | None = None
+        self.searching = False
         self.cancel_requested = False
         self.ended = threading.Event()  # set once finished, for waiters
         self.stop_event: threading.Event | None = None  # the feature's, set when the node stops
@@ -214,6 +220,13 @@ class Job:
                 self.done_bytes += gained
         self._progressed(now)
 
+    def providers(self, count: int, searching: bool):
+        """The fetch now uses count providers and is searching for more or not. A search beginning or ending is told
+        at once, as a state change is: nothing else may happen for the minutes a search takes on a radio."""
+        changed = searching != self.searching
+        self.fetch_providers, self.searching = count, searching
+        self._progressed(time.monotonic(), force=changed)
+
     def read(self, length: int):
         """An add or import read length bytes of its path (the facade's progress callback, on the job's thread):
         counted as done. Raises Cancelled once the job is cancelled or the node stops, which stops the read at
@@ -240,9 +253,10 @@ class Job:
             # as long as it runs (about 10 MB a day)
             self._prune(now)
 
-    def _progressed(self, now: float):
-        """Tell on_progress, if EVENT_INTERVAL has passed since it was last told (on the job's thread, no lock)."""
-        if self.on_progress is None or now - self._last_event < EVENT_INTERVAL:
+    def _progressed(self, now: float, force: bool = False):
+        """Tell on_progress, if EVENT_INTERVAL has passed since it was last told or force (on the job's thread, no
+        lock)."""
+        if self.on_progress is None or (now - self._last_event < EVENT_INTERVAL and not force):
             return
         self._last_event = now
         self.on_progress(self)
@@ -261,6 +275,7 @@ class Job:
             self.retry_due, self.retry_at = self.retry_at, None
             self.runs += 1
             self.done_bytes = self.blocks = self.downloaded_bytes = self._moved = 0
+            self.fetch_providers, self.searching = None, False
             self._seen = set()
             self._partial = {}
             self._samples = deque([(time.monotonic(), 0)])
@@ -288,12 +303,15 @@ class Job:
         return max(0.0, (moved - base) / elapsed)
 
     def to_dict(self) -> dict:
-        """The job as the API shows it, with its current rate and ETA."""
+        """The job as the API shows it, with its current rate and ETA, and while it runs its fetch's providers in use
+        and whether it is searching for more (None and False otherwise)."""
         rate = self.rate()
         eta = None
         if rate and self.total_bytes is not None:
             eta = max(0.0, (self.total_bytes - self.done_bytes) / rate)
-        return {**self.to_record(), "state": self.state, "rate": rate, "eta": eta, "retry_at": self.retry_at}
+        running = self.state == RUNNING
+        return {**self.to_record(), "state": self.state, "rate": rate, "eta": eta, "retry_at": self.retry_at,
+                "providers": self.fetch_providers if running else None, "searching": running and self.searching}
 
     def event(self) -> dict:
         """The job's "job" event fields (EVENT_FIELDS): its state and progress, not its result. Its kind is
@@ -1214,6 +1232,8 @@ def format_progress(job: dict, width: int = 20) -> str:
             return f"waiting for the NomadNet node's answer: {human_size(done)}, {speed}"
         if total is None and job.get("kind") in LOCAL_KINDS:
             return f"reading: {human_size(done)}, {speed}"  # its size is being measured
+        if total is None and job.get("searching") and not job.get("providers"):
+            return "looking for providers"  # a search takes minutes on a radio, before any block comes
         if total is None:
             blocks = job.get("blocks") or 0
             return f"finding the target: {blocks} block{'' if blocks == 1 else 's'}, {speed}"
@@ -1250,6 +1270,8 @@ def job_fields(job: dict) -> dict:
     if job.get("rate") is not None:
         fields["rate"] = f"{human_size(job['rate'])}/s"
         fields["eta"] = human_duration(job.get("eta"))
+    if job.get("providers") is not None or job.get("searching"):
+        fields["providers"] = f"{job.get('providers') or 0}" + (", looking for more" if job.get("searching") else "")
     for name in ("created", "started", "finished", "retry_at", "retry_since"):
         if job.get(name):
             fields[name] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(job[name]))

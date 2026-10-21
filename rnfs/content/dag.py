@@ -24,6 +24,7 @@ from RNS.vendor import umsgpack
 
 from rnfs.constants import MAX_BLOCK_SIZE
 from rnfs.content.cid import Cid
+from rnfs.entry_names import MAX_NAME_BYTES, check_name, is_valid_name  # noqa: F401 - the DAG's name rule
 from rnfs.errors import InvalidDag
 
 FILE, DIRECTORY, INDEX = 1, 2, 3
@@ -32,7 +33,6 @@ KINDS = (KIND_FILE, KIND_EXECUTABLE, KIND_DIRECTORY)
 KIND_NAMES = {KIND_FILE: "file", KIND_EXECUTABLE: "executable", KIND_DIRECTORY: "directory"}  # as `ls` shows them
 
 MAX_SIZE = 2**64 - 1  # a size above this makes a DAG invalid
-MAX_NAME_BYTES = 255
 # decode()'s memo of nodes by block bytes, least recently used forgotten first: a node's Python objects take
 # several times its block's bytes, so this holds well under 20 MB
 MEMO_BLOCKS = 256
@@ -145,32 +145,6 @@ class IndexNode:
 
 
 Node = FileNode | DirectoryNode | IndexNode
-
-
-def check_name(name) -> None:
-    """Raise ValueError unless name is a valid entry name: UTF-8, 1-255 bytes, no / or NUL, not . or .."""
-    if not isinstance(name, str):
-        raise ValueError("name must be a string")
-    try:
-        encoded = name.encode("utf-8")
-    except UnicodeEncodeError:
-        # Lone surrogates, e.g. from a filename that wasn't valid UTF-8 (os.fsdecode's surrogateescape)
-        raise ValueError(f"name {name!r} is not valid UTF-8") from None
-    if not 1 <= len(encoded) <= MAX_NAME_BYTES:
-        raise ValueError(f"name {name!r} must be 1-{MAX_NAME_BYTES} bytes of UTF-8")
-    if "/" in name or "\0" in name:
-        raise ValueError(f"name {name!r} contains / or NUL")
-    if name in (".", ".."):
-        raise ValueError(f"name {name!r} is not allowed")
-
-
-def is_valid_name(name) -> bool:
-    """True if check_name accepts name."""
-    try:
-        check_name(name)
-        return True
-    except ValueError:
-        return False
 
 
 def encode(node: Node) -> bytes:

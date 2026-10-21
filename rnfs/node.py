@@ -667,6 +667,7 @@ class RnfsNode:
         self.events = events.EventLog()
         self.slow = slow
         self.channel: ChannelLoad | None = None  # a slow node's radios' measured load, once Reticulum runs
+        self._nomadnet_hash: str | None = None  # the NomadNet identity's hash, once status() read it
         self._is_known = is_known
         self.members = config.member_set
         # Private mode: node IDs that sent /provide as a member this run (their identity was checked then)
@@ -3111,6 +3112,8 @@ class RnfsNode:
         return {"version": __version__, "node_id": self.node_id.hex(),
                 # The RNS identity hash, which other nodes' members and remote_pin_identities list (None offline)
                 "identity_hash": identity.hash.hex() if (identity := getattr(self, "identity", None)) else None,
+                # What `add --identify` identifies to NomadNet nodes as: a page's operator lists it (rnfs 0.2.0)
+                "nomadnet_identity_hash": self._nomadnet_identity_hash(),
                 "dht_mode": self.config.dht_mode, "slow": self.slow,
                 "private": self.config.private, "known_nodes": self.routing.node_count(),
                 "records": self.records.record_count(), "pins": self.storage.pin_count(),
@@ -3124,6 +3127,19 @@ class RnfsNode:
                 "local_servers": len(self.local), **self.partition.state(),
                 "network": self._network_status(), "record_store": self.records.usage(),
                 **{key: value for feature in self.features.values() for key, value in feature.status().items()}}
+
+    def _nomadnet_identity_hash(self) -> str | None:
+        """The hash (hex) of the identity `add --identify` identifies to NomadNet nodes with (node_content.
+        nomadnet_identity_path), made now if there is none yet, so the user can ask a node's operator to list it
+        before the first such add; None if it can't be read or written (an identified add says why)."""
+        if self._nomadnet_hash is None:
+            try:
+                identity = load_or_create_identity(node_content.nomadnet_identity_path(self.config))
+            except RuntimeError as e:
+                log(f"couldn't read or make the NomadNet identity: {e}", LOG_WARNING)
+                return None
+            self._nomadnet_hash = identity.hash.hex()
+        return self._nomadnet_hash
 
     def _network_status(self) -> dict:
         """What the node sees of the network, for status() (specification section 11), from what it keeps in memory:

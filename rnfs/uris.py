@@ -18,6 +18,7 @@ from urllib.parse import quote, unquote_to_bytes
 from rnfs import ids
 from rnfs.constants import ID_LENGTH, MAX_DEPTH
 from rnfs.content.cid import Cid
+from rnfs.entry_names import check_name
 
 # LXMF's fields for embedding other protocols (LXMF/LXMF.py): a type identifier and its payload. LXMF reserves
 # the unallocated fields below 0x80 for its own future use and calls those above 0xFF unstable
@@ -34,12 +35,6 @@ MAX_LINK_KEYS = 16  # keys in one link map, known or not
 
 _SEGMENT = re.compile(r"(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+")
 _QUERY_VALUE = re.compile(r"(?:[A-Za-z0-9\-._~!$'()*+,;=:@/]|%[0-9A-Fa-f]{2})*")  # "&" separates parameters
-
-
-def _check_name(name: str):
-    """dag.check_name, imported here because rnfs.content.dag loads RNS's msgpack."""
-    from rnfs.content import dag
-    dag.check_name(name)
 
 
 @dataclass(frozen=True)
@@ -111,7 +106,7 @@ def parse_uri(text) -> Link:
             decoded = unquote_to_bytes(segment).decode("utf-8")
         except UnicodeDecodeError:
             raise ValueError(f"path name {segment!r} is not UTF-8") from None
-        _check_name(decoded)
+        check_name(decoded)
         names.append(decoded)
     from_node = None
     if has_query:
@@ -193,7 +188,7 @@ def decode_field(fields) -> list[Link] | None:
         if type(path) is not list or len(path) > MAX_PATH_NAMES or not all(type(n) is str for n in path):
             raise ValueError(f"path must be a list of at most {MAX_PATH_NAMES} names")
         for item in path:
-            _check_name(item)
+            check_name(item)
         if "size" in entry:
             size = entry["size"]
             if type(size) is not int or not 0 <= size < 2 ** 64:

@@ -1266,7 +1266,9 @@ class Job:
     has a path (and an add its options) instead of a target; an add of a NomadNet link has that link (nomadnet)
     instead of a path. source is what a pin, add or import job pins with ("user", or the app's that queued it).
     retry_at is when a get, pin or export job queued again because its content wasn't found is tried again (None
-    otherwise; error says why), retry_since when it first wasn't found; retry True: it was submitted to be."""
+    otherwise; error says why), retry_since when it first wasn't found; retry True: it was submitted to be.
+    While it runs (rnfs 0.2.0): providers, how many its fetch uses (None before it has any, and for an add or import),
+    and searching, True while the fetch looks for providers, which takes minutes on a radio before any byte comes."""
 
     id: str
     kind: str
@@ -1297,12 +1299,14 @@ class Job:
     retry_at: float | None = None
     retry_since: float | None = None
     retry: bool = False
+    providers: int | None = None
+    searching: bool = False
     _owner: Rnfs | None = field(default=None, repr=False, compare=False)
 
     FIELDS = ("id", "kind", "target", "output", "sealed_name", "fallback_dht", "path", "options", "no_extract",
               "source", "nomadnet", "state", "created", "started",
               "finished", "error", "result", "runs", "total_bytes", "done_bytes", "blocks", "blocks_total",
-              "downloaded_bytes", "rate", "eta", "retry_at", "retry_since", "retry")
+              "downloaded_bytes", "rate", "eta", "retry_at", "retry_since", "retry", "providers", "searching")
 
     @classmethod
     def from_dict(cls, data: dict, owner: Rnfs | None = None) -> "Job":
