@@ -97,6 +97,10 @@ class SettingsFeature(Feature):
                     if name == "rnfs_dir":
                         raise ValueError("rnfs_dir can't be set in rnfs.toml; use --dir")
                     raise ValueError(f"unknown setting {name!r}")
+                least = settings.MIN_DURATIONS.get(name)
+                if least is not None and type(value) in (int, float) and value < least:
+                    # A file's is raised to it (Config.combine, for an upgraded node to start); a new one is refused
+                    raise ValueError(f"{name} must be at least {least:g} seconds")
                 if value is None:
                     values.pop(name, None)
                 else:

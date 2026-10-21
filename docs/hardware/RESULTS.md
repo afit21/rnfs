@@ -239,4 +239,5 @@ the fixed build. The findings are REL-1 to REL-19 in CHANGELOG.md (the attacks a
     counting, and a search that has found nobody waits for it at most 3 times as long. On the laptop, searches for
     content nobody held then logged a query "slow to answer" each and ended in 325 s and 104 s (the slowest path held
     135 s by a server failing at 169 s), against more than 600 s before. Three gateway ranges of a file only the PC
-    held came in 103–115 s, the provider asked first each time.
+    held came in 103–115 s, the provider asked first each time. (The user was also using the RNodes that
+    evening, which may have shared the channel with these runs.)

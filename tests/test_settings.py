@@ -329,6 +329,10 @@ class ApiTest(SettingsBase):
         self.assertEqual(self.setting("quiet_hours")["file"], "22:00:00")
         self.assertIsNotNone(body["file_error"])
 
+    def test_set_refuses_an_interval_under_its_minimum(self):
+        body = self.set({"announce_interval": 10}, status=400)
+        self.assertEqual(body["error"], "announce_interval must be at least 60 seconds")
+
     def test_set_on_a_file_with_a_byte_order_mark(self):
         self.write("\ufeffmax_storage = 100\n")
         self.set({"max_storage": 5_000_000})

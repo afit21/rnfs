@@ -145,6 +145,12 @@ class LoadTest(unittest.TestCase):
             self.load("bootstrap_nodes = " + "[" * 1000 + "]" * 1000 + "\n")
         self.assertIn("rnfs.toml isn't valid TOML: it is nested too deeply", str(caught.exception))
 
+    def test_an_interval_under_its_minimum_in_the_file_is_raised_to_it(self):
+        """A node upgraded with announce_interval = 10 in rnfs.toml (taken before 0.2.0) still starts, warned."""
+        config = self.load("announce_interval = 10\nscan_interval = 0.5\n")
+        self.assertEqual((config.announce_interval, config.scan_interval), (60.0, 1.0))
+        self.assertTrue(any("announce_interval = 10" in warning for warning in config.warnings), config.warnings)
+
     def test_a_byte_order_mark_is_no_reason_to_refuse_the_file(self):
         """Some Windows editors start a UTF-8 file with one."""
         config = self.load("\ufeffprivate = true\n")

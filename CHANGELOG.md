@@ -925,7 +925,8 @@ Fixed:
   stopped arriving partway now has the next request of that provider made in ranges, as after a stall.
 - `announce_interval`, `republish_interval` and `scan_interval` had to be only above 0, so a typo such as
   `announce_interval = 1e-300` would have announced in a loop, flooding a radio channel. They are now at least 60 s,
-  10 minutes and 1 s.
+  10 minutes and 1 s: `config set` refuses less, and a smaller value already in rnfs.toml is raised to the minimum
+  with a warning, so an upgraded node still starts.
 - An `rnfs.toml` starting with a UTF-8 byte-order mark, as some Windows editors save it, was refused as invalid TOML:
   it is read, and `config set` writes it back without the mark.
 - The API answered `HEAD` (always refused, 405) with a JSON body after the headers, which a client reads as the start

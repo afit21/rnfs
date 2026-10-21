@@ -52,7 +52,7 @@ CLIENT_CONFIG = """[reticulum]
 # Default rnfs config except for short intervals so the node starts and announces quickly; the H1 knobs
 # (max_blocks_responses = 4, deadline_slack = 30, unmeasured_bitrate = 100) are all left at their defaults.
 VICTIM_TOML = """default_bootstrap = false
-announce_interval = 10
+announce_interval = 60  # the least rnfs takes; the startup announces come first anyway
 startup_announce_delay = 2
 scan_interval = 3
 republish_interval = 600

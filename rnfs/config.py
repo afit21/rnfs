@@ -468,6 +468,13 @@ class Config:
         warnings = tuple(f"ignoring {name}{f' in {path}' if name in file_values else ''}: it is no longer a setting "
                          f"({RETIRED_SETTINGS[name]}); remove it" for name in retired)
         defaults, file_values, overrides = _current(defaults), _current(file_values), _current(overrides)
+        for name, least in MIN_DURATIONS.items():
+            value = file_values.get(name)
+            if _is_number(value) and 0 < value < least:
+                # Taken before 0.2.0 set these minimums: raised to them, so an upgraded node still starts
+                file_values[name] = least
+                warnings += (f"{name} = {value:g} in {path} is under {least:g} s, the least rnfs takes: using "
+                             f"{least:g}; set it to at least that",)
         values: dict = dict(defaults)
         values.update(file_values)
         known = {f.name for f in fields(cls)}
