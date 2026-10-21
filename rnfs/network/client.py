@@ -281,9 +281,7 @@ class PeerClient:
                                    watchdog=self._stall_watchdog(rate), on_progress=on_progress)
         name = node_name(node_id)
         if exchange.stalled:
-            log(f"/blocks from {name} stalled ({exchange.stalled}); closing the link", LOG_WARNING)
-            # Closing the link cancels the transfer, so it doesn't compete with the next provider
-            self.links.close_link(peer)
+            self._close_stalled(peer, f"/blocks from {name} stalled ({exchange.stalled})")
             return BlocksResult(STALLED, unsent=wanted, reason=exchange.stalled)
         if exchange.cancelled:
             # The responder gave the slot to another request or ran out of time, or the transfer was lost in
@@ -358,8 +356,7 @@ class PeerClient:
                                    silence_expected=silence_expected)
         name = node_name(node_id)
         if exchange.stalled:
-            log(f"/range from {name} stalled ({exchange.stalled}); closing the link", LOG_WARNING)
-            self.links.close_link(peer)
+            self._close_stalled(peer, f"/range from {name} stalled ({exchange.stalled})")
             return RangeResult(STALLED, reason=exchange.stalled)
         if exchange.cancelled:
             log(f"{name}'s /range answer stopped arriving (cancelled by it, or lost in transit)", LOG_VERBOSE)
@@ -369,7 +366,9 @@ class PeerClient:
             return RangeResult(BUSY, reason="closed")
         if not exchange.answered:
             # Nothing at all came back, the link up: not an answer that started and failed on the way
-            silent = peer.is_active() and exchange.receipt is not None and exchange.response_started is None
+            # (or closed here for it, Exchange.went_dead: nothing at all came back on it meanwhile)
+            silent = exchange.went_dead or (peer.is_active() and exchange.receipt is not None
+                                            and exchange.response_started is None)
             log(f"no answer from {name} to /range", LOG_VERBOSE)
             return RangeResult(LOST if self._lost(peer, exchange) else FAILED, silent=silent, reason="no answer")
         if exchange.response is False:
@@ -408,9 +407,21 @@ class PeerClient:
         lost request looks just so, and failing the provider for it ended a fetch from its one provider."""
         if exchange.went_dead:
             return True
+        if exchange.receipt is None and not peer.is_active():
+            return True  # never sent: the link was closed while it waited for its slot (another request's stall)
         if peer.is_active():
             return exchange.receipt is not None
         return timed_out(peer.link)
+
+    def _close_stalled(self, peer, what: str):
+        """Close peer's link after a response on it stalled, which cancels the transfer so it doesn't compete with the
+        next provider; unless other requests use it or wait for its slot, which a close would fail outright (REL-7):
+        they have it now, and if it is dead they come back lost and are asked again on a new link."""
+        if peer.used_by_others({threading.get_ident()}):
+            log(f"{what}; leaving the link to the other requests on it", LOG_WARNING)
+            return
+        log(f"{what}; closing the link", LOG_WARNING)
+        self.links.close_link(peer)
 
     def _stall_watchdog(self, rate: float | None) -> Callable[[Exchange, float], str | None]:
         """Stall test for a /blocks response on a link with this rate estimate (section 7, step 5)."""

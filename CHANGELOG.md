@@ -834,6 +834,16 @@ Fixed:
   the radios' load meanwhile (the RPC refused). That is now a verbose line; other failures to read the stats stay
   warnings. The node itself carries on through the restart, as before (tested on the laptop: a fetch over LoRa
   12 s after `rnsd` came back).
+- **An older node isn't taken for one that answers `/range` for good** (REL-5): a `/range` whose link the other end
+  closed before answering (a busy 0.1.6 node evicts the link first, as it doesn't count the unanswered `/range` as a
+  request) recorded the node as answering `/range`, a record never checked again, so every later fetch from it over a
+  slow link waited out its silences as lost requests and failed it. Only an answer, a refusal, a response started or
+  a malformed answer show a handler now; and a node recorded as answering that leaves one wholly unanswered isn't
+  known any more, so a record made in error is learnt afresh (a 0.2.0 node's next answer restores it).
+- **A stalled response no longer fails the other requests on its link** (REL-7): closing the link for it failed a
+  request waiting for its slot (another fetch from the same provider, which then failed the provider) and a `/find`
+  in progress on it. The link is closed only if nothing else uses it, and a request that wasn't sent because its link
+  closed meanwhile counts as lost, asked again on a new link.
 - **A provider named by an answer that came after its lookup ended is used** (spec section 6, Finding providers): a
   lookup completes once the closest nodes by rank have answered, with queries still out, and their answers' providers
   were dropped. Over LoRa the PC searched for a file the laptop had just added: the laptop, one hop away on the radio

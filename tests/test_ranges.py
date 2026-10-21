@@ -254,7 +254,37 @@ class RangesFetchTest(unittest.TestCase):
         self.client.no_range.add(P1)
         result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
         self.assertEqual(result.status, peer_client.LOST)
+        # Not known any more (REL-5): a record made in error, of an older node, is learnt afresh by the next silence
+        self.assertIsNone(self.ranges.support.answers(P1))
+        result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
+        self.assertEqual(result.status, peer_client.UNSUPPORTED)
+        self.assertIs(self.ranges.support.answers(P1), False)
+        # A 0.2.0 node's lost packet costs no more: its next answer makes it known again
+        self.client.no_range.discard(P1)
+        self.ranges.support.record(P1, True)
+        self.client.no_range.add(P1)
+        self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
+        self.client.no_range.discard(P1)
+        self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
         self.assertIs(self.ranges.support.answers(P1), True)
+
+    def test_a_link_closed_before_an_answer_doesnt_show_a_range_handler(self):
+        """REL-5: a busy older node evicts a link it sees idle (an unanswered /range isn't a request to it), and a link
+        refused at its opening carries nothing: neither shows the node answers /range, which a True record would claim
+        for good, failing every later fetch from it over a slow link."""
+        cid, block = raw(os.urandom(20 * KIB))
+        self.client.holdings[P1] = {cid: block}
+        self.client.range_behaviour[P1] = lambda c, offset, max_bytes, compress: peer_client.RangeResult(
+            peer_client.BUSY, reason="closed")
+        result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
+        self.assertEqual(result.status, peer_client.BUSY)
+        self.assertIsNone(self.ranges.support.answers(P1))
+        for reason in ("busy", "cancelled"):  # a refusal and a response started: only a handler gives those
+            self.client.range_behaviour[P1] = lambda c, offset, max_bytes, compress, reason=reason: \
+                peer_client.RangeResult(peer_client.BUSY, reason=reason)
+            self.ranges.support.records.pop(P1, None)  # not known
+            self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
+            self.assertIs(self.ranges.support.answers(P1), True)
 
     def test_a_partial_in_use_falls_back_to_blocks(self):
         cid, block = raw(os.urandom(20 * KIB))

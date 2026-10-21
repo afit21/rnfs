@@ -456,6 +456,31 @@ class PeerClientTest(unittest.TestCase):
         self.assertEqual(fakes.FakeLink.created[0].status, fakes.FakeLink.CLOSED)
         self.assertFalse(self.client.has_link(NODE))
 
+    def test_a_stall_leaves_the_link_to_a_request_waiting_for_its_slot(self):
+        """REL-7: closing the link for a stalled response failed every other request on it outright (one waiting for the
+        /blocks slot came back failed, and its fetch failed the provider). It is left to them; one that wasn't sent
+        because the link closed meanwhile is lost, asked again on a new link, not failed."""
+        first, second = block_of(10, 1)[0], block_of(10, 2)[0]
+        served = {second: block_of(10, 2)[1]}
+        self.respond(lambda link, path, data: fakes.Stall(10_000) if first.binary in data[1]
+                     else protocol.encode_blocks_response([served.get(Cid.from_bytes(c)) for c in data[1]]))
+        results = {}
+        stalled = threading.Thread(target=lambda: results.__setitem__("first", self.client.blocks(NODE, [first])))
+        stalled.start()
+        time.sleep(0.2)  # its /blocks holds the link's slot
+        results["second"] = self.call(lambda: self.client.blocks(NODE, [second]))
+        stalled.join(5)
+        self.assertEqual(results["first"].status, client.STALLED)
+        self.assertEqual((results["second"].status, list(results["second"].blocks)), (client.OK, [second]))
+        self.assertEqual(len(fakes.FakeLink.created), 1)  # the same link served it
+
+    def test_a_request_not_sent_as_its_link_closed_is_lost(self):
+        self.respond(lambda link, path, data: [None])
+        peer = self.call(lambda: self.pool.get(NODE))
+        exchange = links.Exchange(time.monotonic)
+        self.pool.close_link(peer)
+        self.assertTrue(client.PeerClient._lost(peer, exchange))
+
     def peer_with_incoming(self, incoming):
         """Open the shared link, giving it an incoming_resources list like RNS's."""
         peer = self.call(lambda: self.pool.get(NODE))

@@ -316,9 +316,9 @@ class Ranges:
         max_bytes = max(1, min(wanted, MAX_BLOCK_SIZE))
         if known is not None:
             max_bytes = max(1, min(max_bytes, known - len(held)))
-        result = client.block_range(node_id, cid, held, max_bytes, compress, known, on_progress,
-                                    answers=self.support.answers(node_id))
-        if result.silent and self.support.answers(node_id) is not True:
+        answers = self.support.answers(node_id)
+        result = client.block_range(node_id, cid, held, max_bytes, compress, known, on_progress, answers=answers)
+        if result.silent and answers is not True:
             # As an older node leaves it (no handler for /range, section 3), or a lost packet on a lossy path: asked
             # with /blocks for the rest of this fetch; twice in a row and it is taken for an older node
             if self.support.silent(node_id):
@@ -328,7 +328,13 @@ class Ranges:
                 log(f"{node_name(node_id)} left /range unanswered once (a second time in a row would mark it as not "
                     "answering): asking it with /blocks for now", LOG_VERBOSE)
             return peer_client.BlocksResult(peer_client.UNSUPPORTED, unsent=[cid], reason="no answer to /range")
-        if result.status in (peer_client.OK, peer_client.BUSY) or result.reason == "malformed response":
+        if result.silent:
+            # Known to answer, yet nothing at all came back: a lost packet, or a record made in error (an older node,
+            # REL-5). Not known again, so the next silence is counted as an older node's; this one is retried as lost
+            self.support.silent(node_id)
+        # What only a /range handler gives: an answer, a refusal, a response started, a malformed answer. Not a link
+        # closed by the other end (before the request was sent, or as a busy older node evicts a link it sees idle)
+        if result.status == peer_client.OK or result.reason in ("busy", "cancelled", "malformed response"):
             self.support.answered(node_id)
         if result.status != peer_client.OK:
             if result.reason == "malformed response":
