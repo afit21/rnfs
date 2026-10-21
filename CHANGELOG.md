@@ -947,6 +947,9 @@ Fixed:
 - The API's integer parameters, a request's `Content-Length` and `quiet_hours` took whatever Python's `int()` takes:
   `1_0`, `+7`, spaces, other scripts' digits. Only ASCII digits are taken now, and a `Content-Length` of 2**63 or more,
   which overflowed the body reader, is refused (400, as a negative one is; one that isn't a number stays 411).
+- Path requests in a burst kept their spacing only as reserved: a thread that slept past its turn, as a loaded machine
+  does (80 ms on a CI runner), went with the next one's, two requests at once. The spacing now holds between the
+  requests that actually go.
 - A fetch running for days kept every search it made again (one each 10 minutes that found its providers again):
   it now keeps its first and the latest 8.
 - **A stalled response no longer fails the other requests on its link** (REL-7): closing the link for it failed a

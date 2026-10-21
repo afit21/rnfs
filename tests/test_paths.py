@@ -400,7 +400,13 @@ class ConcurrentTest(unittest.TestCase):
         self.assertEqual(results, [True] * 4)
         self.assertEqual(len(transport.requests), 1)
 
-    def test_a_burst_is_spaced(self):
+    def test_a_burst_is_spaced_when_the_waits_oversleep(self):
+        """A loaded machine oversleeps (80 ms on a CI runner): a thread waking late went with the next turn's, two
+        requests at once. The spacing holds between the requests that actually go."""
+        import time
+        self.test_a_burst_is_spaced(sleep=lambda seconds: time.sleep(seconds + 0.03))
+
+    def test_a_burst_is_spaced(self, sleep=None):
         times = []
         lock = threading.Lock()
         transport = FakeTransport(lambda: 0.0)
@@ -412,7 +418,8 @@ class ConcurrentTest(unittest.TestCase):
                 times.append(time.monotonic())
             return True
         transport.await_path = await_path
-        budget = paths.PathRequests(transport=lambda: transport, reticulum=lambda: None, spacing=0.05)
+        budget = paths.PathRequests(transport=lambda: transport, reticulum=lambda: None, spacing=0.05,
+                                    **({"sleep": sleep} if sleep is not None else {}))
         threads = [threading.Thread(target=budget.await_path, args=(bytes([i]) * 16, 5)) for i in range(1, 7)]
         for thread in threads:
             thread.start()

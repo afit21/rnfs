@@ -144,6 +144,7 @@ class PathRequests:
         self.stretch: Callable[[], float] = lambda: 1.0
         self._lock = threading.Lock()
         self._next_turn = -math.inf  # the earliest time the next turn may be
+        self._last_went = -math.inf  # when the last turn was actually taken (a request went)
         self._waits: dict[bytes, threading.Event] = {}  # destination -> set when its owner's wait ends
         self._sent: OrderedDict[bytes, float] = OrderedDict()  # destination -> when last requested, oldest first
         self._lacked: OrderedDict[bytes, None] = OrderedDict()  # destinations whose last wait found no path
@@ -309,19 +310,34 @@ class PathRequests:
                 if ready() or (cancel is not None and cancel.is_set()):
                     return False
                 if not self._over_ceiling():
-                    return True
+                    return self._go(spacing, ready, cancel)
                 if held_since is None:
                     held_since = self.clock()
                     with self._lock:
                         self.held += 1
                 elif self.clock() - held_since >= CEILING_HOLD:
-                    return True
+                    return self._go(spacing, ready, cancel)
         finally:
             waited = self.clock() - started
             with self._lock:
                 self.waited += waited
             if waited >= self.spacing:
                 log(f"path request for {node_name(destination)} waited {waited:.0f}s for its turn", LOG_DEBUG)
+
+    def _go(self, spacing: float, ready: Callable[[], bool], cancel: threading.Event | None) -> bool:
+        """Take the turn: at least spacing after the last one taken, whatever the turns reserved say. A thread that
+        slept past its turn (a loaded machine oversleeps: by 80 ms on a CI runner) would otherwise go with the next
+        one's, two requests at once. True when it may go, False if ready() held or cancel was set meanwhile."""
+        while True:
+            with self._lock:
+                now = self.clock()
+                gap = self._last_went + spacing - now
+                if gap <= 0:
+                    self._last_went = now
+                    return True
+            if ready() or (cancel is not None and cancel.is_set()):
+                return False
+            self.sleep(min(POLL, gap))
 
     def _spacing(self) -> float:
         """The spacing of the next turn: spacing, stretched (at least 1 time) while a slow node's channel is busy."""
