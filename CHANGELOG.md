@@ -73,6 +73,9 @@ Security:
   `[time, path hash, data]` unchecked, so one whose plaintext was an int, a short list or had a list as its path
   raised on RNS's request thread, a traceback in the log for every such packet, before rnfs's per-link rate limit
   saw it. The guards now drop it with a throttled verbose line; no handler could have served it.
+- **A tar member of negative size is refused by rnfs itself** (REL-4): Python's tarfile parses a negative size from
+  a base-256 field or a pax `size=` record, and only interpreters with its own offset check (3.12.3 and later fixes)
+  refused such a stream; rnfs supports 3.11. Sealed folders and tar adds now refuse it on every interpreter.
 - **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
   may be no larger than `max_download_size` and the free space above the disk reserve; each Resource segment may
   decompress to one segment, and must follow the sequence an honest sender keeps (same original hash and total,

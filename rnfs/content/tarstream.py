@@ -128,14 +128,21 @@ def _header_class() -> type:
             """The next member; a malformed header anywhere is an error (tarfile ends the archive quietly at one
             past the first member, which would take a damaged upload for a shorter one)."""
             try:
-                return super().fromtarfile(tarfile_)
+                member = super().fromtarfile(tarfile_)
             except (tarfile.InvalidHeaderError, tarfile.TruncatedHeaderError) as e:
                 raise _refused(f"malformed tar header ({e})") from None
+            if member.size < 0:  # from a pax size= record, applied after _proc_member's check
+                raise _refused(f"a tar member of {member.size} bytes")
+            return member
 
         def _proc_member(self, tarfile_):
             """Check a header just parsed against the limits, before tarfile reads what it announces (tarfile calls
             this for every header block, extension headers' too, however it parsed it)."""
             cls = type(self)
+            if self.size < 0:
+                # A base-256 size field can be negative; only interpreters with tarfile's own offset check (3.12.3 and
+                # later fixes) refused it, and rnfs supports 3.11 (REL-4)
+                raise _refused(f"a tar member of {self.size} bytes")
             if self.type == tarfile.GNUTYPE_SPARSE:
                 raise _refused("sparse files aren't supported")
             if self.type in _EXTENSION_TYPES:
