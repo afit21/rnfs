@@ -1640,9 +1640,10 @@ class Publisher:
             state.heal = True
         return state.heal
 
-    def heal(self) -> int:
-        """Partition mode ended: every item marked (its last round reached no off-island server) is due now, so the
-        rounds that follow (paced on slow nodes as ever) republish it beyond the island. Returns how many."""
+    def heal(self, why: str = "partition mode ended") -> int:
+        """Partition mode ended (or why, for the log: servers beyond the island answer after a start): every item
+        marked (its last round reached no off-island server) is due now, so the rounds that follow (paced on slow nodes
+        as ever) republish it beyond the island. Returns how many."""
         now = self.clock()
         with self._lock:
             marked = self._marked()
@@ -1655,7 +1656,7 @@ class Publisher:
                     if state is not None:
                         self._touch_item(item)
         if marked:
-            log(f"partition mode ended: republishing {plural(marked, 'key')} stored only on the island", LOG_NOTICE)
+            log(f"{why}: republishing {plural(marked, 'key')} stored only on the island", LOG_NOTICE)
             self.wake()
         return marked
 

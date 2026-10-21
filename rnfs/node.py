@@ -1316,7 +1316,7 @@ class RnfsNode:
         such contact since the start republishes the keys still marked for the heal republish (Publisher.heal)."""
         if self._heal_at_contact and not self.partition.active and not self.local.is_local(node_id):
             self._heal_at_contact = False
-            self.publisher.heal()
+            self.publisher.heal(f"{node_name(node_id)}, beyond the island, was heard (the first since the start)")
 
     def _is_member_node(self, node_id: bytes) -> bool:
         """Private mode's routing table admission: node_id's identity is a member."""
