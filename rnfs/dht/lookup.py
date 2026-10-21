@@ -212,6 +212,7 @@ class Lookup:
         # node -> the nodes it named, for every answer about the key, also those that came after the run that asked
         # stopped waiting (it completes with queries still out)
         self._replies: dict[bytes, list[bytes]] = {}
+        self._provided: dict[bytes, list[bytes]] = {}  # node -> the providers its answer about the key listed, likewise
         self._wake: queue.Queue | None = None
         self._lock = threading.Lock()
         self._start_nodes = [n for n in dict.fromkeys(start_nodes) if self._usable(n)]
@@ -361,6 +362,27 @@ class Lookup:
         if self.deadline is None:
             return self.timeout
         return max(0.0, self.deadline - self.clock())
+
+    def late_providers(self) -> list[bytes]:
+        """The providers listed by answers that came after the run that asked had ended (a run completes with queries
+        still out, often to nodes behind a slow path, which rank last), not reported before: reported now, as a run
+        reports them (not this node, nor one exclude names), and their listers counted as a run's are. Call it
+        between runs, in the caller's thread."""
+        with self._lock:
+            provided = list(self._provided.items())
+        late: list[bytes] = []
+        for node_id, providers in provided:
+            fresh = [provider for provider in providers if provider not in self._reported and provider not in late
+                     and provider != self.own_id and not self.exclude(provider)]
+            if not fresh:
+                continue
+            with self._lock:
+                self._listing.add(node_id)
+                for provider in providers:
+                    self._listed_by.setdefault(provider, set()).add(node_id)
+            late += fresh
+        self._reported.update(late)
+        return late
 
     def listing_nodes(self) -> list[bytes]:
         """The nodes that have answered with at least one provider (in any run)."""
@@ -717,6 +739,8 @@ class Lookup:
             if reply is not None and key == self.key:
                 with self._lock:
                     self._replies[node_id] = reply[1]
+                    if reply[0]:
+                        self._provided[node_id] = list(reply[0])
             try:
                 (self.on_failure if reply is None else self.on_answer)(node_id)
             except Exception as e:  # noqa: BLE001 - a caller's callback must not end the lookup; logged

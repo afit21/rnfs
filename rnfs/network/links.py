@@ -161,6 +161,7 @@ class Exchange:
         # lost it in transit; the requester can't tell which
         self.cancelled = False
         self.receipt = None  # the RNS RequestReceipt, once sent
+        self.went_dead = False  # unanswered on a link that heard nothing meanwhile (Links._went_dead)
 
     # RNS callbacks: they run on RNS threads, so they only record and never block
 
@@ -796,6 +797,7 @@ class LinkPool:
             finally:
                 self._log_outcome(peer, path, exchange)
             if not silence_expected and self._went_dead(peer, exchange):
+                exchange.went_dead = True
                 # Nothing at all came back on the link while the request waited out RNS's timeout: the other end
                 # most likely lost it (its rnsd or a transport node on the way restarted), which RNS notices only at
                 # its keepalive, about 10 minutes on LoRa; meanwhile every request on it waited out its timeout too.

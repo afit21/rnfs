@@ -817,6 +817,15 @@ Fixed:
   the radios' load meanwhile (the RPC refused). That is now a verbose line; other failures to read the stats stay
   warnings. The node itself carries on through the restart, as before (tested on the laptop: a fetch over LoRa
   12 s after `rnsd` came back).
+- **A provider named by an answer that came after its lookup ended is used** (spec section 6, Finding providers): a
+  lookup completes once the closest nodes by rank have answered, with queries still out, and their answers' providers
+  were dropped. Over LoRa the PC searched for a file the laptop had just added: the laptop, one hop away on the radio
+  but ranked last as a slow path, answered with itself as provider 29 ms after the first lookup completed, and the
+  fetch failed a second later. Those providers are now reported once the search's runs are over.
+- **One lost request no longer fails a provider at once**: a request left unanswered on a link that heard nothing
+  meanwhile closes the link (0.2.0, above), and the request then counted as a failure rather than as lost, so the
+  provider was dropped from the fetch. Over LoRa a lone lost `/range` looks just so, and a fetch from the file's one
+  provider failed. It now counts as lost: asked again on a new link, failed only `max_failures` times in a row.
 
 ## 0.1.6
 

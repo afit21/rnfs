@@ -710,7 +710,9 @@ A request on a shared link that RNS fails (`RECEIPT_FAILED`, nothing of an answe
 active, received nothing since it was sent (`Link.no_inbound_for()` longer than the request took: `_went_dead`) closes
 that link (not one opened since), unless another thread uses it or the caller expected silence (`silence_expected`: a
 `/range` to a node not known to answer it, `PeerClient.block_range(answers=)`), 0.2.0: the far end lost it, which RNS
-would notice only at its keepalive.
+would notice only at its keepalive. The exchange is marked `went_dead`, and `PeerClient._lost` counts it `LOST` (asked
+again on a new link, failing the provider only `max_failures` times in a row), not `FAILED`: over LoRa a lone lost
+request looks the same.
 Every link `LinkPool` opens gets an `EarlyResponses` (`PeerLink.early`, 0.2.0) in place of its `handle_response`
 (RNS looks it up on the link): a response no `Link.pending_requests` entry matches is kept (at most
 `MAX_EARLY_RESPONSES`, 16, for `EARLY_RESPONSE_LIFE`, 30 s), and `LinkPool._request`, once `Link.request` has

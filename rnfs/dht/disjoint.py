@@ -189,6 +189,13 @@ class DisjointLookup:
         self._sample()
         return found
 
+    def late_providers(self) -> list[bytes]:
+        """Lookup.late_providers of every path, not reported before (reported now)."""
+        late = [provider for path in self.paths for provider in path.late_providers()]
+        late = [provider for provider in dict.fromkeys(late) if provider not in self._reported]
+        self._reported.update(late)
+        return late
+
     def stop(self):
         """Wake a running find_providers so it checks should_stop() now."""
         events = self._events

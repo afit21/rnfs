@@ -403,7 +403,11 @@ class PeerClient:
         with the link still up (it timed out: the request or the response's advertisement was lost, or the response
         transfer ran out of retries), or the link itself timed out under it. Not when it wasn't sent, or the link
         was closed by either end. A response RNS rejected at its advertisement (too large) fails the same way and
-        can't be told from a lost one, so it is retried too: no more than a busy refusal costs (section 6)."""
+        can't be told from a lost one, so it is retried too: no more than a busy refusal costs (section 6). Also when
+        this node closed the link for it, as nothing came back on it meanwhile (Exchange.went_dead): over LoRa a lone
+        lost request looks just so, and failing the provider for it ended a fetch from its one provider."""
+        if exchange.went_dead:
+            return True
         if peer.is_active():
             return exchange.receipt is not None
         return timed_out(peer.link)

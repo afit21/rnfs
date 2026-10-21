@@ -902,6 +902,37 @@ class FindProvidersTest(LookupTestCase):
         self.lookup(self.net, self.key, self.start).find_providers(found.append)
         self.assertEqual(sorted(found), providers)
 
+    def test_a_provider_answered_after_the_run_completed_is_late(self):
+        """A query still out when the run completes (its node no longer among the beta closest) can still list a
+        provider: late_providers reports it, once, with its lister; not this node, nor one excluded."""
+        net = self.network()
+        key = ident(0x1000)
+        near = [ident(0x1001), ident(0x1002), ident(0x1003)]
+        start, straggler = ident(0x9000), ident(0x9001)
+        for n in near:
+            net.add(n, knows=near)
+        net.add(start, knows=near)
+        net.add(straggler)
+        for provider in (ident(0x7777), ident(0), ident(0x6666)):
+            net.nodes[straggler].store.store(key, provider)
+        release = threading.Event()
+
+        def query(node_id, about):
+            if node_id == straggler:
+                release.wait(5)
+            return net.query(node_id, about)
+        lookup = Lookup(key, [start, straggler], query, ident(0), timeout=5, poll_interval=0.05, alpha=3, beta=3,
+                        exclude={ident(0x6666)}.__contains__)
+        self.assertEqual(lookup.find_providers(lambda p: None), [])
+        self.assertEqual(lookup.ended, "complete")
+        self.assertEqual(lookup.late_providers(), [])  # nothing came late yet
+        release.set()
+        late = []
+        wait_for(lambda: late.extend(lookup.late_providers()) or late)
+        self.assertEqual(late, [ident(0x7777)])
+        self.assertEqual(lookup.listers(ident(0x7777)), {straggler})
+        self.assertEqual(lookup.late_providers(), [])  # reported once
+
     def test_on_provider_called_as_soon_as_found(self):
         provider = ident(0x500)
         self.net.publish(self.key, provider)

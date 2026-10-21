@@ -866,6 +866,10 @@ and repeat.
   up to 10 minutes; not for a fetch from a given node): providers appear as others finish the same fetch, and one may
   be on a faster route. Measured between cloud nodes, a 30 MB fetch over a 4-hop route ran 29 minutes at 18 KB/s while
   a node 2 hops away, done in 26 s, provided it. A slow node doesn't, a search costing it a minute of airtime.
+  A run completes with queries still out (to nodes no longer among the `beta` closest, often behind a slow path,
+  which rank last); the providers an answer lists that comes after its run ended SHOULD still be used, once the
+  search's runs are over (rnfs 0.2.0). Over LoRa the provider itself, one hop away on the radio, answered 29 ms after
+  the first lookup completed, and the fetch failed with its record in hand.
 - **Choosing providers.** A node SHOULD rank providers by these keys, in this order:
   1. **Seniority.** Providers that have been in the routing table for over `provider_seniority` come first.
      This key MUST stay first: an attacker can create fresh identities that sit close in hops, or earn a score
@@ -887,7 +891,7 @@ and repeat.
   A provider *fails* when its link fails (there is no path to it twice in a row, a minute apart: rnfs 0.2.0, as a
   radio node is out of reach for a minute when its `rnsd` restarts; or this node closed the link under a request), its
   answer is malformed, it answers `None` for a block of the root it advertised, it answers `False` (busy or refused)
-  or closes the link (`DESTINATION_CLOSED`, a refusal: above; asked again on a new link) `max_failures` times in a row, its requests go unanswered `max_failures` times in a row, or it stalls twice (section
+  or closes the link (`DESTINATION_CLOSED`, a refusal: above; asked again on a new link) `max_failures` times in a row, its requests go unanswered `max_failures` times in a row (one left unanswered on a link this node closed because nothing came back on it meanwhile counts so, 0.2.0), or it stalls twice (section
   7). A `False` is retried after a short delay. A request goes *unanswered* when RNS times it out with the link up (on a
   lossy path its packet or its answer's was lost: RNS resends neither), the link times out under it, or a new link to a
   node RNS has a path to isn't established (its link request or proof lost); the requester closes that link (which

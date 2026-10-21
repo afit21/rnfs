@@ -40,6 +40,7 @@ class FakeSearchLookup:
         self.sent = 7
         self.runs = 0
         self.reports: list[str] = []
+        self.late: list[bytes] = []  # what late_providers gives next
 
     def report(self, text):
         """Note a report."""
@@ -51,6 +52,11 @@ class FakeSearchLookup:
         for provider in self.providers:
             on_provider(provider)
         return list(self.providers)
+
+    def late_providers(self):
+        """The late answers' providers set, once."""
+        late, self.late = self.late, []
+        return late
 
     def remaining(self):
         """The time left."""
@@ -94,6 +100,18 @@ class SearchTest(unittest.TestCase):
         self.assertEqual(search.find_providers(reported.append), [])
         self.assertEqual((first.runs, second.runs), (1, 2))
         self.assertEqual(reported, [ident(6), ident(5)])
+
+    def test_late_answers_providers_are_reported(self):
+        """A provider listed by an answer that came after its run ended is reported once the runs are over: over
+        LoRa the provider itself, behind a slow path, answered 29 ms after the first lookup completed."""
+        first = FakeSearchLookup([], left=42.0)
+        second = FakeSearchLookup([])
+        first.late = [ident(7)]
+        second.late = [ident(7), ident(8)]
+        search = Search(first, lambda left, queries: second)
+        reported = []
+        self.assertEqual(search.find_providers(reported.append), [ident(7), ident(8)])
+        self.assertEqual(reported, [ident(7), ident(8)])  # each once
 
     def test_no_fallback_out_of_time_or_when_stopped(self):
         made = []

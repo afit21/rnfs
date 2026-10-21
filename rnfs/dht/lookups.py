@@ -101,8 +101,8 @@ class Search:
     def find_providers(self, on_provider: NodeCallback, should_stop: Callable[[], bool] = lambda: False
                        ) -> list[bytes]:
         """Lookup.find_providers: a run of the first lookup (of the fallback, once escalated), then the fallback if no
-        provider has been found yet, time is left and should_stop() isn't True. Returns the providers this call
-        found."""
+        provider has been found yet, time is left and should_stop() isn't True, then the providers of answers that came
+        after their run ended (Lookup.late_providers). Returns the providers this call found."""
         found: list[bytes] = []
 
         def report(provider: bytes):
@@ -117,6 +117,11 @@ class Search:
             self.second = self._escalate(should_stop)
             if self.second is not None:
                 self.second.find_providers(report, should_stop)
+        # Answers that came after their run ended: over LoRa the provider itself, a slow path's node ranked last, may
+        # answer just after the first lookup completed, and the fetch would fail with its record in hand
+        for lookup in [self.first] + ([self.second] if self.second is not None else []):
+            for provider in lookup.late_providers():
+                report(provider)
         self._count()
         return found
 

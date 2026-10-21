@@ -528,7 +528,9 @@ class LinkPoolTest(unittest.TestCase):
         FakeLink.responder = staticmethod(lambda link, path, data: FAIL)
         peer = run(self, lambda: self.pool.get(NODE))
         peer.link.silence = 10_000.0
-        self.assertFalse(run(self, lambda: self.pool.request(peer, "/find", b"k")).answered)
+        exchange = run(self, lambda: self.pool.request(peer, "/find", b"k"))
+        self.assertFalse(exchange.answered)
+        self.assertTrue(exchange.went_dead)  # the client counts it lost, not failed (BlocksResult LOST)
         self.assertEqual(peer.link.status, FakeLink.CLOSED)
         FakeLink.responder = staticmethod(lambda link, path, data: True)
         fresh = run(self, lambda: self.pool.get(NODE))
@@ -539,7 +541,8 @@ class LinkPoolTest(unittest.TestCase):
         # The request or its answer was lost on the way (RNS resends neither); the link itself works
         FakeLink.responder = staticmethod(lambda link, path, data: FAIL)
         peer = run(self, lambda: self.pool.get(NODE))
-        self.assertFalse(run(self, lambda: self.pool.request(peer, "/find", b"k")).answered)
+        exchange = run(self, lambda: self.pool.request(peer, "/find", b"k"))
+        self.assertFalse(exchange.answered or exchange.went_dead)
         self.assertEqual(peer.link.status, FakeLink.ACTIVE)
         self.assertIs(run(self, lambda: self.pool.get(NODE)), peer)
 

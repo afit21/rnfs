@@ -340,6 +340,20 @@ class PeerClientTest(unittest.TestCase):
         self.assertEqual((result.status, result.unsent), (client.LOST, [cid]))
         self.assertTrue(self.client.has_link(NODE))  # the fetcher decides whether to close it
 
+    def test_a_request_unanswered_on_a_silent_link_is_lost(self):
+        """Nothing came back on the link while it waited: the link is closed for it (Links._went_dead), which is how a
+        lone lost request looks over LoRa, so the provider is asked again on a new link rather than failed."""
+        def silent(link, path, data):
+            """Hear nothing on the link, and leave the request unanswered."""
+            link.silence = 10_000.0
+            return fakes.FAIL
+        self.respond(silent)
+        for request in (lambda: self.client.blocks(NODE, [block_of(10, 1)[0]]),
+                        lambda: self.client.block_range(NODE, block_of(10, 1)[0], b"", 1024, answers=True)):
+            result = self.call(request)
+            self.assertEqual(result.status, client.LOST)
+            self.assertFalse(self.client.has_link(NODE))
+
     def close_under_request(self, reason):
         """Respond by closing the link with RNS's teardown reason (None: closed by this node's teardown())."""
         def answer(link, path, data):
