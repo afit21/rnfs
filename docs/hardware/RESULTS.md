@@ -234,6 +234,9 @@ the fixed build. The findings are REL-1 to REL-19 in CHANGELOG.md (the attacks a
     twice, and three others failed meanwhile.
   - One finding was left as is. A search from the laptop asked internet servers within 3 hops first, as its local
     servers: every path from the laptop goes through the PC, the known single-gateway case. Two of its three query
-    slots then waited 127 s and 217 s on servers that never answered, one of them 34 hops away by RNS's path. Letting
-    a query that has waited long give up its slot while its answer still counts would speed such searches; it
-    changes the lookup, so it is left for after 0.2.0.
+    slots then waited 127 s and 217 s on servers that never answered, one of them 34 hops away by RNS's path. Fixed by
+    `2938ce1`: a search's query unanswered after 15 s (45 s on a slow node) gives up its slot, its answer still
+    counting, and a search that has found nobody waits for it at most 3 times as long. On the laptop, searches for
+    content nobody held then logged a query "slow to answer" each and ended in 325 s and 104 s (the slowest path held
+    135 s by a server failing at 169 s), against more than 600 s before. Three gateway ranges of a file only the PC
+    held came in 103–115 s, the provider asked first each time.
