@@ -133,14 +133,21 @@ class Partials:
 
     def __init__(self, directory: str | None, limit: int = MAX_PARTIALS):
         """Partials in files in directory (created if missing; any left by an earlier run deleted), or in memory if
-        directory is None; at most limit of them."""
+        directory is None, or can't be made or listed (logged); at most limit of them."""
         self.directory = directory
         self.limit = limit
         self.lock = threading.Lock()
         self.partials: OrderedDict[bytes, Partial] = OrderedDict()  # least recently written first
         if directory is not None:
-            os.makedirs(directory, mode=0o700, exist_ok=True)
-            for name in os.listdir(directory):
+            try:
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                names = os.listdir(directory)
+            except OSError as e:
+                # A file or a dangling link in its place, say: partials only save a retried fetch the bytes it had,
+                # so they are kept in memory rather than the node not starting (FileExistsError, before)
+                log(f"could not use {directory} for partial blocks ({e}); keeping them in memory", LOG_WARNING)
+                self.directory, names = None, []
+            for name in names:
                 if name.endswith(PARTIAL_SUFFIX):
                     self._remove(os.path.join(directory, name))
 
@@ -206,7 +213,8 @@ class Partials:
             partial.data += data
         else:
             try:
-                with open(partial.path, "ab") as f:
+                # An empty partial's file starts afresh: one left at its path (its removal failed) isn't its bytes
+                with open(partial.path, "ab" if partial.length else "wb") as f:
                     f.write(data)
             except OSError as e:
                 log(f"could not write the partial block of {partial.cid}: {e}", LOG_WARNING)

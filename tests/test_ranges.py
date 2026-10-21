@@ -10,6 +10,7 @@ from rnfs.constants import DAY, KIB
 from rnfs.content.cid import RAW, Cid
 from rnfs.network import client as peer_client
 from tests.fakes.client import FakeClient
+from tests.support import CAN_SYMLINK
 
 P1, P2 = b"\x01" * 16, b"\x02" * 16
 
@@ -157,6 +158,41 @@ class PartialsTest(unittest.TestCase):
                 f.write(b"left by an earlier run")
         ranges.Partials(self.dir)
         self.assertEqual(os.listdir(self.dir), [])
+
+    def test_a_file_in_place_of_the_directory_keeps_them_in_memory(self):
+        """Something other than a directory at <state dir>/partial (a file, or a dangling link) is logged and left as
+        it is, and the partials are kept in memory: it raised FileExistsError, and the node didn't start."""
+        targets = ["file"] + (["link"] if CAN_SYMLINK else [])
+        for what in targets:
+            with self.subTest(what=what):
+                if what == "file":
+                    with open(self.dir, "wb") as f:
+                        f.write(b"not a directory")
+                else:
+                    os.remove(self.dir)
+                    os.symlink(os.path.join(self.tmp.name, "missing"), self.dir)
+                with mock.patch.object(ranges, "log") as log:
+                    partials = ranges.Partials(self.dir)
+                self.assertIsNone(partials.directory)
+                self.assertIn("keeping them in memory", log.call_args.args[0])
+                cid = raw(b"x" * 10)[0]
+                partial = partials.acquire(cid, P1)
+                self.assertTrue(partials.append(partial, 10, b"abc"))
+                self.assertEqual(partials.read(partial), b"abc")
+                self.assertTrue(os.path.lexists(self.dir) and not os.path.isdir(self.dir))
+
+    def test_a_file_left_at_an_empty_partials_path_is_replaced(self):
+        """An empty partial's first bytes start its file afresh: a file left at its path (its removal failed) was
+        appended to, so the partial held bytes that weren't its own."""
+        partials = ranges.Partials(self.dir)
+        cid = raw(b"x" * 10)[0]
+        partial = partials.acquire(cid, P1)
+        with open(partial.path, "wb") as f:
+            f.write(b"stale")
+        self.assertTrue(partials.append(partial, 10, b"abc"))
+        self.assertEqual(partials.read(partial), b"abc")
+        self.assertTrue(partials.append(partial, 10, b"def"))
+        self.assertEqual(partials.read(partial), b"abcdef")
 
     def test_one_request_at_a_time(self):
         partials = ranges.Partials(None)
