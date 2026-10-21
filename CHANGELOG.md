@@ -876,6 +876,25 @@ Fixed:
   read-only disk) left the partial empty but counted as progress, so the fetch asked for the same first range for
   ever, a whole range of airtime each time over LoRa. That, or a partial that can't be read back, now has the block
   asked whole with `/blocks` for the rest of the fetch.
+- **Damaged local state no longer stops the node** (REL-18, found by fuzzing the state files, the state database and
+  `rnfs.toml`): each of these failed every start (or, in the provider store, every expiry pass and save), and is now
+  treated as damage: logged, and dropped, set aside or clamped.
+  - A legacy JSON state file or a saved row nested about 10,000 levels deep raised RecursionError: the file is moved
+    to `.damaged` and the row deleted, as when they aren't JSON (a `names.json` still stops startup, with a plain
+    error). An `rnfs.toml` nested a few hundred levels gave every CLI command a traceback: it is refused as invalid
+    TOML.
+  - Infinite provider times in `providers.json` or a 0.1.5 or 0.1.6 database failed the upgrade's provider standing
+    step (NOT NULL), leaving the schema as it was: those publishers now start as Newcomers, and their times are
+    clamped to now as any future time is. Finite times upgrade as before.
+  - An LXMF inbox or outbox file whose `next_id` was below -2^63 failed its import: a `next_id` below 1 counts as
+    missing.
+  - A provider record whose key isn't a 16-byte blob crashed the start, expiry and every later save of the records:
+    such rows are never read. A provider standing whose records, days or publisher isn't an integer (or an ID) in
+    range, or whose records summed past 2^63, stopped the start: it counts as no standing.
+  - A cut-short publish round's saved item list holding an item that didn't parse stopped the start: the list counts
+    as malformed whole.
+  - A file or a dangling link at `<state dir>/partial` stopped the start: partial blocks are kept in memory, with a
+    warning. An empty partial block's first range was appended to a file left at its path: the file starts afresh.
 - **A crash during a get job's write-out leaves nothing behind** (REL-10): `node.get` wrote under a random hidden name
   beside the output (`.rnfs-get-<random>.partial`, up to the download's size, there for a sealed file's whole fetch),
   which nothing removed after a crash. A get job's write-out is now named after the job
