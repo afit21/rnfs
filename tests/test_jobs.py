@@ -17,7 +17,7 @@ from rnfs import cli, retry, statedb
 from rnfs.api import ApiServer
 from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE
-from rnfs.content.cid import RAW, Cid
+from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.storage import USER
 from rnfs.features import jobs
 from rnfs.node import STOP_TIMEOUT, RnfsNode
@@ -910,6 +910,24 @@ class ParsingAndFormattingTest(unittest.TestCase):
             self.assertAlmostEqual(job.rate(), (240 * 100 + 60 * 400) / jobs.RATE_WINDOW)
             self.assertEqual(job.downloaded_bytes, (seconds - 60) * 100 + 60 * 400)
             self.assertEqual(job.blocks, seconds)
+
+    def test_partial_ranges_count_before_the_block_is_whole(self):
+        """A block arriving in ranges over a slow link counts as it arrives, each byte once: a resend from another
+        provider's smaller partial adds nothing, and the whole block adds only what its ranges hadn't."""
+        job = jobs.Job("0123abcd", "get", "x", "/o")
+        job.begin_run()
+        chunk = Cid.for_block(RAW, b"chunk")
+        job.partial(chunk, 16_000)
+        job.partial(chunk, 40_000)
+        job.partial(chunk, 10_000)  # another provider's partial, behind
+        self.assertEqual((job.done_bytes, job.downloaded_bytes, job._moved, job.blocks), (40_000, 40_000, 40_000, 0))
+        job.block(chunk, 65_536, True)
+        self.assertEqual((job.done_bytes, job.downloaded_bytes, job._moved, job.blocks), (65_536, 65_536, 65_536, 1))
+        job.partial(chunk, 65_536)  # met already: nothing
+        self.assertEqual(job.done_bytes, 65_536)
+        node = Cid.for_block(DAG, b"node")
+        job.partial(node, 1_000)  # a DAG node's bytes are downloaded, not content
+        self.assertEqual((job.done_bytes, job.downloaded_bytes), (65_536, 66_536))
 
     def test_settings_validated(self):
         for settings in ({"max_jobs": 0}, {"max_jobs": True}, {"max_jobs": 1.5}, {"max_finished_jobs": -1},

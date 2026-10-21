@@ -162,10 +162,11 @@ class Job:
         self.position: int | None = None  # its row's place in the jobs table (creation order), once queued or loaded
         # Called with the job at most every EVENT_INTERVAL while it progresses (the feature's progress event)
         self.on_progress: Callable[["Job"], None] | None = None
-        self._lock = threading.Lock()  # guards _samples, _moved and _seen
+        self._lock = threading.Lock()  # guards _samples, _moved, _seen and _partial
         self._moved = 0  # what the rate counts: bytes downloaded (transfers) or read (add, import) this run
         self._samples: deque[tuple[float, int]] = deque()  # (monotonic time, _moved)
         self._seen: set = set()  # CIDs met this run, so each counts once
+        self._partial: dict = {}  # bytes counted of each block not yet met, from the ranges of it (/range)
         self._last_event = float("-inf")  # monotonic time of the last progress event
 
     @property
@@ -185,14 +186,31 @@ class Job:
         """A block met: count it once, its bytes as content if it is a chunk."""
         now = time.monotonic()
         with self._lock:
+            counted = self._partial.pop(cid, 0)  # its ranges' bytes, counted already
             if downloaded:
-                self.downloaded_bytes += length
-                self._sample(now, length)
+                self.downloaded_bytes += max(0, length - counted)
+                self._sample(now, max(0, length - counted))
             if cid not in self._seen:
                 self._seen.add(cid)
                 self.blocks += 1
                 if cid.is_raw:
-                    self.done_bytes += length
+                    self.done_bytes += max(0, length - counted)
+        self._progressed(now)
+
+    def partial(self, cid, held: int):
+        """Part of a block not yet met arrived with /range, held bytes of it from one provider: what goes beyond the
+        bytes counted of it is counted as downloaded (and done, for a chunk), so a fetch over a slow link, where one
+        block takes minutes, shows its progress and rate before the block is whole."""
+        now = time.monotonic()
+        with self._lock:
+            gained = held - self._partial.get(cid, 0)
+            if cid in self._seen or gained <= 0:
+                return
+            self._partial[cid] = held
+            self.downloaded_bytes += gained
+            self._sample(now, gained)
+            if cid.is_raw:
+                self.done_bytes += gained
         self._progressed(now)
 
     def read(self, length: int):
@@ -243,6 +261,7 @@ class Job:
             self.runs += 1
             self.done_bytes = self.blocks = self.downloaded_bytes = self._moved = 0
             self._seen = set()
+            self._partial = {}
             self._samples = deque([(time.monotonic(), 0)])
             self._last_event = time.monotonic()  # the "running" event has just been published
 

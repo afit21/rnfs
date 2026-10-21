@@ -270,6 +270,9 @@ class Observer:
     def block(self, cid: Cid, length: int, downloaded: bool):
         """A block was met that is now stored: downloaded just now, or already stored (downloaded False)."""
 
+    def partial(self, cid: Cid, held: int):
+        """Part of a block not yet met arrived with /range: held bytes of it are held now, from one provider."""
+
     def cancelled(self) -> bool:
         """True makes the fetch raise Cancelled at its next step (checked at least every POLL seconds)."""
         return False
@@ -1847,6 +1850,10 @@ class Fetch:
             outstanding.discard(cid)
         for cid, block in late.items():
             self._accept(cid, block, self._expects, {}, self.budget)
+        if self.observer is not None:
+            for cid in result.partial:
+                if cid in outstanding:
+                    self.observer.partial(cid, self.fetcher.ranges.partials.length(cid, node_id))
         if result.blocks:
             self._served(node_id)
         if probe:

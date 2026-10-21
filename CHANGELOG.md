@@ -807,6 +807,10 @@ Fixed:
   replicas of its neighbours' content. Over LoRa the laptop held the island record of a file and waited 51 s for its
   search to find the provider it named. The providers this node's own `/find` answer would list are now candidates
   as the search starts; the search still runs, so a record held here can't hide other providers.
+- **A job's progress counts a block as its ranges arrive**: `rnfs jobs` and the job's progress events counted a
+  block only once it was whole. Over LoRa, where a 64 KB chunk comes in `/range` responses over two minutes, a job
+  resumed after a restart showed `0 B/s  ETA ?` for 90 s while 56 KB of its next chunk had arrived. The bytes each
+  range brings now count towards `done_bytes` and the rate, once each.
 
 ## 0.1.6
 

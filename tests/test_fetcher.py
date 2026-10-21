@@ -1076,10 +1076,25 @@ class RangeTransferTest(FetcherTest):
         built = self.file(data)
         self.hold(P1)
         self.runs.append([P1])
-        self.fetch_all(built.cid)
+        seen = []
+
+        class Recorder(fetcher_module.Observer):
+            def partial(self, cid, held):
+                seen.append(("partial", cid, held))
+
+            def block(self, cid, length, downloaded):
+                seen.append(("block", cid, length))
+        with fetcher_module.observing(Recorder()):
+            self.fetch_all(built.cid)
         self.assertEqual(self.read(built.cid), data)
         first = self.ranges_of(P1, self.chunks(built)[0].cid)
         self.assertGreater(len(first), 1)  # several ranges, not one whole chunk
+        # Each range but the last reported (a job's progress), growing, before the block itself
+        cid = self.chunks(built)[0].cid
+        reported = [held for kind, c, held in seen if kind == "partial" and c == cid]
+        self.assertEqual(len(reported), len(first) - 1)
+        self.assertEqual(reported, sorted(reported))
+        self.assertLess(seen.index(("partial", cid, reported[-1])), seen.index(("block", cid, CHUNK_SIZE)))
         self.assertEqual(first[0][:2], (0, self.config.min_rate_sample))  # no rate: what gives an estimate
         for chunk in self.chunks(built):
             self.assertTrue(all(compress for _, _, compress in self.ranges_of(P1, chunk.cid)))
