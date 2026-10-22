@@ -347,12 +347,15 @@ class AppPinsTest(unittest.TestCase):
         with self.app.pin_key("k"):
             queued = self.app.submit_job("pin", cid)
         self.assertEqual(queued["source"], "app:wiki:k")
-        self.assertNotIn("source", self.cli.submit_job("pin", cid))  # a user job's record is as before
+        users = self.cli.submit_job("pin", cid)
+        self.assertNotIn("source", users)  # a user job's record is as before
         record = statedb.load(state_rows(self.node.config.state_dir, "SELECT record FROM jobs WHERE id = ?",
                                          (queued["id"],))[0][0])
         self.assertEqual(record["source"], "app:wiki:k")
         jobs.start()
+        # Both jobs run at once (max_jobs 2): the user's may finish after the app's
         self.assertEqual(self.app.job(queued["id"], wait=10)["state"], "done")
+        self.assertEqual(self.cli.job(users["id"], wait=10)["state"], "done")
         self.assertEqual(self.sources(cid), {USER, "app:wiki:k"})
         jobs.stop()
         held = self.app.submit_job("pin", cid)

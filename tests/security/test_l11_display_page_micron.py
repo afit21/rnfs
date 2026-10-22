@@ -27,10 +27,10 @@ HOSTILE = "\n".join([
     "#!fg=fff",
     "`=",
     ">After an early end of the block",
-    "`́=",
+    "`\u0301=",
     "`{f64a846313b874ee4a357040807f8c77:/page/partial.mu",
     "\x1b[2Jcleared\tscreen",
-    "‮evil",
+    "\u202eevil",
     "-",
     "# a comment hiding text",
 ]) + "\n"

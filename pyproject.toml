@@ -33,6 +33,14 @@ include = ["rnfs*"]
 [tool.setuptools.dynamic]
 version = {attr = "rnfs.__init__.__version__"}  # not "rnfs": setuptools would find rnfs.py
 
+[tool.bandit]
+# Run as `bandit -c pyproject.toml -r .`: not the virtualenv, build output or agent worktrees (copies of the tree)
+exclude_dirs = [".venv", "venv", "build", "build-dir", "dist", ".claude", ".flatpak-builder"]
+
+[tool.bandit.assert_used]
+# Tests assert by design
+skips = ["*/tests/*"]
+
 [tool.ruff]
 target-version = "py311"
 # docs/simulations: the research scripts behind the 0.2.0 plan, kept as they were run, not rnfs code

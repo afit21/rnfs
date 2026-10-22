@@ -13,3 +13,4 @@ build-dir/
 .coverage
 .coverage.*
 htmlcov/
+bandit/
