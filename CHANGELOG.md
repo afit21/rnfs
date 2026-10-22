@@ -2,7 +2,7 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
-## 0.2.0 (unreleased)
+## 0.2.0
 
 The feature-complete release: the local API and the library for companion apps; providing at scale (sweep
 providing, provider records on disk within a byte budget, storage tiers against floods); finding content when
