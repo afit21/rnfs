@@ -964,6 +964,12 @@ Fixed:
   unreliable until it answers, and its answer still counts. A search that has found nobody still waits for such
   queries, up to 3 times as long after each was sent, as one may hold the only record. Finding the closest nodes,
   for publishing, is unchanged.
+- **A get just after the add finds the content** (specification section 6, Finding providers): content added
+  elsewhere is found only once its publisher's records are out, which between cloud nodes took over 20 s when the
+  publish lookup waited on a server that didn't answer, so a `get` of a CID shared as it was added failed with "no
+  provider found" (several fetches of the soak, asked 20 s after the add). A fetch the user asked for that found no
+  provider at all now searches once more, a twentieth of `lookup_timeout` (30 s) later, before it fails; the
+  gateway's and the node's own retries don't.
 - **A provider named by an answer that came after its lookup ended is used** (spec section 6, Finding providers): a
   lookup completes once the closest nodes by rank have answered, with queries still out, and their answers' providers
   were dropped. Over LoRa the PC searched for a file the laptop had just added: the laptop, one hop away on the radio

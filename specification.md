@@ -879,6 +879,11 @@ and repeat.
   no provider still waits for those queries, up to 3 × the patience after each was sent, as one may hold the only
   record. Finding the closest nodes, for publishing, doesn't do this: where records are stored matters more than how
   soon.
+  A fetch the user asked for just now (rnfs: `get`, `cat`, `pin add` and the rest of the CLI and API, not the gateway
+  or the node's own retries) whose search found no provider at all SHOULD search once more a short while later
+  (rnfs 0.2.0: a twentieth of `lookup_timeout`, 30 s at its default) before it fails: content just added elsewhere is
+  found only once its publisher's records are out, and between cloud nodes a get of a CID shared as it was added
+  failed, the publish lookup having waited 24 s on a server that didn't answer.
   A run completes with queries still out (to nodes no longer among the `beta` closest, often behind a slow path,
   which rank last); the providers an answer lists that comes after its run ended SHOULD still be used, once the
   search's runs are over (rnfs 0.2.0). Over LoRa the provider itself, one hop away on the radio, answered 29 ms after

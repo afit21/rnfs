@@ -173,6 +173,11 @@ UNFOUND_FOR = 600
 # max_parallel, a search starts this long after the last one ended, the wait doubling each time up to SEARCH_AGAIN_MAX
 SEARCH_AGAIN_AFTER = 60.0
 SEARCH_AGAIN_MAX = 600.0
+# An explicit fetch whose search found no provider at all searches once more this part of lookup_timeout later (30 s
+# at its default), before it fails: content just added elsewhere is found only once its publisher's records are out,
+# which took over 20 s between cloud nodes (the publish lookup waited on a server that didn't answer), so a get of a
+# CID shared at once failed (_search_late)
+LATE_SEARCH_PART = 1 / 20
 SEARCHES_KEPT = 8  # the later searches of a fetch kept besides its first, for crediting the nodes that listed providers
 # A provider no path was found to is asked again this long after, and fails only if it is unreachable again then: on a
 # radio a node is out of reach for a minute when its rnsd restarts or a path request is lost
@@ -604,6 +609,9 @@ class Fetcher:
         # The providers of a key this node holds records of, as a DHT server (rnfs.dht.providers.ProviderRecords);
         # the node sets its own. Each search starts with them as candidates (Fetch._discover)
         self.held_providers: Callable[[bytes], list[bytes]] = lambda key: []
+        # The part of lookup_timeout an explicit fetch that found no provider waits before its one late search (None:
+        # none, as tests that count the searches made have it)
+        self.late_search: float | None = LATE_SEARCH_PART
         self._lock = threading.Lock()
         self._db = None if state_dir is None else statedb.connect(state_dir)
         self._invalid: OrderedDict[Cid, None] = OrderedDict()  # oldest first
@@ -781,6 +789,8 @@ class Fetch:
         self.pinned = pinned
         self.hint = hint  # asked first, with the remembered providers and the open links (_discover)
         self.explicit = explicit  # searches even if a search found no provider within UNFOUND_FOR (Fetcher.unfound)
+        self._late_search_at: float | None = None  # when the one late search (_search_late) is due, once set
+        self._late_searched = False  # it has started
         self._unfound_ago: float | None = None  # set when it didn't search for that reason: how long ago that was
         self._remembered_asked: set[bytes] = set()  # remembered providers asked first (_discover)
         self.target: Expect | None = None  # set by resolve()
@@ -1247,9 +1257,14 @@ class Fetch:
             self._search_again()
             self._assign(pending, in_flight, outstanding, wanted, budget)
             if not in_flight and not self._lookup_running and not self._waiting_for_busy():
-                if not self._rerun_lookup():
+                if self._rerun_lookup():
+                    continue
+                late = self._search_late()
+                if late is None:
                     raise NotFound(self._not_found_message(needed))
-                continue
+                if late:
+                    continue
+                # waiting for the late search: as for events, which wakes it at its time or for a cancel
             try:
                 events = [self._events.get(timeout=self._wait_time())]
             except queue.Empty:
@@ -1776,6 +1791,30 @@ class Fetch:
             del self._lookups[1]
         self._lookup_found = 0
         self._start_lookup()
+
+    def _search_late(self) -> bool | None:
+        """The search found no provider at all: for an explicit fetch (not one from a given node), search once more
+        LATE_SEARCH_PART of lookup_timeout later, as content just added elsewhere is found only once its records are out. True when
+        that search starts, False while it is waited for, None if there is none (the fetch fails)."""
+        if (not self.explicit or self.from_node is not None or self._providers or self._lookup is None
+                or self.closed or self._late_searched or self.fetcher.late_search is None):
+            return None
+        now = self.fetcher.clock()
+        if self._late_search_at is None:
+            wait = self.config.lookup_timeout * self.fetcher.late_search
+            self._late_search_at = now + wait
+            self._progress_at = max(self._progress_at, self._late_search_at)  # waiting isn't hanging
+            log(f"no provider of {self.root} found yet; searching again in {wait:.0f}s, as one added just now is found "
+                "only once its records are out", LOG_VERBOSE)
+            return False
+        if now < self._late_search_at:
+            return False
+        self._late_searched = True
+        self._lookup = self.fetcher.make_lookup(self.root.key)
+        self._lookups.append(self._lookup)
+        self._lookup_found = 0
+        self._start_lookup()
+        return True
 
     def _rerun_lookup(self) -> bool:
         """Every provider failed: search again for a fresh random half, within lookup_timeout. False if not."""

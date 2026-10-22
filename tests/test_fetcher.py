@@ -100,6 +100,7 @@ class FetcherTest(unittest.TestCase):
             return lookup
         fetcher = Fetcher(self.storage, self.client, self.config, OWN, self.routing, make_lookup, slow,
                           os.path.join(self.tmp.name, "state"), busy_delay=0.01)
+        fetcher.late_search = None  # these tests count the searches a fetch makes (LateSearchTest has it on)
         self.addCleanup(fetcher.close)
         return fetcher
 
@@ -1087,6 +1088,44 @@ def text_of(size: int) -> bytes:
     while len(out) < size:
         out += b" ".join(rng.choice(words) for _ in range(12)) + b"\n"
     return bytes(out[:size])
+
+
+class LateSearchTest(FetcherTest):
+    """An explicit fetch that found no provider searches once more before it fails: between cloud nodes a get of a CID
+    shared as it was added failed, its publisher's records not out yet (its publish lookup waited 24 s on a server
+    that didn't answer)."""
+
+    def setUp(self):
+        super().setUp()
+        self.fetcher.late_search = 0.0005  # of lookup_timeout: 0.3 s here
+        self.built = self.file(os.urandom(CHUNK_SIZE))
+        self.hold(P1)
+        self.searches: list[list[bytes]] = []  # what each new search finds, in turn (then nobody)
+
+        def make_lookup(key):
+            """A FakeLookup reporting the next of self.searches."""
+            lookup = FakeLookup([self.searches.pop(0) if self.searches else []])
+            self.lookups.append(lookup)
+            return lookup
+        self.fetcher.make_lookup = make_lookup
+
+    def test_records_out_by_the_late_search_are_found(self):
+        self.searches.extend([[], [P1]])  # nobody at first; the provider, once its records are out
+        self.fetch_all(self.built.cid)
+        self.assertTrue(self.storage.is_complete(self.built.cid))
+        self.assertEqual(len(self.lookups), 2)
+
+    def test_it_searches_once_more_only(self):
+        self.searches.extend([[], [], [P1]])
+        with self.assertRaises(NotFound):
+            self.fetch_all(self.built.cid)
+        self.assertEqual(len(self.lookups), 2)
+
+    def test_not_for_a_fetch_that_isnt_explicit(self):
+        self.searches.extend([[], [P1]])  # a gateway request: what nobody asked for just now fails at once
+        with self.assertRaises(NotFound):
+            self.fetch_all(self.built.cid, explicit=False)
+        self.assertEqual(len(self.lookups), 1)
 
 
 class RangeTransferTest(FetcherTest):
