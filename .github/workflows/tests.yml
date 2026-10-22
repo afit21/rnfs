@@ -40,8 +40,9 @@ jobs:
       # that passes then is named in a warning on the run's page and summary instead of failing the run
       - name: Unit tests
         run: python -m tests.ci_run
-        # Windows takes 23-32 minutes (Linux and macOS about 9): 30 stopped runs that would have passed
-        timeout-minutes: 45
+        # Windows takes 23-45 minutes as its runners vary (Linux and macOS about 9): 30 and then 45 stopped runs whose
+        # every test passed
+        timeout-minutes: 60
       # On Windows the daemons are started in their own process groups and stopped with CTRL_BREAK_EVENT. Every
       # module gated on RNFS_E2E is listed here (test_packaging checks it): the embedded node and the security
       # regressions that need real RNS included
