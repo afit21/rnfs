@@ -33,8 +33,8 @@ from rnfs.constants import BLOCKS_PATH, FIND_PATH, PIN_PATH, PROVIDE_PATH
 
 # Module paths, in start order. A feature may use the features before it
 FEATURE_MODULES: list[str] = ["rnfs.features.peers", "rnfs.features.jobs", "rnfs.features.keepers",
-                               "rnfs.features.follow", "rnfs.features.contacts", "rnfs.features.lxmf",
-                               "rnfs.features.deny"]
+                               "rnfs.features.follow", "rnfs.features.contacts",
+                               "rnfs.features.deny", "rnfs.features.settings"]
 
 ApiRoute = Callable[[object], None]  # handler(api_handler)
 API_METHODS = ("GET", "POST")  # what a feature's API route may answer
@@ -152,6 +152,10 @@ class Feature:
     def status(self) -> dict:
         """Fields added to `rnfs status`."""
         return {}
+
+    def app_removed(self, name: str):
+        """App name was removed (rnfs app rm): its token no longer passes, and its pins are released once this
+        returns. Drop what the feature holds or runs for it."""
 
     def requests(self) -> dict[str, Callable]:
         """{path: handler(data, remote_identity) -> response} for new rnfs.dht request paths.

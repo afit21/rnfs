@@ -2,9 +2,10 @@
 token) on a new connection. It did that for any daemon that closed it, which kept the old race for every daemon: the
 daemon could stop between the proof and the new connection, and a program taking the port then got the token.
 
-Now the client reconnects only for a daemon whose proved version is below 0.1.5 (a deb-installed 0.1.4 still works);
-any other daemon that closes the proof's connection gets ConnectionFailed, and nothing more is sent. The fallback is
-to be dropped in 0.1.7.
+From 0.1.5 to 0.1.6 the client reconnected only for a daemon whose proved version was below 0.1.5; any other daemon
+that closed the proof's connection got ConnectionFailed. Since 0.2.0 that fallback is gone: a daemon proved older
+than 0.1.5 is refused before the token is sent (check_daemon), and every daemon that closes the proof's connection
+gets nothing more.
 """
 import json
 import os
@@ -48,14 +49,16 @@ class OldDaemonFallbackTest(unittest.TestCase):
             self.assertIn("closed the connection", str(raised.exception), version)
             self.assertEqual(listener.tokens(), [None], version)  # only the proof request: no token sent
 
-    def test_older_daemon_still_works(self):
-        # A pre-0.1.5 daemon (deb-installed 0.1.4) gets the request on a new connection, as its clients sent it
+    def test_older_daemon_is_refused_before_the_token(self):
+        # 0.2.0: a pre-0.1.5 daemon is refused, saying why, and gets neither the token nor a second connection
         for version in ("0.1.4", "0.1.0", "0.1.4.post1", "0.0.9"):
             listener = FakeListener(self, closing_daemon(version))
             api = ApiConnection(self.tmp, port=listener.port)
-            self.assertEqual(api.status(), {"node_id": "ab"}, version)
+            with self.assertRaises(apiclient.ApiError, msg=version) as raised:
+                api.status()
+            self.assertIn("too old for this client", str(raised.exception), version)
             self.assertEqual(api.daemon_version, version)
-            self.assertEqual(listener.tokens(), [None, TOKEN], version)
+            self.assertEqual(listener.tokens(), [None], version)
 
 
 if __name__ == "__main__":

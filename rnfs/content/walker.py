@@ -404,6 +404,12 @@ def _directory_entries(expect: Expect, get: Get, memo: dict | None = None) -> It
             stack.extend(reversed(children(current, node)))
 
 
+def directory_entries(expect: Expect, get: Get, memo: dict | None = None) -> Iterator[tuple[Entry, Expect]]:
+    """Every entry of a directory in name order with the entry's expectation (memo: directory and index nodes
+    already decoded, kept for repeated subtrees). Raises ValueError for a file. Unbounded: the caller counts."""
+    return _directory_entries(expect, get, memo)
+
+
 def list_directory(expect: Expect, get: Get, max_entries: int | None = None) -> Iterator[Entry]:
     """The entries of a directory in name order. Raises ValueError for a file, TooLarge past max_entries."""
     for count, (entry, _) in enumerate(_directory_entries(expect, get), 1):
@@ -679,10 +685,10 @@ class _FdOutput:
         self.fd = _open_directory(dest)
         try:
             st = os.fstat(self.fd)
-            if st.st_uid != os.geteuid():
+            if st.st_uid != os.geteuid():  # noqa: TID251 - _FdOutput is used only off Windows
                 raise ValueError(f"{CHANGED}: {dest} belongs to someone else")
             self.mode = stat.S_IMODE(st.st_mode)  # what mkdir gave it, given back by finish()
-            os.fchmod(self.fd, 0o700 | (self.mode & stat.S_ISGID))
+            os.fchmod(self.fd, 0o700 | (self.mode & stat.S_ISGID))  # noqa: TID251 - _FdOutput is used only off Windows
             # Until the chmod, anyone the parent's mode lets in could create an entry in it; from now on nobody
             # else can, so an empty root stays this write-out's alone
             planted = os.listdir(self.fd)
@@ -738,7 +744,7 @@ class _FdOutput:
 
     def finish(self):
         """The write-out is complete: give the root back the mode mkdir gave it."""
-        os.fchmod(self.fd, self.mode)
+        os.fchmod(self.fd, self.mode)  # noqa: TID251 - _FdOutput is used only off Windows
 
     def close(self):
         """Close the root's descriptor."""
@@ -832,4 +838,4 @@ def _write_file(expect: Expect, get: Get, out, small: SmallLeaves, block: bytes 
         # Through the descriptor, so a path swapped for a symlink meanwhile can't redirect the chmod
         mode = os.fstat(out.fileno()).st_mode
         # Execute wherever read is allowed, as the umask already decided read permissions
-        os.fchmod(out.fileno(), stat.S_IMODE(mode) | ((mode & 0o444) >> 2))
+        os.fchmod(out.fileno(), stat.S_IMODE(mode) | ((mode & 0o444) >> 2))  # noqa: TID251 - not on Windows

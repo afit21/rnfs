@@ -155,7 +155,7 @@ class DenyFeature(Feature):
             self._set_state(source, "in use")
             return True
         try:
-            with self.node.fetcher.open(root, names, pinned=True) as fetch:
+            with self.node.pinned_fetch(root, names, explicit=False) as fetch:
                 expect = fetch.resolve()
                 if previous == expect.cid and self.deny.in_use(source):
                     self._set_state(source, "in use")

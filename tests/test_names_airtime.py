@@ -5,6 +5,7 @@ validation (BG-L7) and nicks for `name resolve`.
 """
 import io
 import os
+import random
 import tempfile
 import time
 import types
@@ -30,7 +31,7 @@ from rnfs.publisher import KEY_MIN_INTERVAL, SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUP
 from tests.support import FakeClock
 from tests.test_names import FakeNetwork
 from tests.test_names_keep import KeeperNet
-from tests.test_publisher import FakeClient, FakeLookup
+from tests.test_publisher import FakeClient, FakeLookup, near
 
 A_ID, B_ID = bytes([0xA] * 16), bytes([0xB] * 16)
 N1, N2 = bytes([1]) * 16, bytes([2]) * 16
@@ -171,8 +172,9 @@ class FollowBackoffTest(NodeTestCase):
 class KeyCadenceTest(unittest.TestCase):
     """DS-M1: kept names' keys are republished at most every 3 days, desynchronised, and paced on slow nodes."""
 
-    def make_publisher(self, keys: set[bytes], slow: bool = False, **settings) -> Publisher:
-        """A publisher providing only keys, with fake network and clock."""
+    def make_publisher(self, keys: set[bytes], slow: bool = False, regions: bool = False, **settings) -> Publisher:
+        """A publisher providing only keys, with fake network and clock; with regions, each key's lookup finds
+        servers that make it a region of its own (sweep providing), else every lookup finds N1 and N2."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         from rnfs.content.storage import Storage
@@ -181,8 +183,9 @@ class KeyCadenceTest(unittest.TestCase):
         self.addCleanup(storage.close)  # its state database, before the directory goes (Windows)
         self.clock = FakeClock(1_000_000.0)
         self.client = FakeClient()
-        publisher = Publisher(bytes(16), config, storage, ProviderStore(10_000, None), self.client,
-                              lambda key: FakeLookup([N1, N2]), slow_node=slow, clock=self.clock)
+        publisher = Publisher(bytes(16), config, storage, ProviderStore(None), self.client,
+                              lambda key: FakeLookup(near(key) if regions else [N1, N2]), slow_node=slow,
+                              clock=self.clock)
         publisher.add_key_source(lambda: set(keys))
         publisher.refresh()
         return publisher
@@ -198,6 +201,18 @@ class KeyCadenceTest(unittest.TestCase):
         self.assertGreater(max(intervals) - min(intervals), 0.15 * KEY_MIN_INTERVAL)  # spread out
         self.assertEqual(key_interval(keys[0], DAY), key_interval(keys[0], DAY))  # fixed per key
 
+    def test_jitter_comes_from_the_first_byte(self):
+        """Keys sharing their first byte (as a region's keys share their leading bits) come due together; the 256
+        first bytes give 256 slots, spread over the whole +-10%."""
+        rng = random.Random(5)
+        for first in (0, 0x7F, 0xFF):
+            keys = [bytes([first]) + rng.randbytes(15) for _ in range(20)]
+            self.assertEqual(len({key_interval(key, DAY) for key in keys}), 1)
+        slots = sorted({key_interval(bytes([first]) + bytes(15), DAY) for first in range(256)})
+        self.assertEqual(len(slots), 256)
+        self.assertLess(slots[0], 0.91 * KEY_MIN_INTERVAL)
+        self.assertGreater(slots[-1], 1.09 * KEY_MIN_INTERVAL)
+
     def test_keys_republished_every_three_days_not_daily(self):
         key = os.urandom(16)
         publisher = self.make_publisher({key})
@@ -208,8 +223,10 @@ class KeyCadenceTest(unittest.TestCase):
         self.assertEqual(publisher.publish_due()["published"], [DhtKey(key)])
 
     def test_slow_node_paces_lookups(self):
+        """At most SLOW_ROUND_LOOKUPS region lookups a round (each key a region here), and SLOW_LOOKUP_PACE per
+        lookup before the next round."""
         keys = {os.urandom(16) for _ in range(25)}
-        publisher = self.make_publisher(keys, slow=True)
+        publisher = self.make_publisher(keys, slow=True, regions=True)
         self.assertEqual(len(publisher.publish_due()["published"]), SLOW_ROUND_LOOKUPS)
         self.assertEqual(publisher.publish_due()["published"], [])
         self.assertGreaterEqual(publisher.next_due(), SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS - 1)
@@ -249,7 +266,7 @@ class RestartKeysTest(NodeTestCase):
         gone = [os.urandom(16) for _ in range(20)]
         batches = protocol.provide_batches(keys, keys + gone, 400)  # ~ a link MDU: several batches
         self.assertGreater(len(batches), 1)
-        store = ProviderStore(10_000, None)
+        store = ProviderStore(None)
         store.provide(A_ID, gone)
         for batch_keys, batch_withdrawn in batches:
             store.provide(A_ID, batch_keys, batch_withdrawn)

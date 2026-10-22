@@ -1,10 +1,9 @@
-"""NEW-2 (the same pattern in other pin sources): follow: and lxmf: pins that a crash left unrecorded were never released.
+"""NEW-2 (the same pattern in other pin sources): follow: pins that a crash left unrecorded were never released.
 
 - follow: unfollow saves the followed names before releasing the pin, and check() pins the new target before
   saving the name's and only then releases the target recorded there. A crash in between left a
   `follow:<name>` pin that no later check, unfollow or `pin rm` released.
-- lxmf: an auto-fetched pin is saved at once, the inbox only every few seconds, so a crash could leave an
-  `lxmf:<sender>` pin whose message the saved inbox doesn't have; inbox removal could never release it.
+- lxmf: the same in the LXMF feature's inbox. Its test left rnfs with the feature in 0.2.0.
 
 The crash is a BaseException from a wrapped call, and the node or feature is then built again on the same
 directory without stop(), as in a real crash (each is stopped and closed only when the test is done).
@@ -20,12 +19,9 @@ import RNS
 from rnfs import statedb
 from rnfs.config import Config
 from rnfs.content.cid import Cid
-from rnfs.content.storage import USER
-from rnfs.features import lxmf
 from rnfs.features.follow import follow_source
 from rnfs.node import RnfsNode
 from tests.support import state_rows
-from tests.test_lxmf import SENDER, FeatureTestCase
 from tests.test_names import FakeNetwork
 from tests.test_names_keep import KeeperNet
 
@@ -143,30 +139,6 @@ class FollowCrashTest(unittest.TestCase):
         cid3 = self.publish(b"version three", 3, b)
         self.assertTrue(b.feature("follow").check(self.name, network=False))
         self.assertEqual(b.storage.pinned_by(self.source), {cid3})
-
-
-class LxmfCrashTest(FeatureTestCase):
-    """B auto-fetches a link from a trusted sender, then crashes before its inbox is saved."""
-
-    def test_pin_of_a_message_the_saved_inbox_lacks_is_released_at_start(self):
-        feature = self.feature_node(lxmf_auto_fetch_from=[SENDER.hex()])
-        kept = feature.received(self.link_message(number=1))
-        feature.process_auto_fetches()
-        feature.save()  # the first message and its pin are saved
-        target = Cid.parse(feature.inbox.get(kept)["auto"][0]["cid"])
-        other = Cid.parse(self.a.add_stream(io.BytesIO(os.urandom(2000)))["cid"])
-        lost = feature.received(self.link_message(lxmf.Link(other, from_node=A_ID), number=2))
-        feature.process_auto_fetches()
-        self.assertEqual(feature.inbox.get(lost)["auto"][0]["state"], "pinned")
-        self.b.storage.pin(other, USER)  # another source's pin is never touched
-        # Crash before the inbox is saved: the feature is built again from what is on disk
-        again = self.reloaded()
-        source = f"lxmf:{SENDER.hex()}"
-        # NEW-2: fails until lxmf: pins the saved inbox doesn't record are released at start
-        self.assertEqual(self.b.storage.pinned_by(source), {target})
-        self.assertEqual(self.b.storage.pins()[other], {USER})
-        self.assertEqual(again.inbox_rm(kept), 1)
-        self.assertEqual(self.b.storage.pinned_by(source), set())
 
 
 if __name__ == "__main__":

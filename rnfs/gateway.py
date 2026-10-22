@@ -3,10 +3,15 @@
 GET/HEAD /rnfs/<cid>[/path]   content by CID: immutable, ETag "<cid>" of the target
 GET/HEAD /name/<name>[/path]  content a name points at, resolved with for_gateway=True
 
+Subdomain hosts (sites), an origin per root so a page can read its own DAG with fetch():
+GET/HEAD http://<k + base36 CID>.rnfs.localhost:<port>/[path]  as /rnfs/<cid>/[path]
+GET/HEAD http://<name>.name.localhost:<port>/[path]            as /name/<name>/[path]
+
 Behaviour:
 - Path segments are percent-decoded one by one; a decoded segment can't contain "/" or NUL, so every
   segment is exactly one name.
-- Files: Content-Type from ?filename=, else the path's last name, else sniffed from the first bytes. The
+- Files: Content-Type from ?filename=, else the path's last name, else sniffed from the first bytes (on site
+  hosts, never from ?filename=, and a file inside the site's DAG never sniffed as a page: see Sites). The
   user's own HEAD, or range not starting at byte 0, uses the first bytes only if they are stored (else the
   name, or application/octet-stream), so it never fetches what it doesn't send; the deny list applies to
   them as to any read (451). A web page's request (see
@@ -15,16 +20,31 @@ Behaviour:
   Single byte ranges (206, 416, Accept-Ranges; If-Range honoured); several ranges get the whole file.
 - Directories: without a trailing slash, 301 to the slash form; with one, index.html if present, else
   an HTML-escaped listing with percent-encoded links.
-- /rnfs/ responses carry ETag "<cid>" and "Cache-Control: public, max-age=31536000, immutable";
-  If-None-Match answers 304. /name/ responses are mutable and carry neither.
+- /rnfs/ responses carry ETag "<cid>" and "Cache-Control: public, max-age=31536000, immutable", but those that
+  render as documents (DOCUMENT_TYPES and listings) "public, no-cache": their headers (the CSP, which gateway_scripts
+  sets) are the node's policy, not the content's, and must reach a browser's cached copy (REL-9);
+  If-None-Match answers 304, without Cache-Control (what the browser stored stays). /name/ responses are mutable and
+  carry neither.
 - Every response, errors and redirects included, carries X-Content-Type-Options: nosniff and the spec's
   sandboxing Content-Security-Policy. With gateway_scripts off, allow-scripts and 'unsafe-eval' are
   dropped and script-src 'none' added, so no script runs even if a browser ignores the sandbox.
-- No response carries Access-Control-* headers. Gateway pages run in a sandboxed, opaque origin, so they can
-  load files of their DAG as subresources (img, script, link…) but can't read gateway responses with fetch()
+- No response carries Access-Control-* headers. Path gateway pages run in a sandboxed, opaque origin, so they
+  can load files of their DAG as subresources (img, script, link…) but can't read gateway responses with fetch()
   or XMLHttpRequest, and neither can any other web page. Sending Access-Control-Allow-Origin for
-  `Origin: null` would let every site's sandboxed iframe or data: page read the gateway. Per-CID origins
-  (a subdomain per root) would be the way to let pages read their own DAG, and are possible future work.
+  `Origin: null` would let every site's sandboxed iframe or data: page read the gateway.
+- Sites: parse_host matches the Host header exactly (lowercased, as browsers send it), apart from the API's own
+  check (api.host_allowed, unchanged); the base36 CID becomes a Cid at once, so ETags, listings and logs show
+  base32. A site's page keeps its origin (CSP_SITE_SCRIPTS: sandbox with allow-same-origin, frame-ancestors
+  'self', plus Origin-Agent-Cluster), so its fetch() of its own files is same-origin and needs no CORS header;
+  every other origin is still refused by the browser for want of one. Its path is a DAG path and nothing else
+  (no /rnfs/ or /name/ prefix, no ?format=), every segment a valid name, and its redirects are rebuilt from
+  the decoded names. Requests for a service worker script (Service-Worker header) get 403: a worker on a
+  name's site could go on serving old content after the name moves. A site's page runs script in the site's own
+  origin, so a file put into its DAG mustn't become one unless the DAG names it so (REV6): ?filename= only names a
+  download (Content-Disposition: attachment, the type still from the path's own name), and a file reached by a path
+  inside the site's DAG is sniffed only to the passive types of SITE_SNIFFED_TYPES (never HTML, SVG, XML or PDF;
+  anything else is application/octet-stream). A site whose root is itself a file is sniffed as on the path gateway:
+  that file is its origin's only content. Everything else is as on the path gateway.
 - A GatewayError (the gateway's own refusals) or NotFound says what went wrong. Every other error (a 400,
   413, 422, 503 or 507 from the node, 451 for content the deny list blocks, or a 500) gets only a fixed
   message for its status: a node error's text
@@ -57,9 +77,9 @@ from collections import OrderedDict
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from rnfs.api import LocalServer, TimedHandler, error_status, host_allowed, loggable, parse_hex_id, raw_response
-from rnfs import debuglog
+from rnfs import debuglog, ids
 from rnfs import gateway_formats  # --- content ---
-from rnfs.content.cid import Cid
+from rnfs.content.cid import Cid, from_base36
 from rnfs.content.seal import is_sealed  # --- content ---
 from rnfs.errors import NotFound
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_VERBOSE, log
@@ -68,7 +88,23 @@ CSP_SCRIPTS = ("sandbox allow-scripts allow-forms allow-popups; "
                "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; form-action 'self'")
 CSP_NO_SCRIPTS = ("sandbox allow-forms allow-popups; "
                   "default-src 'self' 'unsafe-inline' data: blob:; script-src 'none'; form-action 'self'")
+# On subdomain hosts (sites): the page keeps its own origin (allow-same-origin), so it can read its own DAG with
+# fetch(), and only pages of its own origin may frame it
+CSP_SITE_SCRIPTS = ("sandbox allow-same-origin allow-scripts allow-forms allow-popups; "
+                    "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; form-action 'self'; "
+                    "frame-ancestors 'self'")
+CSP_SITE_NO_SCRIPTS = ("sandbox allow-same-origin allow-forms allow-popups; "
+                       "default-src 'self' 'unsafe-inline' data: blob:; script-src 'none'; form-action 'self'; "
+                       "frame-ancestors 'self'")
+SITE_DOMAINS = {"rnfs": "rnfs.localhost", "name": "name.localhost"}  # site kind -> the domain its hosts are under
+HOST_REFUSED = ("Host header must be 127.0.0.1:<port> or localhost:<port>, or <k + base36 CID>.rnfs.localhost:<port> "
+                "or <name>.name.localhost:<port>")
 IMMUTABLE = "public, max-age=31536000, immutable"
+REVALIDATE = "public, no-cache"  # a document's, by CID too: kept, but asked again (a 304) before each use
+# Types a browser renders as a document, which the CSP governs: never cached as immutable (REL-9)
+DOCUMENT_TYPES = frozenset({"text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
+                            "application/pdf"})
+LOCATION_SAFE = "".join(chr(code) for code in range(0x21, 0x7f))  # what a Location keeps as it is: printable ASCII
 RETRY_AFTER = "10"  # seconds a limited request should wait before retrying
 SNIFF_SIZE = 512  # bytes read to guess a type, as in the WHATWG MIME sniffing standard
 NAME_CACHE_TIME = 60.0
@@ -93,6 +129,14 @@ EXTRA_TYPES = {".html": "text/html", ".htm": "text/html", ".css": "text/css", ".
                ".webp": "image/webp", ".avif": "image/avif", ".svg": "image/svg+xml", ".json": "application/json",
                ".md": "text/markdown", ".webm": "video/webm", ".opus": "audio/ogg", ".woff2": "font/woff2"}
 
+# What sniffing may give a file inside a site's DAG (REV6), whose pages keep their origin: only types a browser never
+# renders as a document running script there, so a file put into a site's DAG under a name that gives no type can't
+# run script in the site's origin (a site whose root is a file is sniffed freely: it is its origin's only content). Anything else sniff() returns (HTML, SVG, PDF...) is served as SITE_UNSNIFFED
+SITE_SNIFFED_TYPES = frozenset({
+    "image/png", "image/jpeg", "image/gif", "image/webp", "audio/ogg", "audio/mpeg", "audio/flac", "audio/wav",
+    "video/webm", "video/mp4", "font/woff2", "application/wasm", "text/plain; charset=utf-8"})
+SITE_UNSNIFFED = "application/octet-stream"
+
 # Tags that make a document HTML when it starts with them (WHATWG MIME sniffing, "identifying HTML")
 HTML_TAGS = (b"<!doctype html", b"<html", b"<head", b"<script", b"<iframe", b"<h1", b"<div", b"<font", b"<table",
              b"<a", b"<style", b"<title", b"<b", b"<body", b"<br", b"<p", b"<!--")
@@ -103,9 +147,16 @@ def type_from_name(name: str | None) -> str | None:
     if not name:
         return None
     dot = name.rfind(".")
-    if dot > 0 and name[dot:].lower() in EXTRA_TYPES:
-        return EXTRA_TYPES[name[dot:].lower()]
-    return mimetypes.guess_type(name, strict=False)[0]
+    if dot <= 0:
+        return None
+    extension = name[dot:].lower()
+    if extension in EXTRA_TYPES:
+        return EXTRA_TYPES[extension]
+    if not extension[1:].isascii() or not extension[1:].isalnum():
+        return None
+    # By the extension alone: guess_type of the whole name takes a data: URL's media type as it is written, so
+    # ?filename=data:<anything>, set any Content-Type, control characters included (REL-17)
+    return mimetypes.guess_type("file" + extension, strict=False)[0]
 
 
 def sniff(head: bytes) -> str:
@@ -174,6 +225,15 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None | str:
     return start, min(int(last), size - 1) if last else size - 1
 
 
+def for_type(cache: dict, content_type: str) -> dict:
+    """cache's headers for a response of content_type: a document's (DOCUMENT_TYPES, any +xml) revalidated rather
+    than immutable, so a change of the node's policy (gateway_scripts' CSP) reaches a browser's copy (REL-9)."""
+    base = content_type.split(";", 1)[0].strip().lower()
+    if cache.get("Cache-Control") == IMMUTABLE and (base in DOCUMENT_TYPES or base.endswith("+xml")):
+        return {**cache, "Cache-Control": REVALIDATE}
+    return cache
+
+
 def etag_matches(header: str | None, etag: str) -> bool:
     """True if an If-None-Match header matches etag (weak comparison, or "*")."""
     if not header:
@@ -220,6 +280,34 @@ class GatewayError(Exception):
         super().__init__(message)
         self.status = status
         self.headers = headers or {}
+
+
+def parse_host(host: str | None, port: int) -> tuple[str, Cid | bytes] | None:
+    """What a request's Host header names on the gateway listening on port.
+
+    None: the path gateway, 127.0.0.1:<port> or localhost:<port> exactly as the API allows (api.host_allowed).
+    ("rnfs", Cid): <k + base36 CID>.rnfs.localhost:<port>. ("name", 16 bytes): <32 hex>.name.localhost:<port>.
+    Hosts are compared lowercased, as browsers send them; nothing else matches: no other label, no IP address,
+    no trailing dot, no missing or other port. Raises GatewayError 403 for any other host (DNS rebinding) and 400
+    for a site host whose CID or name is invalid. The base36 CID is turned into a Cid here, so it is written in
+    base32 from then on (specification section 4).
+    """
+    if host_allowed(host, port):
+        return None
+    if host is None or not host.isascii():  # so lower() maps nothing outside ASCII onto it
+        raise GatewayError(403, HOST_REFUSED)
+    label, _, domain = host.lower().partition(".")
+    kind = next((kind for kind, name in SITE_DOMAINS.items() if domain == f"{name}:{port}"), None)
+    if kind is None:
+        raise GatewayError(403, HOST_REFUSED)
+    if kind == "rnfs":
+        try:
+            return kind, from_base36(label)
+        except ValueError as e:
+            raise GatewayError(400, str(e)) from None
+    if not ids.HEX16_LOWER.fullmatch(label):
+        raise GatewayError(400, f"invalid name {label!r} in host: must be 32 hex characters")
+    return kind, bytes.fromhex(label)
 
 
 class FetchLimiter:
@@ -315,6 +403,7 @@ class GatewayHandler(TimedHandler):
     server_version = "rnfs"
     sys_version = ""
     status_sent: int | None = None  # the response's status, once sent (for the debug log)
+    site: tuple[str, Cid | bytes] | None = None  # the subdomain host's site (parse_host), or None
 
     def log_message(self, format, *args):
         """Log nothing: RNS does the node's logging, and per-request lines would drown it out."""
@@ -338,7 +427,13 @@ class GatewayHandler(TimedHandler):
     def end_headers(self):
         """Add the headers every response carries, then end the headers."""
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", CSP_SCRIPTS if self.config.gateway_scripts else CSP_NO_SCRIPTS)
+        if self.site is None:
+            self.send_header("Content-Security-Policy", CSP_SCRIPTS if self.config.gateway_scripts else CSP_NO_SCRIPTS)
+        else:
+            csp = CSP_SITE_SCRIPTS if self.config.gateway_scripts else CSP_SITE_NO_SCRIPTS
+            self.send_header("Content-Security-Policy", csp)
+            # Origin-keyed: document.domain can't be relaxed to rnfs.localhost, which every site's host shares
+            self.send_header("Origin-Agent-Cluster", "?1")
         # Deliberately no Access-Control-* headers, for any Origin or Referer (module docstring)
         self.headers_sent = True
         super().end_headers()
@@ -400,7 +495,8 @@ class GatewayHandler(TimedHandler):
         number = next(_request_numbers)
         started = time.monotonic()
         self.wfile = _CountingWriter(self.wfile)
-        shown = ", ".join(f"{name}: {self.headers[name]}" for name in DEBUG_HEADERS if self.headers.get(name) is not None)
+        shown = ", ".join(f"{name}: {self.host_for_log() if name == 'Host' else self.headers[name]}"
+                          for name in DEBUG_HEADERS if self.headers.get(name) is not None)
         with debug.tag(f"gateway #{number}"):
             debug.note(f"gateway {self.command} {self.path}" + (f" ({shown})" if shown else ""))
             try:
@@ -415,23 +511,23 @@ class GatewayHandler(TimedHandler):
         self.close_connection = True
         self.headers_sent = False
         self.slot = False
+        self.site = None
         try:
-            if not host_allowed(self.headers.get("Host"), self.server.server_address[1]):
-                raise GatewayError(403, "Host header must be 127.0.0.1:<port> or localhost:<port>")
+            self.site = parse_host(self.headers.get("Host"), self.server.server_address[1])
             if self.command not in ("GET", "HEAD"):
                 raise GatewayError(405, "the gateway only answers GET and HEAD", {"Allow": "GET, HEAD"})
             self.request_read()  # GET and HEAD have no body
             self.serve()
         except GatewayError as e:
-            log(f"gateway refused {loggable(self.path)} with {e.status}: {e}", LOG_DEBUG)
+            log(f"gateway refused {self.path_for_log()} with {e.status}: {e}", LOG_DEBUG)
             self.respond_error(e.status, str(e), e.headers)
         except NotFound as e:
-            log(f"gateway: {loggable(self.path)} not found: {e}", LOG_DEBUG)
+            log(f"gateway: {self.path_for_log()} not found: {e}", LOG_DEBUG)
             self.respond_error(404, str(e) or ERROR_MESSAGES[404], {})
         except Exception as e:  # noqa: BLE001 - every error becomes a response, never a dropped connection
             status = error_status(e)
             # str(e) may name local paths (a StorageFull's or an OSError's) or the node's limits: logged only
-            log(f"gateway {self.command} {loggable(self.path)} failed: {e!r}",
+            log(f"gateway {self.command} {self.path_for_log()} failed: {e!r}",
                 LOG_ERROR if status == 500 else LOG_VERBOSE)
             self.respond_error(status, ERROR_MESSAGES.get(status, ERROR_MESSAGES[500]),
                                {"Retry-After": RETRY_AFTER} if status == 503 else {})
@@ -439,10 +535,31 @@ class GatewayHandler(TimedHandler):
             if self.slot:
                 self.limiter.release()
 
+    def path_for_log(self) -> str:
+        """The request's path for the log, after its site on a subdomain host (the CID written in base32)."""
+        if self.site is None:
+            return loggable(self.path)
+        kind, value = self.site
+        return f"{kind} site {value if kind == 'rnfs' else value.hex()} {loggable(self.path)}"
+
+    def host_for_log(self) -> str:
+        """The Host header for the debug log: a subdomain host as its site, so a CID shows in base32."""
+        host = self.headers.get("Host")
+        try:
+            site = parse_host(host, self.server.server_address[1])
+        except GatewayError:
+            return host
+        if site is None:
+            return host
+        kind, value = site
+        return f"{value if kind == 'rnfs' else value.hex()}.{SITE_DOMAINS[kind]} (subdomain)"
+
     def respond_error(self, status: int, message: str, headers: dict):
         """Send an error, unless a response is already under way (then the connection is just closed)."""
         if self.headers_sent:
             return
+        # A status line or headers buffered by a response that failed before end_headers: not sent before this one
+        self._headers_buffer = []
         try:
             self.send_text(status, message, headers)
         except OSError:
@@ -471,9 +588,11 @@ class GatewayHandler(TimedHandler):
     # Serving
 
     def serve(self):
-        """Route /rnfs/ and /name/ requests."""
+        """Route /rnfs/ and /name/ requests, and every request on a subdomain host."""
         url = urlsplit(self.path)
         self.query = parse_qs(url.query, keep_blank_values=True)
+        if self.site is not None:
+            return self.serve_site(url)
         segments = url.path.split("/")  # "", "rnfs", <cid>, names…; a trailing "" means a trailing slash
         if len(segments) < 3 or segments[0] != "" or segments[1] not in ("rnfs", "name") or not segments[2]:
             raise GatewayError(404, "gateway paths are /rnfs/<cid>[/path] and /name/<name>[/path]")
@@ -487,14 +606,38 @@ class GatewayHandler(TimedHandler):
                 root = str(Cid.parse(segments[2]))
             except ValueError as e:
                 raise GatewayError(400, str(e)) from None
-            immutable = True
-            # Answer a revalidation of a bare CID before touching the node at all
-            if not names and etag_matches(self.headers.get("If-None-Match"), f'"{root}"'):
-                return self.send_not_modified(root)
         else:
             root = self.resolve_name(segments[2])
-            immutable = False
+        # url.path starts with /rnfs/ or /name/, so this can't become a protocol-relative open redirect
+        location = url.path + "/" + (f"?{url.query}" if url.query else "")
+        self.serve_target(root, names, slash, segments[1] == "rnfs", f"/{segments[1]}/{segments[2]}", location)
 
+    def serve_site(self, url):
+        """Serve a request on a subdomain host: its path is a path in the site's root, nothing else."""
+        if self.headers.get("Service-Worker") is not None:
+            # A worker on a name's site could go on serving old content after the name moves
+            raise GatewayError(403, "service workers aren't allowed on the gateway")
+        if not self.path.startswith("/"):  # origin-form only: an absolute-form target could name another host
+            raise GatewayError(400, "the path must start with /")
+        segments = url.path[1:].split("/")  # names…; a trailing "" means a trailing slash ("/" is the root's)
+        slash = segments[-1] == ""
+        # Every segment is a valid name: an empty one ("//") is refused, so no redirect is protocol-relative
+        names = [self.decode_segment(segment) for segment in (segments[:-1] if slash else segments)]
+        if self.param("format") is not None:
+            raise GatewayError(400, "?format= is only answered on the path gateway: /rnfs/<cid>?format=raw|archive")
+        kind, value = self.site
+        root = str(value) if kind == "rnfs" else self.resolve_name(value.hex())
+        # Built from the decoded names, each percent-encoded whole, so the redirect stays a path on this site
+        location = "/" + "".join(quote(name, safe="") + "/" for name in names) + (f"?{url.query}" if url.query else "")
+        self.serve_target(root, names, slash, kind == "rnfs", f"/{kind}/{root if kind == 'rnfs' else value.hex()}",
+                          location)
+
+    def serve_target(self, root: str, names: list[str], slash: bool, immutable: bool, title: str, location: str):
+        """Serve root (a written CID) / names: slash if the URL ended with one, immutable for content named by
+        CID, title the listing's title for root, location the slash form a directory without one redirects to."""
+        # Answer a revalidation of a bare CID before touching the node at all
+        if immutable and not names and etag_matches(self.headers.get("If-None-Match"), f'"{root}"'):
+            return self.send_not_modified(root)
         target = "/".join([root, *names])
         if self.limited() and not self.node.is_local(target):
             self.need_network()
@@ -510,10 +653,15 @@ class GatewayHandler(TimedHandler):
 
         if info["type"] == "directory":
             if not slash:
-                return self.redirect_to_slash(url)
-            return self.serve_directory(target, segments, names, cache)
-        filename = self.param("filename") or (names[-1] if names else None)
-        self.serve_file(target, info["size"], filename, cache)
+                return self.redirect_to_slash(location)
+            return self.serve_directory(target, "/".join([title, *names]) + "/", bool(names), cache)
+        if self.site is None:
+            filename = self.param("filename") or (names[-1] if names else None)
+        else:
+            filename = names[-1] if names else None  # ?filename= only names the download on a site (REV6)
+        # A site's root that is a file is its origin's only content, so sniffing it as a page gains nobody anything;
+        # a file reached by a path inside a site's DAG may be someone else's, put there (REV6)
+        self.serve_file(target, info["size"], filename, cache, passive_only=self.site is not None and bool(names))
 
     def decode_segment(self, segment: str) -> str:
         """One percent-decoded path segment, which must be a single valid name."""
@@ -547,21 +695,21 @@ class GatewayHandler(TimedHandler):
         return cid
 
     def send_not_modified(self, cid: str):
-        """304 for a cached immutable response."""
+        """304 for a cached response by CID. No Cache-Control: a 304 updates the headers it carries, and the stored
+        response's (immutable, or a document's no-cache) is right; its CSP, current, does reach the stored copy."""
         log(f"gateway: {cid} not modified", LOG_DEBUG)
         self.send_response(304)
         self.send_header("ETag", f'"{cid}"')
-        self.send_header("Cache-Control", IMMUTABLE)
         self.end_headers()
 
-    def redirect_to_slash(self, url):
-        """301 from a directory path without a trailing slash to the slash form, keeping the query."""
-        # url.path starts with /rnfs/ or /name/, so this can't become a protocol-relative open redirect
-        location = url.path + "/" + (f"?{url.query}" if url.query else "")
+    def redirect_to_slash(self, location: str):
+        """301 from a directory path without a trailing slash to location, its slash form: anything but printable
+        ASCII in it (the request's query, as sent) percent-encoded, so no control character reaches a header (REL-17)."""
+        location = quote(location, safe=LOCATION_SAFE)
         self.send_text(301, f"see {location}", {"Location": location})
 
-    def serve_directory(self, target: str, segments: list[str], names: list[str], cache: dict):
-        """Serve a directory as its index.html, or as a listing."""
+    def serve_directory(self, target: str, title: str, has_parent: bool, cache: dict):
+        """Serve a directory as its index.html, or as a listing titled title."""
         entries = list(self.node.ls(target, for_gateway=True))
         for entry in entries:
             if entry["name"] == INDEX and entry["kind"] != "directory":
@@ -569,13 +717,13 @@ class GatewayHandler(TimedHandler):
                 if self.limited() and not self.node.is_local(index_target):
                     self.need_network()  # the directory may be stored without its index.html
                 log(f"gateway: serving {index_target}", LOG_DEBUG)
-                return self.serve_file(index_target, entry["size"], INDEX, cache)
+                return self.serve_file(index_target, entry["size"], INDEX, cache, passive_only=self.site is not None)
         log(f"gateway: listing {target} ({len(entries)} entries)", LOG_DEBUG)
-        title = "/" + "/".join([segments[1], segments[2], *names]) + "/"
-        self.send_body(200, "text/html; charset=utf-8", listing_html(title, entries, bool(names)), cache)
+        self.send_body(200, "text/html; charset=utf-8", listing_html(title, entries, has_parent),
+                       for_type(cache, "text/html"))
 
-    def serve_file(self, target: str, size: int, filename: str | None, cache: dict):
-        """Serve a file, or the requested byte range of it."""
+    def serve_file(self, target: str, size: int, filename: str | None, cache: dict, passive_only: bool = False):
+        """Serve a file, or the requested byte range of it; passive_only: sniff only to SITE_SNIFFED_TYPES."""
         byte_range = parse_range(self.headers.get("Range"), size)
         if_range = self.headers.get("If-Range")
         if if_range is not None and if_range.strip() != cache.get("ETag"):
@@ -584,10 +732,12 @@ class GatewayHandler(TimedHandler):
             raise GatewayError(416, "range not satisfiable", {"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"})
         # A web page's HEAD or later range reads the first bytes too: its type mustn't depend on what is stored
         content_type = self.file_type(target, size, filename, self.limited() or (
-            self.command != "HEAD" and (byte_range is None or byte_range[0] == 0)))
-        headers = {"Accept-Ranges": "bytes", **cache}
+            self.command != "HEAD" and (byte_range is None or byte_range[0] == 0)), passive_only)
+        headers = {"Accept-Ranges": "bytes", **for_type(cache, content_type)}
         if self.param("filename"):
-            headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(self.param('filename'), safe='')}"
+            # On a site, a link naming a file x.html mustn't make it render in the site's origin (REV6)
+            disposition = "inline" if self.site is None else "attachment"
+            headers["Content-Disposition"] = f"{disposition}; filename*=UTF-8''{quote(self.param('filename'), safe='')}"
 
         if byte_range is None:
             status, start, length = 200, 0, size
@@ -601,8 +751,10 @@ class GatewayHandler(TimedHandler):
         chunks = iter(self.node.read(target, offset=start, length=length, for_gateway=True))
         self.send_stream(status, content_type, length, headers, chunks)
 
-    def file_type(self, target: str, size: int, filename: str | None, read_start: bool) -> str:
-        """A file's Content-Type: octet-stream for a sealed file (never decrypted here), else by name or sniffed.
+    def file_type(self, target: str, size: int, filename: str | None, read_start: bool,
+                  passive_only: bool = False) -> str:
+        """A file's Content-Type: octet-stream for a sealed file (never decrypted here), else by name or sniffed
+        (with passive_only, a file inside a site's DAG, only to SITE_SNIFFED_TYPES).
 
         With read_start (a response that sends the first bytes anyway, or any web page's request) they are
         read, fetched if need be. Otherwise (the user's own HEAD or range starting later) they are used only if
@@ -615,7 +767,15 @@ class GatewayHandler(TimedHandler):
             head = self.node.stored_head(target, length)
             if head is None:
                 return type_from_name(filename) or "application/octet-stream"
-        return "application/octet-stream" if is_sealed(head) else type_from_name(filename) or sniff(head)
+        if is_sealed(head):
+            return "application/octet-stream"
+        by_name = type_from_name(filename)
+        if by_name:
+            return by_name
+        sniffed = sniff(head)
+        if passive_only and sniffed not in SITE_SNIFFED_TYPES:
+            return SITE_UNSNIFFED  # a file its DAG doesn't name as a page never becomes one in a site's origin
+        return sniffed
 
     def send_stream(self, status: int, content_type: str, length: int, headers: dict, chunks):
         """Send length bytes from chunks. The first chunk is read before the status, so early errors show."""
@@ -637,7 +797,7 @@ class GatewayHandler(TimedHandler):
                 raise
             # Too late for an error status; the short body (Content-Length) tells the client
             if not isinstance(e, OSError):
-                log(f"gateway {loggable(self.path)} failed mid-stream: {e!r}", LOG_ERROR)
+                log(f"gateway {self.path_for_log()} failed mid-stream: {e!r}", LOG_ERROR)
         finally:
             close = getattr(chunks, "close", None)
             if close:

@@ -7,36 +7,63 @@ fetch_listing() fetch what the operation needs. Blocks already stored are never 
 CID is fetched once however often it appears.
 
 Providers, in the order they are tried:
-1. up to max_parallel_providers nodes with an open outgoing link, asked for the first missing block;
+1. up to max_parallel_providers nodes asked for the first missing block (probes): a fetch's hint first, link or not
+   and whatever its link's speed (the node that asked for a remote pin, which may not have published its records
+   yet); then the providers remembered for the root (Fetcher.remembered: nodes that served verified blocks of it
+   within REMEMBER_FOR), then the nodes with an open outgoing link, each group ranked as providers are; on a node that
+   isn't slow, none of the last two over a slow link (below). A probe uses /range where a provider would (Ranges,
+   below: over a slow link that is a single-chunk file's root), and one that sends part of the block becomes its
+   provider, owning the partial. A remembered provider that answers None, or whose request fails, is forgotten for the
+   root; one that is busy is kept;
 2. if none has it, providers found by a Lookup running in the background, so downloading starts with
    the first one found; the search ends once max_parallel_providers providers are known and the root
    block has arrived, when the lookup is complete, or at lookup_timeout. Providers in the routing table
-   for over provider_seniority are tried first, the rest after them; within each group, fewer hops first,
-   then a faster next-hop interface (rnfs.mesh.provider_rank), then reply order. Open links are ranked
-   the same way. Hops and bitrates come from path_info (the node passes RNS's; by default none are known).
+   for over provider_seniority are tried first, the rest after them; within each group, a better local score
+   first (by band), then fewer hops, then a faster next-hop interface (rnfs.mesh.provider_rank), then reply
+   order. Open links are ranked the same way. Hops and bitrates come from path_info (the node passes RNS's;
+   by default none are known).
 `get --from` uses only the given node.
 
-A provider fails, and isn't used again during the fetch, when its link fails, it answers None for a block
-of the root it advertised, it is busy max_failures times in a row (each retried after BUSY_DELAY), or it
-stalls twice. When no providers are left, the lookup runs again for a fresh random half of providers,
-within the same lookup_timeout. A block not matching its CID bans the provider; a correctly hashed block
-that isn't a valid DAG node marks the root invalid locally and fails the fetch (a stored block that no
-longer matches its CID is local damage: it is deleted and fetched again). A fetch that gets no verified
-block and no response progress for lookup_timeout + stall_timeout fails, so a hung one ends.
+Remembered providers and searches that found none (Fetcher, in memory only): every node that serves verified blocks of a
+fetch's root is remembered for it, for REMEMBER_FOR after it last did (K per root, MAX_REMEMBERED roots, the least
+recently used forgotten first); one that fails during a fetch, answers None when asked first, or is banned is forgotten.
+Only a provider that served verified blocks is remembered, never one a /find reply names, so no other node can make
+this one ask a node again. A search whose lookup ran to its end, heard from at least one node and found no provider,
+in a fetch that found none either, is remembered for UNFOUND_FOR (MAX_UNFOUND roots): a fetch that isn't explicit
+(Fetcher.open: the gateway's, and the node's own retries of followed names and deny lists) still asks its step 1
+nodes, but doesn't search again within it and fails with NotFound. An explicit fetch (the user's get, cat, pin add and
+the rest of the CLI and API, a remote pin's) always searches. Only this node's own lookups set it, keyed on the root.
+
+A provider fails, and isn't used again during the fetch, when its link fails (a malformed answer; no path twice in a
+row, the second try UNREACHABLE_RETRY after the first), it answers
+None for a block of the root it advertised, it is busy (refuses, or closes the link: peer_client.BUSY) max_failures
+times in a row (each retried after BUSY_DELAY), its requests go unanswered max_failures times in a row the way a lossy link loses them
+(peer_client.LOST: each has its link closed and is retried on a new one after BUSY_DELAY), or it stalls twice. When no
+providers are left, the lookup runs again for a fresh random half of providers, within the same lookup_timeout. A block
+not matching its CID bans the provider; a correctly hashed block that isn't a valid DAG node marks the root invalid
+locally and fails the fetch (a stored block that no longer matches its CID is local damage: it is deleted and fetched
+again). A fetch that gets no verified block and no response progress for lookup_timeout + stall_timeout fails, so a hung
+one ends.
+
+Local scores (rnfs.dht.scores, section 6): a response with verified blocks raises its provider's score, and, once
+per fetch, the scores of the nodes whose /find answers listed it; a provider that fails falls, one sending a block
+not matching its CID much further.
 
 End-game duplication (NET-4; section 7): once nothing is left to ask for, an idle provider is also asked for a
-batch another has had in flight for longer than deadline_slack, so a response dripping in (never stalling, its
-deadline hours away at unmeasured_bitrate) doesn't hold the fetch up. Each request is duplicated at most once,
-and only while fewer than max_parallel_providers requests are in flight (never on a slow node). The first
+batch another has had in flight for longer than deadline_slack (and, on a link with a rate estimate, DUPLICATE_AFTER
+times its blocks' transfer time at it), so a response dripping in (never stalling, its deadline hours away at
+unmeasured_bitrate) doesn't hold the fetch up. Each request is duplicated at most once, only while fewer than
+max_parallel_providers requests are in flight, and never over a slow link (so never on a slow node). The first
 verified copy wins: the request still sending what has arrived has its link closed (unless another fetch has a
 request on it: then it is left to finish), and its outcome isn't counted against its provider.
 
-Upload pacing (section 3): a responder starts a slow link's next /blocks response no sooner than its size at
-the upload cap (by default half the rate estimate) after the previous one started, and refuses a request it
-would have to hold back for longer than a few seconds. So after a response on a slow link, a provider isn't
-asked again until as long as that request took has passed again. Refusals within four times that of a
-served response aren't counted towards max_failures (the estimates at the two ends differ, and a responder
-may set a lower cap): they are retried every eighth of that time, or BUSY_DELAY if longer.
+Upload pacing (section 3): a responder starts a slow link's next /blocks response no sooner than its size at the upload
+cap (by default half the rate estimate) after the previous one started, and refuses a request it would have to hold back
+for longer than a few seconds. So after a response on a slow link, a provider isn't asked again until as long as that
+request took has passed again, and its link counts as in use meanwhile (PeerClient.hold_link), so the idle sweep doesn't
+close it and lose the rate estimate. Refusals within four times that of a served response aren't counted towards
+max_failures (the estimates at the two ends differ, and a responder may set a lower cap): they are retried every eighth
+of that time, or BUSY_DELAY if longer.
 
 Limits (sections 7 and 8): max_download_size bounds both the target's verified size and the DAG node bytes a
 fetch downloads (a DAG of empty files has size 0 but can hold gigabytes of directory nodes); listings and
@@ -60,7 +87,11 @@ it is asked for or read; a complete stored DAG is checked whole, since fetch_dag
 blocks against a quota).
 
 Requests are spread over up to max_parallel_providers providers (1 on slow nodes), one /blocks request in
-flight per provider. Request threads only call the client and note when a response last made progress
+flight per provider. A provider is reached over a slow link (Fetch._slow) when its link's rate estimate is below
+slow_bitrate, or, with none, when the next-hop interface to it is or it is behind a slow path (fetcher.slow_path,
+mesh.SlowPaths); the providers over slow links behind one next-hop interface share one request in flight
+(Fetch._slot), so a node with a fast and a slow interface, which isn't slow, runs parallel requests over the fast
+one only. Request threads only call the client and note when a response last made progress
 (Fetch._heard_at, which the no-progress deadline reads with the fetch thread's own _progress_at); all other
 fetch state is changed by the thread that runs the fetch, from the events they queue (ResultEvent, and the
 lookup thread's ProviderEvent and LookupDone).
@@ -70,17 +101,33 @@ soon as it is met, stored or downloaded, rather than once its whole tree level h
 for a level's last response. A parent is always stored before its children are asked for, so whatever an
 interrupted fetch stored hangs together from the target, and the next fetch resumes from it.
 
-read_range fetches WINDOW chunks at a time, and asks for the next window's before handing the reader this one's
-bytes, so the providers don't sit idle between windows; a block that a request brings after the call that asked
-for it has returned is stored all the same. A fetch that ends by an error, is cancelled, or ends with requests it
-no longer needs (a reader that stopped early, which has had at most one window fetched that it didn't read)
-closes the links of its requests still in flight, unless another fetch has a request on the same (shared) link:
-then its request is left to finish, rather than fail the other's. It never cancels a response's Resource: a
-responder would take that for a rejection and cool the requester down (section 3).
+read_range fetches WINDOW chunks at a time (SLOW_WINDOW while no provider known is reached over a fast link: 32 chunks
+take about 5 hours on LoRa before the first byte), and asks for the next window's before handing the reader this one's
+bytes, so the providers don't sit idle between windows; a block that a request brings after the call that asked for it
+has returned is stored all the same. A fetch that ends by an error, is cancelled, or ends with requests it no longer
+needs (a reader that stopped early, which has had at most one window fetched that it didn't read) closes the links of
+its requests still in flight, unless another fetch has a request on the same (shared) link: then its request is left to
+finish, rather than fail the other's. It never cancels a response's Resource: a responder would take that for a
+rejection and cool the requester down (section 3).
 
-Within `with observing(observer):`, every fetch the thread opens reports its total size and each block it
-meets to the Observer, and raises Cancelled once observer.cancelled() is true (background jobs use this).
+Ranges (rnfs 0.2.0; specification section 7, `/range`; rnfs.ranges). Over a slow link (Fetch._slow), a raw chunk
+whose parent declares at least RANGE_MIN_BLOCK (or no size) is asked for alone, a byte range at a time with /range,
+compressed; so is one from a provider whose response stalled earlier in the fetch (uncompressed, ranges of at most
+STALLED_RANGE), and any block a partial is held of from that provider. Each range aims at max(min_rate_sample,
+response_target of transfer at the link's rate estimate) bytes on the wire, times the compression that provider's last
+range achieved (Fetch._range_plan). A range that doesn't complete its block comes back as progress
+(BlocksResult.partial): the block goes back to the front of the queue, owned by that provider while it is usable
+(Fetch._owners: no other provider is given it, so two partials of one block don't both cross the channel), and the
+provider is paced as after any response. A provider that leaves a /range unanswered (an older node, or a lost packet)
+is asked with /blocks for the rest of the fetch, the block at once, without counting against it
+(peer_client.UNSUPPORTED; a probe likewise, asked again with /blocks); two such silences in a row, in one fetch or several, record the node as not answering /range
+(rnfs.ranges.RangeSupport).
+
+Within `with observing(observer):`, every fetch the thread opens reports its total size, each block it meets, and
+how many providers it uses and whether it is searching for more (Fetch._report_providers) to the Observer, and raises
+Cancelled once observer.cancelled() is true (background jobs use this).
 """
+import os
 import queue
 import threading
 import time
@@ -89,13 +136,14 @@ from contextlib import contextmanager
 from itertools import islice
 from typing import Callable, Iterator, NamedTuple
 
-from rnfs import statedb
+from rnfs import ranges, statedb
 from rnfs.config import Config
-from rnfs.constants import CHUNK_SIZE, KIB, MAX_BLOCK_SIZE, MAX_CHILDREN, MAX_DEPTH, MAX_REQUEST_SIZE
+from rnfs.constants import CHUNK_SIZE, KIB, K, MAX_BLOCK_SIZE, MAX_CHILDREN, MAX_DEPTH, MAX_REQUEST_SIZE
 from rnfs.content import walker
 from rnfs.content.cid import Cid
 from rnfs.content.storage import Storage
 from rnfs.content.walker import Expect
+from rnfs.dht.scores import Scores
 from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, TooLarge
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name, plural
 from rnfs.network import client as peer_client
@@ -105,10 +153,40 @@ from rnfs import mesh
 BUSY_DELAY = 2.0  # seconds before a busy provider is asked again
 MAX_STALLS = 2  # a provider that stalls this often fails
 WINDOW = 32  # chunks fetched ahead of what a byte-range read has written out
+SLOW_WINDOW = 1  # the same while no provider known is over a fast link (Fetch._window): one chunk, one ahead
 POLL = 0.5  # seconds between checks while waiting for responses
 DAG_NODE_GUESS = 8 * KIB  # assumed size of a DAG node block when reserving a request's batch
 MAX_BATCH = 32  # CIDs reserved for one request at most; the client sends as many as fit one packet
 MAX_INVALID = 10_000  # roots remembered as invalid; past this the oldest is forgotten
+# End-game duplication: a batch on a link with a rate estimate is asked of another provider too only once it has
+# been in flight this many times as long as its bytes take at that rate (and deadline_slack at least)
+DUPLICATE_AFTER = 1.5
+# Remembered providers (Fetcher.remembered): asked first when a root is fetched again, for this long after they last
+# served verified blocks of it (provider records live 7 days, republished daily), K per root, for at most MAX_REMEMBERED
+# roots, the least recently used forgotten first
+REMEMBER_FOR = 3 * 3600
+MAX_REMEMBERED = 4096
+# A search that found no provider of a root isn't repeated by a fetch that isn't explicit for this long
+# (Fetcher.unfound); at most MAX_UNFOUND roots are remembered so, the oldest forgotten first
+UNFOUND_FOR = 600
+# Searching again during a long fetch (Fetch._search_again): on a node that isn't slow, with fewer providers usable than
+# max_parallel, a search starts this long after the last one ended, the wait doubling each time up to SEARCH_AGAIN_MAX
+SEARCH_AGAIN_AFTER = 60.0
+SEARCH_AGAIN_MAX = 600.0
+# An explicit fetch whose search found no provider at all searches once more this part of lookup_timeout later (30 s
+# at its default), before it fails: content just added elsewhere is found only once its publisher's records are out,
+# which took over 20 s between cloud nodes (the publish lookup waited on a server that didn't answer), so a get of a
+# CID shared at once failed (_search_late)
+LATE_SEARCH_PART = 1 / 20
+SEARCHES_KEPT = 8  # the later searches of a fetch kept besides its first, for crediting the nodes that listed providers
+# A provider no path was found to is asked again this long after, and fails only if it is unreachable again then: on a
+# radio a node is out of reach for a minute when its rnsd restarts or a path request is lost
+UNREACHABLE_RETRY = 60.0
+MAX_UNFOUND = 4096
+# Ranges (the module docstring): raw chunks declared this large or larger are fetched in ranges over slow links, and a
+# provider that stalled gets ranges of at most STALLED_RANGE on the wire
+RANGE_MIN_BLOCK = 4 * KIB
+STALLED_RANGE = CHUNK_SIZE // 2
 
 
 def import_invalid(value: list, tx) -> int:
@@ -198,6 +276,13 @@ class Observer:
 
     def block(self, cid: Cid, length: int, downloaded: bool):
         """A block was met that is now stored: downloaded just now, or already stored (downloaded False)."""
+
+    def partial(self, cid: Cid, held: int):
+        """Part of a block not yet met arrived with /range: held bytes of it are held now, from one provider."""
+
+    def providers(self, count: int, searching: bool):
+        """The fetch now uses count providers (not failed), and is searching for providers or not: told when either
+        changes, so a job can say it is still looking (a search takes minutes on a radio) and from how many."""
 
     def cancelled(self) -> bool:
         """True makes the fetch raise Cancelled at its next step (checked at least every POLL seconds)."""
@@ -351,6 +436,15 @@ class ResultEvent(NamedTuple):
     rate: float | None  # the link's rate estimate it was sent with (the responder's upload cap derives from it)
 
 
+class RangePlan(NamedTuple):
+    """How a request asks for its one block with /range (Fetch._range_plan)."""
+
+    compress: bool  # ask for bz2 (over slow links)
+    target: int  # bytes on the wire the range aims at
+    ratio: float  # the compression the provider's last range achieved (1: none known)
+    size: int | None  # the block's length, if its parent declares it
+
+
 class ProviderEvent(NamedTuple):
     """A provider the lookup found, queued by the lookup thread as its reply arrives."""
 
@@ -361,6 +455,7 @@ class LookupDone(NamedTuple):
     """A lookup run ended, queued by the lookup thread."""
 
     found: int  # providers it reported
+    answered: bool = False  # it ran to its end (the fetch didn't stop it) and some node answered it
 
 
 class _Pending:
@@ -450,8 +545,8 @@ class _Walk:
 class _Provider:
     """What a fetch knows about one provider."""
 
-    __slots__ = ("node_id", "order", "busy", "busy_until", "stalls", "failed", "path", "pacing_until",
-                 "pacing_retry")
+    __slots__ = ("node_id", "order", "busy", "busy_until", "stalls", "cut", "lost", "failed", "path", "pacing_until",
+                 "pacing_retry", "ratio", "no_ranges", "unreached")
 
     def __init__(self, node_id: bytes, order: int, path: mesh.PathInfo = mesh.NO_PATH):
         """A provider found order-th, path hops away (looked up once, when found)."""
@@ -461,9 +556,16 @@ class _Provider:
         self.busy = 0  # busy refusals in a row
         self.busy_until = 0.0
         self.stalls = 0
+        # Responses that stopped arriving partway (BUSY "cancelled"): over a route that breaks large transfers at the
+        # same point each time, asked in ranges after, as after a stall (REL-19)
+        self.cut = 0
+        self.lost = 0  # requests unanswered in a row the way a lossy link loses them (peer_client.LOST)
         self.failed = False
         self.pacing_until = 0.0  # until then, a refusal is most likely the responder's upload pacing...
         self.pacing_retry = 0.0  # ...and is retried after this many seconds
+        self.ratio = 1.0  # the compression its last compressed /range answer achieved (ranges)
+        self.no_ranges = False  # it left a /range unanswered (UNSUPPORTED): /blocks for the rest of the fetch
+        self.unreached = False  # its last request found no path to it: the next unreachable one fails it
 
 
 class Fetcher:
@@ -472,8 +574,11 @@ class Fetcher:
     def __init__(self, storage: Storage, client, config: Config, own_id: bytes, routing,
                  make_lookup: Callable[[bytes], object], slow_node: bool = False, state_dir: str | None = None,
                  after_store: Callable[[], None] | None = None, clock: Callable[[], float] = time.monotonic,
-                 busy_delay: float = BUSY_DELAY, make_room: Callable[[int], None] | None = None):
-        """Fetch into storage with client (PeerClient); routing is the RoutingTable (bans, seniority).
+                 busy_delay: float = BUSY_DELAY, make_room: Callable[[int], None] | None = None,
+                 scores: Scores | None = None):
+        """Fetch into storage with client (PeerClient); routing is the RoutingTable (bans, seniority), and scores the
+        local scores, raised by verified blocks and the answers that led to them, lowered by failures and bad blocks
+        (in memory only unless given).
 
         make_lookup(key) returns a dht.lookup.Lookup for key; after_store() runs after each batch of stored
         blocks, so the node can enforce max_storage; make_room(nbytes) evicts cache so an unpinned fetch can
@@ -485,6 +590,7 @@ class Fetcher:
         self.config = config
         self.own_id = own_id
         self.routing = routing
+        self.scores = scores if scores is not None else Scores()
         self.make_lookup = make_lookup
         self.slow_node = slow_node
         self.after_store = after_store or (lambda: None)
@@ -497,6 +603,15 @@ class Fetcher:
         # path_info of several nodes at once (mesh.RnsPaths.infos: one RPC to a shared instance, not one each)
         self.path_infos: Callable[[list[bytes]], dict[bytes, mesh.PathInfo]] = lambda node_ids: {
             node_id: self.path_info(node_id) for node_id in node_ids}
+        # Whether a node is behind a slow path (mesh.SlowPaths: more than SLOW_PATH_HOPS hops, or this node's last link
+        # to it was slow); the node sets its own. Without it, rate estimates and next-hop bitrates alone tell slow links
+        self.slow_path: Callable[[bytes], bool] = lambda node_id: False
+        # The providers of a key this node holds records of, as a DHT server (rnfs.dht.providers.ProviderRecords);
+        # the node sets its own. Each search starts with them as candidates (Fetch._discover)
+        self.held_providers: Callable[[bytes], list[bytes]] = lambda key: []
+        # The part of lookup_timeout an explicit fetch that found no provider waits before its one late search (None:
+        # none, as tests that count the searches made have it)
+        self.late_search: float | None = LATE_SEARCH_PART
         self._lock = threading.Lock()
         self._db = None if state_dir is None else statedb.connect(state_dir)
         self._invalid: OrderedDict[Cid, None] = OrderedDict()  # oldest first
@@ -515,6 +630,13 @@ class Fetcher:
                 self._invalid.popitem(last=False)
         # Changed since the last save; a row that didn't parse, or past MAX_INVALID, is deleted by the next
         self._invalid_dirty = len(self._invalid) != len(self._invalid_saved)
+        # root -> {provider: when it last served verified blocks of it}, least recently used root first (remembered)
+        self._remembered: OrderedDict[Cid, dict[bytes, float]] = OrderedDict()
+        self._unfound: OrderedDict[Cid, float] = OrderedDict()  # root -> when a search found no provider; oldest first
+        # /range: which nodes answer it (persisted) and the partial blocks (under the state directory, in memory without
+        # one), shared by every fetch (rnfs.ranges)
+        self.ranges = ranges.Ranges(ranges.RangeSupport(self._db), ranges.Partials(
+            None if state_dir is None else os.path.join(state_dir, ranges.PARTIAL_DIR)))
 
     @property
     def max_parallel(self) -> int:
@@ -522,8 +644,13 @@ class Fetcher:
         return max(1, self.config.effective_max_parallel_providers(self.slow_node))
 
     def open(self, root: Cid, names: list[str] | tuple[str, ...] = (), from_node: bytes | None = None,
-             pinned: bool = False) -> "Fetch":
+             pinned: bool = False, hint: bytes | None = None, explicit: bool = True) -> "Fetch":
         """A fetch of <root>/<names>, to use as `with fetcher.open(...) as fetch:`.
+
+        hint is a node likely to hold it (a remote pin's asker), asked first along with the remembered providers and
+        the nodes with an open link, as they are: one that hasn't it isn't penalised, and the lookup follows. Ignored
+        with from_node. explicit is False for a fetch the user didn't ask for just now (a gateway request, a retry the
+        node makes itself): it doesn't search again for a root a search found no provider of within UNFOUND_FOR.
 
         Raises InvalidDag if root was found invalid before. Its traversals raise StorageFull if what they
         would store doesn't fit on the disk (never because of max_storage).
@@ -535,7 +662,7 @@ class Fetcher:
             error.root = root
             raise error
         self.check_denied(root)
-        return Fetch(self, root, list(names), from_node, pinned)
+        return Fetch(self, root, list(names), from_node, pinned, hint, explicit)
 
     def check_denied(self, cid: Cid):
         """Raise Denied if the deny list (the storage's) denies cid."""
@@ -583,11 +710,74 @@ class Fetcher:
         if self._db is not None:
             self._db.close()
 
+    # Remembered providers, and searches that found none (the module docstring)
+
+    def remembered(self, root: Cid) -> list[bytes]:
+        """The providers remembered for root, the one that served most recently first; those remembered for longer
+        than REMEMBER_FOR, or banned since, are forgotten."""
+        now = self.clock()
+        with self._lock:
+            providers = self._remembered.get(root)
+            if providers is None:
+                return []
+            for node_id, served in list(providers.items()):
+                if now - served >= REMEMBER_FOR or self.routing.is_banned(node_id):
+                    del providers[node_id]
+            if not providers:
+                del self._remembered[root]
+                return []
+            self._remembered.move_to_end(root)
+            return list(reversed(providers))
+
+    def remember(self, root: Cid, node_id: bytes):
+        """node_id served verified blocks of root: remember it for REMEMBER_FOR (keeping the K that served most
+        recently), and forget that a search found no provider of root."""
+        with self._lock:
+            providers = self._remembered.get(root)
+            if providers is None:
+                providers = self._remembered[root] = {}
+                while len(self._remembered) > MAX_REMEMBERED:
+                    self._remembered.popitem(last=False)
+            providers.pop(node_id, None)
+            providers[node_id] = self.clock()  # insertion order is serving order: the oldest goes first
+            while len(providers) > K:
+                del providers[next(iter(providers))]
+            self._remembered.move_to_end(root)
+            self._unfound.pop(root, None)
+
+    def forget(self, root: Cid, node_id: bytes):
+        """Stop remembering node_id as a provider of root (it failed, or answered None)."""
+        with self._lock:
+            providers = self._remembered.get(root)
+            if providers is not None and providers.pop(node_id, None) is not None and not providers:
+                del self._remembered[root]
+
+    def note_unfound(self, root: Cid):
+        """This node's search for root ran to its end, heard from some node and found no provider."""
+        with self._lock:
+            self._unfound.pop(root, None)
+            self._unfound[root] = self.clock()
+            while len(self._unfound) > MAX_UNFOUND:
+                self._unfound.popitem(last=False)
+
+    def unfound(self, root: Cid) -> float | None:
+        """Seconds since a search found no provider of root, if within UNFOUND_FOR; else None."""
+        with self._lock:
+            since = self._unfound.get(root)
+            if since is None:
+                return None
+            ago = self.clock() - since
+            if ago >= UNFOUND_FOR:
+                del self._unfound[root]
+                return None
+            return ago
+
 
 class Fetch:
     """One fetch of a target: its protection session, providers, lookup and the blocks it has stored."""
 
-    def __init__(self, fetcher: Fetcher, root: Cid, names: list[str], from_node: bytes | None, pinned: bool):
+    def __init__(self, fetcher: Fetcher, root: Cid, names: list[str], from_node: bytes | None, pinned: bool,
+                 hint: bytes | None = None, explicit: bool = True):
         """Use Fetcher.open."""
         self.fetcher = fetcher
         self.storage = fetcher.storage
@@ -597,6 +787,12 @@ class Fetch:
         self.names = names
         self.from_node = from_node
         self.pinned = pinned
+        self.hint = hint  # asked first, with the remembered providers and the open links (_discover)
+        self.explicit = explicit  # searches even if a search found no provider within UNFOUND_FOR (Fetcher.unfound)
+        self._late_search_at: float | None = None  # when the one late search (_search_late) is due, once set
+        self._late_searched = False  # it has started
+        self._unfound_ago: float | None = None  # set when it didn't search for that reason: how long ago that was
+        self._remembered_asked: set[bytes] = set()  # remembered providers asked first (_discover)
         self.target: Expect | None = None  # set by resolve()
         self.observer: Observer | None = getattr(_observers, "current", None)  # progress and cancel hook
         self.downloaded_blocks = 0
@@ -613,10 +809,16 @@ class Fetch:
         self._protection = None
         self._providers: dict[bytes, _Provider] = {}
         self._live = 0  # providers not failed; read by the lookup thread, so kept as a plain counter
+        self._reported: tuple[int, bool] | None = None  # what the observer was last told (_report_providers)
         self._probed = from_node is not None  # open links are only asked when the DHT may be used
         self._lookup = None
         self._lookup_running = False
         self._lookup_found = 0  # providers the last lookup run reported
+        self._lookups: list = []  # every search of this fetch, the latest last (their listers earn the credit)
+        # When the last search ended (the fetch thread's clock); until one has, when the fetch began, so a fetch whose
+        # first request brought the root (a probe) also looks for more providers if it runs long
+        self._searched_at: float = fetcher.clock()
+        self._search_wait = SEARCH_AGAIN_AFTER  # how long after it the next may start (_search_again)
         self._events: queue.Queue = queue.Queue()
         # provider -> (CIDs asked for, is a probe); kept across _download calls, since a request may outlive one
         self._in_flight: dict[bytes, tuple[list[Cid], bool]] = {}
@@ -627,6 +829,7 @@ class Fetch:
         # thread's clock; a request duplicated -> its duplicate, and back, while each is in flight; and the
         # requests whose links were closed because the other copy won, whose outcome isn't counted
         self._sent_at: dict[bytes, float] = {}
+        self._expected: dict[bytes, float | None] = {}  # its bytes' transfer time at its link's rate estimate, if any
         self._duplicated: dict[bytes, bytes] = {}
         self._duplicates: dict[bytes, bytes] = {}
         self._abandoned: set[bytes] = set()
@@ -634,6 +837,8 @@ class Fetch:
         # a link another fetch has a request on isn't closed (PeerClient.close_unless_used)
         self._threads: set[int] = set()
         self._links_closed: set[bytes] = set()
+        self._credited: set[bytes] = set()  # nodes whose /find answers led to a provider that served this fetch
+        self._owners: dict[Cid, bytes] = {}  # blocks a provider holds part of (ranges): left to it while it is usable
         if from_node is not None:
             self._new_provider(from_node)
 
@@ -801,7 +1006,8 @@ class Fetch:
 
     def read_range(self, target: Expect, offset: int = 0, length: int | None = None) -> Iterator[bytes]:
         """The bytes of the file target in [offset, offset + length), fetching only the chunks covering them
-        and the nodes above, WINDOW chunks at a time. Raises ValueError for a directory.
+        and the nodes above, a window of chunks at a time (_window: WINDOW, or SLOW_WINDOW while no provider known
+        is over a fast link). Raises ValueError for a directory.
 
         The next window's chunks are asked for before this one's bytes are handed to the reader, so the
         providers keep working while it reads; a reader that stops early has fetched at most one window more
@@ -836,15 +1042,30 @@ class Fetch:
                 yield from self._read_window(window, ahead)
                 window = ahead
 
-    @staticmethod
-    def _next_window(leaves: Iterator[tuple[Expect, int, int]],
+    def _next_window(self, leaves: Iterator[tuple[Expect, int, int]],
                      small: walker.SmallLeaves) -> list[tuple[Expect, int, int]]:
-        """The next WINDOW chunks of a range's walk (fewer at its end, none past it), each met by small."""
-        window = []
-        for leaf in islice(leaves, WINDOW):
-            small.meet(leaf[2])
+        """The next window of chunks of a range's walk (fewer at its end, none past it), each met by small: sized by
+        _window once its first chunk is reached, so the file nodes above it, fetched on the way, have brought
+        their providers."""
+        first = next(leaves, None)
+        if first is None:
+            return []
+        small.meet(first[2])
+        window = [first]
+        for leaf in islice(leaves, self._window() - 1):
+            small.meet(leaf[2])  # each as it is reached, before the walk fetches the nodes above the next
             window.append(leaf)
         return window
+
+    def _window(self) -> int:
+        """Chunks a byte-range read fetches at a time: WINDOW if a usable provider is reached over a fast link
+        (not _slow), else SLOW_WINDOW, with as many asked for ahead. With every provider over a slow link (or none
+        known yet: say, the root and file nodes were stored already), a large window would hold the reader's first
+        byte back for hours, while the providers can't send any faster anyway (they share one request per slow
+        interface, _slot)."""
+        if any(not self._slow(provider.node_id, provider.path) for provider in self._usable()):
+            return WINDOW
+        return SLOW_WINDOW
 
     def _read_window(self, window: list[tuple[Expect, int, int]],
                      ahead: list[tuple[Expect, int, int]]) -> Iterator[bytes]:
@@ -992,6 +1213,8 @@ class Fetch:
             self.node_bytes += len(block)
         budget.count(cid, len(block), children[wanted[cid][0]])
         self.session.put(cid, block)
+        self._owners.pop(cid, None)
+        self.fetcher.ranges.partials.drop(cid)  # any provider's partial of it: nothing more to resume
         self._progress_at = self.fetcher.clock()
         self.downloaded_blocks += 1
         self.downloaded_bytes += len(block)
@@ -1031,11 +1254,17 @@ class Fetch:
             # Requests and lookups have deadlines of their own; this catches whatever hangs regardless
             if self.fetcher.clock() - max(self._progress_at, self._heard_at) > give_up:
                 raise NotFound(f"fetching {self.root} made no progress for {give_up:g}s")
+            self._search_again()
             self._assign(pending, in_flight, outstanding, wanted, budget)
             if not in_flight and not self._lookup_running and not self._waiting_for_busy():
-                if not self._rerun_lookup():
+                if self._rerun_lookup():
+                    continue
+                late = self._search_late()
+                if late is None:
                     raise NotFound(self._not_found_message(needed))
-                continue
+                if late:
+                    continue
+                # waiting for the late search: as for events, which wakes it at its time or for a cancel
             try:
                 events = [self._events.get(timeout=self._wait_time())]
             except queue.Empty:
@@ -1062,16 +1291,29 @@ class Fetch:
             self._add_provider(event.node_id)
         elif isinstance(event, LookupDone):
             self._lookup_running = False
+            self._report_providers()
             self._lookup_found = event.found
+            self._searched_at = self.fetcher.clock()
+            if event.found == 0 and len(self._lookups) > 1 and self._lookups[-1] is self._lookup:
+                self._lookups.pop()  # a later search that found nobody has nobody to credit (_served)
+            if event.answered and event.found == 0 and not self._providers:
+                self.fetcher.note_unfound(self.root)  # nobody provides it, as far as the DHT knows
         elif isinstance(event, ResultEvent):
             cids = event.cids
             _, probe = in_flight.pop(event.node_id, (cids, False))
             self._sent_at.pop(event.node_id, None)
+            self._expected.pop(event.node_id, None)
             abandoned = event.node_id in self._abandoned
             self._abandoned.discard(event.node_id)
             asked_now = [cid for cid in cids if cid in outstanding]
             self._handle(event.node_id, cids, event.result, probe, wanted, children, outstanding, budget,
                          event.sent_at, event.rate, counted=not abandoned)
+            left = [cid for cid in cids if cid in outstanding]  # not brought meanwhile by another probe
+            if probe and event.result.status == peer_client.UNSUPPORTED and left and not self.closed:
+                # A probe with /range left unanswered, as an older node leaves it: asked again at once with /blocks,
+                # on the same link, as a provider would be (rnfs.ranges counted the silence)
+                in_flight[event.node_id] = (left, True)
+                self._send(event.node_id, left)
             self._settle_duplicate(event.node_id, in_flight)
             still_asked = {cid for asked, _ in in_flight.values() for cid in asked}
             requeue = [cid for cid in cids if cid in outstanding and cid not in pending and cid not in still_asked]
@@ -1096,7 +1338,7 @@ class Fetch:
         nothing is evictable), and check the disk. Raises StorageFull if the disk can't take them."""
         if nbytes == 0:
             return
-        if not self.pinned and self.storage.used_bytes() + nbytes > self.storage.max_storage:
+        if not self.pinned and self.storage.allocated_bytes() + nbytes > self.storage.max_storage:
             self.fetcher.make_room(nbytes)
         self.storage.check_disk(nbytes)  # each response, so a DAG whose nodes alone are large stops too
 
@@ -1105,21 +1347,25 @@ class Fetch:
         what = self.root if self.root in outstanding or not self._providers else f"{len(outstanding)} blocks of {self.root}"
         if self.from_node is not None:
             return f"{node_name(self.from_node)} could not supply {what}"
+        if not self._providers and self._unfound_ago is not None:
+            return (f"no provider found for {self.root} (a search {self._unfound_ago:.0f}s ago found none; it isn't "
+                    f"repeated within {UNFOUND_FOR // 60} minutes but for a get, cat or pin add)")
         if not self._providers:
             return f"no provider found for {self.root}"
         return f"no provider could supply {what} ({plural(len(self._providers), 'provider')} tried)"
 
     def _usable(self) -> list[_Provider]:
         """Providers not failed, in the order they're tried: long-known ones first, then the rest; within
-        each, nearest and fastest first, then as found (section 6)."""
+        each, best scored, then nearest and fastest first, then as found (section 6)."""
         return sorted((p for p in self._providers.values() if not p.failed),
                       key=lambda p: self._rank(p.node_id, p.path, p.order))
 
     def _rank(self, node_id: bytes, path: mesh.PathInfo, order: int) -> tuple:
         """Sort key for a provider: seniority stays first (an attacker's fresh identities can't jump the
-        queue by being near), then hops and next-hop bitrate, then order."""
+        queue by being near, or by serving popular blocks), then local score band, then hops and next-hop
+        bitrate, then order."""
         senior = self.fetcher.routing.is_senior(node_id, self.config.provider_seniority)
-        return mesh.provider_rank(senior, path, order)
+        return mesh.provider_rank(senior, path, order, self.fetcher.scores.band(node_id))
 
     def _path(self, node_id: bytes) -> mesh.PathInfo:
         """What RNS knows about the path to node_id (nothing if the lookup fails)."""
@@ -1153,35 +1399,93 @@ class Fetch:
         now = self.fetcher.clock()
         usable = self._usable()
         if not usable and not in_flight:
-            self._discover(pending, in_flight)
+            self._discover(pending, in_flight, wanted)
             return
         busy_providers = sum(1 for _, probe in in_flight.values() if not probe)
+        # The slow interfaces a request is in flight over: providers behind one share it, one request at a time
+        slots = {self._slot(self._providers[node_id]) for node_id, (_, probe) in in_flight.items()
+                 if not probe and node_id in self._providers}
         for provider in usable:
             if not pending or busy_providers >= self.fetcher.max_parallel:
                 break
             if provider.node_id in in_flight or provider.busy_until > now:
                 continue
-            batch = self._take_batch(pending, provider.node_id, wanted, budget)
+            slot = self._slot(provider)
+            if slot is not None and slot in slots:
+                continue
+            others = self._others_owned(pending, provider.node_id)  # left to the providers holding part of them
+            plan = self._range_plan(provider, pending[0], wanted) if pending else None
+            batch = self._take_batch(pending, provider.node_id, wanted, budget, limit=1 if plan else None)
+            pending.push_front(others)
             if batch:
                 in_flight[provider.node_id] = (batch, False)
                 for cid in batch:
                     self._expects[cid] = wanted[cid]
                 self._sent_at[provider.node_id] = now
-                self._send(provider.node_id, batch)
+                self._expected[provider.node_id] = self._expected_time(provider.node_id, batch, wanted)
+                self._send(provider.node_id, batch, plan)
                 busy_providers += 1
+                slots.add(slot)
         if not pending and busy_providers < self.fetcher.max_parallel:
             self._duplicate(usable, in_flight, busy_providers, now)
 
+    def _others_owned(self, pending: _Pending, node_id: bytes) -> list[Cid]:
+        """Take from pending's front the blocks another usable provider holds part of (_owners), to put back once
+        node_id's batch is taken: each is left to the provider that can resume it."""
+        taken = []
+        while pending:
+            owner = self._owners.get(pending[0])
+            provider = self._providers.get(owner) if owner is not None else None
+            if owner is None or owner == node_id or provider is None or provider.failed:
+                break
+            taken.append(pending.popleft())
+        return taken
+
+    def _range_plan(self, provider: _Provider, cid: Cid, wanted: dict[Cid, list[Expect]]) -> RangePlan | None:
+        """How to ask provider for cid with /range, or None to use /blocks (the module docstring, "Ranges"): over a
+        slow link, a raw chunk declared RANGE_MIN_BLOCK or larger (or of no declared size), compressed; from a
+        provider that stalled before, the same chunks in ranges of at most STALLED_RANGE; and any block a partial is
+        held of from provider. Never to a node known not to answer /range."""
+        if provider.no_ranges:
+            return None
+        return self._plan(provider.node_id, provider.path, cid, wanted, provider.stalls + provider.cut, provider.ratio)
+
+    def _plan(self, node_id: bytes, path: mesh.PathInfo, cid: Cid, wanted: dict[Cid, list[Expect]], stalls: int = 0,
+              ratio: float = 1.0) -> RangePlan | None:
+        """_range_plan for node_id, reached by path, which stalled stalls times in this fetch: also a probe's, which
+        has no provider yet (_discover)."""
+        store = self.fetcher.ranges
+        if not store.usable(node_id):
+            return None
+        expects = wanted.get(cid)
+        declared = expects[0].size if expects and cid.is_raw else None
+        large = cid.is_raw and (declared is None or declared >= RANGE_MIN_BLOCK)
+        held = store.partials.length(cid, node_id)
+        if not held and not large:
+            return None
+        slow = self._slow(node_id, path)
+        if not held and not (slow or stalls):
+            return None
+        rate = self.client.rate_estimate(node_id)
+        timed = rates.transfer_bytes(self.config.response_target, rate) if rate else 0
+        target = max(self.config.min_rate_sample, timed)
+        if not slow:
+            target = min(target, STALLED_RANGE)  # it stalled: lose less to the next stall
+        return RangePlan(slow, min(target, MAX_BLOCK_SIZE), ratio, declared)
+
     def _duplicate(self, usable: list[_Provider], in_flight: dict, busy_providers: int, now: float):
-        """End-game duplication (NET-4; section 7, item 7): with nothing left to ask for, ask idle providers too
-        for the batches others have had in flight for longer than deadline_slack, oldest first, each at most
-        once, and within max_parallel requests in flight. A duplicate is sized for its own provider's link and
-        what one response carries (_take_batch)."""
-        idle = [provider for provider in usable if provider.node_id not in in_flight and provider.busy_until <= now]
+        """End-game duplication (NET-4; section 7, item 7): with nothing left to ask for, ask idle providers on
+        fast links too for the batches others have had in flight for longer than deadline_slack and DUPLICATE_AFTER
+        times their expected time (_expected_time, if their link has a rate estimate), oldest first, each at most
+        once, and within max_parallel requests in flight. Nothing is duplicated over a slow link (_slow): it would
+        spend the radio's airtime twice. A duplicate is sized for its own provider's link and what one response
+        carries (_take_batch)."""
+        idle = [provider for provider in usable if provider.node_id not in in_flight and provider.busy_until <= now
+                and not self._slow(provider.node_id, provider.path)]
         if not idle:
             return
         slow = sorted((sent_at, node_id) for node_id, sent_at in self._sent_at.items()
-                      if node_id in in_flight and now - sent_at > self.config.deadline_slack
+                      if node_id in in_flight and now - sent_at > self._duplicate_after(node_id)
                       and node_id not in self._duplicated and node_id not in self._duplicates
                       and node_id not in self._abandoned)
         for sent_at, node_id in slow:
@@ -1201,10 +1505,41 @@ class Fetch:
                 f"{now - sent_at:.0f}s; asking {node_name(provider.node_id)} too", LOG_VERBOSE)
             in_flight[provider.node_id] = (batch, False)
             self._sent_at[provider.node_id] = now
+            self._expected[provider.node_id] = self._expected_time(provider.node_id, batch, self._expects)
             self._duplicated[node_id] = provider.node_id
             self._duplicates[provider.node_id] = node_id
             self._send(provider.node_id, batch)
             busy_providers += 1
+
+    def _duplicate_after(self, node_id: bytes) -> float:
+        """Seconds node_id's request in flight must have taken before it is duplicated: deadline_slack, or
+        DUPLICATE_AFTER times its expected time if longer."""
+        expected = self._expected.get(node_id)
+        return max(self.config.deadline_slack, DUPLICATE_AFTER * expected if expected is not None else 0.0)
+
+    def _slow(self, node_id: bytes, path: mesh.PathInfo) -> bool:
+        """True if node_id is reached over a slow link: by the rate estimate of the link to it, if it has one (below
+        slow_bitrate); else if the next-hop interface on the path to it runs below slow_bitrate, or it is behind a
+        slow path (fetcher.slow_path). On a slow node, every link is."""
+        if self.fetcher.slow_node:
+            return True
+        rate = self.client.rate_estimate(node_id)
+        if rate is not None:
+            return rate < self.config.slow_bitrate
+        if path.bitrate is not None and path.bitrate < self.config.slow_bitrate:
+            return True
+        try:
+            return bool(self.fetcher.slow_path(node_id))
+        except Exception:  # noqa: BLE001 - RNS internals and traffic counters: not known to be slow if they fail
+            return False
+
+    def _slot(self, provider: _Provider) -> tuple | None:
+        """What provider's requests share, one at a time, with those of other providers: its next-hop interface if
+        its link is slow (_slow; an unknown interface counts as one), so providers behind one slow interface don't
+        contend for its channel; None for a fast link (a slot of its own)."""
+        if not self._slow(provider.node_id, provider.path):
+            return None
+        return ("slow", provider.path.interface)
 
     def _settle_duplicate(self, node_id: bytes, in_flight: dict):
         """node_id's request has been answered: if it was one of a duplicated pair and the other copy, still in
@@ -1237,9 +1572,9 @@ class Fetch:
             log(f"could not close the link to {node_name(node_id)}: {e}", LOG_WARNING)
 
     def _take_batch(self, pending: _Pending, node_id: bytes, wanted: dict[Cid, list[Expect]],
-                    budget: _DagBudget | None) -> list[Cid]:
+                    budget: _DagBudget | None, limit: int | None = None) -> list[Cid]:
         """The next CIDs to ask node_id for: what one response can carry and one request packet on its link can
-        hold, at least one.
+        hold, at least one, and at most limit if given (a /range request's one block).
 
         Under a DAG limit, only what the room budget leaves can take for sure (_DagBudget.room), but at least one
         CID when no request is in flight: so a fetch downloads at most about one block beyond the limit. With no
@@ -1255,14 +1590,15 @@ class Fetch:
         # one count covers every batch taken from the front of pending
         mdu = self.client.link_mdu(node_id) or MAX_REQUEST_SIZE
         fit = max(1, protocol.blocks_batch_size(max_bytes, list(islice(pending, MAX_BATCH)), mdu))
+        if limit is not None:
+            fit = min(fit, limit)
         room = None if budget is None else budget.room((cid for cids, _ in self._in_flight.values() for cid in cids),
                                                        wanted)
         batch: list[Cid] = []
         total = 0
         while pending and len(batch) < fit:
             cid = pending[0]
-            known = wanted[cid][0].size if cid.is_raw else None
-            guess = known if known is not None else (CHUNK_SIZE if cid.is_raw else DAG_NODE_GUESS)
+            guess = self._guess(cid, wanted)
             if batch and total + guess > carried:
                 break
             if room is not None:
@@ -1273,8 +1609,28 @@ class Fetch:
             total += guess
         return batch
 
-    def _send(self, node_id: bytes, cids: list[Cid]):
-        """Ask node_id for cids on a request thread, which queues the result."""
+    @staticmethod
+    def _guess(cid: Cid, wanted: dict[Cid, list[Expect]]) -> int:
+        """The bytes a block not yet received is taken to have when sizing a batch: a raw chunk's declared size,
+        else CHUNK_SIZE for a raw chunk and DAG_NODE_GUESS for a DAG node."""
+        known = wanted[cid][0].size if cid.is_raw and cid in wanted else None
+        return known if known is not None else (CHUNK_SIZE if cid.is_raw else DAG_NODE_GUESS)
+
+    def _expected_time(self, node_id: bytes, batch: list[Cid], wanted: dict[Cid, list[Expect]]) -> float | None:
+        """Seconds batch's blocks (as _guess takes them, at most what one response carries beyond its first) take at
+        the rate estimate of the link to node_id; None if it has none."""
+        rate = self.client.rate_estimate(node_id)
+        if not rate:
+            return None
+        carried = rates.response_capacity(rates.requester_max_bytes(rate, self.config), rate, None,
+                                          self.config.response_target)
+        size = sum(self._guess(cid, wanted) for cid in batch)
+        return rates.transfer_seconds(min(size, max(carried, self._guess(batch[0], wanted))), rate)
+
+    def _send(self, node_id: bytes, cids: list[Cid], plan: RangePlan | None = None):
+        """Ask node_id for cids on a request thread, which queues the result: with /blocks, or with plan, the next
+        range of the one block in cids with /range (rnfs.ranges; /blocks if its partial is in use elsewhere)."""
+        self._links_closed.discard(node_id)  # a link closed before (a lost request's) isn't this request's
         def progress(fraction: float):
             """The response is arriving: the fetch isn't hung (on the request thread, so only _heard_at is written)."""
             self._heard_at = self.fetcher.clock()
@@ -1288,7 +1644,12 @@ class Fetch:
             self._threads.add(ident)  # until its request is over: the link's users that are this fetch's
             try:
                 rate = self.client.rate_estimate(node_id)
-                result = self.client.blocks(node_id, cids, on_progress=progress)
+                result = None
+                if plan is not None:
+                    result = self.fetcher.ranges.fetch(self.client, node_id, cids[0], plan.target, plan.ratio,
+                                                       plan.compress, plan.size, on_progress=progress)
+                if result is None:
+                    result = self.client.blocks(node_id, cids, on_progress=progress)
             except Exception as e:  # noqa: BLE001 - any client failure is a failed request, retried elsewhere; logged
                 # The client reports network failures in its result, so this is a bug: logged here, inside the
                 # except, so the debug log has its traceback
@@ -1305,33 +1666,83 @@ class Fetch:
 
     # Finding providers
 
-    def _discover(self, pending: _Pending, in_flight: dict):
-        """No usable provider: ask nodes with open links, else start the lookup."""
+    def _discover(self, pending: _Pending, in_flight: dict, wanted: dict[Cid, list[Expect]]):
+        """No usable provider: ask the hint, the remembered providers and the nodes with open links, else start the
+        lookup (unless a search found none lately and the fetch isn't explicit)."""
         if not self._probed:
             self._probed = True
-            banned = self.fetcher.routing.is_banned
-            linked = [n for n in self.client.open_links() if n != self.fetcher.own_id and not banned(n)]
-            # Ranked like providers; most recently used breaks ties. Their paths in one go: attached to a shared
-            # instance, that is one RPC rather than one per link before the first request (plan C1)
-            paths = self._paths(linked)
-            ranked = sorted(enumerate(linked), key=lambda item: self._rank(item[1], paths[item[1]], item[0]))
-            candidates = [node_id for _, node_id in ranked][:self.fetcher.max_parallel]
+            own, banned = self.fetcher.own_id, self.fetcher.routing.is_banned
+            hinted = [n for n in [self.hint] if n is not None and n != own and not banned(n)]
+            remembered = [n for n in self.fetcher.remembered(self.root) if n != own and n not in hinted]
+            linked = [n for n in self.client.open_links() if n != own and not banned(n) and n not in hinted
+                      and n not in remembered]
+            # Ranked like providers; the most recent to serve (remembered) or be used (open links) breaks ties. Their
+            # paths in one go: attached to a shared instance, that is one RPC rather than one per link before the
+            # first request (plan C1). A node that isn't slow asks none over a slow link, remembered or not: each would
+            # hold the lookup up by a radio round trip, several would each send the root, and the lookup may find
+            # providers over fast links. A slow node, whose every link is slow, keeps its one probe (it probes
+            # max_parallel nodes): one that hits saves a whole lookup over the radio
+            paths = self._paths(remembered + linked)
+            if not self.fetcher.slow_node:
+                remembered = [node_id for node_id in remembered if not self._slow(node_id, paths[node_id])]
+                linked = [node_id for node_id in linked if not self._slow(node_id, paths[node_id])]
+
+            def ranked(node_ids: list[bytes]) -> list[bytes]:
+                """node_ids in the order providers are tried, their own order breaking ties."""
+                return [node_id for _, node_id in sorted(enumerate(node_ids),
+                                                         key=lambda item: self._rank(item[1], paths[item[1]], item[0]))]
+            # The hint goes first, taking one of the probe slots, over any link: one request that saves a lookup,
+            # to the one node known to hold the content before its records are out (a remote pin's asker). The
+            # remembered providers come next: each served this root, while an open link is only a guess
+            candidates = (hinted + ranked(remembered) + ranked(linked))[:self.fetcher.max_parallel]
             if candidates and pending:
-                # Each is asked for just the first block missing, which is the root at the start
-                first = pending[0]
-                log(f"asking {plural(len(candidates), 'node')} with an open link for {first}", LOG_VERBOSE)
+                # Each is asked for just the first block missing, which is the root at the start. Taken from pending as
+                # any request's are, so a probe that brings it doesn't leave it to be asked for again; if none does, it
+                # goes back to the front once the last probe has answered (_handle_event)
+                first = pending.popleft()
+                self._remembered_asked = set(candidates).intersection(remembered)
+                log(f"asking {plural(len(candidates), 'node')} for {first} before searching"
+                    + (f" ({len(self._remembered_asked)} remembered)" if self._remembered_asked else "")
+                    + f": {', '.join(node_name(node_id) for node_id in candidates)}", LOG_VERBOSE)
                 for node_id in candidates:
                     in_flight[node_id] = ([first], True)
-                    self._send(node_id, [first])
+                    # With /range where a provider would be asked with it: over a slow link the probe is most often
+                    # what brings a single-chunk file, so it is compressed and resumable as any other request there.
+                    # Only of a node likely to hold it (the hint, a remembered provider) or known to answer /range: an
+                    # open link is a guess, and an older node's silence would hold the search up a request timeout
+                    likely = node_id in hinted or node_id in self._remembered_asked
+                    plan = None
+                    if likely or self.fetcher.ranges.support.answers(node_id):
+                        path = paths[node_id] if node_id in paths else self._path(node_id)
+                        plan = self._plan(node_id, path, first, wanted)
+                    self._send(node_id, [first], plan)
                 return
-        if self._lookup is None and self.from_node is None:
+        if self._lookup is None and self.from_node is None and self._unfound_ago is None:
+            ago = None if self.explicit else self.fetcher.unfound(self.root)
+            if ago is not None:
+                # The gateway or a retry of the node's own: a search ago seconds back found nobody providing it
+                self._unfound_ago = ago
+                log(f"not searching for {self.root} again: a search {ago:.0f}s ago found no provider", LOG_VERBOSE)
+                return
             self._lookup = self.fetcher.make_lookup(self.root.key)
+            self._lookups.append(self._lookup)
             log(f"looking for providers of {self.root}", LOG_VERBOSE)
             self._start_lookup()
+            # The records this node holds of the root's key are candidates at once, never a reason to skip the search
+            # (its own /find answer, which it would give anyone): on a slow node a search takes a minute, and on an
+            # island a local replica is most often held by the node searching for it
+            try:
+                held = self.fetcher.held_providers(self.root.key)
+            except Exception as e:  # noqa: BLE001 - a failing record store leaves it to the search; logged
+                log(f"couldn't read the records held of {self.root}: {e!r}", LOG_WARNING)
+                held = []
+            for node_id in held:
+                self._add_provider(node_id, " (a record held here)")
 
     def _start_lookup(self):
         """Run find_providers on a thread of its own; providers and its end arrive as events."""
         self._lookup_running = True
+        self._report_providers()
         lookup = self._lookup
 
         def should_stop() -> bool:
@@ -1339,15 +1750,71 @@ class Fetch:
             return self.closed or (self.root_delivered and self._live >= self.fetcher.max_parallel)
 
         def work():
-            """Search, reporting each provider as its reply arrives."""
+            """Search, reporting each provider as its reply arrives, and whether it ran to its end and was answered
+            (so that finding nothing means nobody provides it, not that the fetch ended or nobody could be asked)."""
             found = []
+            answered = False
             try:
                 found = lookup.find_providers(lambda node_id: self._events.put(ProviderEvent(node_id)), should_stop)
+                answered = not self.closed and bool(lookup.closest_answered())
             except Exception as e:  # noqa: BLE001 - a failed lookup ends with the providers found so far
                 log(f"provider lookup for {self.root} failed: {e}", LOG_WARNING)
-            self._events.put(LookupDone(len(found)))
+            self._events.put(LookupDone(len(found), answered))
 
         threading.Thread(target=work, name="rnfs-find-providers", daemon=True).start()
+
+    def _search_again(self):
+        """A long fetch looks for more providers: one of them may be nearer, or on a faster route, than those it has
+        (a 30 MB fetch over a 4-hop path at 18 KB/s ran for 29 minutes while a node 2 hops away, which finished the
+        same fetch in 26 s, provided it). On a node that isn't slow (a search is a minute of airtime on a radio),
+        never for a fetch from a given node, while fewer than max_parallel providers are usable and no search runs:
+        SEARCH_AGAIN_AFTER after the last search ended, the wait doubling each time up to SEARCH_AGAIN_MAX. A new
+        lookup (the last one's time budget is spent by then), stopped as the first is once enough providers are known;
+        what it finds joins the fetch, ranked as any provider is."""
+        if self.fetcher.slow_node or self.from_node is not None or self.closed or self._lookup_running:
+            return
+        now = self.fetcher.clock()
+        if now - self._searched_at < self._search_wait:
+            return
+        # Providers that can be asked now: one waiting out a delay (busy, unreachable) doesn't fill a place. With none
+        # left at all, the fetch searches again or fails as it always did (_rerun_lookup)
+        usable = sum(1 for p in self._providers.values() if not p.failed and p.busy_until <= now)
+        if not self._live or usable >= self.fetcher.max_parallel:
+            return
+        self._search_wait = min(2 * self._search_wait, SEARCH_AGAIN_MAX)
+        log(f"still fetching {self.root} from {plural(self._live, 'provider')}: looking for more", LOG_VERBOSE)
+        self._lookup = self.fetcher.make_lookup(self.root.key)
+        self._lookups.append(self._lookup)
+        if len(self._lookups) > 1 + SEARCHES_KEPT:
+            # The first (whose budget the others share) and the latest: a fetch of days searches every 10 minutes,
+            # and one finding the same providers again would otherwise be kept for its whole life
+            del self._lookups[1]
+        self._lookup_found = 0
+        self._start_lookup()
+
+    def _search_late(self) -> bool | None:
+        """The search found no provider at all: for an explicit fetch (not one from a given node), search once more
+        LATE_SEARCH_PART of lookup_timeout later, as content just added elsewhere is found only once its records are out. True when
+        that search starts, False while it is waited for, None if there is none (the fetch fails)."""
+        if (not self.explicit or self.from_node is not None or self._providers or self._lookup is None
+                or self.closed or self._late_searched or self.fetcher.late_search is None):
+            return None
+        now = self.fetcher.clock()
+        if self._late_search_at is None:
+            wait = self.config.lookup_timeout * self.fetcher.late_search
+            self._late_search_at = now + wait
+            self._progress_at = max(self._progress_at, self._late_search_at)  # waiting isn't hanging
+            log(f"no provider of {self.root} found yet; searching again in {wait:.0f}s, as one added just now is found "
+                "only once its records are out", LOG_VERBOSE)
+            return False
+        if now < self._late_search_at:
+            return False
+        self._late_searched = True
+        self._lookup = self.fetcher.make_lookup(self.root.key)
+        self._lookups.append(self._lookup)
+        self._lookup_found = 0
+        self._start_lookup()
+        return True
 
     def _rerun_lookup(self) -> bool:
         """Every provider failed: search again for a fresh random half, within lookup_timeout. False if not."""
@@ -1361,16 +1828,20 @@ class Fetch:
         self._start_lookup()
         return True
 
-    def _add_provider(self, node_id: bytes):
-        """Use a provider the lookup found, unless it is us, banned, known, or over the unknown-ID budget."""
+    def _add_provider(self, node_id: bytes, source: str = ""):
+        """Use a provider the lookup found (or a record held here named: source, for the log), unless it is us,
+        banned, known, or over the unknown-ID budget."""
         if node_id == self.fetcher.own_id or node_id in self._providers or self.fetcher.routing.is_banned(node_id):
             return
-        if self._lookup is not None and not self._lookup.allow_unknown(node_id):
+        # Every search of the fetch shares the first one's budget of unknown identities (path requests): a later search
+        # (_search_again) doesn't bring a budget of its own
+        budget = self._lookups[0] if self._lookups else self._lookup
+        if budget is not None and not budget.allow_unknown(node_id):
             log(f"skipping provider {node_name(node_id)}: identity unknown and the path request budget is spent",
                 LOG_VERBOSE)
             return
         self._new_provider(node_id)
-        log(f"found provider {node_name(node_id)} for {self.root}", LOG_VERBOSE)
+        log(f"found provider {node_name(node_id)} for {self.root}{source}", LOG_VERBOSE)
 
     # Results
 
@@ -1378,13 +1849,39 @@ class Fetch:
         """Start using node_id as a provider, after those found before it."""
         provider = self._providers[node_id] = _Provider(node_id, len(self._providers), self._path(node_id))
         self._live += 1
+        self._report_providers()
         return provider
 
+    def _report_providers(self):
+        """Tell the observer the providers in use and whether a search runs, if either changed since it was last told
+        (on the fetch thread, which alone changes them)."""
+        state = (self._live, self._lookup_running)
+        if self.observer is not None and state != self._reported:
+            self._reported = state
+            self.observer.providers(*state)
+
+    def _served(self, node_id: bytes):
+        """node_id delivered verified blocks: its score rises, and so, once per fetch, do those of the nodes whose
+        /find answers listed it (local scores, section 6)."""
+        scores = self.fetcher.scores
+        scores.served(node_id)
+        self.fetcher.remember(self.root, node_id)  # asked first when the root is fetched again
+        for lookup in self._lookups:
+            for lister in lookup.listers(node_id) - self._credited:
+                self._credited.add(lister)
+                scores.useful_answer(lister)
+
     def _fail(self, provider: _Provider, why: str):
-        """A provider failed: it isn't used again during this fetch."""
+        """A provider failed: it isn't used again during this fetch, its score falls, and it is no longer remembered
+        as a provider of the root."""
         if not provider.failed:
             provider.failed = True
+            self.fetcher.scores.failed(provider.node_id)
+            self.fetcher.forget(self.root, provider.node_id)
+            for cid in [cid for cid, owner in self._owners.items() if owner == provider.node_id]:
+                del self._owners[cid]  # left to the others now (its partials stay, for a later fetch)
             self._live -= 1
+            self._report_providers()
             log(f"provider {node_name(provider.node_id)} failed for {self.root}: {why}", LOG_VERBOSE)
 
     def _handle(self, node_id: bytes, cids: list[Cid], result, probe: bool, wanted: dict, children: dict,
@@ -1403,6 +1900,7 @@ class Fetch:
             log(f"banning {node_name(node_id)}: it sent {plural(len(result.bad), 'block')} not matching "
                 "the CID requested", LOG_WARNING)
             self.fetcher.routing.ban(node_id)
+            self.fetcher.scores.bad_block(node_id)
             if provider is None:
                 provider = self._new_provider(node_id)
             self._fail(provider, "sent a block not matching its CID")
@@ -1417,28 +1915,76 @@ class Fetch:
             outstanding.discard(cid)
         for cid, block in late.items():
             self._accept(cid, block, self._expects, {}, self.budget)
+        if self.observer is not None:
+            for cid in result.partial:
+                if cid in outstanding:
+                    self.observer.partial(cid, self.fetcher.ranges.partials.length(cid, node_id))
+        if result.blocks:
+            self._served(node_id)
         if probe:
-            # A node with an open link that has the block becomes a provider; one that hasn't isn't penalised
-            if result.blocks and provider is None:
-                provider = self._new_provider(node_id)
-                log(f"{node_name(node_id)} (open link) has {self.root}", LOG_VERBOSE)
+            # A node asked first that has the block (or sent part of it, with /range) becomes a provider; one that
+            # hasn't isn't penalised
+            if result.blocks or result.partial:
+                if provider is None:  # else the lookup found it meanwhile
+                    provider = self._new_provider(node_id)
+                    log(f"{node_name(node_id)} (asked first) has {self.root}", LOG_VERBOSE)
+                if result.ratio is not None:
+                    provider.ratio = min(max(result.ratio, 1.0), ranges.MAX_RATIO)
+                for cid in result.partial:
+                    if cid in outstanding:
+                        self._owners.setdefault(cid, node_id)  # the first to send part of it resumes it
+                if result.partial:
+                    self._progress_at = self.fetcher.clock()
                 self._pace(provider, sent_at, rate)
+            elif result.status == peer_client.UNSUPPORTED:
+                pass  # it left /range unanswered: asked again with /blocks at once (_handle_event)
+            elif not result.blocks and node_id in self._remembered_asked and result.status != peer_client.BUSY:
+                # A remembered provider that answered None (it no longer has it) or failed: not asked first again for
+                # this root. One that was busy may still have it
+                self.fetcher.forget(self.root, node_id)
             return
         if provider is None or provider.failed or not counted:
             return
         now = self.fetcher.clock()
+        if result.status != peer_client.LOST and result.reason != "unreachable":
+            # It answered (or failed outright). Not a missing path, whose retry a lost request otherwise re-arms: a
+            # provider whose results alternate the two would never fail, and its fetch would never end (REL-1)
+            provider.lost = 0
+        if result.ratio is not None:
+            provider.ratio = min(max(result.ratio, 1.0), ranges.MAX_RATIO)
+        if result.reason != "unreachable":
+            provider.unreached = False  # no path twice in a row (consecutive results) fails it
         if result.status == peer_client.OK:
             provider.busy = 0
             if result.missing:
+                if result.reneged:
+                    # It sent ranges of the block, then said it doesn't hold it: a block's airtime spent for nothing,
+                    # which only a block not matching its CID otherwise costs. Scored so (not banned: content
+                    # unpinned and collected while it was sent does it too), so it isn't asked first again
+                    self.fetcher.scores.bad_block(node_id)
                 self._fail(provider, f"doesn't have {plural(len(result.missing), 'block')} of the root it advertised")
-            elif result.blocks:
+            elif result.blocks or result.partial:
+                for cid in result.partial:
+                    if cid in outstanding:
+                        self._owners[cid] = node_id  # it resumes from what it sent
+                if result.partial:
+                    self._progress_at = now  # a range arrived: not hung, though no block is stored yet
                 self._pace(provider, sent_at, rate)
-        elif result.status == peer_client.BUSY and result.reason != "cancelled" and now < provider.pacing_until:
+        elif result.status == peer_client.UNSUPPORTED:
+            # It left /range unanswered, as an older node does (rnfs.ranges counts the silence): asked with /blocks at
+            # once and for the rest of the fetch, not counted against it
+            provider.no_ranges = True
+            provider.busy_until = 0.0
+        elif result.status == peer_client.BUSY and result.reason not in ("cancelled", "closed") \
+                and now < provider.pacing_until:
             # Refused soon after it served us: most likely its upload pacing, which isn't a failure (a response
-            # it cancelled, displaced or past its deadline, counts as busy as usual)
+            # it cancelled, displaced or past its deadline, or a link it closed, counts as busy as usual)
             provider.busy_until = now + provider.pacing_retry
         elif result.status == peer_client.BUSY:
             provider.busy += 1
+            if result.reason == "cancelled":
+                provider.cut += 1  # the next is asked in ranges (_range_plan): between cloud nodes a route cut every
+                # 64 KiB response from one provider at the same point (52 of 64 KiB), three times in a row
             if provider.busy >= self.config.max_failures:
                 self._fail(provider, f"busy {provider.busy} times in a row")
             else:
@@ -1447,6 +1993,23 @@ class Fetch:
             provider.stalls += 1
             if provider.stalls >= MAX_STALLS:
                 self._fail(provider, f"stalled {provider.stalls} times")
+        elif result.status == peer_client.LOST:
+            # A lost packet, most likely (at 5% packet loss, more than half of 1 MiB fetches lose a request): asked
+            # again on a new link after the busy delay. The link is closed first, so a response still being
+            # sent on it stops (a link closing starts no cooldown, section 3) and the next isn't refused for it
+            provider.lost += 1
+            self._close_link(node_id)
+            if provider.lost >= self.config.max_failures:
+                self._fail(provider, f"{result.reason or 'no answer'} {provider.lost} times in a row")
+            else:
+                provider.busy_until = now + self.fetcher.busy_delay
+        elif result.reason == "unreachable" and not provider.unreached:
+            # No path to it, once: asked again after UNREACHABLE_RETRY rather than failed for the rest of the fetch (over
+            # LoRa a fetch from its one provider failed so when the provider's rnsd restarted, a minute's outage)
+            provider.unreached = True
+            provider.busy_until = now + UNREACHABLE_RETRY
+            self._progress_at = max(self._progress_at, provider.busy_until)  # waiting isn't hanging
+            log(f"no path to {node_name(provider.node_id)}; asking it again in {UNREACHABLE_RETRY:.0f}s", LOG_VERBOSE)
         else:
             self._fail(provider, result.reason or "request failed")
 
@@ -1469,6 +2032,9 @@ class Fetch:
             # transfer time has passed UPLOAD_CAP_DIVISOR times since it started: took has passed once already
             provider.busy_until = max(provider.busy_until, now + (rates.UPLOAD_CAP_DIVISOR - 1) * took)
             self._progress_at = max(self._progress_at, provider.busy_until)  # waiting isn't hanging
+            # Waiting is using the link: on LoRa a 64 KiB chunk takes about 9 minutes, and so does the wait, longer
+            # than link_idle_timeout; a link swept meanwhile would take its rate estimate, and the pacing, with it
+            self.client.hold_link(provider.node_id, provider.busy_until - now)
 
 
 def describe(fetch: Fetch) -> str:

@@ -1,13 +1,13 @@
 """M4: a provider store filled by about 100 publishers refused every publisher it hadn't seen yet, this node included.
 
-A ProviderStore of the default size (Config().max_records) is filled to the brim by 100 identities storing their
-per-publisher maximum each. A publisher that stored before the flood is still accepted; a new one, and the node's
-own ID with no records yet, must be too (the newcomer pool, and own records always admitted). Further tests pin
-down the limits: the per-publisher cap and its ramp-up with age, the first-seen grace after a publisher's last
-record goes, and how many keys one /provide request may carry on the server side.
+Rebuilt against the 0.2.0 store (a byte budget and storage tiers instead of max_records and per-publisher caps): a
+store at its budget, holding an established (Earned) publisher's records and filled to the brim by 100 fresh
+identities. The established publisher is still accepted, and so are a new publisher and the node's own records (the
+Newcomer tier makes room from its largest holders; own records are always admitted). Further tests pin down what
+replaced the per-publisher caps: no cap while there is room, refresh days kept a TTL past a publisher's last record,
+and across a restart; and how many keys one /provide request may carry on the server side.
 """
 import os
-import random
 import tempfile
 import unittest
 
@@ -15,7 +15,7 @@ import RNS
 
 from rnfs.config import Config
 from rnfs.constants import DAY, ID_LENGTH, MAX_PROVIDE_KEYS, MAX_REQUEST_SIZE, PROVIDE_PATH, PROVIDER_TTL
-from rnfs.dht.providers import ProviderStore
+from rnfs.dht.providers import EARNED_DAYS, ProviderStore
 from rnfs.network import protocol, server
 from rnfs.network.identity import node_id_for_identity
 from tests.support import FakeClock
@@ -25,6 +25,8 @@ OWN = bytes([0x01] * ID_LENGTH)
 HONEST_OLD = bytes([0x02] * ID_LENGTH)
 NEWCOMER = bytes([0x03] * ID_LENGTH)
 FLOODERS = 100
+RECORDS = 100_000  # the store's capacity in these tests (the default budget holds millions)
+SIZE = 117  # bytes a record takes (fixed here; the node measures it)
 
 
 def ident(n: int) -> bytes:
@@ -32,176 +34,133 @@ def ident(n: int) -> bytes:
     return n.to_bytes(ID_LENGTH, "big")
 
 
+def earn(store: ProviderStore, clock: FakeClock, publisher: bytes, key: bytes):
+    """Make publisher Earned: it stores key, and refreshes it on EARNED_DAYS later days."""
+    assert store.store(key, publisher)
+    for _ in range(EARNED_DAYS):
+        clock.now += DAY
+        assert store.store(key, publisher)
+
+
 class FullStoreTest(unittest.TestCase):
-    """A default-sized store: one honest publisher, then FLOODERS identities filling it."""
+    """A store of RECORDS records: one established publisher, then FLOODERS fresh identities filling it."""
 
     def setUp(self):
-        """The store, filled; every flooder stores its maximum, a second after the one before."""
+        """The store, filled; every flooder stores a hundredth of it, a second after the one before. (The write budget,
+        REV2, would spread such a flood over hours; this test is about the full store's tiers, so it has none.)"""
         self.clock = FakeClock(1_700_000_000.0)
-        self.store = ProviderStore(Config().max_records, None, clock=self.clock, own_id=OWN)
-        self.assertTrue(self.store.store(ident(1), HONEST_OLD))
-        self.clock.now += 1
+        self.store = ProviderStore(None, RECORDS * SIZE, clock=self.clock, own_id=OWN, record_bytes=SIZE,
+                                   write_budget=None)
+        earn(self.store, self.clock, HONEST_OLD, ident(1))
         key = 1 << 64
         for flooder in range(FLOODERS):
             publisher = ident((0xF << 120) + flooder)
-            for _ in range(self.store.max_per_publisher):
+            for _ in range(RECORDS // FLOODERS):
                 key += 1
                 self.store.store(ident(key), publisher)
             self.clock.now += 1
-        self.assertEqual(self.store.record_count(), self.store.max_records)
+        self.assertTrue(self.store.is_full())
 
-    def test_flooders_needed_to_fill(self):
-        """Today 100 publishers at 1% each fill the default store of 100,000 records."""
-        self.assertEqual((self.store.max_records, self.store.max_per_publisher), (100_000, 1000))
+    def test_flooders_fill_the_store(self):
+        """100 publishers at 1% each fill it: no per-publisher cap holds them back while there is room."""
         self.assertEqual(self.store.publisher_count(), FLOODERS + 1)
+        self.assertEqual(self.store.record_count(), RECORDS)
 
     def test_established_publisher_accepted(self):
         self.assertTrue(self.store.store(ident(2), HONEST_OLD))
-        self.assertEqual(self.store.record_count(), self.store.max_records)
+        self.assertEqual(self.store.record_count(), RECORDS)
 
     def test_new_publisher_can_store(self):
         accepted = sum(self.store.store(ident(10 + i), NEWCOMER) for i in range(10))
-        self.assertGreater(accepted, 0, "a new honest publisher stored none of 10 records in the full store")
+        self.assertEqual(accepted, 10, "a new honest publisher was refused by the full store")
 
     def test_own_records_always_accepted(self):
         self.assertIsNone(self.store.first_seen(OWN))
         self.assertTrue(self.store.store(ident(3), OWN), "the node's own record was refused by its full store")
 
     def test_own_records_never_refused(self):
-        """However many: each evicts a record of the newest publisher outside the pool, never the honest one."""
+        """However many: the node's own go over the budget rather than be refused, and evict no one."""
         self.assertEqual(sum(self.store.store(ident(10_000 + i), OWN) for i in range(2000)), 2000)
-        self.assertEqual(self.store.record_count(), self.store.max_records)
+        self.assertEqual(self.store.record_count(), RECORDS + 2000)
         self.assertEqual(self.store.providers(ident(1)), [HONEST_OLD])
 
-    def test_newcomers_only_churn_the_pool(self):
-        """A flood of new identities displaces pooled records only: the publishers seen first keep everything."""
+    def test_newcomers_only_churn_newcomers(self):
+        """A flood of new identities displaces only the Newcomers' records: the established publisher keeps
+        everything, and each new one gets in."""
         self.assertEqual(sum(self.store.store(ident(10_000 + i), ident((0xE << 120) + i)) for i in range(2000)), 2000)
-        self.assertEqual(self.store.record_count(), self.store.max_records)
+        self.assertEqual(self.store.record_count(), RECORDS)
         self.assertEqual(self.store.providers(ident(1)), [HONEST_OLD])
-        first_flooder = ident(0xF << 120)
-        held = sum(first_flooder in self.store.providers(ident((1 << 64) + 1 + i)) for i in range(1000))
-        self.assertEqual(held, 1000)
 
 
-class AllowanceTest(unittest.TestCase):
-    """The per-publisher allowance grows with age: a tenth until a publisher was seen provider_seniority ago."""
+class NoCapTest(unittest.TestCase):
+    """While there is room, no per-publisher cap: a large publisher (a mirror) stores all it has."""
+
+    def test_a_publisher_may_hold_far_more_than_a_hundredth(self):
+        store = ProviderStore(None, RECORDS * SIZE, clock=FakeClock(1_700_000_000.0), record_bytes=SIZE)
+        publisher = ident(7)
+        self.assertEqual(sum(store.store(ident(100 + i), publisher) for i in range(5000)), 5000)
+
+    def test_the_default_budget(self):
+        """1 GiB, millions of records at the size a record takes on disk."""
+        self.assertEqual(Config().record_budget, 1 << 30)
+        self.assertEqual(ProviderStore(None).record_budget, 1 << 30)
+
+
+class StandingTest(unittest.TestCase):
+    """What took the place of the first-seen grace: refresh days, kept a TTL past a publisher's last record."""
 
     def setUp(self):
-        """A default-sized store ramping up over a day, as the node makes it."""
+        """A store on a temporary state directory."""
         self.clock = FakeClock(1_700_000_000.0)
-        self.store = ProviderStore(Config().max_records, None, clock=self.clock, own_id=OWN,
-                                   seniority=Config().provider_seniority)
-        self.assertEqual(Config().provider_seniority, DAY)
-
-    def test_new_publisher_gets_a_tenth(self):
-        self.assertEqual((self.store.max_per_publisher, self.store.newcomer_per_publisher), (1000, 100))
-        publisher = ident(7)
-        self.assertEqual(self.store.allowance(publisher), 100)
-        self.assertEqual(sum(self.store.store(ident(100 + i), publisher) for i in range(1000)), 100)
-        self.clock.now += DAY
-        self.assertEqual(self.store.allowance(publisher), 1000)
-        self.assertEqual(sum(self.store.store(ident(100 + i), publisher) for i in range(1001)), 1000)
-
-    def test_own_id_unlimited_from_the_start(self):
-        self.assertIsNone(self.store.allowance(OWN))
-        self.assertEqual(sum(self.store.store(ident(100 + i), OWN) for i in range(1500)), 1500)
-
-    def test_first_seen_kept_for_a_ttl_after_the_last_record_goes(self):
-        publisher = ident(7)
-        self.assertTrue(self.store.store(ident(100), publisher))
-        first_seen = self.store.first_seen(publisher)
-        self.clock.now += 2 * DAY
-        self.store.withdraw(ident(100), publisher)
-        self.assertIsNone(self.store.first_seen(publisher))
-        # Back within a TTL: its age, and so its full allowance, comes back with it
-        self.clock.now += PROVIDER_TTL - 1
-        self.assertEqual(self.store.allowance(publisher), 1000)
-        self.assertTrue(self.store.store(ident(101), publisher))
-        self.assertEqual(self.store.first_seen(publisher), first_seen)
-        # Records expiring count as leaving too; after a TTL more it is new again
-        self.clock.now += PROVIDER_TTL
-        self.store.expire()
-        self.clock.now += PROVIDER_TTL
-        self.store.expire()
-        self.assertEqual(self.store.allowance(publisher), 100)
-        self.assertTrue(self.store.store(ident(102), publisher))
-        self.assertEqual(self.store.first_seen(publisher), self.clock.now)
-
-    def test_young_publishers_are_not_remembered(self):
-        """A publisher seen for less than provider_seniority has no standing to keep, so a flood of fresh
-        identities can't push older publishers' first-seen times out of the bounded memory."""
-        self.assertTrue(self.store.store(ident(100), ident(7)))
-        self.clock.now += 60
-        self.store.withdraw(ident(100), ident(7))
-        self.clock.now += 60
-        self.assertTrue(self.store.store(ident(100), ident(7)))
-        self.assertEqual(self.store.first_seen(ident(7)), self.clock.now)
-
-
-class ReturningPublisherTest(unittest.TestCase):
-    """A publisher back within the grace counts as seen when it was first seen, also for eviction."""
-
-    def test_returning_publisher_evicts_the_newest(self):
-        clock = FakeClock(1_700_000_000.0)
-        store = ProviderStore(100, None, clock=clock, seniority=DAY)
-        old, newer = ident(1), ident(2)
-        store.store(ident(100), old)
-        clock.now += 2 * DAY
-        store.withdraw(ident(100), old)  # away, with its first-seen time remembered
-        for i in range(store.max_per_publisher):
-            store.store(ident(200 + i), newer)
-        for n in range(8):  # fill the store outside the pool with others seen after it
-            for i in range(store.max_per_publisher):
-                store.store(ident(1000 * (n + 1) + i), ident(10 + n))
-            clock.now += 1
-        self.assertEqual(store.record_count(), store.main_size)
-        # Seen first, so it displaces the newest publisher outside the pool rather than going into the pool
-        self.assertTrue(store.store(ident(100), old))
-        self.assertEqual(store.record_count(), store.main_size)
-        self.assertEqual(store.providers(ident(100)), [old])
-
-
-class PersistenceTest(unittest.TestCase):
-    """The pool and remembered first-seen times survive a restart."""
-
-    def test_round_trip(self):
-        """A restarted store keeps which records are pooled and a departed publisher's first-seen time."""
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        state = os.path.join(directory.name, "state")
-        clock = FakeClock(1_700_000_000.0)
-        store = ProviderStore(100, state, clock=clock, rng=random.Random(1), seniority=DAY)
+        self.state = os.path.join(directory.name, "state")
+
+    def open(self) -> ProviderStore:
+        """A store on self.state, closed when the test ends."""
+        store = ProviderStore(self.state, 100 * SIZE, clock=self.clock, record_bytes=SIZE)
         self.addCleanup(store.close)
-        gone = ident(9)
-        store.store(ident(1), gone)
-        clock.now += 2 * DAY
-        store.withdraw(ident(1), gone)
-        for n in range(10):  # 90 outside the pool, then the last 10 pooled
-            for i in range(10):
-                store.store(ident(100 * (n + 1) + i), ident(10 + n))
-        store.save()
-        loaded = ProviderStore(100, state, clock=clock, rng=random.Random(1), seniority=DAY)
-        self.addCleanup(loaded.close)
-        self.assertEqual(loaded.record_count(), 100)
-        self.assertEqual(loaded.allowance(gone), loaded.max_per_publisher)
-        # Pooled records stay pooled: a newcomer evicts one of them, not a record outside the pool
-        self.assertTrue(loaded.store(ident(5), ident(99)))
-        self.assertEqual(sum(len(loaded.providers(ident(100 * (n + 1) + i))) for n in range(9) for i in range(10)),
-                         90)
+        return store
 
-
-class PerPublisherCapTest(unittest.TestCase):
-    """Today's per-publisher cap: max(10, max_records // 100)."""
-
-    def test_cap(self):
-        for max_records, cap in ((100, 10), (999, 10), (1000, 10), (5000, 50), (100_000, 1000)):
-            with self.subTest(max_records=max_records):
-                self.assertEqual(ProviderStore(max_records, None).max_per_publisher, cap)
-
-    def test_cap_enforced(self):
-        store = ProviderStore(100_000, None, clock=FakeClock(1_700_000_000.0))
+    def test_refresh_days_kept_a_ttl_after_the_last_record_goes(self):
+        store = self.open()
         publisher = ident(7)
-        self.assertEqual(sum(store.store(ident(100 + i), publisher) for i in range(1001)), 1000)
+        earn(store, self.clock, publisher, ident(100))
+        store.withdraw(ident(100), publisher)
+        self.assertIsNone(store.first_seen(publisher))
+        # Back within a TTL: still Earned
+        self.clock.now += PROVIDER_TTL - DAY
+        store.maintain()
+        self.assertTrue(store.store(ident(101), publisher))
+        self.assertEqual(store.standing(publisher)["tier"], "earned")
+        store.withdraw(ident(101), publisher)
+        # A TTL after its last refresh day, forgotten: new again
+        self.clock.now += PROVIDER_TTL + DAY
+        store._last_hourly = float("-inf")
+        store.maintain()
+        self.assertIsNone(store.standing(publisher))
+        self.assertTrue(store.store(ident(102), publisher))
+        self.assertEqual(store.standing(publisher)["tier"], "newcomer")
+
+    def test_fresh_identities_leave_nothing_behind(self):
+        """A publisher that never refreshed a record has no standing to keep once its records go: a flood of fresh
+        identities leaves no rows."""
+        store = self.open()
+        for n in range(50):
+            store.store(ident(100 + n), ident(1000 + n))
+            store.withdraw(ident(100 + n), ident(1000 + n))
+        store.save()
+        self.assertEqual(store.publisher_count(), 0)
+        self.assertEqual([store.standing(ident(1000 + n)) for n in range(50)], [None] * 50)
+
+    def test_standing_survives_a_restart(self):
+        store = self.open()
+        earn(store, self.clock, ident(9), ident(1))
+        store.save()
+        store.close()
+        loaded = self.open()
+        self.assertEqual(loaded.standing(ident(9))["tier"], "earned")
+        self.assertEqual(loaded.standing(ident(9))["days"], EARNED_DAYS)
 
 
 class ProvideRequestSizeTest(unittest.TestCase):

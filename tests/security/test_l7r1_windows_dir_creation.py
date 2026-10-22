@@ -43,8 +43,7 @@ class NewRnfsDirTest(WindowsTestCase):
         """Each directory has the private DACL from the call that creates it: none is ever set afterwards
         (the old code made the root with os.makedirs, then set its DACL)."""
         node_module._make_private_dirs(self.root)
-        expected = [self.root] + [os.path.join(self.root, name) for name in ("state", "blocks", "storage", "names",
-                                                                                     "lxmf")]
+        expected = [self.root] + [os.path.join(self.root, name) for name in ("state", "blocks", "storage", "names")]
         self.assertEqual(self.acl.set_calls, [], "a DACL was set after the directory was created with its "
                                                  "parent's access list")
         self.assertEqual(self.acl.created, expected)

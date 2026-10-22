@@ -2,10 +2,18 @@
 import os
 import tempfile
 import unittest
+from types import MappingProxyType
+from unittest import mock
 
-from rnfs.config import DURATIONS, MAX_DURATION, OPTIONAL, Config
+from rnfs import config as config_module
+from rnfs.config import DURATIONS, MAX_DURATION, MIN_DURATIONS, OPTIONAL, Config
 
 ID = "ab" * 16
+
+
+def ignored(config: Config) -> list[str]:
+    """config's warnings about retired settings (left out), without those about the file's mode."""
+    return [warning for warning in config.warnings if warning.startswith("ignoring ")]
 
 
 class ValidateTest(unittest.TestCase):
@@ -26,7 +34,7 @@ class ValidateTest(unittest.TestCase):
 
     def test_whole_numbers(self):
         for name in ("max_storage", "gateway_fetches", "max_blocks_responses", "max_incoming_links", "beta",
-                     "max_records", "name_table_size", "remote_pin_quota", "max_output_entries", "verbosity"):
+                     "record_budget", "name_table_size", "remote_pin_quota", "max_output_entries", "verbosity"):
             for value in ("2", 2.0, True, None):
                 self.assert_invalid(**{name: value})
         for name, value in (("gateway_fetches", -1), ("max_output_entries", -5), ("max_incoming_links", 0),
@@ -56,6 +64,9 @@ class ValidateTest(unittest.TestCase):
             Config(**{name: 65535}).validate()
         self.assert_invalid(api_port=0)  # the CLI must know the API's port
         Config(gateway_port=0).validate()  # any free port, printed at start
+        # One port for both: the daemon's start would fail binding the second
+        self.assert_invalid(api_port=9000, gateway_port=9000)
+        Config(api_port=9000, gateway_port=9001).validate()
 
     def test_rates_and_durations(self):
         for name in ("slow_bitrate", "unmeasured_bitrate", "max_upload_rate"):
@@ -70,7 +81,13 @@ class ValidateTest(unittest.TestCase):
                 self.assert_invalid(**{name: 0})
             elif name not in OPTIONAL:
                 Config(**{name: 0}).validate()
-            Config(**{name: 1.5}).validate()
+            least = MIN_DURATIONS.get(name)
+            if least is None:
+                Config(**{name: 1.5}).validate()
+            else:  # how often something is sent: not so often a typo floods the channel
+                self.assert_invalid(**{name: least - 0.001})
+                self.assert_invalid(**{name: 1e-300})
+                Config(**{name: least}).validate()
         Config(link_idle_timeout=MAX_DURATION).validate()
         Config(republish_interval=None).validate()
 
@@ -121,10 +138,76 @@ class LoadTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=text):
                 self.load(text)
 
+    def test_file_nested_too_deeply_is_refused_as_invalid_toml(self):
+        """rnfs.toml nested deeper than tomllib can parse (a few hundred levels) is refused as one that isn't TOML is,
+        with a ValueError naming it, which the CLI shows as an error rather than a RecursionError's traceback."""
+        with self.assertRaises(ValueError) as caught:
+            self.load("bootstrap_nodes = " + "[" * 1000 + "]" * 1000 + "\n")
+        self.assertIn("rnfs.toml isn't valid TOML: it is nested too deeply", str(caught.exception))
+
+    def test_an_interval_under_its_minimum_in_the_file_is_raised_to_it(self):
+        """A node upgraded with announce_interval = 10 in rnfs.toml (taken before 0.2.0) still starts, warned."""
+        config = self.load("announce_interval = 10\nscan_interval = 0.5\n")
+        self.assertEqual((config.announce_interval, config.scan_interval), (60.0, 1.0))
+        self.assertTrue(any("announce_interval = 10" in warning for warning in config.warnings), config.warnings)
+
+    def test_a_byte_order_mark_is_no_reason_to_refuse_the_file(self):
+        """Some Windows editors start a UTF-8 file with one."""
+        config = self.load("\ufeffprivate = true\n")
+        self.assertTrue(config.private)
+
     def test_valid_file(self):
         config = self.load(f'private = true\nmembers = ["{ID}"]\nslow_bitrate = 50000\nstall_timeout = 90.5\n'
                            'max_storage = 1_000_000\n', api_port=9000)
         self.assertEqual((config.private, config.members, config.api_port), (True, [ID], 9000))
+        self.assertEqual(ignored(config), [])
+
+    def test_retired_settings_are_dropped_with_a_warning(self):
+        """A retired setting starts the node, wherever it is given, with a warning (an embedded node's defaults
+        excepted: those are the app's); an unknown one is still refused."""
+        path = os.path.join(self.dir, "rnfs.toml")
+        with mock.patch.object(config_module, "RETIRED_SETTINGS", MappingProxyType({"old_limit": "use new_limit"})):
+            config = self.load("old_limit = 5\nbeta = 4\n")
+            self.assertEqual(config.beta, 4)
+            self.assertFalse(hasattr(config, "old_limit"))
+            self.assertEqual(ignored(config), [f"ignoring old_limit in {path}: it is no longer a setting "
+                                               "(use new_limit); remove it"])
+            config = self.load("", old_limit=3)
+            self.assertEqual(ignored(config), ["ignoring old_limit: it is no longer a setting (use new_limit); "
+                                               "remove it"])
+            self.assertEqual(dict(config.overrides), {})
+            config = Config.load(self.dir, defaults={"old_limit": 1, "beta": 5})
+            self.assertEqual((config.beta, ignored(config), dict(config.given_defaults)), (5, [], {"beta": 5}))
+            with self.assertRaises(ValueError):
+                self.load("old_limit = 5\nnew_thing = 1\n")
+
+    def test_max_records_is_retired(self):
+        """0.2.0 bounds provider records by record_budget (bytes): a max_records an older version's rnfs.toml holds
+        is ignored with a warning naming its replacement, and the settings schema no longer lists it."""
+        config = self.load("max_records = 40\n")
+        self.assertEqual(len(ignored(config)), 1)
+        self.assertIn("record_budget", ignored(config)[0])
+        self.assertEqual(config.record_budget, 1 << 30)
+        self.assertNotIn("max_records", [entry["name"] for entry in config_module.settings_schema()])
+        record_budget = next(e for e in config_module.settings_schema() if e["name"] == "record_budget")
+        self.assertEqual((record_budget["unit"], record_budget["minimum"]), ("bytes", 0))
+
+    def test_lxmf_settings_are_retired(self):
+        """0.2.0 moved LXMF out of rnfs: every lxmf_* setting an older rnfs.toml holds, or a program gives an
+        embedded node, is ignored with a warning saying so, and the node starts with its other settings."""
+        path = os.path.join(self.dir, "rnfs.toml")
+        config = self.load('lxmf_enabled = true\nlxmf_display_name = "me"\nlxmf_propagation_node = "' + ID + '"\n'
+                           'lxmf_send_from_hint = false\nlxmf_sync_interval = 60\nlxmf_accept_from = ["' + ID + '"]\n'
+                           'lxmf_auto_fetch_from = ["' + ID + '"]\nlxmf_auto_fetch_quota = 5\nbeta = 4\n')
+        self.assertEqual(config.beta, 4)
+        names = sorted(["lxmf_enabled", "lxmf_display_name", "lxmf_propagation_node", "lxmf_send_from_hint",
+                        "lxmf_sync_interval", "lxmf_accept_from", "lxmf_auto_fetch_from", "lxmf_auto_fetch_quota"])
+        reason = "since rnfs 0.2.0 LXMF messaging is no longer part of rnfs, but an app of its own"
+        self.assertEqual(ignored(config), [f"ignoring {name} in {path}: it is no longer a setting ({reason}); remove it"
+                                           for name in names])
+        self.assertFalse(any(hasattr(config, name) for name in names))
+        self.assertEqual(ignored(self.load("", lxmf_enabled=False)),
+                         [f"ignoring lxmf_enabled: it is no longer a setting ({reason}); remove it"])
 
 
 if __name__ == "__main__":

@@ -12,7 +12,8 @@ from RNS.vendor import umsgpack
 
 from rnfs.config import Config
 from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, ID_LENGTH, K, KIB, MAX_REQUEST_SIZE,
-                            MAX_REQUESTS_PER_LINK, MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
+                            MAX_REQUESTS_PER_LINK, MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH, RANGE_PATH,
+                            RESPONSE_OVERHEAD)
 from rnfs.content.cid import RAW, Cid
 from rnfs.network import guards, protocol, server
 from rnfs.network.identity import node_id_for_identity
@@ -362,6 +363,10 @@ class FakeBackend:
         """The served block for cid, if any."""
         return self.blocks.get(cid)
 
+    def serves(self, cid):
+        """Whether a block is served for cid."""
+        return cid in self.blocks
+
     def served_block_size(self, cid):
         """Not known: the server reads each block to size it."""
         return None
@@ -427,7 +432,7 @@ class RequestServerTest(unittest.TestCase):
     def test_registration(self):
         self.assertEqual(RNS.Resource.AUTO_COMPRESS_MAX_SIZE, 0)
         self.assertEqual(self.destination.max_request_size, MAX_REQUEST_SIZE)
-        self.assertEqual(set(self.destination.handlers), {FIND_PATH, PROVIDE_PATH, BLOCKS_PATH, PIN_PATH})
+        self.assertEqual(set(self.destination.handlers), {FIND_PATH, PROVIDE_PATH, BLOCKS_PATH, PIN_PATH, RANGE_PATH})
         for _, allow, auto_compress in self.destination.handlers.values():
             self.assertEqual(allow, RNS.Destination.ALLOW_ALL)
             self.assertIs(auto_compress, False)
@@ -435,7 +440,7 @@ class RequestServerTest(unittest.TestCase):
     def test_malformed_requests_get_false(self):
         link = self.connect(b"a")
         for path, data in ((FIND_PATH, b"short"), (PROVIDE_PATH, [KEY]), (BLOCKS_PATH, [True, []]),
-                           (PIN_PATH, [b"x", True])):
+                           (PIN_PATH, [b"x", True]), (RANGE_PATH, [b"x", 0, 1, 0])):
             with self.subTest(path=path):
                 self.assertIs(self.ask(path, data, link, self.identity), False)
 
@@ -444,6 +449,21 @@ class RequestServerTest(unittest.TestCase):
         providers, nodes = self.ask(FIND_PATH, KEY, link)
         self.assertEqual(len(providers), K)
         self.assertEqual(nodes, [KEY])
+
+    def test_a_stopping_node_refuses_every_request_quietly(self):
+        """Once the node is stopping (close), its state is being saved and closed: a request then failed in its
+        handler and was logged as an error (seen on a cloud node's restart); now each is refused before any handler
+        runs, so the requester asks elsewhere at once."""
+        link = self.connect(b"a")
+        self.server.close()
+        self.backend.find = mock.Mock(side_effect=AssertionError("a handler ran"))
+        with mock.patch.object(server, "log") as logged:
+            for path, data in ((FIND_PATH, KEY), (PROVIDE_PATH, [[KEY], []]),
+                               (BLOCKS_PATH, protocol.encode_blocks(MAX_RESPONSE_SIZE, [self.big[0][0]]))):
+                with self.subTest(path=path):
+                    self.assertIs(self.ask(path, data, link, self.identity), False)
+        self.assertEqual(logged.call_args_list, [])
+        self.backend.find.assert_not_called()
 
     def test_client_mode_refuses_find_and_provide(self):
         self.backend.dht_server = False
@@ -765,6 +785,28 @@ class RequestServerTest(unittest.TestCase):
             self.assertNotEqual(self.blocks(link, request_id=b"t" * 16), False)
         self.assertEqual(len(sleeps), 1)
         self.assertAlmostEqual(sleeps[0], wait)
+
+    def test_the_default_caps_wait_follows_the_time_a_response_took(self):
+        """REL-12: the default cap (half a slow link's rate) set the next response's start from the estimate it had,
+        which small /range responses had left far below what the link carries: a fast link's next response was held
+        back a minute after one took 8 s, and the requester, pacing by the time it took, failed the provider. Once the
+        response concludes, the next may start twice the time it took after it started, if that is sooner."""
+        link = self.connect(b"a", mtu=1500, mdu=1400)
+        self.server.rates.record(link.link_id, 64 * KIB, 80_000)  # read low: below slow_bitrate, so capped
+        with mock.patch.object(self.server, "_pace", lambda response, wait: None):
+            self.assertNotEqual(self.blocks(link, [self.big[0][0]]), False)
+        estimated = self.server.pacer.wait_time(link.link_id)
+        self.assertGreater(estimated, 20)  # ~100 KiB at 40 kbit/s
+        self.clock.now += 4  # it took 4 s: the link carries 200 kbit/s
+        self.send(link).complete()
+        self.assertAlmostEqual(self.server.pacer.wait_time(link.link_id), 4.0)  # 2 × 4 s after it started
+        explicit = self.make_server(Config(max_upload_rate=40_000)) or self.server  # an explicit cap stands as set
+        link = self.connect(b"b", mtu=1500, mdu=1400)
+        with mock.patch.object(explicit, "_pace", lambda response, wait: None):
+            self.assertNotEqual(self.blocks(link, [self.big[0][0]]), False)
+        self.clock.now += 4
+        self.send(link).complete()
+        self.assertGreater(explicit.pacer.wait_time(link.link_id), 15)
 
     def test_pacing_bound_ignores_the_link_rtt(self):
         """The requester can inflate the RTT RNS reports, so it doesn't lengthen how long a response is held."""

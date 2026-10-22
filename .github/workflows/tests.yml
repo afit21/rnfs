@@ -5,6 +5,7 @@ on:
     branches: ["**"]  # not tags: the release workflow runs these jobs itself before publishing
   pull_request:
   workflow_call:  # from release.yml, which grants no more than contents: read
+  workflow_dispatch:  # by hand, on any branch: Actions > tests > Run workflow, to try macOS and Windows before a PR
 
 # Read-only token: these jobs only check out and test the code
 permissions:
@@ -35,8 +36,13 @@ jobs:
           python -m pip install --require-hashes --only-binary=:all: -r packaging/build-backend.lock
           python -m pip install --no-deps --no-build-isolation .
           python -m pip check
+      # tests/ci_run.py runs `unittest discover tests`, then once more, alone, any test that failed (up to 5): one
+      # that passes then is named in a warning on the run's page and summary instead of failing the run
       - name: Unit tests
-        run: python -m unittest discover tests
+        run: python -m tests.ci_run
+        # Windows takes 23-45 minutes as its runners vary (Linux and macOS about 9): 30 and then 45 stopped runs whose
+        # every test passed
+        timeout-minutes: 60
       # On Windows the daemons are started in their own process groups and stopped with CTRL_BREAK_EVENT. Every
       # module gated on RNFS_E2E is listed here (test_packaging checks it): the embedded node and the security
       # regressions that need real RNS included
@@ -44,8 +50,8 @@ jobs:
         env:
           RNFS_E2E: "1"
         run: >-
-          python -m unittest tests.test_e2e tests.test_client tests.test_embedded tests.security.test_h1_real_rns
-          tests.security.test_m1_real_rns tests.security.test_h2_display_page_pins
+          python -m tests.ci_run tests.test_e2e tests.test_client tests.test_embedded tests.security.test_h1_real_rns
+          tests.security.test_m1_real_rns tests.security.test_h2_display_page_pins tests.test_nomadnet_e2e
         timeout-minutes: 20
       - name: Command works
         run: rnfs --version
@@ -70,7 +76,7 @@ jobs:
       - name: Tests under coverage
         env:
           RNFS_E2E: "1"
-        run: python -m coverage run --source=rnfs -m unittest discover tests
+        run: python -m coverage run --source=rnfs -m tests.ci_run
         timeout-minutes: 30
       - name: Report
         run: python -m coverage report --sort=cover

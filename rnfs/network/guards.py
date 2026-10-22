@@ -21,8 +21,7 @@ allocated (on every link with PROCESS, on rnfs.dht links only with DHT):
 - on rnfs.dht links, any multi-segment Resource: the checks above see one segment at a time, so a
   response of many segments (hundreds of MiB, later read wholly into memory) would pass them, while every
   legitimate rnfs response fits one. Other destinations' Resources are told apart by the link's destination
-  name, which this node chose itself (LXMF's delivery and propagation node links refuse several segments in
-  features/lxmf.py, which also covers an embedded node);
+  name, which this node chose itself;
 - on rnfs.dht links, any Resource carrying metadata: RNS decodes metadata with umsgpack as the Resource
   completes, before anyone can look at it, and rnfs responses never have any;
 - on rnfs.dht links, any compressed Resource (the advertisement's compressed flag): RNS would decompress it as
@@ -45,6 +44,17 @@ to the link's MDU and start a thread for it before finding nothing to run it. Th
 on incoming links only.
 A refused response answers its request with None, which every rnfs.dht parser refuses as malformed, so the
 requester fails it at once, as it would a malformed response.
+
+Links this node opens to NomadNet nodes (rnfs/network/nomadnet.py, `rnfs add <destination>:/page/…`; marked with
+mark_nomadnet as they are made) are rnfs's own too, in either scope: the advertisement checks that apply to every
+link in the daemon apply to them in an embedded node as well (no request Resources, transfer size within data
+size and one segment's largest), while the three rnfs.dht-only ones don't (NomadNet sends compressed Resources of
+several segments, files with metadata), the fetch bounding those per link instead (its resource_started callback:
+a decompression limit per segment, and the segments' sequence). A page answer is checked from its msgpack headers
+before RNS decodes it, as rnfs.dht responses are, but against its own shape (protocol.page_response_refusal: one
+flat byte string); a file answer (a Resource with metadata) is handed over undecoded. An answer arriving after the
+fetch tore its link down (refusing a segment) is dropped unread, and Link.receive drops request packets on them as
+on rnfs.dht links this node opened.
 
 It also bounds half-open incoming links (section 3, link exhaustion). For every link request, RNS's
 Destination.incoming_link_request runs Link.validate_request, which does the key exchange, sends a proof,
@@ -81,11 +91,13 @@ _compress_limit = None  # Resource.AUTO_COMPRESS_MAX_SIZE before a PROCESS insta
 _original_accept = None
 _original_response_resource_concluded = None
 _original_receive = None
+_original_handle_request = None
 _unsupported_reported = False  # the error for an RNS whose advertisements lack t and d, logged once per process
 _ABSENT = object()
 
 
 DHT_NAME = f"{APP_NAME}.{DHT_ASPECT}"
+NOMADNET_MARK = "rnfs_nomadnet"  # the attribute mark_nomadnet sets on a link this node opened to a NomadNet node
 
 
 def is_dht_link(link) -> bool:
@@ -96,6 +108,19 @@ def is_dht_link(link) -> bool:
     destination = getattr(link, "destination", None) or getattr(link, "owner", None)
     name = getattr(destination, "name", None)
     return isinstance(name, str) and (name == DHT_NAME or name.startswith(DHT_NAME + "."))
+
+
+def mark_nomadnet(link):
+    """Mark link, which this node just opened to a NomadNet node (rnfs/network/nomadnet.py), as rnfs's own: the
+    guards then check it as the module says. Done right after the link is made, before anything can arrive on it.
+    Marked rather than told by its destination's name, so another program's NomadNet links in the same process
+    (an embedded node's host, say) behave as with RNS alone."""
+    setattr(link, NOMADNET_MARK, True)
+
+
+def is_nomadnet_link(link) -> bool:
+    """True if mark_nomadnet marked link."""
+    return getattr(link, NOMADNET_MARK, False) is True
 
 
 def _report_unsupported():
@@ -117,7 +142,7 @@ def scope() -> str:
 def refusal(adv, link=None) -> str | None:
     """Why an unpacked ResourceAdvertisement arriving on link must be rejected, or None if it may be accepted."""
     dht = link is not None and is_dht_link(link)
-    if not dht and _scope == DHT:
+    if not dht and _scope == DHT and not (link is not None and is_nomadnet_link(link)):
         return None  # an embedded node's host program: its links are RNS's alone
     transfer, data = getattr(adv, "t", _ABSENT), getattr(adv, "d", _ABSENT)
     if transfer is _ABSENT or data is _ABSENT:
@@ -209,10 +234,37 @@ def _read_resource(resource) -> bytes | None:
     return packed if isinstance(packed, (bytes, bytearray)) else None
 
 
+def _page_refusal(resource) -> str | None:
+    """Why a completed answer Resource on a NomadNet link can't be a page answer (protocol.page_response_refusal),
+    read from its first bytes and its size without reading the rest; None if it may be, or has metadata (a file,
+    which RNS hands over as an open file without decoding it)."""
+    if getattr(resource, "has_metadata", False):
+        return None
+    data = getattr(resource, "data", None)
+    try:
+        head = data.read(protocol.PAGE_HEAD_SIZE)
+        length = data.seek(0, 2)
+        data.seek(0)
+    except Exception:  # noqa: BLE001 - RNS's stream: unreadable can't be checked, so it is refused
+        return "unreadable"
+    if not isinstance(head, (bytes, bytearray)) or not isinstance(length, int):
+        return "unreadable"
+    return protocol.page_response_refusal(bytes(head), length)
+
+
 def guarded_response_resource_concluded(link, resource):
     """RNS.Link.response_resource_concluded, but on rnfs.dht links refusing a completed response that can't be
-    an rnfs response before RNS decodes it."""
-    if is_dht_link(link) and getattr(resource, "status", None) == RNS.Resource.COMPLETE:
+    an rnfs response before RNS decodes it, and on NomadNet links one that can't be a page or file answer (or that
+    arrives after the fetch closed the link)."""
+    if is_nomadnet_link(link):
+        if getattr(link, "status", None) != RNS.Link.ACTIVE:
+            return None  # the fetch refused part of it and closed the link: nothing is waiting for it
+        reason = _page_refusal(resource) if getattr(resource, "status", None) == RNS.Resource.COMPLETE else None
+        if reason is not None:
+            _log_refused_response(f"refused a NomadNet answer before decoding it: {reason}", LOG_WARNING)
+            _answer_as_malformed(link, getattr(resource, "request_id", None), getattr(resource, "total_size", 0) or 0)
+            return None
+    elif is_dht_link(link) and getattr(resource, "status", None) == RNS.Resource.COMPLETE:
         reason = "rnfs responses carry no metadata" if getattr(resource, "has_metadata", False) else None
         packed = _read_resource(resource) if reason is None else None
         if packed is not None:
@@ -227,14 +279,29 @@ def guarded_response_resource_concluded(link, resource):
 
 def guarded_receive(link, packet):
     """RNS.Link.receive, but on rnfs.dht links checking a response packet before RNS decodes it, and dropping a
-    request packet on a link this node opened."""
+    request packet on a link this node opened; on NomadNet links checking a page answer's packet the same way, and
+    dropping requests."""
+    nomadnet = is_nomadnet_link(link)
     if getattr(packet, "context", None) == RNS.Packet.REQUEST and getattr(link, "initiator", False) is True \
-            and getattr(packet, "packet_type", None) == RNS.Packet.DATA and is_dht_link(link):
+            and getattr(packet, "packet_type", None) == RNS.Packet.DATA and (nomadnet or is_dht_link(link)):
         # The remote destination of a link this node opened has no max_request_size and no handlers, so RNS
         # would decode the request (up to the link's MDU) and start a thread for it before finding nothing to run
         _log_unexpected_request("dropped a request arriving on an outgoing link, which serves none", LOG_VERBOSE)
         return None
-    if getattr(packet, "context", None) == RNS.Packet.RESPONSE and is_dht_link(link) \
+    if nomadnet and getattr(packet, "context", None) == RNS.Packet.RESPONSE \
+            and getattr(packet, "packet_type", None) == RNS.Packet.DATA:
+        data = getattr(packet, "data", b"")
+        if len(data) > PACKET_CHECK_SIZE:
+            try:
+                packed = link.decrypt(data)
+            except Exception:  # noqa: BLE001 - undecryptable is left to RNS, as on rnfs.dht links
+                packed = None
+            reason = protocol.page_response_refusal(packed, len(packed)) if packed is not None else None
+            if reason is not None:
+                _log_refused_response(f"refused a NomadNet answer before decoding it: {reason}", LOG_WARNING)
+                _answer_as_malformed(link, protocol.packed_request_id(packed), len(packed))
+                return None
+    elif getattr(packet, "context", None) == RNS.Packet.RESPONSE and is_dht_link(link) \
             and getattr(packet, "packet_type", None) == RNS.Packet.DATA:
         if not getattr(link, "initiator", False):
             _log_unexpected_response("dropped a response arriving on an incoming link, which has no requests",
@@ -254,6 +321,18 @@ def guarded_receive(link, packet):
     return _original_receive(link, packet)
 
 
+def guarded_handle_request(link, request_id, unpacked_request):
+    """RNS.Link.handle_request, but dropping (quietly, throttled) a request that isn't [requested_at, path_hash, data]
+    with a bytes path hash: RNS indexes it unchecked on its request thread, so another shape (an int, a short list, a
+    list as the path) raised there, a traceback in the log for each packet, before any rnfs check (REL-3). No handler
+    can serve such a request, so nothing else changes."""
+    if not (isinstance(unpacked_request, (list, tuple)) and len(unpacked_request) == 3
+            and isinstance(unpacked_request[1], bytes)):
+        _log_unexpected_request("dropped a request that isn't [time, path hash, data]", LOG_VERBOSE)
+        return None
+    return _original_handle_request(link, request_id, unpacked_request)
+
+
 def _wrapped(owner, name: str, guard) -> bool:
     """True if owner.name (set on owner itself, plain or as a staticmethod) is guard."""
     current = owner.__dict__.get(name)
@@ -270,7 +349,7 @@ def _wrap(owner, name: str, guard, staticmethod_: bool = False):
 
 
 def install(scope: str | None = None):
-    """Wrap RNS.Resource.accept, Link.response_resource_concluded and Link.receive with the guards. Idempotent;
+    """Wrap RNS.Resource.accept, Link.response_resource_concluded, Link.receive and Link.handle_request with the guards. Idempotent;
     called by the node, RequestServer and LinkPool.
 
     scope is PROCESS (the daemon: the advertisement checks cover every link, and RNS's process-wide
@@ -278,7 +357,8 @@ def install(scope: str | None = None):
     embedded node: rnfs.dht links only, and the limit is left as the host program has it, or put back if a
     PROCESS install changed it); None keeps the scope already set (PROCESS at first).
     """
-    global _original_accept, _original_response_resource_concluded, _original_receive, _scope, _compress_limit
+    global _original_accept, _original_response_resource_concluded, _original_receive, _original_handle_request
+    global _scope, _compress_limit
     with _lock:
         if scope is not None:
             if scope not in (PROCESS, DHT):
@@ -301,13 +381,18 @@ def install(scope: str | None = None):
         original = _wrap(RNS.Link, "receive", guarded_receive)
         if original is not None:
             _original_receive = original
+        original = _wrap(RNS.Link, "handle_request", guarded_handle_request)
+        if original is not None:
+            _original_handle_request = original
+            guarded_handle_request.__wrapped__ = original  # what it wraps, for inspect (as functools.wraps marks it)
 
 
 def installed() -> bool:
     """True if the guards are in place."""
     return (_wrapped(RNS.Resource, "accept", guarded_accept)
             and _wrapped(RNS.Link, "response_resource_concluded", guarded_response_resource_concluded)
-            and _wrapped(RNS.Link, "receive", guarded_receive))
+            and _wrapped(RNS.Link, "receive", guarded_receive)
+            and _wrapped(RNS.Link, "handle_request", guarded_handle_request))
 
 
 # Half-open incoming links

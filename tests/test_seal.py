@@ -349,8 +349,11 @@ class NodeSealTest(unittest.TestCase):
     def test_refusals(self):
         directory = os.path.join(self.tmp.name, "dir")
         os.mkdir(directory)
-        with self.assertRaisesRegex(ValueError, "single files"):
-            self.a.add_path(directory, to_self=True)
+        # A folder is sealed as one tar (tests/test_sealed_folders.py), but only under its name
+        with self.assertRaisesRegex(ValueError, "no-sealed-name"):
+            self.a.add_path(directory, to_self=True, seal_name=False)
+        with self.assertRaisesRegex(ValueError, "only-hash"):
+            self.a.add_path(directory, to_self=True, only_hash=True)
         with self.assertRaisesRegex(ValueError, "only-hash"):
             self.a.add_stream(io.BytesIO(b"x"), to_self=True, only_hash=True)
 
@@ -399,7 +402,9 @@ class NodeSealTest(unittest.TestCase):
 
         with fetcher.observing(Watch()):
             self.b.get(cid, os.path.join(self.tmp.name, "watched"))
-        self.assertEqual(totals, [self.b.info(cid)["stored_size"]])
+        # node.get tells it from the root, open_sealed again (for cat, which reads ranges): the same either way
+        self.assertTrue(totals)
+        self.assertEqual(set(totals), {self.b.info(cid)["stored_size"]})
 
     def test_tampered_blocks_are_reported(self):
         data = os.urandom(2 * SEGMENT_SIZE)

@@ -15,6 +15,7 @@ import unittest
 import urllib.error
 import urllib.request
 
+from rnfs.content.blockstore import shard_of
 from tests import support
 from tests.support import free_port
 
@@ -64,6 +65,9 @@ scan_interval = 2
 republish_interval = 600
 path_timeout = 10
 lookup_timeout = 30
+# Settings of rnfs before 0.2.0, which moved LXMF out of rnfs: ignored with a warning, never stopping the daemon
+lxmf_enabled = true
+lxmf_display_name = "e2e"
 """
 
 
@@ -335,9 +339,24 @@ class NetworkTest(unittest.TestCase):
         status, _, body = b.gateway(f"/name/{name}/index.txt")
         self.assertEqual((status, body), (200, b"hello from rnfs\n"))
 
+        # A name synced to a folder: the daemon's sync thread scans it at once (it publishes once the folder has been
+        # unchanged a minute, which rnfs.name_sync's tests check with a fake clock); unsync and name rm stop it
+        synced_site = self.path("synced-site")
+        os.makedirs(synced_site)
+        with open(os.path.join(synced_site, "index.txt"), "wb") as f:
+            f.write(b"synced\n")
+        a.out("name", "create", "synced")
+        self.assertIn("syncing", a.out("name", "sync", "synced", synced_site))
+        wait_for(lambda: "\tsettling\t" in a.out("name", "syncs"), 30, "A's sync thread to scan the folder")
+        a.cli("name", "unsync", "synced")
+        self.assertEqual(a.out("name", "syncs"), "")
+        a.cli("name", "sync", "synced", synced_site)
+        a.cli("name", "rm", "synced")
+        self.assertEqual(a.out("name", "syncs"), "")
+
         # A damaged block on A: A re-checks before serving, so it answers None rather than bad data; B then
         # fails over to the hub, which imported the archive and provides it too
-        with open(os.path.join(a.dir, "blocks", index_cid), "wb") as f:
+        with open(os.path.join(a.dir, "blocks", shard_of(index_cid), index_cid), "wb") as f:
             f.write(b"damaged on disk")
         b.cli("gc")  # B cached index.txt through its gateway above
         failed = b.cli("get", f"{dir_cid}/index.txt", "-o", self.path("b-index-a"), "--from", a.node_id, check=False)
@@ -362,6 +381,10 @@ class NetworkTest(unittest.TestCase):
         self.assertIn(a.node_id, peers)
         self.assertGreater(peers[a.node_id]["received"], 0)
         self.assertIsNotNone(peers[a.node_id]["hops"])
+        # b fetched from a over a link it opened: RNS measured its round trip, and a answered within the window
+        self.assertGreaterEqual(peers[a.node_id]["rtt"], 0)
+        self.assertTrue(peers[a.node_id]["online"])
+        self.assertLessEqual(peers[a.node_id]["first_heard"], peers[a.node_id]["rtt_at"])
         self.assertIn(a.node_id, b.out("peers"))
         self.assertGreater(b.status()["bytes_received"], 0)
         self.assertGreater(a.status()["bytes_sent"], 0)
@@ -377,6 +400,21 @@ class NetworkTest(unittest.TestCase):
         self.assertIn("state: done", c.out("jobs", "show", job_id))
         self.assertIn("removed", c.out("jobs", "clear"))
         # --- end transfers ---
+
+        # --- apps: an app's own token (rnfs app add -o), its pins its own source, released when it is removed ---
+        import rnfs
+        token_file = self.path("app-token")
+        b.cli("app", "add", "e2e", "-o", token_file)
+        self.assertEqual(b.out("app", "ls").split()[0], "e2e")
+        with rnfs.Client(b.dir, port=b.api_port, app="e2e", token_file=token_file) as client:
+            client.pin(file_cid)
+            with client.pin_key("k"):
+                client.pin(file_cid)
+        sources = json.loads(b.out("pin", "ls", file_cid, "--json"))[0]["sources"]
+        self.assertLessEqual({"app:e2e", "app:e2e:k"}, set(sources))
+        self.assertEqual(b.out("app", "rm", "e2e"), "removed app e2e, releasing 2 pins")
+        self.assertNotIn("app:e2e", b.out("pin", "ls"))
+        # --- end apps ---
 
         # --- content: sealed files for B, FastCDC, --no-pin, trustless gateway formats ---
         secret = os.urandom(150 * 1024)
@@ -409,24 +447,18 @@ class NetworkTest(unittest.TestCase):
         self.assertEqual(len(body), int(headers["Content-Length"]))
         # --- end content ---
 
-        # --- lxmf: A sends B a link over LXMF; B fetches it from its inbox ---
-        b_address = b.out("lxmf", "address").splitlines()[0]
-        self.assertEqual(b.status()["lxmf_address"], b_address)
-        wait_for(lambda: a.cli("send", b_address, file_cid, "-m", "hello B", check=False).returncode == 0, 60,
-                 "A to send B an LXMF message")
-        inbox = wait_for(lambda: (lambda out: out if file_cid in out else None)(b.out("inbox")), 90,
-                         "the message in B's inbox")
-        self.assertIn("hello B", inbox)
-        self.assertIn(f"from={a.node_id}", inbox)  # the sender's node, as a provider hint
-        wait_for(lambda: "delivered" in a.out("outbox"), 60, "A's outbox to show the message delivered")
-        number = inbox.split()[0].lstrip("#")
-        fetched = b.out("inbox", "get", number, "-o", self.path("b-lxmf")).split()
-        if fetched[0] == "job":  # with rnfs/features/jobs.py the fetch runs as a background job
-            b.out("jobs", "wait", fetched[1].rstrip(":"))
-        with open(self.path("b-lxmf"), "rb") as f:
-            self.assertEqual(f.read(), content)
-        self.assertIn("removed 1", b.out("inbox", "rm", number))
-        # --- end lxmf ---
+        # --- no lxmf: LXMF left rnfs in 0.2.0. Its settings are ignored with a warning, its commands are gone,
+        # and the daemon has no LXMF address and keeps no LXMF state ---
+        with open(b.log_path, encoding="utf-8", errors="replace") as f:
+            log = f.read()
+        for setting in ("lxmf_enabled", "lxmf_display_name"):  # not `name`: the scenario's name, used below
+            self.assertIn(f"ignoring {setting} in ", log)
+        for command in (["send", b.node_id, file_cid], ["inbox"], ["outbox"], ["lxmf", "address"]):
+            self.assertNotEqual(a.cli(*command, check=False).returncode, 0, command)
+        self.assertNotIn("lxmf_address", b.status())
+        self.assertFalse(os.path.exists(os.path.join(b.dir, "lxmf")))
+        self.assertFalse(os.path.exists(os.path.join(b.dir, "storage", "lxmf_identity")))
+        # --- end no lxmf ---
 
         # --- names: keepers, contacts, follow. The hub keeps A's name; once A is gone, C gets the signed
         # record from the hub (only a keeper's /name answer carries the signature C keeps) ---

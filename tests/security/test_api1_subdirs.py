@@ -29,7 +29,8 @@ from rnfs.node import RnfsNode, lock_rnfs_dir
 from tests.security.test_l7_windows_acl import SHARED, WindowsTestCase
 from tests.support import CAN_SYMLINK, POSIX_MODES
 
-SUBDIRS = ("state", "blocks", "storage", "names", "lxmf")
+# Not lxmf/ since rnfs 0.2.0: LXMF's router state is left as it is for the LXMF app (test_lxmf_dir_is_left_alone)
+SUBDIRS = ("state", "blocks", "storage", "names")
 
 
 def foreign(path: str, real):
@@ -41,7 +42,7 @@ def foreign(path: str, real):
         if (info.st_dev, info.st_ino) != (target.st_dev, target.st_ino):
             return info
         fields = list(info[:10])
-        fields[4] = os.geteuid() + 1  # st_uid
+        fields[4] = os.geteuid() + 1  # noqa: TID251 - st_uid; used only by classes skipped without POSIX_MODES
         return os.stat_result(fields)
     return fake
 
@@ -108,6 +109,17 @@ class SubdirectoryTest(unittest.TestCase):
         with mock.patch("os.walk", side_effect=AssertionError("scanned")):
             node_module._make_private_dirs(self.root)
         self.assertEqual(self.mode(blocks), 0o700)
+
+    def test_lxmf_dir_is_left_alone(self):
+        """lxmf/, LXMF's router state before rnfs 0.2.0, is neither created nor changed: an LXMF app adopts it."""
+        node_module._make_private_dirs(self.root)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "lxmf")))
+        lxmf = os.path.join(self.root, "lxmf")
+        os.mkdir(lxmf)
+        os.chmod(lxmf, 0o750)
+        node_module._make_private_dirs(self.root)
+        self.assertEqual(self.mode(lxmf), 0o750)
+        self.assertNotIn(lxmf, self.messages())
 
     def test_private_subdirectories_are_left_alone(self):
         node_module._make_private_dirs(self.root)

@@ -1,15 +1,18 @@
-"""The objects rnfs.Node and rnfs.Client return (design.md, "Public API"; provisional until 0.2). No RNS.
+"""The objects rnfs.Node and rnfs.Client return (design.md, "Public API"; provisional until 1.0.0). No RNS.
 
 Each is a frozen dataclass made from the local API's JSON form (from_dict, which the facade's dicts share) and
-turned back into it (to_dict: CIDs as their written form, node IDs and names as hex). str() gives the CID, name
-or path where an object has one obvious text form. Cid is rnfs.content.cid's.
+turned back into it (to_dict: CIDs as their written form, node IDs, names and hashes as hex, nested objects as
+their own form). str() gives the CID, name or path where an object has one obvious text form. A field whose JSON
+key is a Python keyword ("from") is named otherwise (sender, from_node). Cid is rnfs.content.cid's.
 """
 from dataclasses import MISSING, dataclass, field, fields
 
 from rnfs.content.cid import Cid
 
 __all__ = ["Cid", "Added", "Written", "Entry", "Info", "Stat", "Pin", "Record", "Status", "Collected", "Verified",
-           "Exported", "Imported", "DenyState"]
+           "Exported", "Imported", "DenyState", "Peer", "Stats", "Contact", "Kept", "Followed", "Cached",
+           "Uncached", "Event", "EventBatch", "Capabilities", "Setting", "Settings", "SettingsChange", "RemotePin",
+           "ServedPin", "RemotePinUsage", "ServedPins", "FolderSync"]
 
 
 def _cid(text) -> Cid:
@@ -23,22 +26,34 @@ def _hex(value) -> bytes | None:
 
 
 def _dump(value):
-    """A field's JSON form: CIDs written out, bytes as hex, tuples as lists."""
+    """A field's JSON form: CIDs written out, bytes as hex, tuples as lists, objects as their to_dict()."""
     if isinstance(value, Cid):
         return str(value)
     if isinstance(value, (bytes, bytearray)):
         return bytes(value).hex()
     if isinstance(value, tuple):
         return [_dump(item) for item in value]
+    if isinstance(value, frozenset):
+        return sorted(_dump(item) for item in value)
+    if isinstance(value, _Object):
+        return value.to_dict()
     return value
 
 
-def _field(load=None, default=MISSING):
-    """A dataclass field whose JSON value from_dict turns into its type with load."""
+def _field(load=None, default=MISSING, key: str | None = None):
+    """A dataclass field whose JSON value from_dict turns into its type with load; key is its JSON key, if not
+    the field's name."""
     metadata = {"load": load} if load is not None else {}
+    if key is not None:
+        metadata["key"] = key
     if default is MISSING:
         return field(metadata=metadata)
     return field(default=default, metadata=metadata)
+
+
+def _key(f) -> str:
+    """A field's JSON key."""
+    return f.metadata.get("key", f.name)
 
 
 def _json_fields(cls) -> list:
@@ -56,28 +71,31 @@ class _Object:
 
     def to_dict(self) -> dict:
         """The local API's JSON form."""
-        return {f.name: _dump(getattr(self, f.name)) for f in _json_fields(self)}
+        return {_key(f): _dump(getattr(self, f.name)) for f in _json_fields(self)}
 
     @classmethod
     def from_dict(cls, data: dict):
-        """The object for a JSON form (the API's, or the facade's dict); fields missing take their defaults."""
+        """The object for a JSON form (the API's, or the facade's dict); fields missing take their defaults, and
+        keys it doesn't know (a newer daemon's) are left out."""
         values = {}
         for f in _json_fields(cls):
-            if f.name in data:
+            if _key(f) in data:
                 load = f.metadata.get("load")
-                value = data[f.name]
+                value = data[_key(f)]
                 values[f.name] = load(value) if load is not None and value is not None else value
         return cls(**values)
 
 
 @dataclass(frozen=True)
 class Added(_Object):
-    """What add() stored: the root's CID and size, warnings (entries a directory add skipped), whether sealed."""
+    """What add() (or add_tar()) stored: the root's CID and size, warnings (entries a directory add or a tar
+    skipped; warnings_total counts them past the first 100, where an add_tar caps them), whether sealed."""
 
     cid: Cid = _field(_cid)
     size: int = 0
     warnings: tuple[str, ...] = _field(tuple, ())
     sealed: bool = False
+    warnings_total: int | None = None
 
     def __str__(self) -> str:
         """The CID's written form."""
@@ -87,7 +105,8 @@ class Added(_Object):
 @dataclass(frozen=True)
 class Written(_Object):
     """What get() wrote: the target's CID, the output path, warnings (warnings_total past the first 100), and for
-    a sealed file whether it was one and its sealed name (only a name fit to be an output name)."""
+    a sealed file whether it was one and its sealed name (only a name fit to be an output name); for a sealed folder
+    unpacked (extracted), the name of the directory written instead."""
 
     cid: Cid = _field(_cid)
     output: str | None = None
@@ -95,6 +114,7 @@ class Written(_Object):
     warnings_total: int | None = None
     sealed: bool = False
     name: str | None = None
+    extracted: bool = False
 
     def __str__(self) -> str:
         """The output path."""
@@ -123,7 +143,8 @@ class Entry(_Object):
 @dataclass(frozen=True)
 class Info(_Object):
     """A target's own CID, type ("file" or "directory"), size and executable bit; for a sealed file, sealed,
-    recipient (this node can open it), stored_size, and its plaintext size and sealed name if a recipient."""
+    recipient (this node can open it), stored_size, and its plaintext size and sealed name if a recipient, and
+    whether it is a sealed folder get would unpack (sealed_folder; False from a daemon before 0.2.0)."""
 
     cid: Cid = _field(_cid)
     type: str = "file"
@@ -133,6 +154,7 @@ class Info(_Object):
     recipient: bool | None = None
     stored_size: int | None = None
     name: str | None = None
+    sealed_folder: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,7 +171,10 @@ class Stat(_Object):
 @dataclass(frozen=True)
 class Pin(_Object):
     """A pin: its CID, sources ("user", "folder", "name:<alias>", ...), whether complete, its type and whether a
-    sealed file (None when its stored blocks can't tell), and a local name for it if one is known."""
+    sealed file (None when its stored blocks can't tell), and a local name for it if one is known. From 0.2.0 (None
+    from an older daemon, or where not known): the label its user gave it (label_pin), where it was added from on
+    this machine (origin), its content size (once its root block is stored), a directory's entry count, and when
+    it was first pinned (Unix time; None for a pin made before 0.2.0)."""
 
     cid: Cid = _field(_cid)
     sources: tuple[str, ...] = _field(tuple, ())
@@ -157,6 +182,11 @@ class Pin(_Object):
     type: str | None = None
     sealed: bool | None = None
     name: str | None = None
+    label: str | None = None
+    origin: str | None = None
+    size: int | None = None
+    entries: int | None = None
+    added: float | None = None
 
     def __str__(self) -> str:
         """The CID's written form."""
@@ -176,7 +206,7 @@ class Record(_Object):
 
 @dataclass(frozen=True)
 class Status(_Object):
-    """The node's status; features holds every other field (traffic, jobs, LXMF, ...)."""
+    """The node's status; features holds every other field (traffic, jobs, ...)."""
 
     version: str
     node_id: bytes | None = _field(_hex, None)
@@ -187,11 +217,36 @@ class Status(_Object):
     known_nodes: int | None = None
     records: int | None = None
     pins: int | None = None
-    provided: int | None = None
+    provided: int | None = None  # CIDs provided, entries included
+    provided_entries: int | None = None  # of those, the files and folders inside pins (provide_entries; rnfs 0.2.0)
+    provide_entries_off: str | None = None  # why no entries are provided, or None
+    provide_entries_capped: int | None = None  # pins whose entries were left out at the cap
     blocks: int | None = None
-    used_bytes: int | None = None
+    used_bytes: int | None = None  # the stored blocks' bytes
     max_storage: int | None = None
+    # What the stored blocks take on disk, each rounded up to allocation_unit (the filesystem's block or cluster):
+    # what max_storage counts (rnfs 0.2.0)
+    allocated_bytes: int | None = None
+    allocation_unit: int | None = None
     names: int | None = None
+    unexported_names: list | None = None  # aliases whose key was never exported or imported (rnfs 0.2.0)
+    announces_held: list | None = None  # aliases whose announces wait for the clock to pass their last (rnfs 0.2.0)
+    # The network's clock less this node's (seconds, positive when it is behind), estimated from the announces heard;
+    # None until enough were (rnfs 0.2.0)
+    clock_offset: int | None = None
+    local_servers: int | None = None  # the servers on this node's island it knows of (rnfs 0.2.0)
+    partition: bool | None = None  # cut off from the servers beyond its island: local ones only (rnfs 0.2.0)
+    partition_since: float | None = None  # Unix time partition mode began, while in it
+    # What the node sees of the network (rnfs 0.2.0): {"size_estimate" (DHT servers, None until estimated),
+    # "size_samples", "density_checked_hour", "density_flagged_hour", "density_checked_day", "density_flagged_day"}
+    network: dict | None = None
+    # The provider records it stores against record_budget (rnfs 0.2.0): {"bytes", "budget", "capacity", "full",
+    # "publishers", "own_records", "tiers": {"known"|"earned"|"newcomer": {"records", "share", "floor",
+    # "refused_hour", "refused_day", "evicted_hour", "evicted_day"}}}
+    record_store: dict | None = None
+    # What `add --identify` identifies to NomadNet nodes as, for a page's operator to list (rnfs 0.2.0); after the
+    # others, so they keep their places for a caller giving them by position
+    nomadnet_identity_hash: bytes | None = _field(_hex, None)
     features: dict = field(default_factory=dict, repr=False, metadata={"json": False})
 
     def to_dict(self) -> dict:
@@ -246,3 +301,381 @@ class DenyState(_Object):
 
     entries: tuple[str, ...] = _field(tuple, ())
     lists: tuple[dict, ...] = _field(tuple, ())
+
+
+@dataclass(frozen=True)
+class Peer(_Object):
+    """A node this one knows (peers()): its node ID, DHT mode ("server", "client", None unknown), whether in the
+    routing table and for how many seconds (seniority; senior once past provider_seniority), the path's hops,
+    interface and bitrate, whether a link is open and its rate estimate (bits/s), when it was last heard and last
+    active (Unix times), whether banned, the traffic counted since the node started (bytes sent and received,
+    requests made, answered, refused, failed, and bad blocks), and from 0.2.0 when it was first heard, the
+    round-trip seconds of the last link to it (rtt, measured at rtt_at) and whether it is online now (None from a
+    daemon that predates them)."""
+
+    node_id: bytes = _field(_hex)
+    mode: str | None = None
+    in_table: bool = False
+    seniority: float | None = None
+    senior: bool = False
+    hops: int | None = None
+    interface: str | None = None
+    bitrate: float | None = None
+    link: bool = False
+    rate: float | None = None
+    last_heard: float | None = None
+    last_active: float | None = None
+    banned: bool = False
+    sent: int = 0
+    received: int = 0
+    requests: int = 0
+    answered: int = 0
+    refused: int = 0
+    failed: int = 0
+    bad: int = 0
+    first_heard: float | None = None
+    rtt: float | None = None
+    rtt_at: float | None = None
+    online: bool | None = None
+
+    def __str__(self) -> str:
+        """The node ID in hex."""
+        return self.node_id.hex()
+
+
+@dataclass(frozen=True)
+class Stats(_Object):
+    """The node's traffic since it started (stats()): since (Unix time), totals ({"sent", "received",
+    "responses", "requests", "answered", "refused", "failed"}), the /blocks refusals by reason, the bytes sent and
+    received per interface ({name: {"sent", "received"}}), and the upload budget per hour and what is left of it
+    (None without one)."""
+
+    since: float | None = None
+    totals: dict = field(default_factory=dict)
+    refused: dict = field(default_factory=dict)
+    interfaces: dict = field(default_factory=dict)
+    upload_budget: int | None = None
+    upload_budget_left: int | None = None
+
+
+@dataclass(frozen=True)
+class Contact(_Object):
+    """An address book entry (contacts): its nick, its kind ("name", "node" or "lxmf") and the hash it names (16
+    bytes)."""
+
+    nick: str
+    kind: str
+    id: bytes = _field(_hex)
+
+    def __str__(self) -> str:
+        """The nick."""
+        return self.nick
+
+
+@dataclass(frozen=True)
+class Kept(_Object):
+    """A name this node keeps (names.keep): the name (16 bytes), why it is kept ("user", "follow", "own"), and the
+    signed record held, if any: its sequence, CID and emission time (Unix)."""
+
+    name: bytes = _field(_hex)
+    reasons: tuple[str, ...] = _field(tuple, ())
+    sequence: int | None = None
+    cid: Cid | None = _field(_cid, None)
+    emitted: float | None = None
+
+    def __str__(self) -> str:
+        """The name in hex."""
+        return self.name.hex()
+
+
+@dataclass(frozen=True)
+class Followed(_Object):
+    """A name this node follows (names.follow): the name (16 bytes), the target pinned for it (None until the
+    first is complete), the latest target and sequence known, and what the last check did (state: "waiting",
+    "current", "unresolved", "fetching <cid>", or why it failed)."""
+
+    name: bytes = _field(_hex)
+    pinned: Cid | None = _field(_cid, None)
+    latest: Cid | None = _field(_cid, None)
+    sequence: int | None = None
+    state: str = "waiting"
+
+    def __str__(self) -> str:
+        """The name in hex."""
+        return self.name.hex()
+
+
+@dataclass(frozen=True)
+class FolderSync(_Object):
+    """A name of this node synced to a folder (names.sync): its alias, the folder (a path on the node's machine),
+    the sync's state ("new": not scanned yet, "settling": a change waiting to stay unchanged a minute, "waiting":
+    for an hour since its last publish, "synced", "paused": reason says why), the folder's root as last imported,
+    the root the sync last published and when (Unix time), and when the hourly limit next lets it publish (None:
+    it holds nothing back)."""
+
+    alias: str
+    path: str
+    state: str = "new"
+    reason: str | None = None
+    root: Cid | None = _field(_cid, None)
+    published: Cid | None = _field(_cid, None)
+    published_at: float | None = None
+    next_publish: float | None = None
+
+    def __str__(self) -> str:
+        """The alias."""
+        return self.alias
+
+
+@dataclass(frozen=True)
+class Cached(_Object):
+    """A cached fetch (cache()): a download kept until evicted, not pinned. cid is the target, reached from root
+    through path (() for a bare CID); whether the same content is pinned too, complete, its type and size (None
+    until its root block is stored), and whether it is provided to the network."""
+
+    cid: Cid = _field(_cid)
+    root: Cid | None = _field(_cid, None)
+    path: tuple[str, ...] = _field(tuple, ())
+    pinned: bool = False
+    complete: bool = False
+    type: str | None = None
+    size: int | None = None
+    provided: bool = False
+
+    def __str__(self) -> str:
+        """The CID's written form."""
+        return str(self.cid)
+
+
+@dataclass(frozen=True)
+class RemotePin(_Object):
+    """A remote pin this node asked for (remote_pins()): the node asked (16 bytes) and the CID; whether it asked to pin
+    it (False: to release it) and whether the node accepted; when (Unix time); its state ("waiting", "done",
+    "missing", "refused", "released") and done; when last checked conclusively and when the node was last found
+    providing it (None if never)."""
+
+    node: bytes = _field(_hex)
+    cid: Cid = _field(_cid)
+    pin: bool = True
+    accepted: bool = False
+    asked: float | None = None
+    state: str = "waiting"
+    done: bool = False
+    checked: float | None = None
+    seen: float | None = None
+
+    def __str__(self) -> str:
+        """The CID's written form."""
+        return str(self.cid)
+
+
+@dataclass(frozen=True)
+class ServedPin(_Object):
+    """A remote pin another identity asked of this node (served_pins()): the identity hash (16 bytes), the CID, its
+    state ("waiting", "fetching", "pinned", "dropped", "refused", "released"), why for one dropped or refused
+    ("quota", "not_found", "denied", "queue_full", ...), when (Unix time; None where not recorded) and a detail.
+    retry_at: for one waiting because its content wasn't found yet (reason "not_found"), when it is tried again."""
+
+    identity: bytes = _field(_hex)
+    cid: Cid = _field(_cid)
+    state: str = "waiting"
+    reason: str | None = None
+    at: float | None = None
+    detail: str | None = None
+    retry_at: float | None = None
+
+    def __str__(self) -> str:
+        """The CID's written form."""
+        return str(self.cid)
+
+
+@dataclass(frozen=True)
+class RemotePinUsage(_Object):
+    """An identity's remote pins on this node: bytes used against its quota (remote_pin_quota), how many are pinned
+    and waiting, and whether it is still on remote_pin_identities."""
+
+    identity: bytes = _field(_hex)
+    used: int = 0
+    quota: int = 0
+    pinned: int = 0
+    waiting: int = 0
+    allowed: bool = False
+
+
+def _served(values) -> tuple[ServedPin, ...]:
+    """ServedPins from their JSON form."""
+    return tuple(ServedPin.from_dict(value) for value in values)
+
+
+def _usage(values) -> tuple[RemotePinUsage, ...]:
+    """RemotePinUsages from their JSON form."""
+    return tuple(RemotePinUsage.from_dict(value) for value in values)
+
+
+@dataclass(frozen=True)
+class ServedPins(_Object):
+    """served_pins(): the remote pins served, most recent first, each identity's usage, and remote_pin_quota."""
+
+    pins: tuple[ServedPin, ...] = _field(_served, ())
+    usage: tuple[RemotePinUsage, ...] = _field(_usage, ())
+    quota: int = 0
+
+
+@dataclass(frozen=True)
+class Uncached(_Object):
+    """What uncache() evicted: the cache records, and the blocks (and bytes) nothing else needed."""
+
+    removed_records: int = 0
+    removed_blocks: int = 0
+    freed_bytes: int = 0
+    # Blocks nothing used before (an unpinned add's), collected with them
+    unreferenced_blocks: int = 0
+    unreferenced_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class Event(_Object):
+    """Something that changed on the node (events): seq (1, 2, ... in the node's run), kind ("job", "pin",
+    "cache", "name", "peer", "remote_pin"; design.md, "Events", lists each kind's fields), time (Unix), and
+    the kind's own fields in fields. kind "lost" (lost is True) is no node's: events.watch delivers it when events
+    were missed (the watch fell behind, or the daemon restarted), so what the app shows should be read again; its
+    fields hold the run's "epoch"."""
+
+    seq: int
+    kind: str
+    time: float | None = None
+    fields: dict = field(default_factory=dict, metadata={"json": False})
+
+    @property
+    def lost(self) -> bool:
+        """True for the "lost" marker."""
+        return self.kind == "lost"
+
+    def to_dict(self) -> dict:
+        """The API's form: seq, kind and time with the kind's fields merged in."""
+        return {**self.fields, **super().to_dict()}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Event":
+        """From the API's form, every key but seq, kind and time going into fields."""
+        known = {"seq", "kind", "time"}
+        return cls(data["seq"], data["kind"], data.get("time"),
+                   {key: value for key, value in data.items() if key not in known})
+
+
+def _events(values) -> tuple[Event, ...]:
+    """Events from their JSON form."""
+    return tuple(Event.from_dict(value) for value in values)
+
+
+@dataclass(frozen=True)
+class EventBatch(_Object):
+    """What events.since() answered: the events, the sequence to ask after next, whether events were missed
+    (lost: the node's run changed, or they are no longer held; events then holds every one held, and the app should
+    read again what it shows), and the run's epoch to pass back."""
+
+    events: tuple[Event, ...] = _field(_events, ())
+    next: int = 0
+    lost: bool = False
+    epoch: str | None = None
+
+
+def _routes(values) -> tuple[tuple[str, str], ...]:
+    """Routes ([method, path] pairs) as tuples."""
+    return tuple(tuple(route) for route in values)
+
+
+@dataclass(frozen=True)
+class Capabilities(_Object):
+    """What the node offers (capabilities()): its version, its capabilities (api.CAPABILITIES: "events",
+    "pin_label", "config", ...), the API routes ((method, path)), the features loaded, the event kinds and the
+    error codes. Empty from a daemon before 0.2.0, which can't say: every has() is False."""
+
+    version: str | None = None
+    capabilities: frozenset[str] = _field(frozenset, frozenset())
+    routes: tuple[tuple[str, str], ...] = _field(_routes, ())
+    features: tuple[str, ...] = _field(tuple, ())
+    event_kinds: tuple[str, ...] = _field(tuple, ())
+    error_codes: tuple[str, ...] = _field(tuple, ())
+
+    def has(self, capability: str) -> bool:
+        """Whether the node offers capability."""
+        return capability in self.capabilities
+
+
+def _frozen(value):
+    """A setting's JSON value with lists made tuples (so a frozen Setting compares and reads alike from either
+    class: the API's JSON has lists where a Node may have either)."""
+    if isinstance(value, (list, tuple)):
+        return tuple(_frozen(item) for item in value)
+    return value
+
+
+@dataclass(frozen=True)
+class Setting(_Object):
+    """One setting (config()): its schema (rnfs.config.settings_schema: name, group, type, choices, nullable,
+    default, unit, minimum, maximum, exclusive_minimum, description, live: a change applies without a restart),
+    the running value, rnfs.toml's (file; None where it doesn't set it), whether the command line (a Node's
+    settings) overrides rnfs.toml, and whether a restart would run another value (pending). Lists are tuples."""
+
+    name: str
+    group: str | None = None
+    type: str | None = None
+    choices: tuple | None = _field(tuple, None)
+    nullable: bool = False
+    default: object = _field(_frozen, None)
+    unit: str | None = None
+    minimum: float | None = None
+    maximum: float | None = None
+    exclusive_minimum: bool = False
+    description: str | None = None
+    live: bool = False
+    value: object = _field(_frozen, None)
+    file: object = _field(_frozen, None)
+    overridden: bool = False
+    pending: bool = False
+
+    def __str__(self) -> str:
+        """The setting's name."""
+        return self.name
+
+
+def _settings(values) -> tuple[Setting, ...]:
+    """Settings from their JSON form."""
+    return tuple(Setting.from_dict(value) for value in values)
+
+
+@dataclass(frozen=True)
+class Settings(_Object):
+    """The node's settings (config()): its rnfs.toml's path, every setting in the schema's order (settings[name]
+    gives one, iterating gives each), why a restart would refuse rnfs.toml (file_error, None if it wouldn't), and
+    the warnings reading it gave."""
+
+    path: str | None = None
+    settings: tuple[Setting, ...] = _field(_settings, ())
+    file_error: str | None = None
+    warnings: tuple[str, ...] = _field(tuple, ())
+
+    def __getitem__(self, name: str) -> Setting:
+        """The setting called name. KeyError if there is none."""
+        for setting in self.settings:
+            if setting.name == name:
+                return setting
+        raise KeyError(name)
+
+    def __iter__(self):
+        """Each setting."""
+        return iter(self.settings)
+
+
+@dataclass(frozen=True)
+class SettingsChange(_Object):
+    """What config_set() did to rnfs.toml (path): the settings applied to the running node now, those whose new
+    value applies at the next start (restart_required), those the command line overrides (overridden, which keeps
+    winning), and the warnings reading the file gave."""
+
+    path: str | None = None
+    applied: tuple[str, ...] = _field(tuple, ())
+    restart_required: tuple[str, ...] = _field(tuple, ())
+    overridden: tuple[str, ...] = _field(tuple, ())
+    warnings: tuple[str, ...] = _field(tuple, ())

@@ -9,6 +9,7 @@ node saved as accepted (every SAVE_EVERY_NODES nodes or SAVE_EVERY_SECONDS) gets
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import RNS
 
@@ -62,10 +63,15 @@ class CrashingClient(FakeClient):
 
 
 class CrashCutRoundTest(unittest.TestCase):
-    """A round over many nodes, crashed part way, then a restart that stops providing the CID."""
+    """A round over many nodes, crashed part way, then a restart that stops providing the CID. Requests go one at
+    a time (as slow nodes send them), so the crash point says which nodes were sent to; test_publisher's
+    test_crash_while_sending_in_parallel covers other nodes' parallel sends."""
 
     def setUp(self):
-        """Storage with one pinned CID; a temporary state directory."""
+        """Storage with one pinned CID; a temporary state directory; /provide sent one node at a time."""
+        patcher = mock.patch.object(publisher_module, "PROVIDE_PARALLEL", 1, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.state = os.path.join(self.tmp.name, "state")
@@ -78,7 +84,7 @@ class CrashCutRoundTest(unittest.TestCase):
 
     def publisher(self, client, nodes) -> Publisher:
         """A publisher on the shared state directory whose lookups find nodes (closed when the test ends)."""
-        publisher = Publisher(OWN, self.config, self.storage, ProviderStore(1000, None), client,
+        publisher = Publisher(OWN, self.config, self.storage, ProviderStore(None), client,
                               lambda key: FakeLookup(nodes), False, self.state, clock=self.clock)
         self.addCleanup(publisher.close)
         return publisher

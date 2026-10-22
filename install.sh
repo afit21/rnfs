@@ -39,7 +39,7 @@
 # goes ahead with a warning: SHA256SUMS shows the download is whole, but whoever could replace the release's
 # files could replace it too.
 #
-# Dependencies (rns, lxmf, cryptography, ...) are installed as wheels at the versions and sha256 hashes
+# Dependencies (rns, cryptography, ...) are installed as wheels at the versions and sha256 hashes
 # pinned in the source's packaging/requirements.lock (pip --require-hashes --only-binary=:all:), and rnfs
 # itself is built with the setuptools pinned in packaging/build-backend.lock, in a separate build venv
 # without pip's build isolation (which would fetch the newest setuptools). A source without those files (a
@@ -164,7 +164,8 @@ find_python() {
         found=$(python3 -I -c 'import platform; print(platform.python_version())' 2>/dev/null || echo unknown)
         die "rnfs needs Python 3.11 or newer, and python3 is $found.
 Install a newer Python, then run this again (with --python /path/to/python3.X if it isn't python3):
-  Debian/Ubuntu:  sudo apt install python3.12 python3.12-venv   (or the newest python3.X your release has)
+  Debian/Ubuntu:  sudo apt install python3.12 python3.12-venv   (or the newest python3.X your release has:
+                  on Ubuntu 22.04, python3.11 python3.11-venv)
   Fedora:         sudo dnf install python3.12
   Arch:           sudo pacman -S python"
     fi
@@ -324,6 +325,13 @@ warn_plain_http() {  # warn when SOURCE (from RNFS_SOURCE) is, or names, a plain
     case "$SOURCE" in
         *[Hh][Tt][Tt][Pp]://*) warn "$SOURCE is fetched over plain http://, so anyone on the network path can replace
 what gets installed (no checksum or provenance is checked for RNFS_SOURCE). Use an https:// URL or a local file." ;;
+    esac
+}
+
+check_source() {  # a local RNFS_SOURCE (a path, not a URL or another pip requirement) must exist, before anything changes
+    case "$SOURCE" in
+        [Hh][Tt][Tt][Pp]://*|[Hh][Tt][Tt][Pp][Ss]://*) return ;;
+        */*|*.zip|*.whl|*.tar|*.tar.*|*.tgz) [ -e "$SOURCE" ] || die "RNFS_SOURCE $SOURCE doesn't exist (a source directory, a .zip, .tar.gz or .whl file, an https:// URL, or a pip requirement)" ;;
     esac
 }
 
@@ -548,6 +556,7 @@ do_install() {
     check_unit
     choose_source
     warn_plain_http
+    check_source
     updating=no
     if venv_ok; then
         say "Updating rnfs in $VENV"

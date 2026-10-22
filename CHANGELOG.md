@@ -2,6 +2,984 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## 0.2.0
+
+The feature-complete release: the local API and the library for companion apps; providing at scale (sweep
+providing, provider records on disk within a byte budget, storage tiers against floods); finding content when
+identities are generated next to its key (the density check, disjoint lookup paths, the announce first-seen
+log); LoRa islands (fast nodes sparing them, two-level records, partition mode); and new features (per-app API
+tokens, encrypted folders, NomadNet add, gateway sites, name sync, name key backups, remote pin status, network
+status, files inside folders provided by their own CIDs). LXMF messaging moved out of rnfs into an app of its own
+(Removed, below). The wire format gained one optional request, `/range` (Added, below), which these nodes send
+only to nodes that answer it; nothing else on the wire changed, and CIDs are unchanged: these nodes, 0.1.6, 0.1.5,
+0.1.4 and 0.1.3 nodes work together (`tests/interop.py` against 0.1.6 passes). The local API stays compatible but
+for LXMF: every route, field and status of 0.1.6 is unchanged but LXMF's, which are gone, and error bodies gain a
+field. The upgrade of an `<rnfs dir>` is automatic and one-way.
+
+Upgrade notes:
+- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
+  `routing`, `peer_scores`, `announce_first_seen`, `provider_standing`, `remote_pins_asked`, `remote_pins_served`,
+  `name_syncs`, `name_sync_files`, `published_heal`, `name_announces`, `remote_pin_retries`, `range_support`,
+  `publish_items`, `publish_stores`); an older rnfs can't open it afterwards. The publisher's `published` and
+  `published_earlier` rows move into `publish_items` (a row per provided item), leaving those tables empty. Pins
+  made before the upgrade have no `added` time, name keys made before it count as never exported (`rnfs status`
+  lists them until `rnfs name export` is run), and remote pins asked before it have no status entry.
+- **LXMF:** rnfs no longer sends or receives LXMF (Removed, below). Pins of links auto-fetched over LXMF change
+  source from `lxmf:<address>` to `app:lxmf:<address>` (`pin ls` shows the new one), an app called `lxmf`'s, so
+  they stay pinned for an LXMF app to take over; nothing is released by the change, and an older `pins.json`
+  imported at the upgrade gets the same rewrite. `storage/lxmf_identity`, `lxmf/` and the inbox and outbox in
+  `rnfs.db` are kept, untouched. `lxmf_*` settings in `rnfs.toml` are ignored with a warning. If you rely on
+  `rnfs send` and `rnfs inbox`, don't upgrade before an LXMF app is there: the upgrade can't be undone.
+- **Provider records:** the upgrade gives each publisher of the records a node stores a standing
+  (`provider_standing`, and indexes on `provider_records`): Earned if it was first seen at least 3 days before its
+  latest store and refreshed a record outside the newcomer pool a day or more after storing it, else Newcomer. The
+  newcomer pool's records are no longer pooled, and the remembered departed and evicted publishers are dropped.
+- **`max_records` is retired:** a `max_records` left in `rnfs.toml` (or given to `rnfs.Node`) is ignored with a
+  warning instead of stopping the daemon; `record_budget` (bytes) replaces it. `rnfs config set max_records` is
+  refused as an unknown setting; `rnfs config unset max_records` removes it.
+- **Blocks:** they move from `blocks/<cid>` into 1,024 subdirectories, `blocks/<xy>/<cid>` (the CID's third- and
+  second-to-last characters), at the first start, which takes a while on a large store (a rename per block; the API
+  answers once it is done: 6 minutes for 883k blocks on a desktop SSD, and 6 for 857k on a 2-vCPU cloud VM, of which
+  110 s the move; the log says how far the listing and the move got about every 30 seconds, and, if they take over 10
+  seconds, the listing of every block that follows and the first working out of what the node provides). Each start
+  moves whatever is left, so an interrupted upgrade loses nothing, and a block Windows won't let rnfs move stays
+  readable until a later start moves it. An older rnfs doesn't find the moved blocks. A subdirectory of `blocks/` that
+  is a link, not a directory or another user's stops the start. The state database gains a `block_sizes` table, every
+  stored block's size, which the first start fills by listing the blocks.
+- **`<rnfs dir>/daemon.json`:** the daemon writes it while it runs. Clients from 0.2.0 on read the API port from
+  it first, so one that can't read a newer daemon's `rnfs.toml` still finds it.
+- **Settings:** `rnfs.toml` may now be rewritten by the daemon (`rnfs config set`, `POST /api/config/set`). Only the
+  assignments changed are replaced; comments and other lines are kept. Settings whose `api_port` equals a
+  non-zero `gateway_port` are now refused at start (such a daemon could never listen on both).
+- **Routing state:** the state database gains tables for the routing table (`routing`), which is now kept across
+  restarts, for local scores (`peer_scores`) and for the announce first-seen log (`announce_first_seen`).
+- **Files and folders inside pins are provided** (`provide_entries`, below, on by default): after the upgrade a node
+  that isn't slow also publishes the CID of every file and folder inside its own complete pins (not remote pins or
+  followed names), up to `provide_entries_max` (100,000), so its first rounds publish more keys. Set
+  `provide_entries = false` to keep 0.1.6's behaviour.
+
+Security:
+- **A provider can't keep a fetch alive for ever by alternating unreachable and unestablished links** (REL-1): a "no
+  path" result (retried once, a minute later) reset the count of lost requests, and a link that didn't establish
+  (lost) re-armed the retry, so a provider whose results alternated the two, as a node ignoring link requests and
+  answering every other path request gets, never failed, and its fetch, thread and searches lived as long as it
+  liked. Only an answer, or an outright failure, resets the lost count now.
+- **A request for nothing served can't cancel a download** (REL-2, specification section 3): a `/blocks` or `/range`
+  request took a response slot, displacing a response in progress when the pool was full, before the node asked
+  whether it serves anything requested. One ~100-byte request for a made-up CID from a fresh link cancelled an honest
+  slow-link download, and repeating it broke every one. Such a request is now answered at once, with the same answer
+  as before, without a slot.
+- **A request of the wrong shape is dropped before RNS indexes it** (REL-3): RNS reads a request as
+  `[time, path hash, data]` unchecked, so one whose plaintext was an int, a short list or had a list as its path
+  raised on RNS's request thread, a traceback in the log for every such packet, before rnfs's per-link rate limit
+  saw it. The guards now drop it with a throttled verbose line; no handler could have served it.
+- **A tar member of negative size is refused by rnfs itself** (REL-4): Python's tarfile parses a negative size from
+  a base-256 field or a pax `size=` record, and only interpreters with its own offset check (3.12.3 and later fixes)
+  refused such a stream; rnfs supports 3.11. Sealed folders and tar adds now refuse it on every interpreter.
+- **A file in the rnfs dir can't be added through another name for it** (REL-8, completing REV1): the check that `add`
+  refuses the rnfs dir compared paths, and a file added as the add's root isn't walked (the walks skip the rnfs dir by
+  inode), so on a case-insensitive disk (macOS: `~/.RNFS/api_token`) or through a bind mount an app could add the
+  CLI's token, the node identity or a name key and read it back. The file's directories are now compared by device and
+  inode too, up to the rnfs dir's `files/`.
+- **Gateway documents are revalidated, not cached as immutable** (REL-9, specification section 11): every `/rnfs/`
+  response was `immutable` for a year, though its Content-Security-Policy follows `gateway_scripts`, so a page cached
+  while scripts were allowed kept running them in the browser after they were turned off. HTML, SVG, other XML, PDF
+  and listings now carry `Cache-Control: public, no-cache` (the browser keeps them and asks again, a `304` from the
+  node), and a `304` carries no `Cache-Control`. Other files stay immutable.
+- **Withdrawing and restoring the same records spends no write budget** (REL-13, completing REV2): a withdrawal
+  spent a row of the provider write budget and a restore before the next save spent nothing but gave nothing back,
+  though neither row is then written. One identity looping over its own 27 records spent the budget other publishers'
+  new records need, while writing almost nothing, and every other Newcomer's new record was refused (an Earned one's
+  too, from an Earned attacker). The row a withdrawal spent is now given back when it is undone.
+- **A keeper can't make this node keep and serve a name below the sequence it knows** (REL-14): the keeper store's
+  rollback check, and the sequence a keeper query checks answers against, left out the name floor (the highest
+  sequence of a name resolved before, kept after its record left the table). A lying keeper's old, validly signed
+  record of such a name, once kept, was served onward by this node. The floor counts now.
+- **A flood of fresh identities can't set the clock-offset estimate** (REL-15, specification section 9): it was the
+  median of the 128 senders heard most recently, so 128 announces of fresh identities emitted 2 h ahead pushed every
+  honest sender out, and the node warned that its correct clock was 2 h behind. Once 5 senior servers were heard the
+  estimate is theirs alone, and the table forgets other senders first.
+- **What fuzzing the gateway, the API, settings and tar streams found** (REL-17): a web page could set any
+  Content-Type, control characters included, with the gateway's `?filename=data:<type>,` (the type is now taken from
+  the name's extension alone, and a failed response's buffered status line is dropped rather than sent before the
+  error's); a control character in a request's query reached a redirect's `Location` (percent-encoded now); a request
+  line of four words ending `HTTP/0.9` was answered without a status line or headers (refused as HTTP/0.9 is); a
+  deeply nested JSON body answered 500 (400 now); a whole number past 64 bits in a setting raised `OverflowError`, and
+  `upload_budget = 10**400` passed validation, then stopped the node starting (settings hold 64-bit numbers, as
+  rnfs.toml does); and a tar member refused by name but declaring 2**88 bytes held a tar add's reader for good, as
+  tarfile skips it by reading its size and reads nothing for ever at the end (refused as an invalid tar now). Nothing
+  a remote node sends reached any of these.
+- **A `/range` provider that disowns a block it was sending is scored as one that sent a bad block** (REL-20): it could
+  send ranges of a block, checked only once whole, then answer that it doesn't hold it, so the airtime was spent and it
+  failed only for that fetch, free to do the same in the next. Its score now falls by what a block not matching its CID
+  costs; it isn't banned, as content unpinned and collected while it was sent does the same.
+- **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
+  may be no larger than `max_download_size` and the free space above the disk reserve; each Resource segment may
+  decompress to one segment, and must follow the sequence an honest sender keeps (same original hash and total,
+  the next index, the segment count the total gives), else the transfer is cancelled and the link closed; what is
+  assembled may not outgrow the advertised total; a file's metadata must be a small flat map, checked before RNS
+  decodes it; a page must be one flat byte string, checked from its msgpack headers before RNS decodes it. The
+  daemon's process-wide decompression limit stays 0, and `rnfs.dht` links keep every rule they have.
+- **A NomadNet page answer may be at most 16 MiB** (specification section 11): RNS reads an answer without metadata
+  (a page) whole into memory and decodes it, so a "page" as large as the free disk could exhaust a small node's
+  memory. One advertised larger is refused at its first segment, before any of it is transferred (the add fails
+  with too large); files, written to disk, keep the bound above.
+- **Gateway sites don't render uploads as pages** (specification section 11, Sites). A site's pages run script in
+  its own origin, so a file someone else got into a site's DAG could be made to run script there: on site hosts
+  `?filename=` now only names a download (`Content-Disposition: attachment`; the type comes from the path's own
+  name), and a file inside the site's DAG whose name gives no type is sniffed only to an image, audio, video, font,
+  wasm or plain text, else served as `application/octet-stream`, never as HTML, SVG or PDF. A site's `index.html`,
+  the files its DAG names `.html` or `.svg`, and a site whose root is itself a file render as before; the path
+  gateway is unchanged.
+- **App names stay private** (specification section 11): a request naming an app that doesn't exist in
+  `X-Rnfs-App` gets an `X-Rnfs-Proof` too, keyed by an HMAC of a secret made at each start and the name, which no
+  client can check, instead of none; so every answer, the open `GET /api/status` and the 403s included, looks the
+  same whether or not the app exists, and anyone who can reach the API port can no longer list the installed apps.
+- **What an app's token can do, said plainly** (specification section 11, README): an app can do anything the CLI
+  can, managing apps included in effect. The `/api/apps` routes refuse its token, but it reads and writes files as
+  the daemon's user, which reaches the CLI's token; `rnfs app add` now says so. Give a token only to software you
+  would trust with the CLI.
+- **Unpacking a sealed folder counts what its entries take on disk** (REV10; specification section 5,
+  Unpacking): the tar's headers are read first, before anything is stored, and every file and directory counts
+  at least one filesystem allocation unit (4 KiB or the filesystem's own, if larger) in the block store and
+  again as written, where the plaintext's bytes were counted before. A sender could seal a folder of many tiny
+  files that passed the check and then took 4 to 8 times as much, twice, filling the recipient's disk past the
+  reserve (1,000 one-byte files: 10.9 MB written where 2 MB was checked). Such a get is now refused (413, naming
+  `--no-extract`).
+- **An unpack the process died in no longer leaves the plaintext stored** (REV10): its decrypted blocks used to
+  stay in the block store, unpinned, until a gc or an eviction. An unpack now marks the state database while it
+  runs, and a start that finds the mark deletes every block nothing reaches before serving anything (the
+  unrecorded blocks of a fetch the same crash interrupted too: a retry fetches them again).
+- **Documented: a sealed file is only as safe as the recipient's node identity** (REV12), which is online while
+  the node runs and stored unencrypted in the rnfs dir (`storage/identity`): sealing protects against the
+  network, not against someone who can read the recipient's disk (README, Known limitations; specification
+  section 5).
+- **`add` refuses the rnfs dir** (specification section 5): `rnfs add ~` pinned and provided the node identity, the
+  name keys, `api_token` and `rnfs.db`, each findable by its own CID with `provide_entries`, and an app token could
+  read the CLI's token through `add`. `add` (the CLI, the API, add jobs, sealed folders) now refuses the rnfs dir, a
+  directory holding it, anything inside `storage/`, `names/`, `state/`, `blocks/` or `lxmf/`, and anything else in
+  the rnfs dir but outside `files/`. Every walk (`add`, the shared folder, `name sync`, sealed folders) also skips,
+  with a warning, a directory that is the rnfs dir or one of those subdirectories by device and inode, which catches
+  a bind mount of them; one given as the root is refused.
+- **Provider records have a write budget** (REV2; specification section 6, "Provider records"): with no
+  per-publisher cap left, one identity storing and withdrawing records in a loop made the store write about
+  100,000 rows a second in-process, and 9.5 MB/s at 100 requests a second. New records and withdrawals now spend a
+  budget of 60 rows every 30 s open to all, plus 30 each kept for Earned and Known publishers, carried over for up
+  to 6 hours; past it new records are refused (`False`), withdrawals never are, and refreshes cost nothing. A
+  withdrawal followed by a store of the same key before the next save is a refresh, and a refresh is written once
+  it moves a record's last-stored time by 6 hours rather than 1. A Newcomer flood now makes the store write at most
+  about 150 kB/s (fresh identities, inserted and withdrawn, on a 1M-record database), a hundredth of what it did.
+- **A full key can't be taken over** (REV3; specification section 6): Earned publishers never gave way to each other
+  at a full key, so about 1000 identities that each refreshed one key on 3 UTC days (from about 48 hours) held all
+  its 1000 publishers, and every new provider of it but Known ones was refused. Now Earned records give way to
+  Earned and Known storers (a random one outside the `K/2` oldest), and Newcomers keep a tenth of the key: below it
+  a Newcomer evicts a random Earned record, past it Newcomers give way first, so a flood of fresh identities holds
+  at most that share.
+- **Provider standings without records are capped** (REV11; specification section 6): a publisher left without
+  records keeps its refresh days a week, and nothing else bounded those rows, so identities that each refreshed one
+  record a day later and withdrew it grew the state database (and took room from the record budget, which measures
+  it). At most 50,000 are kept (about 5 MB); past that the hourly pass forgets those with the fewest refresh days
+  first, so Earned publishers that left outlast such a flood.
+- **Partition mode can't be forced from outside** (spec section 6, "LoRa islands"; REV4): a server beyond the island
+  could answer a slow node's `/find` with 3 made-up IDs, whose failures entered partition mode at once. Only failures
+  of servers the node knows (its routing table or first-seen log, or an identity or path RNS knows) count, and 3 in a
+  row ask for a probe of an off-island server that answered or announced itself recently, as silence does: partition
+  mode starts only if that probe fails (or nothing beyond the island was heard to probe). An ID that only ever failed
+  is never a probe target.
+- **The announce first-seen log keeps its senior servers** (spec section 6, "Announce first-seen log"; REV7): it
+  forgot the least recently heard server first, so about 3 announces a second of fresh identities pushed every honest
+  server out between its 6-hourly announces, and none ever became senior (`provider_seniority`), which publishing and
+  searching's senior rule needs. When full it now forgets first a server silent for 2 × `announce_interval` (counted
+  from the start at the earliest), then the server not yet senior that it first heard most recently (in a flood, the
+  newcomer itself), and a senior server heard lately only when nothing else can go. At a tenth of the scale (6,553
+  rows, 200 honest servers, a fresh identity every 3.3 s for 2 days) every honest server became senior, against none.
+- **Made-up IDs can't inflate the network size estimate** (spec section 6, "Identities placed next to a key"; REV8):
+  a lookup took its sample, the distance to the 10th-closest server, over every ID replies named, so a server naming
+  made-up IDs just beyond the 3 closest (which a lookup completes without asking) inflated the estimate about 3
+  times, weakening the density check. A sample now counts only servers that answered or whose identity is known,
+  from the closest up to the first that isn't (its distance scaled to the 10th), so a node that knows few identities,
+  on a LoRa island, doesn't underestimate the network instead. Over 300 servers with such a server in every lookup:
+  288 -> 743 before, 288 -> 318 now.
+- **RNS's identity blackhole is honoured** (specification section 10, "Blackholed identities"): RNS drops a
+  blackholed identity's announces and paths, but rnfs kept using what it held, so the node stayed in the routing
+  table, was asked in lookups, and its provider records were handed out and fetched from. The node now reads the
+  list (`rnpath -B`, blackhole sources; through rnsd too) every 5 minutes and treats a listed identity's node ID as
+  banned while it is listed (nothing of it is saved: it ends when the identity leaves the list), and answers `False`
+  to every request on a link identified as a listed identity.
+
+Removed:
+- **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
+  out of core"): rnfs is the core (content, the DHT, names, pinning, the local API, the library), and messaging is
+  a companion app's. Gone: the commands `rnfs send`, `inbox` (`inbox get`, `inbox rm`), `outbox`, `lxmf address` and
+  `lxmf sync`; the routes `GET /api/lxmf/address`, `POST /api/lxmf/send`, `GET /api/lxmf/inbox`,
+  `POST /api/lxmf/inbox/get`, `/api/lxmf/inbox/rm`, `GET /api/lxmf/outbox` and `POST /api/lxmf/sync` (now 404
+  `no_such_endpoint`); `lxmf` among `GET /api/capabilities`' features; the `lxmf_address`, `lxmf_inbox` and
+  `untrusted_dropped` fields of `GET /api/status` and `rnfs status`; the `lxmf` dependency, from `pyproject.toml`,
+  the lock and every package (the `.deb`, the Flatpak, the Windows exe, the install script). This is a deliberate
+  break of the local API for LXMF only: every other route, field and status of 0.1.6 is unchanged. The
+  library's `lxmf` methods, their objects and the `inbox` events, added during 0.2.0's development, never shipped,
+  nor did the deprecation path first planned for this release (warnings, a `Deprecation` header).
+- **What stays:** nothing on the network changes, and `rnfs:` URIs and the LXMF link map (the field an LXMF message
+  carries rnfs links in) stay part of the specification (section 13) as the contract an LXMF app and other clients
+  use; `rnfs.Node` and `rnfs.Client` still take an `rnfs:` URI as a target (`rnfs/uris.py`). Contacts of kind
+  `lxmf` stay in the address book, for an app to read which senders are trusted. On disk, nothing is deleted:
+  `storage/lxmf_identity` and `lxmf/` are left as they are (rnfs no longer creates or checks `lxmf/`), so an LXMF
+  app can adopt them and keep the node's LXMF address; the inbox and outbox stay in `rnfs.db`'s `lxmf_messages`
+  table (0.1.4's `lxmf_inbox.json` and `lxmf_outbox.json` are still imported into it), which nothing reads,
+  changes or deletes, for the app to import.
+- **Pins of links fetched automatically over LXMF** stay pinned, as `app:lxmf:<address>` (upgrade notes, above):
+  an app called `lxmf` holds them, and nothing else releases them. An LXMF app registered under that name
+  (`rnfs app add lxmf`) takes them over; to release them without one, run `rnfs app add lxmf` then
+  `rnfs app rm lxmf`.
+- **Retired settings:** `lxmf_enabled`, `lxmf_display_name`, `lxmf_propagation_node`, `lxmf_send_from_hint`,
+  `lxmf_sync_interval`, `lxmf_accept_from`, `lxmf_auto_fetch_from` and `lxmf_auto_fetch_quota`. One left in
+  `rnfs.toml` (or given to `rnfs.Node`) is ignored with a warning, as `max_records` is, instead of stopping the
+  daemon; `rnfs config set` refuses one as unknown, and `rnfs config unset` removes it.
+- **If you used `rnfs send` or `rnfs inbox`:** use an LXMF app built on rnfs once one is released. Meanwhile an
+  `rnfs:` link can go through any LXMF client (Sideband, NomadNet, MeshChat) as text, and the recipient fetches
+  `rnfs:<cid>/<path>?from=<node>` with `rnfs get <cid>/<path> --from <node>`. If you rely on rnfs's own inbox
+  and auto-fetch, stay on 0.1.6 until then: an `<rnfs dir>` 0.2.0 has upgraded can't go back to it.
+
+Added, for apps:
+- **App tokens:** an app can have a token of its own, kept across restarts (`rnfs app add`, below), sent as
+  `X-Rnfs-Api` with `X-Rnfs-App: <name>`; the proof a client checks before sending it is keyed by the token's
+  verifier, which is all the daemon keeps of it (`rnfs.db`'s new `apps` table). `rnfs.Client(app=..., token=...
+  or token_file=...)` and `ApiConnection(app=, token=)`. The `api_token` stays the CLI's, unchanged, and a
+  request without `X-Rnfs-App` is checked exactly as before.
+- **Managing apps:** `rnfs app add <name> [-o file]` issues an app a token, printed once (alone on stdout, for
+  scripts) or written to a new file only you can read, and says on stderr that the app can do anything the CLI
+  can (export name keys, change settings, stop the daemon), managing apps included in effect; `rnfs app ls [--json]`;
+  `rnfs app rm <name>` revokes the token and releases every pin the app made. Routes `GET /api/apps`,
+  `POST /api/apps/add`, `POST /api/apps/rm`, for the CLI's token only (an app's gets 403 with the new error code
+  `forbidden`); capability `apps`. An app called `lxmf` holds the `app:lxmf:` pins rnfs's own LXMF left
+  (Removed, below).
+- **An app's pins:** what an app adds, pins, imports or makes with `dir set`/`dir rm` (and its pin, add and import
+  jobs) is pinned with the source `app:<name>`, or `app:<name>:<key>` with `X-Rnfs-Pin-Key: <key>`
+  (`client.pin_key(key)`), shown by `pin ls`. Its `pin rm` releases only its own source; the CLI's still
+  releases only `user`'s, and a pin key with the CLI's token is refused (400). Removing the app releases them all
+  and cancels its jobs.
+- **Discovery:** `<rnfs dir>/daemon.json`, written atomically (0600) once the API listens and removed at stop: the
+  daemon's PID, API and gateway ports, version, start time, rnfs dir, Reticulum config directory, whether it
+  attached to a shared instance, and node ID. `rnfs.apiclient.read_daemon_info()` reads it, refusing a symlink,
+  a file others could have written, or one whose process has ended.
+- **Stopping:** `POST /api/shutdown` stops the daemon as SIGTERM does, after answering; `rnfs stop [--wait S]`
+  uses it and waits until the API stops answering. Windows has no other clean way to stop a background daemon.
+- **Error codes:** every API error is `{"error", "code"}`, the code machine-readable (`rnfs.errors.CODES`): the
+  node's errors by status (`bad_request`, `not_found`, `too_large`, `denied`, `invalid_dag`, `busy`,
+  `storage_full`, `internal`) and the API's own refusals (`no_such_endpoint`, `method_not_allowed`,
+  `unauthorized`, `bad_host`, `timeout`, `length_required`, `body_too_large`, `too_many_connections`,
+  `unsupported`). So a 404 for an endpoint a daemon lacks (`no_such_endpoint`) is told from one for missing
+  content (`not_found`). `ApiError.code`, and `NoSuchEndpoint` and `Unsupported` (both `NotFound`s) in the
+  library, which also recognises an older daemon's unknown-endpoint 404 by its message.
+- **No API stability until 1.0.0:** the library (`rnfs.Node`, `rnfs.Client`) and the local API stay provisional
+  (`rnfs.API_STATUS`), and may change in 0.2.x releases; `GET /api/capabilities` says what a daemon offers.
+- **An OpenAPI reference for the local API:** `docs/openapi.json` (OpenAPI 3.1) describes every route, its
+  parameters and bodies (streamed ones too), its answers, the error codes, the token headers and the event
+  kinds, for apps in any language; tests check it against the code (routes, codes, kinds,
+  capabilities, and the fields that live answers carry). It is in the sdist too.
+- **Capabilities:** `GET /api/capabilities` lists the daemon's routes, features, event kinds, error codes and
+  capabilities (`events`, `pin_details`, `cache`, `config`, `jobs_add`, `add_tar`, ...).
+- **Events:** `GET /api/events?after=&kinds=&epoch=&wait=`, a long poll on the node's events (`rnfs/events.py`),
+  replacing an app's polling of each list: `job` (every state change, and a running job's progress at most once
+  a second), `pin` (added, removed, labelled), `cache` (added, removed), `name` (a newer record of a name the node holds
+  or watches) and `peer` (a peer first heard, coming online, going offline). Events are numbered within a run;
+  the last 1024 are kept, and a client that falls behind, or asks of an earlier run (`epoch`), is told `lost`
+  and reloads. At most 8 polls wait at once.
+- **Pins:** `pin ls --json` and `GET /api/pin/ls` give each pin's `label`, `origin` (where it was added from,
+  kept apart from the label), `size`, `entries` (a directory's entry count, as a number) and `added` (when first
+  pinned). `rnfs pin label <cid> [label]` / `POST /api/pin/label` give a pin a label, which becomes its listed
+  name. `name` is otherwise unchanged.
+- **The cache:** `rnfs cache ls [--json]` / `GET /api/cache/ls` list the cached fetches (downloads not pinned),
+  most recently used first, with size, completeness and whether the same content is pinned or provided;
+  `rnfs cache rm <cid>…` / `POST /api/cache/rm` evict those leading to a CID now. Apps no longer need to look in
+  `blocks/`.
+- **Settings:** `GET /api/config` gives every setting with its schema (type, choices, default, unit, range,
+  description, group, whether it applies without a restart), the running value, the value in `rnfs.toml`, and
+  whether the command line overrides it or a restart is pending; `POST /api/config/set` changes `rnfs.toml`
+  (validated as a start would, nothing written otherwise; `null` removes a setting), keeping its comments and
+  other lines, and applies at once what can be. `rnfs config [list|get|set|unset]`. `rnfs.config.settings_schema()`
+  needs no daemon. Settings that now apply without a restart: `max_storage` (enforced at once),
+  `max_download_size`, `max_output_entries`, `max_upload_rate`, `remote_pin_quota`, `follow_quota`, `max_jobs`
+  (queued jobs start if the new limit allows), `max_finished_jobs`, `serve_interfaces`, `no_serve_interfaces`,
+  `quiet_hours`, `keep_max_names`, `keeper_query` and `scan_interval`.
+- **Add and import as jobs:** `POST /api/jobs` takes `kind` `add` (`path` and `POST /api/add`'s options) and
+  `import` (`path`), with progress (`total_bytes` to read, `done_bytes` read, `rate`, `eta`), cancellation at
+  the next read, and the result `POST /api/add` / `/api/import` would give; persisted, and run again from the
+  start if interrupted. `rnfs add --background`, `rnfs import --background`.
+- **Streaming, so a daemon that can't see the app's files (Flatpak) works fully:** `POST /api/add/stream?format=tar`
+  (a tar stream becomes a directory; links, devices, absolute or `..` paths and invalid names are skipped with
+  warnings; bounded by `max_output_entries` and the DAG depth limit; extended headers over 64 KiB, global headers
+  over 4 KiB in all, data after the tar's end, and compressed or malformed tars refused),
+  `GET /api/get/stream?format=tar` (a target as a tar, fetched first, every limit checked before the response
+  starts, with an exact length; files as stored; entries whose names hold `\`, `＼` or `／`, or start as a Windows
+  drive does, `C:`, are skipped and counted),
+  `GET /api/export/stream` (an archive, byte-identical to `rnfs export`) and `POST /api/import/stream`.
+- **Peers:** `GET /api/peers` and `rnfs peers` gain `first_heard`, `rtt` and `rtt_at` (the round trip RNS measured
+  on the last link to the peer, `ping` included) and `online`, worked out by the daemon: an rnfs link is open, or
+  within 15 minutes of its last sign of life — an answer, a request served, a link, or an announce emitted within
+  that time (a path answer, or an announce relayed late, doesn't count). Decided on the monotonic clock, so a
+  wall-clock step changes nothing.
+  `rnfs peers` gains RTT and ONLINE columns.
+- **rnfs.Client and rnfs.Node:** typed methods for what was only reachable through `Client.api`: `peers()`,
+  `stats()`, `contacts.*`, `names.keep/unkeep/kept` and `names.follow/unfollow/following`, with objects (`Peer`,
+  `Stats`, `Contact`, `Kept`, `Followed`); `jobs.add` and `jobs.import_archive`; and the additions above (events,
+  capabilities, pin labels, the cache, settings, streams). A Node raises what a Client gets back.
+- **rnfs links in the library:** `rnfs.Link`, `rnfs.parse_uri`, `rnfs.format_uri`, and the LXMF link map's
+  `rnfs.encode_field` and `rnfs.decode_field` (spec section 13), for an LXMF app and other clients that carry rnfs
+  links, so they need no internal module (`rnfs/uris.py`). They need no node and load no RNS.
+- **Starting:** while a daemon opens its block store, before its API listens, `rnfs status` and the other commands
+  say it is starting, naming its process, rather than that no daemon is running; the library raises
+  `DaemonStarting` (`.pid`), a `DaemonNotRunning`, so code catching that is unchanged. Told by the rnfs dir's
+  lock, which the daemon takes first (`apiclient.dir_holder`).
+- **Per-call timeouts:** `with client.timeout(seconds):` bounds the calling thread's requests only, long polls
+  fitting inside it (a Node accepts it and does nothing); `ApiConnection.request/call/get/post(timeout=)`.
+- **Gateway sites, an origin per root:** `http://<k-cid>.rnfs.localhost:8789/<path>` serves `<cid>/<path>` and
+  `http://<name>.name.localhost:8789/<path>` the name's target, so a page can `fetch()` files of its own DAG.
+  `<k-cid>` is the CID as `k` + base36 (56 or 60 characters: an rnfs-dag CID's usual form is too long for a
+  DNS label), accepted in these hosts only (`rnfs.content.cid.to_base36`); ETags, listings and logs still show
+  the usual base32 CID. Site responses keep the page's origin (`sandbox allow-same-origin …`), can be framed
+  only by their own origin, and carry `Origin-Agent-Cluster: ?1`; service worker scripts (403) and `?format=`
+  (400) are refused there, and paths are DAG paths only. Browsers resolve `*.localhost` themselves; other tools
+  should keep using the path gateway, which is unchanged. All `*.rnfs.localhost` sites share cookies (as do all
+  `*.name.localhost` sites): neither the gateway nor the API uses them. `rnfs url <cid>|<name>[/path]` prints a
+  target's site URL.
+
+Added:
+- **Name key backups:** losing a name's key loses the name for good. `rnfs name create` and `rnfs name import`
+  say so and print the `rnfs name export` command (the API's results carry it as `warning`); the node remembers
+  which keys were exported by `name export` or imported, and `rnfs status` (`GET /api/status`,
+  `Status.unexported_names`) lists the names whose key never was. `name list` entries and `rnfs.Name` gain
+  `exported`.
+- **Clock problems are noticed:** RNS drops an announce emitted (by its sender's clock) no later than the one it took
+  a path from, so a Raspberry Pi without a clock that came back on an older time lost its name updates silently, for
+  up to a week. The node now remembers each name's last announce (`name_announces`) and holds the name's announces
+  while its clock is behind it: a publish is committed as usual, its result says why the announce is held
+  (`announce_held`, printed by `rnfs name publish`, a `RuntimeWarning` from `Name.publish`), and the announce goes
+  out once the clock passes the last one, or after a week held in all. `GET /api/status` (`Status`) gains
+  `announces_held` and `clock_offset`, the clock's offset from the network's estimated from the emission times of
+  the announces heard (the median over senders, so a few wrong clocks don't move it); a warning is logged, and
+  printed by `rnfs status`, while the clock is over 5 minutes behind. Only behind is reported: RNS delivers many
+  announces late (it holds those arriving on an interface that just came up), which looks like a clock ahead, so
+  `clock_offset` reads 0 then. The estimate never changes the clock or what the node does. Name syncs publish
+  through the same path.
+- **Pin by NomadNet address:** `rnfs add <destination>:/page/<path>` (a page as the node renders it) or
+  `<destination>:/file/<path>` (a file it serves) fetches it from that NomadNet node over a link of rnfs's own and adds
+  it like a file, pinned `user` (with an app's token, that app's source) with the link as its origin in `pin ls`; the
+  usual `add` options apply (`--no-pin`, `--wrap`, `--name`, `--to`, `--chunker`, `--only-hash`, `--background`), and it
+  runs as an `add` job with progress. Each run takes a new snapshot. The link is anonymous unless `--identify`, which
+  identifies with an identity of its own (`storage/nomadnet_identity`, made on first use), never the node's; `rnfs
+  status` (`GET /api/status`, `Status`) shows its hash, `nomadnet_identity_hash`, for the NomadNet node's operator to
+  list, making it if there is none yet. A page the node answers with its "Request Not Allowed" page fails rather than
+  being pinned, naming that hash when the add identified. A local file named like such a link
+  is added as `./<name>`. `POST /api/add` takes `nomadnet` (with `name` and `identify`) instead of `path`, as do add
+  jobs (`POST /api/jobs`); capability `add_nomadnet`; `rnfs.Node`/`rnfs.Client` `add_nomadnet()` and
+  `jobs.add_nomadnet()`. Request data (a page's fields or `var_` values) isn't supported.
+- **Encrypted folders:** `rnfs add --to <recipient>… <folder>` (and `--to-self`, `--background`, `POST /api/add` with
+  `to`) seals a folder as one sealed file: the folder is packed as a tar, everything under one top directory
+  `<folder>/`, and sealed under the name `<folder>.tar`, so its file names and structure are hidden along with its
+  content (not its approximate total size). The sealed-file format is unchanged: a recipient on 0.1.x gets a tar it can
+  unpack itself. The tar starts with a marker, a pax global header holding only the POSIX `comment` `rnfs sealed
+  folder`, which extractors ignore. The folder is walked as `add` walks one (symlinks, devices and invalid names skipped
+  with warnings; names holding `\`, `＼` or `／`, or starting as a Windows drive does, skipped too); more than
+  `max_output_entries` entries or a tree deeper than `MAX_DEPTH` is refused, and so are a folder name over 251 bytes and
+  `--no-sealed-name` with a folder (the name is what makes a recipient's `get` unpack it).
+- **Unpacking sealed folders:** `rnfs get` of a sealed folder (a sealed file whose sealed name ends in `.tar` and whose
+  content is a valid tar starting with the marker) unpacks it, by a recipient. A tar sealed as a file (by 0.1.x, or
+  `rnfs add --to bob backup.tar` now) has no marker and is still written as that file, byte for byte; `GET /api/info`
+  gives a recipient `sealed_folder`. The decrypted tar is read with `POST /api/add/stream?format=tar`'s rules (links,
+  devices, absolute or `..` paths skipped; `max_output_entries` and `MAX_DEPTH`) and written with `get`'s (temporary
+  name, unsafe names skipped). Without `-o` the output is named after the tar's top directory. The free-space check
+  counts the content twice (its blocks, then the files), and the decrypted blocks are deleted afterwards, never pinned
+  or provided. A marked `.tar` whose content isn't a valid tar is written as the file, with a warning; one past a limit
+  is refused. `rnfs get --no-extract` writes the `.tar` instead; `POST /api/get`, `POST /api/jobs` (kept with the job),
+  `Node/Client.get` and `jobs.get` take `no_extract`, and `Written` gains `extracted`. `POST /api/get` without
+  `no_extract` unpacks a sealed folder; content sealed before 0.2.0 is written as it always was. `GET /api/capabilities`
+  lists `sealed_folders`. `cat` still gives the decrypted tar, and the gateway and `--raw` the sealed bytes. `POST
+  /api/add/stream?format=tar` still can't seal (400).
+- **Remote pin status** (local only; `/pin` and the wire are unchanged): a node records the remote pins it asks
+  for (node, CID, pin or release, when, whether accepted) and works out whether each accepted one is done by
+  looking the node up among the CID's providers: paced (in the background at most 60 lookups an hour, 4 at
+  once, each pin hourly while waiting and daily after; on slow nodes 4 an hour, one at a time), waiting for up
+  to 24 hours after asking, then missing if not found. So "done" lags the node's publishing and is only as good as
+  the DHT. A node serving remote pins records what became of each (waiting, fetching, pinned, dropped with why:
+  quota, not found, denied, ...; refused because denied or its queue was full; released), which was only logged.
+  At most 10 000 asked entries and 1 000 served outcomes are kept. `remote_pin` events report both.
+  `rnfs pin remote ls [NODE_ID] [CID] [--check] [--json]` lists the pins asked for (`--check` looks them up now:
+  one lookup each, at most 32 a call, 4 on a slow node); `rnfs pin remote ls --served [--json]` lists those served
+  and each identity's use of `remote_pin_quota`. `GET /api/pin/remote?node=&cid=&check=1` and
+  `GET /api/pin/remote/served`; `ApiConnection.pin_remote_ls` / `pin_remote_served`; `Node/Client.remote_pins()`
+  and `served_pins()` (`RemotePin`, `ServedPins`, `ServedPin`, `RemotePinUsage`); capability
+  `remote_pin_status`.
+- **Publishing a folder to a name** (local behaviour built on `name publish`; nothing on the wire changes):
+  `rnfs name sync <alias> <folder>` keeps a name pointing at a folder's current content. Every `scan_interval` the
+  folder is imported as the shared folder is (unchanged files recognised by their metadata, not read again; links,
+  special files and files with other hard links left out; a folder in the rnfs directory refused), with FastCDC,
+  so an edited file shares most of its blocks with the version before. When its root changes the name is
+  published to it, as `name publish` does (the previous version's `name:` pin released), once the folder has
+  stayed unchanged a minute and at most once an hour per name (RNS's transport nodes stop rebroadcasting a
+  destination announcing faster than that). A folder that is missing, unreadable, empty or whose import fails
+  pauses the sync, logged once, and nothing is published. `rnfs name unsync <alias>` stops it, the name keeping
+  its target; `rnfs name rm` stops it too; `rnfs name syncs [--json]` lists the syncs and how they stand. Syncs
+  are kept in the state database and resume after a restart. In private mode `name sync` warns, as `name publish`
+  does, and the sync logs it once. `POST /api/name/sync {"alias", "path"}`, `POST /api/name/unsync {"alias"}`,
+  `GET /api/name/syncs`; `ApiConnection.name_sync`, `name_unsync`, `name_syncs`; `Node/Client.names.sync`,
+  `unsync` and `syncs()` (`FolderSync`); capability `name_sync`. An app's token may start and stop a sync, as it
+  may publish; the name's pin stays the name's.
+- **Files and folders inside pins are provided** (new settings `provide_entries` and `provide_entries_max`; an
+  entry is an ordinary provider record of its CID): every file and directory a directory entry names inside a
+  complete pin of the user's own content (the user's, the shared folder's, names' and apps' pins: not those other
+  nodes asked for or followed names'), at every depth, can be found by its own CID rather than only as
+  `<root>/<path>`, and the same file in two folders from either. Not chunks or other intermediate nodes, and never
+  inside cached downloads, which provide only their root; serving is unchanged (an entry's blocks are its pin's).
+  Unset (the default), it is on up to `provide_entries_max` entry keys (100,000): pins oldest first, each pin's
+  entries all or none, a pin that would pass the cap left out (logged). On a slow node
+  it is on only while republishing every key is estimated to take at most 2% of the channel (from the slowest
+  interface's bitrate, the keys, and the network size the publish rounds' regions show: about 1,300 keys at 100
+  servers and 40 from 1,000 at 1 kbit/s), and none are provided past that; once on, they stay on up to 2.5%.
+  `true` or `false` overrides the default; both settings apply at once when changed through the API. Unpinning a folder
+  withdraws its entries, except those still inside another pin. `rnfs status` (and `GET /api/status`,
+  `Status`) gains `provided_entries`, `provide_entries_off` (why none are provided) and `provide_entries_capped`;
+  `provided` counts entries too. Providing entries tells anyone looking up a file's CID that the node has it.
+- **Network status** (spec section 11, "Network status"): `rnfs status` (`GET /api/status`, the library's
+  `Status.network` and `Status.record_store`) reports what the node sees of the network, with nothing sent to learn
+  it: `network` gives the number of DHT servers the density check estimates (`size_estimate`, null until 8 lookups
+  completed; `known_nodes` is the routing table's, to compare) and how many searches and published keys the check ran
+  on and fired on in the last hour and day; `record_store` gives what counts against `record_budget` (the state
+  database's size), the records the store would hold when full, whether it is full, and for each storage tier
+  (Known, Earned, Newcomer) its records and share against its floor and the new records refused and records evicted
+  in the last hour and day. `rnfs status` sums these up in
+  a few lines after the other fields (`network_size`, `density_check`, `partition_for` while in partition mode,
+  `record_store`, `record_tiers`, `records_refused`, `records_evicted`); every existing field and line is unchanged.
+  The counts are kept in memory (per minute over the last day; a restart starts them afresh), and the status reads
+  nothing more from the state database, so apps can call it as often as before.
+
+The DHT and provider records (local behaviour: nothing on the wire changes):
+- The routing table is saved and loaded at start, so a restart doesn't make every server new again: servers keep
+  their seniority (which ranks providers and keepers), bans last their time, and `/find` replies still leave out
+  servers silent for over 2 × `announce_interval`, the time the node was down included.
+- Local scores: each node keeps a private score per peer, earned by work it checks itself (blocks served that
+  verified, `/find` answers that led to providers who served or to closer servers that answered) and lost by
+  failures, bad blocks and silence (scores halve each week). Bootstrap nodes start with a small seed they keep
+  only by earning it. Nothing is sent; at most 4096 peers are scored.
+- A join (at start, and again while too few servers are live) asks up to 6 servers of the saved routing table
+  first, best scored first, and bootstrap nodes only if fewer than two of those answer: a node that has joined
+  once is its own bootstrap list, so a restart doesn't flood path requests for bootstrap nodes on radio. After
+  such a join, a node that isn't slow still asks the default bootstrap nodes (until one answers, at most 2), so
+  one that saved only an island of servers reaches the rest of the network; a slow node no longer does.
+- Choosing providers: within each seniority group (seniority stays first), providers with a better local score
+  are tried first, before fewer hops: a provider whose blocks verified before is preferred to an unknown one.
+- The announce first-seen log: each node records when it first heard each server's announce (at most 65,536
+  servers, about 12 MB when full: servers silent for 2 × `announce_interval` forgotten first, then the newest not
+  yet senior, Security above), kept across restarts, and can give
+  the closest servers to a key among those heard for at least `provider_seniority`, which identities generated
+  next to a key can't be. Publishing and searching use it (below).
+- **Sweep providing:** republishing many keys takes far fewer lookups. One closest-nodes lookup now serves every
+  due key of its region (the keys sharing as many leading bits as the key looked up shares with its 10th-closest
+  server), with about 1.6 more `/find` a region to fill in its far half; each key still gets its own 10 closest
+  servers (100% of keys on their true 10 closest over a simulated 2000-server network, against about 97% with a
+  lookup per key). A round needs about servers ÷ 12.5 lookups however many keys are due: 1,000 keys on a
+  1,000-server network take about 80 lookups instead of 1,000. Slow nodes' 10 lookups a round now count regions,
+  not keys, so a round publishes every due key of up to 10 regions.
+- **Sweep providing on LoRa islands and at a first start:** a node that knows few identities (on an island, or just
+  started) found a key's 10 closest among them, padded with servers far from the key, so its regions held many keys
+  its lookup knew little about. Regions are now never shorter than the network size estimate implies, a key a
+  lookup until there is an estimate, and a region covers only the keys it can store on all but 2 of their 10 closest
+  servers it heard of (it heard of others whose identity it doesn't know: the others get lookups of their own). Over
+  test_topology's world of backbone and islands (1,000 / 3,000 servers), an island node's records reach 7.0 / 4.7 of
+  their true 10 closest instead of 3.8 / 2.3 (a lookup per key: 7.8 / 5.0), and a node's first round after its first
+  start 6.5 / 5.0 instead of 0.3 / 0.1, its second 7.8 / 6.9 instead of 1.9 / 0.7. It costs island nodes keys per
+  round (1.5 / 1.2 keys a region lookup instead of 6.6 / 4.9, so a slow island node's round of 10 lookups publishes
+  fewer keys); a backbone node, which knows every identity it hears of, runs as many lookups as before
+  (`tests/bench_publisher.py`, 2,000 servers: 159 for 100,000 keys and 176 for 1M, against 158 and 176 without the
+  size estimate).
+- **Stores to long-known servers too:** each key is also stored on the 10 servers closest to it among those the
+  node first heard at least `provider_seniority` (1 day) ago and has heard in the last 2 × `announce_interval`.
+  Without an attack they are mostly the key's 10 closest already, so this adds few stores; identities generated
+  next to a key can't push the record off them. Withdrawals reach them too.
+- **Content is far harder to hide by placing identities next to its key** (spec section 6, "Identities placed next
+  to a key"). Ten identities generated closer to a key than every honest server (about 4 s of one core each among
+  10,000 servers) hid it almost completely from 0.1.x nodes (found 0–4% of the time); with an upgraded publisher
+  and searcher it is found 99–100% of the time over the fake network of `tests/test_eclipse.py` (98.9% on fast
+  nodes and 90.8% on slow ones across every attack of the eclipse simulation). Four local mechanisms, nothing on
+  the wire changed:
+  - a network size estimate: the median distance to the 10th-closest server over the node's last 16 complete
+    lookups for other keys, counting only servers the lookup verified (Security above), kept in the state
+    database's `meta` table so a restart has it at once (the density check waits for 8);
+  - the density check: when the servers found near a key are packed more than twice as densely as the estimate
+    allows (from the 10th on), a search waits until 5 servers of each of two rings beyond them have answered (those
+    ranked after the dense core, and those beyond where 10 honest servers would be expected), and a publisher gives
+    the key a widened lookup of its own and stores it on 10 servers of each ring too;
+  - disjoint lookup paths: a publisher's region lookup runs as 3 lookups that share no node (2 on slow nodes) and
+    stores each key on each path's 10 closest too; a search that finds no provider at all falls back to them, in
+    what is left of the same `lookup_timeout` and of its 80 `/find` (a search still sends at most 80 in all);
+  - searches also wait for the 3 closest of the 10 servers nearest the key that the announce first-seen log heard
+    at least `provider_seniority` ago (none extra without an attack: they are the closest anyway).
+
+  The cost: a little more traffic per publish (over the fake network of 2,000 servers, +17 `/find` and +3 stores
+  to publish one key, once per republish; with sweep providing about 0.65 `/find` and 13 stores a key instead of
+  0.22 and 10), +0.2 to +0.5 `/find` per search on average (the density check fires on 2–6% of searches without an
+  attack), and a search for content nobody provides now costs about 4 times as much (30 `/find` instead of 7: the
+  fallback). A slow node paces that fallback like its publish lookups (it counts as 2 of a round's lookups and runs
+  only if the pacing allows within the lookup's time), and counts widened lookups among its round's 10 (a flagged
+  key that doesn't fit waits for the next round).
+- **Fast nodes spare LoRa islands most lookup traffic** (spec section 6, "Slow paths"; nothing on the wire changes):
+  a node that isn't slow asks servers behind a slow path (an RNS path of more than 3 hops, or its own last link to
+  the server within 24 hours had a round trip above 1 s and a rate estimate below `slow_bitrate`) after every other
+  server but unreliable ones, in searches and publish lookups, and stores to them only to make up 10. They are still
+  asked when a lookup has too few others; the routing table, `/find` replies, provider ranking and failure counts are
+  unchanged. In the topology simulation this cut the airtime internet nodes' lookups cost islands by 97% (27 s to
+  0.6 s each; a 30-server island needed 135–141% of its channel for light internet use before), and internet nodes
+  still found island content 98% of the time. Over the fake network of `tests/test_topology.py` (1,000 servers,
+  21% on islands): island `/find` per internet search 0.76 to 0, island stores per internet publish 2.5 to 0.07. A
+  server whose path was unknown is judged again once the query's path request is answered, before a link is opened.
+  `rnfs peers` is unchanged; the traffic counters now keep each peer's last link's rate estimate too (in memory).
+- **Slow nodes place records better:** a slow node's lookups may make more path requests than its `alpha` (1): up to
+  10 per publishing lookup (its 2 disjoint paths 5 each, and a widened lookup 10) and 3 per search (and 3 more over
+  the fallback's paths). A slow node hears only some servers' announces, so a publish lookup stopped at the closest
+  servers it knew: in the topology simulation an island publisher's records reached 1.3–2.7 of their 10 closest
+  servers, and internet nodes found island content 68–91% of the time; with the larger budget 3.7–4.4 and 99%, for
+  11–19% more airtime per publish. Over the fake network of `tests/test_topology.py` (1,000 servers): 3.6 to 6.9 of
+  the 10 closest. Nodes that aren't slow are unchanged (`alpha` per lookup), as is the keeper query's own budget.
+- **LoRa islands keep their own content findable** (spec section 6, "LoRa islands"; nothing on the wire changes): a
+  node with a slow interface, or naming `local_interfaces`, keeps a set of *local* servers, those whose RNS path goes
+  out on a named interface, or (none named) within `local_hops` (3) hops over an interface below `slow_bitrate`,
+  judged from the path to each server as its announces arrive and from one read of the path table every 10 minutes
+  (through `rnsd`, one RPC: a client's own path table starts empty). It also stores each key it provides on its
+  `local_replicas` (3, at most 5) closest local servers (*two-level records*: ordinary `/provide`s, withdrawn like
+  the rest; a local server no link could be opened to, though a path was found, is tried once more at once, since over
+  LoRa one lost link request left the island without its replica until the next republish), and a search asks the closest local server first (3 of them with a hop radius), its answer seeding the
+  rest of the lookup. In the topology simulation an island neighbour found content during a partition 100% of the
+  time instead of 55–72%, and island-to-island lookups took 42% less airtime, for 12% more publish airtime. Fast
+  nodes with no slow interface and no `local_interfaces` are unchanged. New settings `local_interfaces`,
+  `local_hops`, `local_replicas`; `rnfs status` gains `local_servers`.
+- **Partition mode** (spec section 6, "LoRa islands"): a node with local servers that fails 3 times in a row to reach
+  off-island servers it knows, or hears no off-island announce or answer for over 4 times the usual gap between
+  off-island announces (at least 10 minutes), and then gets no answer from one it probes, uses its local servers
+  only for lookups and publishing, so a search during a gateway outage ends in the time its island takes instead of
+  minutes of link timeouts. Any off-island answer or fresh announce ends it, and a probe of one off-island server
+  every 5 minutes (on slow nodes after 15 minutes, doubling up to 2 hours) keeps it from sticking. Silence alone never
+  enters it, so a small connected network with sparse announces doesn't flap. `rnfs status` gains `partition` and
+  `partition_since`.
+- **The heal republish:** keys whose last publish round reached no server beyond the island (during a partition) are
+  marked, and republished as soon as partition mode ends, paced as a slow node's rounds are, so the rest of the
+  network finds them within hours instead of after their next republish (3 days on a slow node). The marks are kept
+  across restarts (a new table, `published_heal`).
+
+  Together, over the fake network of `tests/test_topology.py` (1,000 servers, 21% on 8 islands, an island's gateway
+  down): a neighbour found what an island node published before the partition 100% of the time instead of 67%, and
+  what it published during it 100% instead of 91%, with 0.2 timeouts and 33 s of simulated time per search instead
+  of 11.7 and 490 s; the backbone found what was published during the partition 0% of the time until the heal
+  republish, 99.5% after it. Over a simulated week with 5 or 20 servers beyond the island announcing every 6 hours,
+  partition mode was entered only while the gateway was down, and left within 49 minutes of its coming back.
+- **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
+  servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
+  at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.
+- **Slow nodes pace withdrawals:** unpinning many keys no longer sends every withdrawal at once over radio. A slow
+  node sends withdrawals along with its round's stores to the same servers, and each server only withdrawals
+  reach counts as one of the round's 10 lookups (up to 5 kept for them while any are queued), so the round waits
+  30 s for it before the next. Other nodes still send withdrawals at once.
+- Kept names' keys take their fixed ±10% republish jitter from the key's first byte rather than the whole key: 256
+  slots still spread them out, and keys sharing their leading bits (the same servers are closest to them) come due
+  together. A key's interval may change once, by at most a fifth, at the upgrade; it stays below 3.5 days.
+- **On disk:** records are read from the state database per `/find` through an index, with a small cache, instead
+  of all held in memory (about 500 bytes each before): memory no longer grows with the records or their publishers.
+  Changes are written together every 30 s; a republish is written only when it moves a record's last-stored time by
+  more than 6 hours, and a refused store writes nothing. A flood of 300 000 fresh identities into a full store of
+  200 000 records cost about 70 µs a store and 112 transactions in all, on a desktop NVMe disk.
+- **A byte budget instead of a record count:** records may take `record_budget` of disk (new, default 1 GiB: about
+  7 million records at the 150 bytes a record takes, measured from the database), never the free disk the blocks'
+  reserve needs. `max_records` (100 000 records) goes.
+- **No per-publisher caps while there is room:** anyone stores freely until the budget is full, so a large
+  publisher (a mirror) is no longer held to 1% of the store, nor a new one to a tenth of that. The newcomer pool and
+  the memories of departed and evicted publishers go too.
+- **Storage tiers once the budget is full:** Known (contacts of kind `node`, private-mode members, bootstrap
+  nodes; 30% floor), Earned (publishers that refreshed a record on 3 distinct UTC days; 60%) and Newcomer (everyone
+  else; 10%). A store to a full node takes a record from a tier's largest holder: the lowest tier below the storer's
+  above its floor first, then, if the storer's own tier is below its floor, a higher tier above its own; else
+  within its own tier, refused for one holding as many as the largest, and for Earned publishers, which never evict
+  each other. While full, a Newcomer's record expires 4.5 days after it was last stored (otherwise every record
+  still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way by tier, with a
+  share kept for Newcomers (Security, above).
+- **Resumable and compressed block transfers** (spec section 7, `/range`): a new optional request, `/range`
+  (`[cid, offset, max_bytes, flags]`, answered `[size, encoding, bytes]`), the one addition to the wire in 0.2.0;
+  `/blocks` is unchanged. Over slow links a node fetches each raw chunk of 4 KiB or more in ranges of about
+  `max(min_rate_sample, response_target` at the link's rate estimate) bytes on the wire (16 KiB at 1 kbit/s, about 2
+  minutes, instead of a whole 64–128 KiB chunk), compressed with bz2, and keeps what arrived in a partial block
+  (`<rnfs dir>/state/partial`, at most 64, deleted at start), verified whole against the CID before it is stored and
+  never served; a provider whose response stalled gets ranges on any link. The first request of a fetch, before any
+  search, uses ranges by the same rule when it goes to the hint, a remembered provider or a node known to answer
+  `/range` (an open link otherwise gets `/blocks`, as an older node's silence would hold the search up): on a radio it
+  is most often what brings a single-chunk file (over LoRa between two Heltec V3 RNodes at 3.5 kbit/s, a 24 KB text came whole in
+  88 s, where bz2 makes it 9.8 KB). Measured with the real fetcher over a fake
+  1 kbit/s link: a stall anywhere in a 64 KiB chunk now resends 8 KiB on average (1.1 minutes) instead of 32 KiB
+  (4.4 minutes), at most 15.6 KB instead of 64.7 KB; a Gutenberg book (Pride and Prejudice, 772 KB) takes 2.8–2.9×
+  less airtime (1.74 hours to 0.63, counting about 0.7 KB of RNS overhead per response). A requester decompresses an
+  answer itself, to at most the range it asked for plus one byte, and refuses anything else (a decompression bomb
+  ends there; `tests/security/test_range_decompression.py`, `test_range_limits.py`). A responder answers `/range`
+  exactly as `/blocks`: the same response slots, pools, cooldowns, upload pacing, airtime controls and
+  `upload_budget`, and compresses at most 256 KiB a second.
+  Nodes before 0.2.0 leave `/range` unanswered (RNS drops a request for a path without a handler, which costs them
+  nothing and counts against nothing): a node asks such a provider with `/blocks` for the rest of the fetch after one
+  silence, which may be a lost packet, and records it as not answering after two silences in a row (in one fetch or
+  several; any answer clears a silence), in the new `range_support` table, asking afresh after 7 days: an older node
+  costs two request timeouts a week.
+
+Changed:
+- **A slow node no longer publishes what it downloads, by default** (spec section 6, "Provide strategy"):
+  `provide_strategy` gains `auto`, the new default, which is `pinned` on a slow node and `roots` (as before) on
+  others. Over LoRa each download's root went to about 10 servers, an identified link each: at 977 bit/s the hour
+  after three 16 KB downloads the laptop transmitted 6.6% of the time, nearly all of it publishing their roots, and it
+  told every node which files its user fetched. A slow node set to `roots` keeps doing so. After the upgrade a slow node
+  with the setting unset withdraws its cached downloads' records (paced, as any withdrawal).
+- **`provide_entries` covers the user's own content only** (a changed default): the files and folders inside pins of
+  the user, the shared folder, names and apps are provided by their own CIDs, but not those inside pins other nodes
+  asked for (`remote:`) or followed names (`follow:`), so a node doesn't publish the file CIDs of content others
+  asked it to keep; a pin the user holds too counts as the user's. Its cap of 100,000 entry keys is a new setting,
+  `provide_entries_max` (applied at once, like `provide_entries`), as a large mirror passes it: a pin whose entries
+  would pass the cap provides none of them.
+- A pacing wait no longer closes the link: after a response on a slow link the fetcher waits as long again before
+  asking that provider again (the responder's upload pacing), and on LoRa a 64 KiB chunk takes about 9 minutes, so
+  the wait outlasted `link_idle_timeout` (5 minutes) and the idle link was closed, taking its rate estimate with it:
+  the next response was sized and paced as on a new link. The link now counts as in use while its provider is
+  waited for.
+- Slow links are judged per provider, not per node: a gateway with a TCP and a LoRa interface isn't a slow node,
+  so it ran 3 parallel `/blocks`, probed open links for the root and duplicated any batch out for 30 s, all over
+  the radio. Now a provider is reached over a slow link when the link's rate estimate is below `slow_bitrate` (or,
+  without one, the next-hop interface is, or the provider is behind a slow path); providers over slow links
+  behind one next-hop interface share one request at a time, a node that isn't slow probes no open link over a
+  slow link (a slow node still probes one, as before: a hit saves a lookup over the radio), nothing is duplicated
+  onto a slow link, and on fast links a batch is duplicated only once it has taken 1.5 times its blocks' transfer
+  time at the rate estimate (and `deadline_slack`, as before).
+- A lost packet no longer drops a provider: a `/blocks` request RNS times out (its packet or its answer's lost,
+  which RNS doesn't resend), whose link times out under it, or whose new link isn't established, failed its
+  provider for the rest of the fetch at once, so at 5% packet loss most 1 MiB fetches from one provider failed.
+  Now its link is closed (which starts no cooldown at the provider) and the request asked again on a new link
+  after the busy delay; the provider fails after `max_failures` such requests in a row. A link closed by either
+  end, no path, or a malformed answer still fails it at once. Measured over the fake link of
+  `tests/test_fetcher.py`'s `LossyLinkTest` (one provider, each request lost with probability 5%), 1 MiB fetches
+  succeeded 39% of the time before and 99.7% after (300 fetches each), or 97.6% when each new link's request and
+  proof are lost at 5% too.
+- Idle links close before RNS keeps them alive. The node that opens a link sends a keepalive after
+  `max(5 s, RTT × 206)` without a packet (at most 360 s) and the other node answers, and keepalives don't count as
+  traffic, so a link left open for `link_idle_timeout` (5 minutes) on a 50 ms path carried about 58 packets, relayed
+  by every transport node on the way, against about 6 for the lookup that opened it. A link without a rate estimate
+  now closes just before its first keepalive (1 s and two round trips before the interval), if that is sooner:
+  reopening it costs about 4 packets. A link that carried `/blocks` and holds a rate estimate keeps
+  `link_idle_timeout`, since closing it resets the provider's estimate and RNS's transfer window. On radio paths
+  (RTT ≥ 1.75 s) nothing changes. Simulated over 8 hours of browsing through the gateway (lookups of 8 servers of
+  300, fetches from 1 of 40 providers, half with a rate estimate; mean of 5 runs) on 50 ms paths, links are opened
+  6,431 times rather than 4,490, 1,971 of them within 5 minutes of closing rather than 1,123, while keepalive
+  packets fall from 328,237 to 19,826, and link opening, closing and keepalive packets together from 346,199 to
+  45,548.
+- A node asked first for a fetch's first block (one with an open link, or a remote pin's asker) that had it was
+  asked for that block again in its next request, so it sent it twice: on LoRa, a whole chunk's airtime more. Now
+  it is asked for the blocks after it.
+- A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private
+  mode) announces `rnfs.dht` only at startup, no longer every `announce_interval`; nothing needs to reach it. It
+  announces again at once when it starts to provide. Servers, and clients that provide, announce as before.
+- Blocks are stored in subdirectories (`blocks/<xy>/<cid>`): one directory of millions of files is slow to list,
+  and FAT32, common on the USB drives added to a Raspberry Pi, holds only about 10,900 such names per directory
+  (a 59–64 character name takes 6 of its 65,536 entries). The cost is at the durability points: storing blocks
+  syncs each subdirectory written to (up to 1,024, 16 at a time) where it synced one directory. Adding 64 MiB
+  (1,029 blocks) to a new store on a desktop NVMe disk: 1.02 → 1.41 s; a tree of 1,024 8 KiB files 0.95 → 1.43 s;
+  fetching them (each block synced on its own) unchanged at about 13.5 s (`tests/bench_block_writes.py`,
+  `today`, median of 3).
+- `max_storage` counts what blocks take on disk: each block is a file of its own, so its size rounded up to the
+  filesystem's block or cluster (read once at the start: at least 4 KiB, 16–32 KiB on a FAT32 USB drive), not its
+  length. On FAT32 a store of small files took several times `max_storage`: 2,000 notes of 200 B–8 KB are 4.1 MiB
+  of blocks but 63 MiB of 32 KiB clusters (9.4 MiB at 4 KiB). Stores of large files barely change (64 KiB chunks
+  fill whole clusters: a mixed store of 297 MiB takes 298 MiB at 4 KiB, 312 MiB at 32 KiB), so cache is evicted a
+  little sooner. `rnfs status` (`GET /api/status`) gains `allocated_bytes`, what `max_storage` counts, and
+  `allocation_unit`; `used_bytes` stays the blocks' bytes. Quotas (`follow_quota`, `remote_pin_quota`) and
+  `max_download_size` still count bytes of content and blocks. Nothing is stored for it: it follows from the block
+  sizes rnfs keeps.
+- `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather
+  than sending the request on a second connection as it did for them until now (the fallback planned to go in
+  0.2.0): stop such a daemon and start the new one. Every daemon of 0.1.5 or later works as before.
+- `POST /api/import` (and `rnfs import`) refuse anything but a regular file, without waiting on a FIFO.
+- `Config.validate` refuses `api_port` equal to a non-zero `gateway_port`.
+- A request that times out raises `ConnectionFailed` saying the daemon "didn't answer within its timeout".
+- `Config.load` reports invalid TOML as "<path> isn't valid TOML: …" (still a `ValueError`).
+- A fetch to pin that fails keeps what it got: `pin add`, `dir set` and `dir rm`, remote pins, followed names and
+  deny lists record it as a cached fetch, as `get` and `cat` already did, so trying again resumes rather than
+  starting over (a 4 MiB pin over LoRa failing at 90% fetched all of it again). Not when it failed on denied
+  content, an invalid DAG or a size bound or quota (`TooLarge`), which a retry can't get past. The record is cache
+  like any other (evictable, removed by `gc`), and never provided as a download of the user's.
+- Remote pins don't give up on content not yet published. The node asked to pin asks the node that asked first
+  (its node ID follows from the identity of the `/pin`'s link), which serves what it added before its provider
+  records are out. A pin whose content can't be found waits and is tried again after 10 minutes, doubling up to 6
+  hours, for up to 3 days, instead of being dropped at once; `pin remote ls --served` shows it waiting
+  (`not_found`) with when it is tried again (`retry_at`, a new field of `GET /api/pin/remote/served`). Pins
+  accepted after it aren't held up, and a release ends the wait at once.
+- A `get`, `pin` or `export` job submitted with the new `retry: true` (`POST /api/jobs`; `retry=True` in the
+  library's `jobs.get`, `pin` and `export`) whose content can't be found is queued again the same way, keeping its
+  blocks, rather than failed: `retry_at` (and `retry_since` while it waits) are new fields of a job, and `rnfs jobs`
+  shows it waiting. Not for a path its directory shows doesn't exist. Retrying is opt-in: the API's default is
+  0.1.6's, failing at once, so an app polling its job still sees it fail rather than stay queued for days. `rnfs
+  get`, `pin add` and `export` with `--background` opt in; in the foreground they still fail at once.
+- **A running job says whether it is still looking for providers:** on a radio a search takes minutes before any
+  byte arrives, and a job showed only that it was running. A job now has `providers` (how many its fetch uses; null
+  before it has any, and for add and import jobs) and `searching` (true while its fetch searches the DHT), in
+  `GET /api/jobs`, its `job` events (a search beginning or ending is published at once) and the library's `Job`;
+  `rnfs get` and `rnfs jobs` show "looking for providers" until one is found, and `rnfs jobs show` the providers.
+- Path requests are paced node-wide: since RNS 1.2.5 every interface limits the path requests arriving on it (3 a
+  second while it is under 2 hours old, as a hub's interface for a newly connected client is), and a fresh node's
+  join and first publish round sent dozens at once, so its hub dropped some and the queries failed after
+  `path_timeout`, enough for partition mode on a gateway. Every path request rnfs sends (link opens, a lookup's path
+  check, name resolves, NomadNet adds) now waits its turn, at least 1 s after the last, and while the busiest
+  interface already sends more than 1.5 a second (other applications' requests included, at most 15 s); the wait
+  isn't counted in `path_timeout`. A link that fails to establish costs a turn, as RNS then asks again by itself;
+  concurrent waits for one destination share one request, and none is sent again within 20 s of the last. In the
+  topology simulation a fresh fast node's hub no longer drops any of its requests and its first publish round takes
+  41–45 s instead of 7 s (22–25 s with drops); island rounds take 60–80 s more of 25–31 minutes.
+- A query that failed for want of a path no longer counts towards partition mode (it still counts in the routing
+  table): island relays in RNS's default `full` mode never forward a request for a path they lack, and a hub drops
+  requests over its limit, so a node with local servers could enter partition mode on a connected network (in the
+  topology simulation 65–72% of island publish rounds with `full` relays). A real partition is still detected, a
+  few seconds later (the first failure for each server is a link failure).
+- Path requests only where the node can be: with its own RNS instance, a node asks for the path to a node a `/find`
+  reply named over a fast interface (at least `slow_bitrate`) only on that interface (a hub's or an AutoInterface's
+  peers count as one interface), so a gateway's lookups no longer send requests for internet nodes over its radio.
+  A node named over a slow interface, joins, names, providers and links to known nodes ask on every interface, and
+  nothing changes through a shared instance.
+- Shorter path waits for lookup candidates on nodes that aren't slow: a node measures how long its path requests take
+  to be answered, and once 20 are measured a lookup's path check waits their 95th percentile, at least RNS's own 15 s,
+  instead of `path_timeout` (30 s): a candidate whose path doesn't come costs half as long, as the lookup has others
+  to ask. Names, nodes the user names, stores, fetches, joins and slow nodes still wait `path_timeout`.
+- A server closing a link (RNS's `DESTINATION_CLOSED`: no room for another incoming link, or going away) is a
+  refusal, not a failure: a lookup's `/find` on such a link no longer counts against the server in the routing table,
+  its score or partition mode (a partition probe it ends counts as reaching the outside), and a `/blocks` provider
+  that closes the link is busy, asked again on a new link after the busy delay and failed after `max_failures` in a
+  row, instead of failing at once. A link that timed out, or that this node closed, counts as before.
+- A slow node paces by its radio's measured load: RNodes report their own airtime and the channel's load (over 15 s
+  and an hour, through rnsd too), which a slow node reads at most every 15 s while it has paced work. While the
+  channel's load is above 25% its path requests and publishing rounds (the heal republish's too) are spaced further
+  apart in proportion (twice as far at 50%, at most 4 times), never so far that a record would go unrepublished for
+  half its 7-day lifetime; while its own airtime over the last hour is above 50% it refuses `/blocks` (a new airtime
+  refusal, `blocks_refused_airtime` in `rnfs status`, `airtime` in `GET /api/stats`'s `refused`); and while its own
+  transmissions took over 2% of the channel in the last hour, `provide_entries`' default doesn't turn entries on. A
+  figure of 0.0 counts as unknown (RNodes report it before their first measurement); other nodes and interfaces
+  without the figures keep the estimates they had.
+
+Faster:
+- A long fetch looks for more providers. A fetch searched once (again only when every provider had failed), so a
+  slow provider was kept to the end: between cloud nodes a 30 MB fetch over a 4-hop route ran 29 minutes at 18 KB/s,
+  while a node 2 hops away, which had fetched the file in 26 s, provided it from then on. A node that isn't slow now
+  searches again while it has fewer providers than `max_parallel_providers`, a minute after the last search ended and
+  then twice as long each time, up to 10 minutes; what it finds joins the fetch, ranked as any provider. Slow nodes
+  don't (a search is a minute of airtime there), nor do fetches from a given node (`--from`).
+- Fetching something again doesn't look it up again. Nothing was kept between fetches, so once its links had closed
+  a gateway reload or a `pin add` after `cat` repeated the lookup (about 13.5 `/find` on a fast node). The nodes
+  that served a root are now remembered for 3 hours after they last did (in memory, up to 10 per root and 4,096
+  roots) and asked for its first block before the nodes with open links, after a remote pin's asker, under the same
+  slow-link rule; one that doesn't have it any more, or fails, is forgotten. Only nodes that served verified blocks
+  are remembered, never the providers a lookup reports. And a search that found nobody providing a root isn't
+  repeated for 10 minutes by the gateway or by the retries of followed names and deny lists, which then fail at
+  once; `get`, `cat`, `pin add`, the rest of the CLI and API, jobs and remote pins always search.
+- Range reads (`cat`, the gateway, sealed reads) size their window by the providers' links: they fetched 32 chunks
+  (2 MiB) before handing over the first byte, about 5 hours at LoRa's 1 kbit/s. While no provider known is reached
+  over a fast link (or none is known yet), the window is one chunk with the next asked for ahead, so the first
+  byte comes after one chunk (about 9 minutes at 1 kbit/s); over fast links it stays 32.
+- A start no longer lists every stored block before the API answers: their sizes are kept in the state database
+  (`block_sizes`) and read from there after a clean stop. After a crash or power loss the start lists them all,
+  as before, and corrects the table. Opening storage on a desktop NVMe disk (warm cache), small blocks: 100 000
+  of them 0.50 → 0.13 s after a clean stop (0.65 s after an unclean one), a million 5.4 → 1.2 s (7.2 s after an
+  unclean one: 1,024 directories listed and the table compared). The first start, moving them out of 0.1.6's flat
+  layout, took 4.2 s and 74 s. A cold cache and a slow disk should gain more, as the table is one file read in
+  order (`tests/bench_startup.py`, `--cold` for a cache dropped as after a reboot).
+- A start works out what the node provides faster, before the API answers. Its first refresh walked every pin's
+  DAG for the blocks the node serves, then read the folders of each of the user's own pins again for the files and
+  folders it provides (`provide_entries`); they now come from the first walk. That walk no longer remembers every
+  chunk it checked, only the DAG nodes, and DAG nodes decode without being encoded again to check they were written
+  in their one canonical form: the decoder takes each header only in its shortest form instead, which accepts
+  exactly the same blocks (a file node of 6 chunks 16.2 → 9.2 µs, of 256 chunks 588 → 346 µs, for every read).
+  Measured with `tests/bench_refresh.py` (565,000 blocks in 28 pins, one a Gutenberg-like folder of 70,000 files;
+  desktop NVMe disk, warm cache): the first refresh 6.26 → 3.81 s (5.30 s with the decoder alone, 4.33 s with the
+  one walk too), its peak memory 178 → 160 MB. A 2-vCPU cloud VM with 857,325 blocks spent about 79 s of an 88 s
+  start there: 54 s in the walk, 23 s reading the folders again.
+- The publisher's state is on disk: where and when each provided key was last published lives in the state
+  database (`publish_items`, indexed by when each is next due) and is read per round, rather than held in memory
+  for every key. A wake asks the index when the next key is due, and a round reads the due keys only, at most
+  50,000 of them (the rest in the rounds that follow at once, in slices of the key space, so the rounds need no
+  more region lookups than one would), so neither looks at every provided key; while a round runs only the stores
+  servers answered are saved, in a small table written in order, and each key's row is written once at its end.
+  Measured with `tests/bench_publisher.py` (a 2,000-server fake network, desktop NVMe disk), before → after:
+  memory per provided key 632 B → 213 B after a round and 1,326 → 187 B after a restart at 100,000 keys, 582 →
+  161 B and 1,287 → 158 B at 1M (what is left is the provide set itself: a 4 GB Raspberry Pi held about 1.5–2M
+  keys; what bounds a node now is how many it can republish a day); a wake (`next_due`, a round
+  with nothing due) 80 → 0.1 ms at 100,000 keys and about 1,100 → 0.1 ms at 1M; disk 278 → 290 B a key (the due
+  index); bytes written per round 55–83 KB → 0.8–0.95 KB a key (SQLite's WAL and checkpoints: rows are written in
+  key order, and an item's row once a round instead of at each save). A first round of 1M keys took 20 rounds of
+  50,000 and 175 region lookups, against one round of 157 (the same with the network size estimate given, as a
+  node's regions are sized: 176 and 159).
+- An answer that comes back before RNS has registered its request is no longer lost. RNS registers a request only
+  after sending it and drops an answer it can't match, so on a fast link with a busy process (about 1 request in
+  800 with 16 at once over local TCP and the CPU busy) the request waited out RNS's whole timeout, 11 s at least,
+  and failed. One such `/find` held back a whole publishing round: `tests/interop.py` sometimes took 10 to 25 s
+  longer to find a node providing what it had just added. The answer is now kept and handed over once the request
+  is registered, on `rnfs.dht` links and on the link of a NomadNet add, where a page small enough for one packet
+  (NomadNet's "Request Not Allowed" among them) could be lost the same way and the add fail.
+
+Fixed:
+- **`rnfs.Client` no longer loads RNS for an `rnfs:` target with a path:** checking the path's names imported the DAG
+  module, which loads RNS's bundled msgpack and so all of RNS. The name rule now has a module of its own
+  (`rnfs/entry_names.py`), which the DAG, `rnfs:` links and NomadNet links share.
+- **`cache rm` counts only the cached fetch's own blocks as its own**: blocks nothing used before (an add just
+  unpinned) are collected with it, and were all counted as the first CID's: on a cloud node a 435 B cached file
+  "removed 670 blocks, freed 42973080 bytes". They are counted apart, as `unreferenced_blocks` and
+  `unreferenced_bytes` (new in the answer of `POST /api/cache/rm` and `Uncached`), and `rnfs cache rm` says so.
+- **A collection after a start no longer reads every pin's DAG again**: a sealed folder's unpack ends with one, and on
+  a cloud node with 857k blocks the first unpack after a start held its result for 3 minutes, its files written at
+  once. The DAGs the start's first refresh found complete are taken whole without being read.
+- **A file-hash deny entry stops a one-block file everywhere** (spec section 8): a file of one block has its content's
+  hash as its CID's digest, and the specification says either entry stops it, but a `sha256:` entry was only checked
+  where content is assembled. A cloud node with such an entry refused the file to its own `cat` and gateway, yet
+  served it to `get --from` from another node and kept providing it. The raw CID a hash names is now denied with it.
+- **The daemon's log reaches the journal as it is written.** Under systemd (and launchd, or the Windows logon task)
+  stdout is a pipe or a file, which Python fills in 8 KiB blocks, so `journalctl --user -u rnfs -f` showed nothing for
+  hours on a quiet node, and lines turned up in bursts stamped hours earlier, all of them at a stop. Seen upgrading a
+  cloud node with 857k blocks: its first start moved them for minutes with nothing in the journal. The daemon now
+  writes stdout a line at a time.
+- **A link the other end lost is closed after one unanswered request** (spec section 3, Links). When the `rnsd` of a
+  node, or of a transport node on the way, restarted, the links through it were gone at the far end but still up at
+  this one until RNS's keepalive noticed, 12 minutes on a radio path; every request on them waited out its timeout.
+  Over LoRa, after the gateway's `rnsd` restarted, a slow node's every `/find` to the gateway took 21–23 s and failed,
+  so a search during the partition that followed found nothing in 3.5 minutes. A link that received nothing at all
+  while a request on it went unanswered is now closed, unless another request is using it or the request was a
+  `/range` to a node not known to answer it (an older node's silence, on a working link), and the next request opens a
+  new one.
+- **No links accepted until the node can answer on them** (spec section 3, Links): the `rnfs.dht` destination
+  accepted links from its creation, at the start of the daemon, but requests only once the node was set up; RNS drops
+  a request without a handler, so through a start (80 s on a cloud node with 857k blocks working out what it
+  provides, minutes at the first start after this upgrade) every request other nodes sent waited out its timeout.
+  Over LoRa a slow node's join asked a gateway restarting meanwhile and waited 20 s for nothing. Links are refused
+  (RNS drops the link request, which fails in seconds) until the request server is in place. A stop now starts by
+  refusing new links and answering every request `False`: a request arriving while the state was being closed failed
+  in its handler, logged as an error ("the state database ... is closed", seen restarting a cloud node).
+- **What a node publishes after starting cut off is healed too** (spec section 6, "The heal republish"): a node
+  that starts while its island is cut off never enters partition mode (its failures are all for want of a path, which
+  don't count) and its rounds find local servers only, so nothing marked their keys for the heal republish. Over LoRa
+  the gateway PC, restarted during an outage, stored a new key on its one neighbour, and once the backbone was back
+  nothing republished it beyond the island until its next republish, days later on a slow node. A round that reached
+  no off-island server now marks its keys while the routing table holds off-island servers but none has answered or
+  announced itself since the start; an island that knows of none, or a node that was heard from beyond it, marks
+  nothing more than before.
+- **A provider out of reach for a minute isn't dropped from the fetch**: one no path was found to failed at once and
+  was never asked again during the fetch. Over LoRa, a fetch from a file's one provider, whose `rnsd` had just
+  restarted, failed after its search reported the provider again, back by then. A provider with no path is now asked
+  again a minute later, and fails only if it is unreachable then too.
+- **A fetch uses the provider records its own node holds** (spec section 6, Finding providers): a search started
+  with nothing, though a DHT server holds records for the keys near it, and on an island a node holds the local
+  replicas of its neighbours' content. Over LoRa the laptop held the island record of a file and waited 51 s for its
+  search to find the provider it named. The providers this node's own `/find` answer would list are now candidates
+  as the search starts; the search still runs, so a record held here can't hide other providers.
+- **A job's progress counts a block as its ranges arrive**: `rnfs jobs` and the job's progress events counted a
+  block only once it was whole. Over LoRa, where a 64 KB chunk comes in `/range` responses over two minutes, a job
+  resumed after a restart showed `0 B/s  ETA ?` for 90 s while 56 KB of its next chunk had arrived. The bytes each
+  range brings now count towards `done_bytes` and the rate, once each. A `get` job also showed "finding the target"
+  until its first chunk was whole (it reads the file's start to tell whether it is sealed): its size, known from the
+  root, is now its total at once.
+- A node attached to a shared instance whose `rnsd` restarted logged a warning with a traceback each time it read
+  the radios' load meanwhile (the RPC refused). That is now a verbose line; other failures to read the stats stay
+  warnings. The node itself carries on through the restart, as before (tested on the laptop: a fetch over LoRa
+  12 s after `rnsd` came back).
+- **An older node isn't taken for one that answers `/range` for good** (REL-5): a `/range` whose link the other end
+  closed before answering (a busy 0.1.6 node evicts the link first, as it doesn't count the unanswered `/range` as a
+  request) recorded the node as answering `/range`, a record never checked again, so every later fetch from it over a
+  slow link waited out its silences as lost requests and failed it. Only an answer, a refusal, a response started or
+  a malformed answer show a handler now.
+- **A partial block the disk fails no longer loops** (REL-6): a `/range` whose bytes couldn't be written (a full or
+  read-only disk) left the partial empty but counted as progress, so the fetch asked for the same first range for
+  ever, a whole range of airtime each time over LoRa. That, or a partial that can't be read back, now has the block
+  asked whole with `/blocks` for the rest of the fetch.
+- **Damaged local state no longer stops the node** (REL-18, found by fuzzing the state files, the state database and
+  `rnfs.toml`): each of these failed every start (or, in the provider store, every expiry pass and save), and is now
+  treated as damage: logged, and dropped, set aside or clamped.
+  - A legacy JSON state file or a saved row nested about 10,000 levels deep raised RecursionError: the file is moved
+    to `.damaged` and the row deleted, as when they aren't JSON (a `names.json` still stops startup, with a plain
+    error). An `rnfs.toml` nested a few hundred levels gave every CLI command a traceback: it is refused as invalid
+    TOML.
+  - Infinite provider times in `providers.json` or a 0.1.5 or 0.1.6 database failed the upgrade's provider standing
+    step (NOT NULL), leaving the schema as it was: those publishers now start as Newcomers, and their times are
+    clamped to now as any future time is. Finite times upgrade as before.
+  - An LXMF inbox or outbox file whose `next_id` was below -2^63 failed its import: a `next_id` below 1 counts as
+    missing.
+  - A provider record whose key isn't a 16-byte blob crashed the start, expiry and every later save of the records:
+    such rows are never read. A provider standing whose records, days or publisher isn't an integer (or an ID) in
+    range, or whose records summed past 2^63, stopped the start: it counts as no standing.
+  - A cut-short publish round's saved item list holding an item that didn't parse stopped the start: the list counts
+    as malformed whole.
+  - A file or a dangling link at `<state dir>/partial` stopped the start: partial blocks are kept in memory, with a
+    warning. An empty partial block's first range was appended to a file left at its path: the file starts afresh.
+- **A crash during a get job's write-out leaves nothing behind** (REL-10): `node.get` wrote under a random hidden name
+  beside the output (`.rnfs-get-<random>.partial`, up to the download's size, there for a sealed file's whole fetch),
+  which nothing removed after a crash. A get job's write-out is now named after the job
+  (`.rnfs-job-<id>.write.partial`), and the run that resumes it removes it, as it does the job's partial output.
+- **A clock stepped forward doesn't end a retry** (REL-11): a job or remote pin first not found while a Raspberry Pi
+  without a real-time clock still had the time it booted with gave up at its next try once NTP had stepped the
+  clock days on, as if it had been retried for 3 days. A try more than 6 hours after it was due (that, or the node
+  off) no longer counts the time between.
+- While a daemon was starting (minutes on a small node as RNS's transport starts), the CLI said "no API token …: is
+  the daemon running?", as the token is written once the API is up: it now says the daemon is starting, as it does
+  once the token is there and the port isn't yet.
+- **A fast link's provider no longer refuses for a minute after a large response** (REL-12): the default upload cap
+  set when the next response may start from the link's rate estimate, which small `/range` responses had left below
+  `slow_bitrate` (RNS's measurement of a small transfer is mostly its ramp-up). After a 327 KB response that took 8 s
+  between two cloud nodes, Madrid refused the next for 57 s, and the requester, pacing by the 8 s, failed it after
+  three refusals, and the fetch failed (found by a soak of random fetches between the cloud nodes). Once a
+  response under the default cap concludes, the next may start twice the time it took after it started.
+- **A name sync stops when its name's key is deleted by hand** (REL-16): the key's pins were released at the next
+  start but its sync stayed, paused, and a new, unrelated name later made or imported under the alias got the old
+  folder published to it at the folder's next change. Such a sync is now dropped at the start, with a warning; one
+  whose key file is there but can't be read is kept, as its pins are.
+- **A provider whose responses a route cuts is asked in ranges** (REL-19): between cloud nodes, one route cut every
+  64 KiB `/blocks` response from Montreal at the same point (52 of 64 KiB); each counted as the provider being busy,
+  and after three the fetch failed it, though ranges, half a chunk each, would have come through. A response that
+  stopped arriving partway now has the next request of that provider made in ranges, as after a stall.
+- `announce_interval`, `republish_interval` and `scan_interval` had to be only above 0, so a typo such as
+  `announce_interval = 1e-300` would have announced in a loop, flooding a radio channel. They are now at least 60 s,
+  10 minutes and 1 s: `config set` refuses less, and a smaller value already in rnfs.toml is raised to the minimum
+  with a warning, so an upgraded node still starts.
+- An `rnfs.toml` starting with a UTF-8 byte-order mark, as some Windows editors save it, was refused as invalid TOML:
+  it is read, and `config set` writes it back without the mark.
+- The API answered `HEAD` (always refused, 405) with a JSON body after the headers, which a client reads as the start
+  of the next response: now the headers only.
+- The API's integer parameters, a request's `Content-Length` and `quiet_hours` took whatever Python's `int()` takes:
+  `1_0`, `+7`, spaces, other scripts' digits. Only ASCII digits are taken now, and a `Content-Length` of 2**63 or more,
+  which overflowed the body reader, is refused (400, as a negative one is; one that isn't a number stays 411).
+- Path requests in a burst kept their spacing only as reserved: a thread that slept past its turn, as a loaded machine
+  does (80 ms on a CI runner), went with the next one's, two requests at once. The spacing now holds between the
+  requests that actually go.
+- A fetch running for days kept every search it made again (one each 10 minutes that found its providers again):
+  it now keeps its first and the latest 8.
+- **A stalled response no longer fails the other requests on its link** (REL-7): closing the link for it failed a
+  request waiting for its slot (another fetch from the same provider, which then failed the provider) and a `/find`
+  in progress on it. The link is closed only if nothing else uses it, and a request that wasn't sent because its link
+  closed meanwhile counts as lost, asked again on a new link.
+- **A search isn't held for minutes by servers that don't answer** (specification section 6, Finding providers):
+  RNS gives a server it has a long path to the whole of its link establishment timeout, and on a LoRa island two
+  servers, one 34 hops away by RNS's path, held two of a search's three query places 127 and 217 s each; the node
+  that knew the provider was asked only after them, 6 minutes in, and a gateway request in a later round ran out its
+  600 s. A search's query unanswered after 15 s (45 s on a slow node) now gives up its place, ranked with the
+  unreliable until it answers, and its answer still counts. A search that has found nobody still waits for such
+  queries, up to 3 times as long after each was sent, as one may hold the only record. Finding the closest nodes,
+  for publishing, is unchanged.
+- **A get just after the add finds the content** (specification section 6, Finding providers): content added
+  elsewhere is found only once its publisher's records are out, which between cloud nodes took over 20 s when the
+  publish lookup waited on a server that didn't answer, so a `get` of a CID shared as it was added failed with "no
+  provider found" (several fetches of the soak, asked 20 s after the add). A fetch the user asked for that found no
+  provider at all now searches once more, a twentieth of `lookup_timeout` (30 s) later, before it fails; the
+  gateway's and the node's own retries don't.
+- **A provider named by an answer that came after its lookup ended is used** (spec section 6, Finding providers): a
+  lookup completes once the closest nodes by rank have answered, with queries still out, and their answers' providers
+  were dropped. Over LoRa the PC searched for a file the laptop had just added: the laptop, one hop away on the radio
+  but ranked last as a slow path, answered with itself as provider 29 ms after the first lookup completed, and the
+  fetch failed a second later. Those providers are now reported once the search's runs are over.
+- **One lost request no longer fails a provider at once**: a request left unanswered on a link that heard nothing
+  meanwhile closes the link (0.2.0, above), and the request then counted as a failure rather than as lost, so the
+  provider was dropped from the fetch. Over LoRa a lone lost `/range` looks just so, and a fetch from the file's one
+  provider failed. It now counts as lost: asked again on a new link, failed only `max_failures` times in a row.
+
 ## 0.1.6
 
 Security fixes, maintainability work and performance work. No wire-format or CID changes: these nodes, 0.1.5,
@@ -120,7 +1098,7 @@ Security:
   and at most 64 KiB of the proof response is read.
 - After the proof, the client sends the request on a new connection only to a daemon that proved a version below
   0.1.5 (those close every connection); a newer daemon that closes the proved connection gets
-  `ConnectionFailed`, and nothing is sent. The fallback for 0.1.4 daemons goes in 0.1.7.
+  `ConnectionFailed`, and nothing is sent. The fallback for 0.1.4 daemons goes in 0.2.0.
 - A followed name can no longer fill the follower's disk: its new target is fetched only if its size, and the
   bytes of its DAG's blocks, fit in `follow_quota` (default 1 GiB); otherwise the check fails, the follow's state
   says why, and the previous target stays pinned. While one target replaces another both are held, so a followed

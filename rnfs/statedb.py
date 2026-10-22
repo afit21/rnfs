@@ -17,7 +17,8 @@
   transaction recorded in the migrated table, then renames it to <name>.migrated. A crash between the commit and
   the rename leaves the record, so the next start only renames the file: nothing is imported twice or by half.
 
-Stores keep their state in memory and read the database only when they load (open_store), and write what changed
+Stores keep their state in memory and read the database only when they load (open_store; the provider store, which
+may hold millions of records, is the exception: it reads them per key, rnfs.dht.providers), and write what changed
 through a RowStore: it keeps the keys changed and not yet written, writes them at once (WRITE_THROUGH) or at the
 store's saves (SNAPSHOT, outside the store's lock, one save at a time), and keeps them for the next write when one
 fails. reconcile_pins makes a feature's pins match its saved state at start. Text that may hold lone
@@ -26,8 +27,10 @@ SQLite's signed 64-bit integers, as decimal text.
 """
 import importlib
 import json
+import math
 import os
 import stat
+import struct
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -35,6 +38,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 from rnfs import fsutil
+from rnfs.constants import ID_LENGTH
+from rnfs.content.cid import Cid
 from rnfs.errors import RnfsError
 from rnfs.log import LOG_ERROR, LOG_NOTICE, log, plural
 
@@ -49,6 +54,84 @@ MIGRATED_SUFFIX = ".migrated"
 # wrote has them already, so an edit there would never reach it. A step's item is an SQL statement, or a callable
 # taking the transaction's connection, for a migration SQL alone can't express.
 Step = str | Callable[[object], None]
+
+# Each publisher's standing for the provider store's tiers (rnfs 0.2.0), built from the records 0.1.x left: its record
+# count, and Earned (tier 1, days 3) if it was first seen at least 3 days before its latest store and has a record
+# outside 0.1.x's newcomer pool that it refreshed a day or more after storing it, else Newcomer (tier 0, days 0). 0.1.x
+# counted no refresh days; that is the nearest it kept to them, and keeps publishers that have been refreshing for
+# days from being treated as strangers by the first flood after the upgrade. last_day is the UTC day of its latest
+# store. Infinite times (0.1.x kept those of a damaged or hand-edited providers.json) are left for the store's load to
+# clamp, but infinity minus infinity is NaN, which SQLite reads as NULL: COALESCE makes an earned it can't decide
+# Newcomer, as a NULL tier would fail NOT NULL and every start with it; it changes nothing for finite times.
+# A schema step and the import of providers.json both run it: never change it once released (a new step gets a new one)
+PROVIDER_STANDING = (
+    "INSERT INTO provider_standing (publisher, records, tier, days, last_day)"
+    " SELECT publisher, records, earned, 3 * earned, last_day FROM ("
+    "SELECT r.publisher AS publisher, COUNT(*) AS records,"
+    " COALESCE(MAX(r.last_stored) - MIN(p.first_seen) >= 259200"
+    " AND MAX(r.pooled = 0 AND r.last_stored - r.first_stored >= 86400), 0) AS earned,"
+    " CAST(MAX(r.last_stored) / 86400 AS INTEGER) AS last_day"
+    " FROM provider_records r JOIN provider_publishers p ON p.publisher = r.publisher GROUP BY r.publisher)")
+
+# publish_items' item for a DhtKey: this byte and the key (a binary CID starts with its version, 01)
+KEY_ITEM_PREFIX = b"\x00"
+ITEM_TIME = struct.Struct(">d")  # an earlier server's time in publish_items' earlier
+
+
+def _published_item(text) -> tuple[bytes, bytes] | None:
+    """(publish_items' item, its key) of an item as the published tables wrote it (str() of a Cid, or "key:" and a key's
+    hex digits), or None if it isn't one."""
+    if isinstance(text, str) and text.startswith("key:"):
+        try:
+            key = bytes.fromhex(text[len("key:"):])
+        except ValueError:
+            return None
+        return (KEY_ITEM_PREFIX + key, key) if len(key) == ID_LENGTH else None
+    try:
+        cid = Cid.parse(text)
+    except ValueError:
+        return None
+    return cid.binary, cid.key
+
+
+def _saved_time(value) -> bool:
+    """True if value is a time the published tables could hold: a finite int or float, not a bool."""
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def move_published(tx):
+    """Move the rows of the published, published_earlier and published_heal tables (rnfs 0.1.x's, and those an import
+    of published.json writes) into publish_items, inside transaction tx: an item's row, its earlier servers and its
+    mark become one row, due 0 until the publisher computes when (it does whenever the meta value (publisher,
+    interval) isn't its republish interval: deleted here). Rows the publisher would have skipped as malformed (an item
+    that doesn't parse, a time that isn't a number, node IDs not 16 bytes) are dropped, as are marks of items without
+    a published row. Times are kept as written: the publisher clamps those in the future when it loads. Never change
+    this: a schema step runs it."""
+    items: dict[bytes, list] = {}  # key -> [item, at, nodes, earlier {node: at}, heal]
+    for text, at, nodes in tx.execute("SELECT item, at, nodes FROM published").fetchall():
+        parsed = _published_item(text)
+        if parsed is None or not _saved_time(at) or not isinstance(nodes, bytes) or len(nodes) % ID_LENGTH:
+            continue
+        items.setdefault(parsed[1], [parsed[0], None, b"", {}, 0])[1:3] = [float(at), nodes]
+    for text, node, at in tx.execute("SELECT item, node, at FROM published_earlier").fetchall():
+        parsed = _published_item(text)
+        if parsed is None or not isinstance(node, bytes) or len(node) != ID_LENGTH or not _saved_time(at):
+            continue
+        items.setdefault(parsed[1], [parsed[0], None, b"", {}, 0])[3][node] = float(at)
+    for (text,) in tx.execute("SELECT item FROM published_heal").fetchall():
+        parsed = _published_item(text)
+        if parsed is not None and parsed[1] in items and items[parsed[1]][1] is not None:
+            items[parsed[1]][4] = 1
+    tx.executemany("INSERT OR REPLACE INTO publish_items (key, item, due, at, retry, nodes, earlier, heal)"
+                   " VALUES (?, ?, 0, ?, NULL, ?, ?, ?)",
+                   sorted((key, item, at, nodes, b"".join(node + ITEM_TIME.pack(when)
+                                                          for node, when in earlier.items()), heal)
+                          for key, (item, at, nodes, earlier, heal) in items.items()))
+    for table in ("published", "published_earlier", "published_heal"):
+        tx.execute(f"DELETE FROM {table}")
+    tx.execute("DELETE FROM meta WHERE store = 'publisher' AND key = 'interval'")
+
+
 SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
     ("statedb", (
         # JSON state files imported, so each is imported once (migrate)
@@ -143,6 +226,140 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         "CREATE TABLE shared_folder_files (name TEXT NOT NULL, state TEXT NOT NULL, cid BLOB NOT NULL,"
         " height INTEGER NOT NULL, digest BLOB, PRIMARY KEY (name, state)) WITHOUT ROWID",
     )),
+    ("pin_details", (
+        # When each pinned CID was first pinned (Unix time; rnfs 0.2.0), by any source; a pin made by an earlier
+        # version has no row. A table of its own: the released tables stay exactly as 0.1.5 made them
+        "CREATE TABLE pin_times (cid BLOB PRIMARY KEY, added REAL NOT NULL) WITHOUT ROWID",
+        # A label the user gave a pin (pin label), kept apart from where it was added from (pin_names); dump()ed
+        "CREATE TABLE pin_labels (cid BLOB PRIMARY KEY, label TEXT NOT NULL) WITHOUT ROWID",
+    )),
+    ("name_exports", (
+        # Name keys known to exist outside this node (rnfs 0.2.0): exported through `name export` (how "export")
+        # or imported from such a file (how "import"), when it last happened. A key made before 0.2.0 has no row
+        "CREATE TABLE name_exports (name BLOB PRIMARY KEY, at REAL NOT NULL, how TEXT NOT NULL) WITHOUT ROWID",
+    )),
+    ("routing", (
+        # The routing table (rnfs 0.2.0; rnfs.dht.routing_state), one row per node: state 0 in the table (first_seen,
+        # at = last heard, failures = failed queries since), 1 dropped with its seniority kept (first_seen, at = when
+        # dropped), 2 banned (at = when the ban ends). Times are Unix time
+        "CREATE TABLE routing (node BLOB PRIMARY KEY, state INTEGER NOT NULL, first_seen REAL, at REAL NOT NULL,"
+        " failures INTEGER NOT NULL) WITHOUT ROWID",
+    )),
+    ("scores", (
+        # Local scores (rnfs 0.2.0; rnfs.dht.scores): a peer's score as of updated, when it was last raised (NULL:
+        # never) and when it was seeded as a bootstrap node (NULL: not). Times are Unix time
+        "CREATE TABLE peer_scores (node BLOB PRIMARY KEY, score REAL NOT NULL, updated REAL NOT NULL, useful REAL,"
+        " seeded REAL) WITHOUT ROWID",
+    )),
+    ("first_seen", (
+        # The announce first-seen log (rnfs 0.2.0; rnfs.dht.firstseen): when each server's rnfs.dht announce was
+        # first heard, and about when last (it orders forgetting). Times are Unix time
+        "CREATE TABLE announce_first_seen (node BLOB PRIMARY KEY, first_heard REAL NOT NULL, last_heard REAL NOT NULL)"
+        " WITHOUT ROWID",
+    )),
+    ("providers_on_disk", (
+        # rnfs 0.2.0: records are read per key rather than loaded whole, within a byte budget, in storage tiers. Each
+        # publisher's standing: records it holds, its tier (0 Newcomer, 1 Earned, 2 Known, 3 this node), the UTC days
+        # (days since the epoch) on which it refreshed a record it held, and the last of them
+        "CREATE TABLE provider_standing (publisher BLOB PRIMARY KEY, records INTEGER NOT NULL, tier INTEGER NOT NULL,"
+        " days INTEGER NOT NULL, last_day INTEGER NOT NULL) WITHOUT ROWID",
+        "CREATE INDEX provider_standing_tier ON provider_standing (tier, records)",  # a tier's largest holders
+        "CREATE INDEX provider_records_publisher ON provider_records (publisher, last_stored)",  # eviction, retain
+        "CREATE INDEX provider_records_last ON provider_records (last_stored)",  # expiry
+        PROVIDER_STANDING,
+        # The newcomer pool and the memories of departed and evicted publishers went with the per-publisher caps
+        "UPDATE provider_records SET pooled = 0 WHERE pooled != 0",
+        "DELETE FROM provider_departed",
+        "DELETE FROM provider_evicted",
+    )),
+    ("lxmf_app_pins", (
+        # In-core LXMF's pins become the LXMF app's (rnfs 0.2.0): lxmf:<address> -> app:lxmf:<address>
+        # (storage.LXMF_PREFIX). Only valid ones, as GLOB is case-sensitive and spelt out: an invalid lxmf: row is
+        # still deleted when storage loads, never turned into a valid app: one. A row whose new form a pin already
+        # has (none can, short of a database edited by hand) stays as it was, and is deleted
+        "UPDATE OR IGNORE pins SET source = 'app:' || source WHERE source GLOB 'lxmf:" + "[0-9a-f]" * 32 + "'",
+        "DELETE FROM pins WHERE source GLOB 'lxmf:" + "[0-9a-f]" * 32 + "'",
+    )),
+    ("apps", (
+        # rnfs app add's apps (rnfs/apps.py; rnfs 0.2.0): name, its token's verifier (apiclient.app_verifier, never
+        # the token), when it was added
+        "CREATE TABLE apps (name TEXT PRIMARY KEY, verifier BLOB NOT NULL, created REAL NOT NULL) WITHOUT ROWID",
+    )),
+    ("block_sizes", (
+        # Every stored block's size (rnfs 0.2.0), so a start needn't list them all: trusted only while the meta
+        # value (block_sizes, clean) is 1, which Storage.close() sets once it has written the table whole
+        "CREATE TABLE block_sizes (cid BLOB PRIMARY KEY, size INTEGER NOT NULL) WITHOUT ROWID",
+    )),
+    ("remote_pin_status", (
+        # Remote pins this node asked for (rnfs 0.2.0; rnfs.remote_pins): the latest ask of each (node, CID), pin 1
+        # or 0 (release), whether accepted, when asked (Unix time), and the checks that work out whether it is done:
+        # the last one tried, the last conclusive one and what it found (1, 0, NULL never), the last finding it.
+        # Pins asked before 0.2.0 have no row
+        "CREATE TABLE remote_pins_asked (node BLOB NOT NULL, cid BLOB NOT NULL, pin INTEGER NOT NULL,"
+        " accepted INTEGER NOT NULL, asked REAL NOT NULL, tried REAL, checked REAL, found INTEGER, seen REAL,"
+        " PRIMARY KEY (node, cid)) WITHOUT ROWID",
+        # The latest outcome of each remote pin other identities asked of this node: state (waiting, fetching,
+        # pinned, dropped, refused, released), why if dropped or refused, when, and a dump()ed detail. Kept apart from
+        # remote_pins (the pins waiting), whose meaning is as released
+        "CREATE TABLE remote_pins_served (identity BLOB NOT NULL, cid BLOB NOT NULL, state TEXT NOT NULL, reason TEXT,"
+        " at REAL NOT NULL, detail TEXT, PRIMARY KEY (identity, cid)) WITHOUT ROWID",
+    )),
+    ("name_sync", (
+        # Folders synced to names (rnfs 0.2.0; rnfs.name_sync), by alias: the folder (its dump()ed absolute path), the
+        # signature and root of its last import (NULL before one), the root the sync last published and when (Unix
+        # time; NULL before one), and when the sync was set up
+        "CREATE TABLE name_syncs (alias TEXT PRIMARY KEY, path TEXT NOT NULL, signature TEXT, root BLOB,"
+        " published BLOB, published_at REAL, added REAL NOT NULL) WITHOUT ROWID",
+        # What each file of a synced folder was built as (FastCDC), as shared_folder_files holds the shared folder's;
+        # name: the dump()ed alias of the sync it was read for
+        "CREATE TABLE name_sync_files (name TEXT NOT NULL, state TEXT NOT NULL, cid BLOB NOT NULL,"
+        " height INTEGER NOT NULL, digest BLOB, PRIMARY KEY (name, state)) WITHOUT ROWID",
+    )),
+    ("publisher_heal", (
+        # The published items (published.item) whose last round reached no server beyond the node's island (rnfs
+        # 0.2.0, section 6 "LoRa islands"): republished when partition mode ends, also after a restart
+        "CREATE TABLE published_heal (item TEXT PRIMARY KEY) WITHOUT ROWID",
+    )),
+    ("name_announces", (
+        # This node's last announce of each of its names (rnfs 0.2.0; rnfs.names, "Announces and the clock"): when it
+        # was emitted (Unix time, whole seconds, as RNS signs it; NULL if none went out yet), and for how many seconds
+        # the name's announces have been held since, the clock being behind it. Kept when the name is removed
+        "CREATE TABLE name_announces (name BLOB PRIMARY KEY, emitted INTEGER, held REAL NOT NULL) WITHOUT ROWID",
+    )),
+    ("remote_pin_retry", (
+        # The remote pins waiting (remote_pins) whose content wasn't found (rnfs 0.2.0; rnfs.retry): when each is
+        # tried again and when it was first not found (Unix times). Saved with remote_pins, in the same transaction
+        "CREATE TABLE remote_pin_retries (source TEXT NOT NULL, cid BLOB NOT NULL, retry_at REAL NOT NULL,"
+        " since REAL NOT NULL, PRIMARY KEY (source, cid)) WITHOUT ROWID",
+    )),
+    ("range_support", (
+        # Whether each node answers /range (rnfs 0.2.0; rnfs.ranges): answers 1 if it answered the last, else 0 with the
+        # /range requests it left unanswered in a row since (2 mark it as not answering), and when last found (Unix
+        # time). The silences are forgotten 7 days after the last, so the node is asked afresh; at most 10,000 rows
+        "CREATE TABLE range_support (node BLOB PRIMARY KEY, answers INTEGER NOT NULL, silences INTEGER NOT NULL,"
+        " at REAL NOT NULL) WITHOUT ROWID",
+    )),
+    ("publisher_on_disk", (
+        # rnfs 0.2.0: the publisher reads its state per round rather than holding it in memory (rnfs.publisher). One
+        # row per provided item, by its DHT key (key: rows in key order, as rounds write them); item is a binary CID,
+        # or 00 and a DhtKey's key; due when it is next published (Unix time; 0: never published); at when it last
+        # was (NULL: never, or that round was cut short),
+        # retry when it is tried again sooner (NULL: not), nodes the servers that recorded it then (their IDs
+        # concatenated), earlier other servers that may still hold a record of it (ID and big-endian double time,
+        # concatenated), heal 1 if its last round reached no server beyond the island
+        "CREATE TABLE publish_items (key BLOB PRIMARY KEY, item BLOB NOT NULL, due REAL NOT NULL, at REAL, retry REAL,"
+        " nodes BLOB NOT NULL, earlier BLOB NOT NULL, heal INTEGER NOT NULL) WITHOUT ROWID",
+        "CREATE INDEX publish_items_due ON publish_items (due)",
+        "CREATE INDEX publish_items_heal ON publish_items (heal) WHERE heal != 0",
+        # The stores of a round in progress, saved as it goes so a crash in a round still leaves where it stored,
+        # and emptied when the round ends (its items' rows have them then). Rows are only appended, which writes few
+        # pages: first, with node x'', the round's items (each as publish_items' item, after a byte giving its
+        # length); then a row per server that answered, when, and the items it recorded (their places in that
+        # list, 4-byte big-endian)
+        "CREATE TABLE publish_stores (node BLOB NOT NULL, at REAL NOT NULL, items BLOB NOT NULL)",
+        # published, published_earlier and published_heal's rows become publish_items rows
+        move_published,
+    )),
 )
 
 
@@ -161,8 +378,13 @@ def dump(value) -> str:
 
 
 def load(text: str):
-    """The value dump() wrote. Raises ValueError (or TypeError) if text isn't JSON."""
-    return json.loads(text)
+    """The value dump() wrote. Raises ValueError (or TypeError) if text isn't JSON, or is nested too deeply to parse."""
+    try:
+        return json.loads(text)
+    except RecursionError:
+        # Nested deeper than json can parse (about 10,000 levels): no dump() wrote that, so it is damage, which every
+        # caller handles as the ValueError of text that isn't JSON
+        raise ValueError("JSON nested too deeply to parse") from None
 
 
 def set_meta(tx, store: str, key: str, value):
@@ -244,6 +466,14 @@ class _Database:
             raise RnfsError(f"the state database {self.path} was written by a newer version of rnfs (schema "
                             f"{version}; this version knows up to {len(SCHEMA)}); run that version or a later "
                             "one (rnfs never moves state back to an older format)")
+        # An existing database's upgrade can take minutes on a large one (steps that move rows): said, so a start that
+        # is busy with it isn't taken for a hung one. A new database's steps only create tables
+        upgrading = 0 < version < len(SCHEMA)
+        started = time.monotonic()
+        if upgrading:
+            steps = plural(len(SCHEMA) - version, "step")
+            log(f"upgrading the state database {self.path} for this version of rnfs ({steps}; once, and on a large "
+                "database it takes a while)", LOG_NOTICE)
         for number in range(version, len(SCHEMA)):
             with self.transaction(durable=True) as tx:
                 for step in SCHEMA[number][1]:
@@ -252,6 +482,8 @@ class _Database:
                     else:
                         tx.execute(step)
                 tx.execute(f"PRAGMA user_version = {number + 1}")
+        if upgrading:
+            log(f"upgraded the state database in {time.monotonic() - started:.1f} s", LOG_NOTICE)
 
     @contextmanager
     def transaction(self, durable: bool) -> Iterator:
@@ -321,6 +553,29 @@ class _Database:
                     self.conn = None
 
 
+class _MemoryDatabase(_Database):
+    """A private in-memory database holding only some stores' tables, for a store that persists nothing (a node's
+    store in tests): the store runs the same code on it as on the state database."""
+
+    def __init__(self, stores: tuple[str, ...]):
+        """A new empty database with the tables of the schema steps labelled with one of stores, applied in order."""
+        self.sqlite3 = _sqlite3()
+        self.state_dir = None
+        self.path = ":memory:"
+        self.lock = threading.Lock()
+        self._owner = None
+        self.references = 0
+        self.synchronous = None
+        self.conn = self.sqlite3.connect(":memory:", isolation_level=None, check_same_thread=False)
+        with self.transaction(durable=False) as tx:
+            for label, steps in SCHEMA:
+                for step in steps if label in stores else ():
+                    if callable(step):
+                        step(tx)
+                    else:
+                        tx.execute(step)
+
+
 def damaged_message(path: str, problem: str) -> str:
     """The startup error for a damaged state database: what is wrong and how to recover."""
     directory = os.path.dirname(path)
@@ -380,7 +635,8 @@ class StateDb:
         return self._db().transaction(durable)
 
     def query(self, sql: str, params=()) -> list[tuple]:
-        """Every row of a read (stores read only when they load). Raises StateDbError."""
+        """Every row of a read (stores read when they load; the provider store also as it goes). Raises
+        StateDbError."""
         return self._db().query(sql, params)
 
     def meta(self, store: str, key: str, default=None):
@@ -396,7 +652,8 @@ class StateDb:
                 return
             database.references -= 1
             if database.references == 0:
-                _open.pop(_key(database.state_dir), None)
+                if database.state_dir is not None:  # an in-memory one (connect_memory) isn't listed
+                    _open.pop(_key(database.state_dir), None)
                 database.close()
 
 
@@ -428,6 +685,15 @@ def connect(state_dir: str) -> StateDb:
         db.close()
         raise
     return db
+
+
+def connect_memory(stores: tuple[str, ...]) -> StateDb:
+    """A reference to a new private in-memory database holding only the tables of the schema steps labelled with
+    one of stores (e.g. ("providers", "providers_on_disk")), for a store that persists nothing. Not shared: each call
+    makes another, gone once closed."""
+    database = _MemoryDatabase(stores)
+    database.references = 1
+    return StateDb(database)
 
 
 def open_databases() -> list[str]:
@@ -589,7 +855,7 @@ class RowStore:
 def reconcile_pins(pins: dict, prefix: str, recorded: Callable[[str, object], bool], clean: bool,
                    adopt: Callable[[dict[str, list]], None], release: Callable[[str, object], None]):
     """At start, make a feature's pins match its saved state. Its pins are those whose source is prefix and an
-    owner ("lxmf:<sender>", "follow:<name>"); pins is storage.pins() (CID -> sources). A pin recorded(owner, cid)
+    owner ("follow:<name>"); pins is storage.pins() (CID -> sources). A pin recorded(owner, cid)
     says the state doesn't record was left by a crash between the pin and the save, or by state that was lost.
 
     If the state is clean (saved whole, and every row of it read), release(owner, cid) releases each such pin:
@@ -662,8 +928,8 @@ LEGACY: tuple[Legacy, ...] = (
     Legacy("keepers.json", "rnfs.features.keepers:import_keepers"),
     Legacy("follow.json", "rnfs.features.follow:import_follow"),
     Legacy("contacts.json", "rnfs.features.contacts:import_contacts"),
-    Legacy("lxmf_inbox.json", "rnfs.features.lxmf:import_inbox"),
-    Legacy("lxmf_outbox.json", "rnfs.features.lxmf:import_outbox"),
+    Legacy("lxmf_inbox.json", "rnfs.lxmf_messages:import_inbox"),
+    Legacy("lxmf_outbox.json", "rnfs.lxmf_messages:import_outbox"),
 )
 
 
@@ -731,6 +997,8 @@ def read_json(path: str, shape: Callable[[object], bool] | None = None):
         return None
     except ValueError as e:
         problem = str(e)
+    except RecursionError:  # nested deeper than json can parse (about 10,000 levels): damage too
+        problem = "nested too deeply to parse"
     except OSError:
         if not os.path.isdir(path):  # Windows reports opening a directory as PermissionError
             raise

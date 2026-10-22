@@ -17,6 +17,7 @@ import unittest
 from unittest import mock
 
 from rnfs import api, cli, features, fsutil
+from rnfs import events as rnfs_events
 from rnfs.api import ApiHandler, ApiServer, BodyReader, LocalServer, loggable
 from rnfs.content import edit
 from rnfs.content.cid import DAG, RAW, Cid
@@ -46,8 +47,11 @@ class FakeNode:
         self.pins: dict[str, set[str]] = {}
         self.keys: dict[str, bytes] = {}  # alias → key
         self.records: dict[str, dict] = {}  # name → {"cid", "sequence"}
+        self.syncs: dict[str, str] = {}  # alias → folder synced (name_sync)
         self.provider_map: dict[str, list[bytes]] = {}
         self.piece = 7  # read() yields pieces this big, to exercise streaming
+        self.cached: set[str] = set()  # cache_ls's targets
+        self.events = rnfs_events.EventLog()  # GET /api/events
 
     def record(self, method, *args, **kwargs):
         """Remember a facade call."""
@@ -155,9 +159,10 @@ class FakeNode:
     # Facade
 
     def add_path(self, path, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True,
-                 chunker=None):
+                 chunker=None, progress=None, source="user"):
         self.record("add_path", path, wrap=wrap, only_hash=only_hash,
-                    **self._given("add_path", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker))
+                    **self._given("add_path", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker,
+                                  source=source))
         if not os.path.isabs(path):
             raise ValueError("path must be absolute")
         if not os.path.exists(path):
@@ -166,25 +171,27 @@ class FakeNode:
         if wrap:
             cid = self.put_dir({os.path.basename(path): cid})
         if pin and not only_hash:
-            self.pins.setdefault(cid, set()).add("user")
+            self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid, "size": self._size(cid), "warnings": ["skipped a symlink"] if wrap else []}
 
     def add_stream(self, stream, size=None, name=None, only_hash=False, pin=True, to=None, to_self=False,
-                   seal_name=None, chunker=None):
+                   seal_name=None, chunker=None, origin=None, source="user"):
         data = stream.read()
         self.record("add_stream", data, size=size, name=name, only_hash=only_hash,
-                    **self._given("add_stream", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker))
+                    **self._given("add_stream", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker,
+                                  origin=origin, source=source))
         if size is not None and len(data) != size:
             raise ValueError("stream shorter than its size")
         cid = self.put_file(data)
         if name:
             cid = self.put_dir({name: cid})
         if pin and not only_hash:
-            self.pins.setdefault(cid, set()).add("user")
+            self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid, "size": len(data), "warnings": []}
 
-    def get(self, target, output, from_node=None, raw=False):  # nothing is sealed here, so raw changes nothing
-        self.record("get", target, output, from_node=from_node, **self._given("get", raw=raw))
+    def get(self, target, output, from_node=None, raw=False, no_extract=False, temporary=None):  # nothing is sealed here, so raw
+        # and no_extract change nothing
+        self.record("get", target, output, from_node=from_node, **self._given("get", raw=raw, no_extract=no_extract))
         cid = self._resolve(target)
 
         def write(cid, dest):
@@ -272,37 +279,37 @@ class FakeNode:
             return None
         return obj[1][:length]
 
-    def dir_set(self, target, name, child_cid, executable=False):
-        self.record("dir_set", target, name, child_cid, executable=executable)
+    def dir_set(self, target, name, child_cid, executable=False, source="user"):
+        self.record("dir_set", target, name, child_cid, executable=executable, **self._given("dir_set", source=source))
         obj = self._object(self._resolve(target))
         if obj[0] != "dir":
             raise ValueError("not a directory")
         cid = self.put_dir({**obj[1], name: child_cid})
-        self.pins.setdefault(cid, set()).add("user")
+        self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid}
 
-    def dir_rm(self, target):
-        self.record("dir_rm", target)
+    def dir_rm(self, target, source="user"):
+        self.record("dir_rm", target, **self._given("dir_rm", source=source))
         edit.check_entry_target(target)  # as RnfsNode.dir_rm, before anything is fetched
         parent, name = target.rsplit("/", 1)
         obj = self._object(self._resolve(parent))
         if name not in obj[1]:
             raise NotFound(f"no such entry: {name}")
         cid = self.put_dir({k: v for k, v in obj[1].items() if k != name})
-        self.pins.setdefault(cid, set()).add("user")
+        self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid}
 
-    def pin_add(self, target):
-        self.record("pin_add", target)
+    def pin_add(self, target, source="user"):
+        self.record("pin_add", target, **self._given("pin_add", source=source))
         cid = self._resolve(target)
-        self.pins.setdefault(cid, set()).add("user")
+        self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid}
 
-    def pin_rm(self, cid):
-        self.record("pin_rm", cid)
-        if "user" not in self.pins.get(cid, set()):
+    def pin_rm(self, cid, source="user"):
+        self.record("pin_rm", cid, **self._given("pin_rm", source=source))
+        if source not in self.pins.get(cid, set()):
             raise NotFound(f"{cid} is not pinned")
-        self.pins[cid].discard("user")
+        self.pins[cid].discard(source)
         if not self.pins[cid]:
             del self.pins[cid]
 
@@ -314,6 +321,39 @@ class FakeNode:
     def pin_remote(self, node_id, cid, pin):
         self.record("pin_remote", node_id, cid, pin)
         return node_id != b"\xff" * 16
+
+    def pin_remote_ls(self, node_id=None, cid=None, check=False):
+        self.record("pin_remote_ls", node_id, cid, **self._given("pin_remote_ls", check=check))
+        return [{"node": "ab" * 16, "cid": cid or "bafkreie", "pin": True, "accepted": True, "asked": 1000.0,
+                 "state": "done" if check else "waiting", "done": check, "checked": 1000.0 if check else None,
+                 "seen": None}]
+
+    def pin_remote_served(self):
+        self.record("pin_remote_served")
+        return {"pins": [{"identity": "cd" * 16, "cid": "bafkreie", "state": "dropped", "reason": "quota",
+                          "at": 1000.0, "detail": "too big"}],
+                "usage": [{"identity": "cd" * 16, "used": 5, "quota": 100, "pinned": 1, "waiting": 0,
+                           "allowed": True}], "quota": 100}
+
+    def pin_label(self, cid, label):
+        self.record("pin_label", cid, label)
+        if cid not in self.pins:
+            raise NotFound(f"{cid} is not pinned")
+        if label is not None and not isinstance(label, str):
+            raise ValueError("a label must be a string")
+        return {"cid": cid, "sources": sorted(self.pins[cid]), "label": label or None}
+
+    def cache_ls(self):
+        self.record("cache_ls")
+        return [{"cid": cid, "root": cid, "path": [], "pinned": False, "complete": True, "type": "file",
+                 "size": 1, "provided": False} for cid in sorted(self.cached)]
+
+    def cache_rm(self, cid):
+        self.record("cache_rm", cid)
+        if cid not in self.cached:
+            raise NotFound(f"{cid} is not in the cache")
+        self.cached.discard(cid)
+        return {"removed_records": 1, "removed_blocks": 1, "freed_bytes": 1}
 
     def gc(self):
         self.record("gc")
@@ -378,6 +418,26 @@ class FakeNode:
         self.records[name] = {"cid": self._resolve(target), "sequence": sequence}
         return {"name": name, **self.records[name]}
 
+    def name_sync(self, alias, path):
+        self.record("name_sync", alias, path)
+        if alias not in self.keys:
+            raise NotFound(f"no name {alias}")
+        if not os.path.isdir(path):
+            raise NotFound(f"no folder {path}")
+        self.syncs[alias] = path
+        return {"alias": alias, "path": path, "state": "new", "reason": None, "root": None, "published": None,
+                "published_at": None, "next_publish": None}
+
+    def name_unsync(self, alias):
+        self.record("name_unsync", alias)
+        if self.syncs.pop(alias, None) is None:
+            raise NotFound(f"name {alias} isn't synced")
+
+    def name_syncs(self):
+        self.record("name_syncs")
+        return [{"alias": alias, "path": path, "state": "new", "reason": None, "root": None, "published": None,
+                 "published_at": None, "next_publish": None} for alias, path in sorted(self.syncs.items())]
+
     def name_resolve(self, name, for_gateway=False):
         self.record("name_resolve", name, for_gateway=for_gateway)
         if name not in self.records:
@@ -391,8 +451,8 @@ class FakeNode:
             f.write(b"archive")
         return {"roots": [cid], "blocks": len(self._dag(cid))}
 
-    def import_archive(self, path):
-        self.record("import_archive", path)
+    def import_archive(self, path, progress=None, source="user"):
+        self.record("import_archive", path, **self._given("import_archive", source=source))
         if not os.path.isfile(path):
             raise NotFound(f"no such file: {path}")
         return {"roots": [self.put_file(b"from archive")], "incomplete": []}
@@ -401,6 +461,21 @@ class FakeNode:
         self.record("status")
         return {"node_id": self.node_id.hex(), "dht_mode": "server", "slow": False, "known_nodes": 4,
                 "records": 2, "pins": len(self.pins), "used_bytes": 1000, "max_storage": 10 ** 10}
+
+    # Apps: through a real AppRegistry a test sets as self.apps (rnfs/apps.py)
+
+    def app_add(self, name):
+        self.record("app_add", name)
+        return self.apps.add(name)
+
+    def app_ls(self):
+        self.record("app_ls")
+        return self.apps.list()
+
+    def app_rm(self, name):
+        self.record("app_rm", name)
+        self.apps.remove(name)
+        return {"released": 0}
 
 
 def raw_request(port, method, path, body=None, headers=None, host="default"):
@@ -420,6 +495,19 @@ def raw_request(port, method, path, body=None, headers=None, host="default"):
         return response.status, response.headers, response.read()
     finally:
         connection.close()
+
+
+class ParseIntTest(unittest.TestCase):
+    """api.parse_int takes ASCII digits only, as a query parameter is written: int() also takes others."""
+
+    def test_only_plain_digits(self):
+        from rnfs.api import parse_int
+        self.assertEqual((parse_int("12", "n", None), parse_int("", "n", 7), parse_int(None, "n", 7)), (12, 7, 7))
+        for text in ("1_0", " 7 ", "+7", "\u0661\u0662", "7.0", "1e3", str(2 ** 63)):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "must be an integer"):
+                parse_int(text, "n", None)
+        with self.assertRaisesRegex(ValueError, "must not be negative"):
+            parse_int("-3", "n", None)
 
 
 class ApiTestCase(unittest.TestCase):
@@ -450,6 +538,10 @@ class ApiTestCase(unittest.TestCase):
 
 
 class SecurityTest(ApiTestCase):
+
+    def test_server_header_is_just_rnfs(self):
+        _, headers, _ = self.call("GET", "/api/status")
+        self.assertEqual(headers["Server"], "rnfs")  # not "rnfs " (BaseHTTPRequestHandler's empty sys_version)
 
     def test_host_check(self):
         for host in (f"127.0.0.1:{self.port}", f"localhost:{self.port}", f"LocalHost:{self.port}"):
@@ -553,6 +645,15 @@ class SecurityTest(ApiTestCase):
             self.assertTrue(data.startswith(b"HTTP/1.0 400 "), (line, data[:80]))
             self.assert_api_headers(data)
 
+    def test_head_is_answered_without_a_body(self):
+        """HEAD is refused (405) with the headers only: a body after them would be read as the next response."""
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+            sock.sendall(f"HEAD /api/status HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n\r\n".encode())
+            data, _ = read_until_closed(sock)
+        head, _, rest = data.partition(b"\r\n\r\n")
+        self.assertTrue(head.startswith(b"HTTP/1.0 405 "), head[:60])
+        self.assertEqual(rest, b"")
+
     def test_http_server_errors_carry_the_headers(self):
         """http.server's own error pages (501 for an unknown method, 414, 431) carry no-store and nosniff, as the
         API's own responses do, each once."""
@@ -652,6 +753,9 @@ class EndpointTest(ApiTestCase):
         self.assertEqual(self.call("POST", "/api/add/stream", b"x", {"Content-Length": "abc"})[0], 411)
         self.assertEqual(self.call("POST", "/api/add/stream")[0], 411)
         self.assertEqual(self.call("POST", "/api/add/stream", b"x", {"Content-Length": "-1"})[0], 400)
+        for length in ("1_0", "+1", "0x10"):  # what int() takes (but 0x) and a Content-Length isn't
+            self.assertEqual(self.call("POST", "/api/add/stream", b"x", {"Content-Length": length})[0], 411, length)
+        self.assertEqual(self.call("POST", "/api/add/stream", b"x", {"Content-Length": str(2 ** 63)})[0], 400)
         self.assertEqual(self.call("POST", "/api/add/stream", b"zz\r\nab", {"Transfer-Encoding": "chunked"})[0], 400)
 
     def test_short_upload_is_rejected(self):
@@ -739,7 +843,8 @@ class EndpointTest(ApiTestCase):
             with mock.patch.object(self.node, "stat", side_effect=error), mock.patch("rnfs.api.log"):
                 code, headers, data = self.call("GET", f"/api/stat?target={file_cid}")
             self.assertEqual(code, status, error)
-            self.assertEqual(json.loads(data), {"error": str(error)})
+            # The message, and since 0.2.0 the machine-readable code of its status
+            self.assertEqual(json.loads(data), {"error": str(error), "code": errors.STATUS_CODES[status]})
             self.assertEqual(headers["Content-Type"], "application/json")
             if status == 503:
                 self.assertIn("Retry-After", headers)
@@ -801,6 +906,9 @@ class EndpointTest(ApiTestCase):
             self.assertEqual(self.node.called("get")[0][1], {"from_node": bytes.fromhex("ab" * 16)})
             with open(os.path.join(out, "a"), "rb") as f:
                 self.assertEqual(f.read(), b"abc")
+            # no_extract (a sealed folder written as its tar) is passed on only when set, as raw is
+            self.ok("POST", "/api/get", {"target": directory, "output": os.path.join(tmp, "tar"), "no_extract": True})
+            self.assertEqual(self.node.called("get")[1][1], {"from_node": None, "no_extract": True})
             archive = os.path.join(tmp, "archive")
             self.assertEqual(self.ok("POST", "/api/export", {"target": directory, "output": archive})["roots"],
                              [directory])
@@ -853,8 +961,8 @@ def free_slots(server: LocalServer) -> int:
     return server.server.slots._value
 
 
-class ConnectionTest(ApiTestCase):
-    """Time limits and the connection cap, with short limits so the tests are quick."""
+class ConnectionTestCase(ApiTestCase):
+    """A server with short time limits (LIMITS) so the tests are quick, and raw connections to it."""
 
     LIMITS = {"request_timeout": 0.5, "body_timeout": 0.5, "max_connections": 3}
 
@@ -875,6 +983,10 @@ class ConnectionTest(ApiTestCase):
         lines = [f"{method} {path} HTTP/1.1", f"Host: 127.0.0.1:{self.port}", f"X-Rnfs-Api: {self.server.token}",
                  *(f"{name.replace('_', '-')}: {value}" for name, value in headers.items())]
         return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+
+class ConnectionTest(ConnectionTestCase):
+    """Time limits and the connection cap."""
 
     def test_idle_connection_is_closed(self):
         data, elapsed = read_until_closed(self.connect())
@@ -907,17 +1019,6 @@ class ConnectionTest(ApiTestCase):
         self.assertTrue(data.startswith(b"HTTP/1.0 408"), data)
         self.assertLess(elapsed, 3)
         self.assertEqual(self.node.objects, {})
-
-    def test_slow_upload_within_body_timeout(self):
-        # Each pause is under body_timeout, and together they exceed request_timeout
-        sock = self.connect()
-        sock.sendall(self.request_head("POST", "/api/add/stream", Content_Length=6))
-        for piece in (b"ab", b"cd", b"ef"):
-            time.sleep(0.3)
-            sock.sendall(piece)
-        data, _ = read_until_closed(sock)
-        self.assertTrue(data.startswith(b"HTTP/1.0 200"), data)
-        self.assertEqual(self.node.called("add_stream")[0][0], (b"abcdef",))
 
     def test_node_work_is_not_timed(self):
         # A fetch longer than every limit still gets its answer
@@ -956,6 +1057,334 @@ class ConnectionTest(ApiTestCase):
         self.assertIn(f"{cid}/\\x1b[2J\\n", message)
         self.assertNotIn("\x1b", message)
         self.assertEqual(loggable("plain/path"), "plain/path")
+
+
+class SlowUploadTest(ConnectionTestCase):
+    """A streamed upload's pauses are timed by body_timeout, not request_timeout. Each pause here leaves body_timeout
+    a wide margin (a slow runner's scheduling once ate a narrower one), and together they exceed request_timeout."""
+
+    LIMITS = {**ConnectionTestCase.LIMITS, "body_timeout": 3.0}
+
+    def test_slow_upload_within_body_timeout(self):
+        sock = self.connect()
+        sock.sendall(self.request_head("POST", "/api/add/stream", Content_Length=6))
+        for piece in (b"ab", b"cd", b"ef"):
+            time.sleep(0.3)
+            sock.sendall(piece)
+        data, _ = read_until_closed(sock)
+        self.assertTrue(data.startswith(b"HTTP/1.0 200"), data)
+        self.assertEqual(self.node.called("add_stream")[0][0], (b"abcdef",))
+
+
+class AppTokenTestCase(ApiTestCase):
+    """Base: the FakeNode with a real AppRegistry (rnfs/apps.py), holding apps "wiki" and "notes"."""
+
+    def setUp(self):
+        """The registry in a temporary state directory, and two apps."""
+        super().setUp()
+        from rnfs.apps import AppRegistry
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.node.apps = AppRegistry(os.path.join(tmp.name, "state"))
+        self.addCleanup(self.node.apps.close)
+        self.wiki = self.node.apps.add("wiki")["token"]
+        self.notes = self.node.apps.add("notes")["token"]
+
+    def as_app(self, name: str, token: str, **headers) -> dict:
+        """The headers of app name's request with token."""
+        return {"X-Rnfs-Api": token, "X-Rnfs-App": name, **headers}
+
+
+class AppAuthTest(AppTokenTestCase):
+    """App tokens: X-Rnfs-App names the app whose token X-Rnfs-Api carries, and keys the proof."""
+
+    def test_app_token_passes_with_its_name(self):
+        """An app's token with X-Rnfs-App naming it is let through (the full status, every route); the caller is
+        "app:<name>"."""
+        status, _, data = self.call("GET", "/api/status", headers=self.as_app("wiki", f" {self.wiki} "), api=False)
+        self.assertEqual(status, 200)
+        self.assertIn("node_id", json.loads(data))
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("notes", self.notes), api=False)[0], 200)
+        seen = []
+        original = ApiHandler.api_gc
+
+        def gc(handler):
+            seen.append(handler.principal)
+            original(handler)
+
+        with mock.patch.object(ApiHandler, "api_gc", gc):
+            self.call("POST", "/api/gc", {}, self.as_app("wiki", self.wiki), api=False)
+            self.call("POST", "/api/gc", {})
+        self.assertEqual(seen, ["app:wiki", api.CLI])
+
+    def test_wrong_pairs_are_refused(self):
+        """Only the token of the app named passes: another app's, the API token, a wrong one, an unknown or
+        invalid name, or an app's token without its name, are all 403 unauthorized; nothing reaches the node."""
+        for headers in (self.as_app("wiki", self.notes), self.as_app("wiki", self.server.token),
+                        self.as_app("wiki", self.wiki + "x"), self.as_app("other", self.wiki),
+                        self.as_app("Wiki", self.wiki), self.as_app("", self.wiki), {"X-Rnfs-Api": self.wiki},
+                        {"X-Rnfs-App": "wiki"}):
+            with self.subTest(headers=headers):
+                status, _, data = self.call("POST", "/api/gc", {}, headers, api=False)
+                self.assertEqual(status, 403)
+                self.assertEqual(json.loads(data)["code"], "unauthorized")
+                status, _, data = self.call("GET", "/api/status", headers=headers, api=False)
+                self.assertEqual(json.loads(data), {"version": rnfs_version()})
+        self.assertEqual(self.node.called("gc"), [])
+
+    def test_removed_app_token_stops_passing(self):
+        """Once the app is removed its token is refused."""
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("wiki", self.wiki), api=False)[0], 200)
+        self.node.apps.remove("wiki")
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("wiki", self.wiki), api=False)[0], 403)
+
+    def test_proof_for_an_app(self):
+        """With X-Rnfs-App the proof is keyed by that app's verifier (app_proof_key of its token), which the daemon
+        has without the token; for an app there isn't, by a key no client has (REV9: the answer mustn't say which
+        apps exist, tests/security/test_rev9_app_name_oracle.py); without the header, by the API token as before."""
+        from rnfs.apiclient import app_proof_key
+        challenge = "0123456789abcdef" * 2
+        for name, token in (("wiki", self.wiki), ("notes", self.notes)):
+            _, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge,
+                                                                     "X-Rnfs-App": name}, api=False)
+            self.assertEqual(headers[cli.PROOF_HEADER], cli.api_proof(app_proof_key(token), self.port, challenge))
+        for name in ("other", "Wiki", ""):
+            _, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge,
+                                                                     "X-Rnfs-App": name}, api=False)
+            self.assertRegex(headers[cli.PROOF_HEADER] or "", "^[0-9a-f]{64}$", name)
+            for key in (self.server.token, app_proof_key(self.wiki), app_proof_key(self.notes)):
+                self.assertNotEqual(headers[cli.PROOF_HEADER], cli.api_proof(key, self.port, challenge), name)
+        _, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge}, api=False)
+        self.assertEqual(headers[cli.PROOF_HEADER], cli.api_proof(self.server.token, self.port, challenge))
+
+    def test_node_without_apps(self):
+        """A node with no app registry (a stand-in) lets no app in, and proves nothing for one."""
+        del self.node.apps
+        challenge = "ab" * 16
+        status, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge,
+                                                                      "X-Rnfs-App": "wiki"}, api=False)
+        self.assertEqual(status, 200)
+        self.assertIsNone(headers[cli.PROOF_HEADER])
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("wiki", self.wiki), api=False)[0], 403)
+
+
+class AppRoutesTest(AppTokenTestCase):
+    """GET /api/apps, POST /api/apps/add and /api/apps/rm: the CLI's token only."""
+
+    def test_list_add_remove(self):
+        """The apps are listed without tokens; a new app's token is given once and works; removing an app revokes
+        its token."""
+        listed = self.ok("GET", "/api/apps")["apps"]
+        self.assertEqual([app["name"] for app in listed], ["notes", "wiki"])
+        self.assertEqual(set(listed[0]), {"name", "created"})
+        added = self.ok("POST", "/api/apps/add", {"name": "gallery"})
+        self.assertEqual(set(added), {"name", "created", "token"})
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("gallery", added["token"]), api=False)[0], 200)
+        self.assertEqual(self.ok("POST", "/api/apps/rm", {"name": "gallery"}), {"released": 0})
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("gallery", added["token"]), api=False)[0], 403)
+        self.assertEqual([app["name"] for app in self.ok("GET", "/api/apps")["apps"]], ["notes", "wiki"])
+
+    def test_refusals(self):
+        """An invalid name or one taken is 400, removing an app there isn't 404."""
+        for name in ("wiki", "Wiki", "a:b", "", None, 7):
+            status, _, data = self.call("POST", "/api/apps/add", {"name": name})
+            self.assertEqual((status, json.loads(data)["code"]), (400, "bad_request"), name)
+        self.assertEqual(self.call("POST", "/api/apps/rm", {"name": "other"})[0], 404)
+        self.assertEqual(self.call("POST", "/api/apps/rm", {"name": "a:b"})[0], 400)
+
+    def test_apps_cant_manage_apps(self):
+        """An app's token is answered 403 forbidden on every app route, before the node is asked."""
+        for method, path, body in (("GET", "/api/apps", None), ("POST", "/api/apps/add", {"name": "mine"}),
+                                   ("POST", "/api/apps/rm", {"name": "notes"})):
+            status, _, data = self.call(method, path, body, self.as_app("wiki", self.wiki), api=False)
+            self.assertEqual((status, json.loads(data)["code"]), (403, "forbidden"), path)
+        self.assertEqual([call for call in self.node.calls if call[0].startswith("app_")], [])
+        self.assertIn("notes", self.node.apps)
+        self.assertIn("forbidden", errors.CODES)
+        self.assertIn("apps", api.CAPABILITIES)
+
+
+def rnfs_version() -> str:
+    """The version the open status gives."""
+    from rnfs import __version__
+    return __version__
+
+
+class AppSupportTest(ApiTestCase):
+    """What 0.2.0 added for apps: error codes, the capability list, events, shutdown, pin labels and the cache."""
+
+    def error(self, method, path, body=None, **kwargs) -> tuple[int, dict]:
+        """(status, JSON body) of a request that must fail."""
+        status, _, data = self.call(method, path, body, **kwargs)
+        self.assertGreaterEqual(status, 400, data)
+        return status, json.loads(data)
+
+    def test_error_codes_tell_endpoints_from_content(self):
+        """A 404 for an unknown endpoint and one for missing content carry different codes; the API's own
+        refusals have theirs; every code is one rnfs.errors lists."""
+        file_cid = self.node.put_file(b"abc")
+        cases = [(("GET", "/api/nope"), 404, "no_such_endpoint"),
+                 (("GET", f"/api/stat?target={str(Cid.for_block(RAW, b'gone'))}"), 404, "not_found"),
+                 (("PUT", "/api/ls"), 405, "method_not_allowed"),
+                 (("GET", f"/api/ls?target={file_cid}"), 400, "bad_request")]
+        for (method, path), status, code in cases:
+            with self.subTest(path=path):
+                self.assertEqual(self.error(method, path), (status, {"error": mock.ANY, "code": code}))
+        self.assertEqual(self.error("GET", "/api/ls", api=False)[1]["code"], "unauthorized")
+        self.assertEqual(self.error("GET", "/api/status", host="evil.example:80")[1]["code"], "bad_host")
+        self.assertEqual(json.loads(ApiHandler.busy_response().split(b"\r\n\r\n", 1)[1])["code"],
+                         "too_many_connections")
+        self.assertLessEqual(set(errors.STATUS_CODES.values()) | set(errors.API_CODES), set(errors.CODES))
+        self.assertEqual(errors.error_code(errors.Unsupported("x"), 404), "unsupported")
+
+    def test_capabilities(self):
+        """The capability list names every route (core and features'), the event kinds and the error codes."""
+        result = self.ok("GET", "/api/capabilities")
+        self.assertEqual({tuple(route) for route in result["routes"]},
+                         set(ApiHandler.ROUTES) | set(features.api_routes()))
+        self.assertEqual(result["capabilities"], sorted(api.CAPABILITIES))
+        self.assertEqual(result["event_kinds"], list(rnfs_events.EVENT_KINDS))
+        self.assertEqual(result["error_codes"], list(errors.CODES))
+        self.assertIn("events", result["capabilities"])
+        self.assertEqual(set(result), {"version", "capabilities", "routes", "features", "event_kinds", "error_codes"})
+
+    def test_events_long_poll(self):
+        """No after: the next sequence at once; then events after it, as they come; kinds filter them; a wait
+        ends with none; an unknown kind is refused; a client behind the log, or of another epoch, is told it lost
+        some."""
+        start = self.ok("GET", "/api/events")
+        self.assertEqual((start["events"], start["lost"]), ([], False))
+        log = self.node.events
+        log.publish("pin", change="added", cids=["x"], count=1)
+        log.publish("job", id="j", state="done")
+        both = self.ok("GET", f"/api/events?after={start['next']}")
+        self.assertEqual([event["kind"] for event in both["events"]], ["pin", "job"])
+        only = self.ok("GET", f"/api/events?after={start['next']}&kinds=job")
+        self.assertEqual([event["kind"] for event in only["events"]], ["job"])
+        timer = threading.Timer(0.3, lambda: log.publish("peer", node_id="ab", change="new"))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        began = time.monotonic()
+        later = self.ok("GET", f"/api/events?after={both['next']}&wait=5")
+        self.assertEqual([event["kind"] for event in later["events"]], ["peer"])
+        self.assertLess(time.monotonic() - began, 4)
+        self.assertEqual(self.ok("GET", f"/api/events?after={later['next']}&wait=1")["events"], [])
+        self.assertEqual(self.error("GET", "/api/events?after=0&kinds=nope")[0], 400)
+        other = self.ok("GET", f"/api/events?after={later['next']}&epoch=elsewhere")
+        self.assertTrue(other["lost"])
+        self.assertEqual(len(other["events"]), 3)
+
+    def test_events_waiters_are_capped(self):
+        """At most MAX_EVENT_WAITERS polls wait at once; the next gets 503 busy; a wait=0 poll still answers."""
+        with mock.patch.object(api, "MAX_EVENT_WAITERS", 1):
+            server = ApiServer(self.node, 0)
+        server.start()
+        self.addCleanup(server.stop)
+        self.server, self.port = server, server.port
+        waiting = threading.Thread(target=self.call, args=("GET", "/api/events?after=0&wait=2"))
+        waiting.start()
+        self.addCleanup(waiting.join)
+        wait_for(lambda: server.server.RequestHandlerClass.event_waiters._value == 0, what="the waiter in its slot")
+        status, body = self.error("GET", "/api/events?after=0&wait=2")
+        self.assertEqual((status, body["code"]), (503, "busy"))
+        self.assertEqual(self.ok("GET", "/api/events?after=0")["events"], [])
+
+    def test_shutdown(self):
+        """POST /api/shutdown answers, then calls the server's shutdown; a server without one answers 404
+        unsupported."""
+        status, body = self.error("POST", "/api/shutdown")
+        self.assertEqual((status, body["code"]), (404, "unsupported"))
+        stopped = threading.Event()
+        server = ApiServer(self.node, 0, shutdown=stopped.set)
+        server.start()
+        self.addCleanup(server.stop)
+        self.server, self.port = server, server.port
+        self.assertEqual(self.ok("POST", "/api/shutdown"), {"stopping": True})
+        self.assertTrue(stopped.wait(5))
+
+    def test_pin_label_and_cache_routes(self):
+        """POST /api/pin/label, GET /api/cache/ls and POST /api/cache/rm reach the facade, CIDs checked first."""
+        cid = self.node.put_file(b"label me")
+        self.node.pins[cid] = {"user"}
+        self.assertEqual(self.ok("POST", "/api/pin/label", {"cid": cid, "label": "mine"})["label"], "mine")
+        self.assertIsNone(self.ok("POST", "/api/pin/label", {"cid": cid, "label": None})["label"])
+        self.assertEqual(self.error("POST", "/api/pin/label", {"cid": "nope", "label": "x"})[0], 400)
+        self.node.cached.add(cid)
+        self.assertEqual([entry["cid"] for entry in self.ok("GET", "/api/cache/ls")["cache"]], [cid])
+        self.assertEqual(self.ok("POST", "/api/cache/rm", {"cid": cid})["removed_records"], 1)
+        self.assertEqual(self.error("POST", "/api/cache/rm", {"cid": cid}), (404, {"error": mock.ANY,
+                                                                                   "code": "not_found"}))
+
+
+class RemotePinStatusTest(ApiTestCase):
+    """GET /api/pin/remote and /api/pin/remote/served (remote pin status): parameters passed on, refusals."""
+
+    def test_asked(self):
+        """The remote pins asked for, filtered by node and CID as given; check=1 is passed on; a GET beside the POST
+        of the same path."""
+        file_cid = self.node.put_file(b"abc")
+        pins = self.ok("GET", "/api/pin/remote")["pins"]
+        self.assertEqual((pins[0]["node"], pins[0]["state"]), ("ab" * 16, "waiting"))
+        self.ok("GET", f"/api/pin/remote?node={'ab' * 16}&cid={file_cid}&check=1")
+        self.assertEqual(self.node.called("pin_remote_ls"),
+                         [((None, None), {}), ((bytes.fromhex("ab" * 16), file_cid), {"check": True})])
+        self.assertEqual(self.call("GET", "/api/pin/remote?node=nope")[0], 400)
+        self.assertEqual(self.call("GET", "/api/pin/remote?cid=nope")[0], 400)
+        self.assertEqual(self.call("PUT", "/api/pin/remote")[0], 405)
+        self.assertEqual(len(self.node.called("pin_remote_ls")), 2)
+        self.assertEqual(len(self.node.called("pin_remote")), 0)  # a GET never asks a node to pin
+
+    def test_served(self):
+        """The pins served and each identity's usage, as the node gives them; the capability is listed."""
+        served = self.ok("GET", "/api/pin/remote/served")
+        self.assertEqual((served["pins"][0]["reason"], served["usage"][0]["used"], served["quota"]), ("quota", 5, 100))
+        self.assertIn("remote_pin_status", self.ok("GET", "/api/capabilities")["capabilities"])
+        self.assertEqual(self.call("POST", "/api/pin/remote/served", {})[0], 405)
+
+
+class NameSyncRoutesTest(ApiTestCase):
+    """POST /api/name/sync, /api/name/unsync and GET /api/name/syncs: parameters passed on, refusals."""
+
+    def test_sync_unsync_and_list(self):
+        """A sync is started with an absolute folder, listed, and stopped; the capability is listed."""
+        self.ok("POST", "/api/name/create", {"alias": "site"})
+        with tempfile.TemporaryDirectory() as folder:
+            entry = self.ok("POST", "/api/name/sync", {"alias": "site", "path": folder})
+            self.assertEqual((entry["alias"], entry["path"], entry["state"]), ("site", folder, "new"))
+            self.assertEqual(self.node.called("name_sync"), [(("site", folder), {})])
+            self.assertEqual([sync["alias"] for sync in self.ok("GET", "/api/name/syncs")["syncs"]], ["site"])
+            self.assertEqual(self.ok("POST", "/api/name/unsync", {"alias": "site"}), {})
+            self.assertEqual(self.ok("GET", "/api/name/syncs"), {"syncs": []})
+        self.assertIn("name_sync", self.ok("GET", "/api/capabilities")["capabilities"])
+
+    def test_refusals(self):
+        """A relative or missing path, or no alias: 400; no such name, or a name not synced: 404; GET of the POST
+        routes: 405."""
+        self.ok("POST", "/api/name/create", {"alias": "site"})
+        self.assertEqual(self.call("POST", "/api/name/sync", {"alias": "site", "path": "relative"})[0], 400)
+        self.assertEqual(self.call("POST", "/api/name/sync", {"alias": "site"})[0], 400)
+        self.assertEqual(self.call("POST", "/api/name/sync", {"path": os.getcwd()})[0], 400)
+        self.assertEqual(len(self.node.called("name_sync")), 0)  # refused before the node is asked
+        self.assertEqual(self.call("POST", "/api/name/sync", {"alias": "nope", "path": os.getcwd()})[0], 404)
+        self.assertEqual(self.call("POST", "/api/name/unsync", {"alias": "site"})[0], 404)
+        self.assertEqual(self.call("GET", "/api/name/sync")[0], 405)
+        self.assertEqual(self.call("POST", "/api/name/syncs", {})[0], 405)
+
+
+class NameSyncAppTest(AppTokenTestCase):
+    """An app's token may start and stop a name's sync, as it may publish the name: the name's pin stays the
+    name's own, so the node isn't given the app's pin source."""
+
+    def test_app_syncs_a_name(self):
+        self.ok("POST", "/api/name/create", {"alias": "site"})
+        with tempfile.TemporaryDirectory() as folder:
+            status, _, _ = self.call("POST", "/api/name/sync", {"alias": "site", "path": folder},
+                                     self.as_app("wiki", self.wiki), api=False)
+            self.assertEqual(status, 200)
+            self.assertEqual(self.node.called("name_sync"), [(("site", folder), {})])
+            status, _, _ = self.call("POST", "/api/name/unsync", {"alias": "site"},
+                                     self.as_app("notes", self.notes), api=False)
+            self.assertEqual(status, 200)
 
 
 class RouteTableTest(unittest.TestCase):

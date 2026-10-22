@@ -5,17 +5,44 @@ provider) and RequestServer (/blocks bytes sent, per requester where it identifi
 this feature reads them. The node's rnfs.dht announce handler counts every announce in them too (Traffic.heard),
 so the DHT mode and the last-heard time of client-mode nodes (which never enter the routing table) are known.
 
+Per peer the listing also gives:
+- first_heard: the earliest of when this run first counted the peer, when it entered the routing table (kept
+  across a short absence, and across restarts) and when RNS's announce cache (Identity.known_destinations, which
+  RNS persists) last heard it; null if none knows.
+- rtt, rtt_at: the round trip RNS measured on the last link established to it (a shared link, ping's, or an
+  identified one for /provide or /pin; LinkPool.on_rtt), in seconds, and when; null if none was.
+- online: mesh.online(), the one rule: an rnfs link to it is open, or it showed it was up within
+  mesh.ONLINE_WINDOW (15 minutes, on the monotonic clock): an answer to a request (a refusal too), a request of its
+  own served, a link established, or an announce of its own emitted within the window (its signed emission time,
+  allowing mesh.EMISSION_SKEW of clock difference, and later than the last counted: Traffic.announced). A path
+  response, or an announce held in a queue or passed on late by a shared instance, says nothing of now. No network
+  I/O.
+
+"peer" events (rnfs.events): {"node_id", "change": "new" | "online" | "offline", "online"}. A thread checks every
+CHECK_INTERVAL (offline comes with time passing, so it can't be a hook) and diffs the online states of the peers
+Traffic counts and those with an open link, both bounded (not the listing, which the routing table may fill: a peer
+only in the routing table is never online). Its first check, at start, only records them, and "new" is for a peer
+first counted in Traffic (first heard or contacted this run) after that, so neither the start nor the routing table
+seeded from RNS's announce cache floods the log: a client lists the peers once, then follows the events, taking
+"new" as add-or-update (a peer listed from the routing table gets "new" once it is first heard). A new peer's event
+says whether it is online and no "online" follows for it; one online that is no longer counted nor linked gets
+"offline"; a peer forgotten beyond mesh.MAX_PEERS and heard again is "new" again.
+
 Nothing is persisted: counts are since the daemon started. Memory is bounded by mesh.MAX_PEERS.
 """
 import json
 import math
+import threading
 import time
 
-from rnfs import mesh
+from rnfs import events, mesh
 from rnfs.features import Feature, _common
 from rnfs.fsutil import printable
 
 NAME = "peers"
+# Seconds between checks of the peers' online states for "peer" events: an offline event is at most this late after
+# mesh.ONLINE_WINDOW has passed, and a check reads only counters and the pool's open links
+CHECK_INTERVAL = 30.0
 
 
 class PeersFeature(Feature):
@@ -31,6 +58,69 @@ class PeersFeature(Feature):
         from rnfs.log import ThrottledLog  # here, not at module level: it loads RNS, and the CLI imports features
         # A listing that can't read something is a bug or an RNS change, met per peer: a line a minute
         self._failure_log = ThrottledLog()
+        self._stop = threading.Event()
+        # The online state of each peer at the last check (None before the first), and that check's time
+        # (Traffic.monotonic): only a peer counted after the first is "new". Only the check thread (or a test) uses them
+        self._states: dict[bytes, bool] | None = None
+        self._since: float | None = None
+
+    # Lifecycle
+
+    def start(self):
+        """Start the thread publishing "peer" events (an offline test node calls check() itself)."""
+        self._spawn(self._run, "rnfs-peers")
+
+    def stop(self, deadline: float | None = None):
+        """Stop the events thread, waiting for it until deadline (as Feature.stop)."""
+        self._stop.set()
+        self._join(deadline)
+
+    def _run(self):
+        """check() now (recording the states without events), then every CHECK_INTERVAL until stop."""
+        while True:
+            try:
+                self.check()
+            except Exception as e:  # noqa: BLE001 - the thread keeps running; logged
+                self._failed(f"couldn't check the peers' online states: {e!r}")
+            if self._stop.wait(CHECK_INTERVAL):
+                return
+
+    def check(self):
+        """Publish a "peer" event for each peer new since the last check (first counted after the first check) or
+        whose online state changed; the first check only records the states. See the module docstring.
+
+        Over the peers Traffic counts and those with an open link (both bounded), not the listing, which the
+        routing table may fill to mesh.MAX_PEERS: a peer cut from it isn't offline. A peer only in the routing table
+        is never online (nothing of it was seen), so leaving it out loses no event. Decided by Traffic.monotonic."""
+        now = self.traffic.monotonic()
+        counters = self.traffic.peers()
+        linked = self._linked()
+        watched = [node_id for node_id in dict.fromkeys([*linked, *counters]) if node_id != self.node.node_id]
+        states = {node_id: mesh.online(node_id in linked, (counters.get(node_id) or {}).get("last_seen"), now)
+                  for node_id in watched}
+        previous, self._states = self._states, states
+        if previous is None:
+            self._since = now
+            return
+        for node_id, online in states.items():
+            before = previous.get(node_id)
+            if before is None:
+                first = (counters.get(node_id) or {}).get("first_counted")
+                if first is not None and first >= self._since:
+                    change = "new"
+                elif online:  # counted before the first check, without a link then (forgotten, counted again)
+                    change = "online"
+                else:
+                    continue
+            elif before != online:
+                change = "online" if online else "offline"
+            else:
+                continue
+            events.publish(self.node, "peer", node_id=node_id.hex(), change=change, online=online)
+        # One no longer watched (its link closed with nothing counted, or forgotten beyond mesh.MAX_PEERS) is offline
+        for node_id, before in previous.items():
+            if before and node_id not in states:
+                events.publish(self.node, "peer", node_id=node_id.hex(), change="offline", online=False)
 
     def status(self) -> dict:
         """Traffic totals and airtime refusals for `rnfs status`."""
@@ -49,19 +139,31 @@ class PeersFeature(Feature):
 
     # Queries
 
+    def _linked(self) -> set[bytes]:
+        """The nodes with an open shared link (empty, logged, if they can't be listed)."""
+        try:
+            return set(self.node.client.open_links())
+        except Exception as e:  # noqa: BLE001 - a listing shows what it can; logged
+            self._failed(f"couldn't list the open links: {e!r}")
+            return set()
+
+    def _known(self, counters: dict, linked: set[bytes]) -> list[bytes]:
+        """The peers listed: in the routing table, with an open link, or in counters (most recent first); this node
+        left out, at most mesh.MAX_PEERS."""
+        node = self.node
+        ids = [n for n in dict.fromkeys([*node.routing.nodes(), *linked, *reversed(list(counters))])
+               if n != node.node_id]
+        return ids[:mesh.MAX_PEERS]
+
     def peers(self) -> list[dict]:
         """Every known node: in the routing table, with an open link, or in the traffic counters; nearest first."""
         node = self.node
         routing = node.routing
         paths = getattr(node, "paths", None)
         counters = self.traffic.peers()
-        try:
-            linked = set(node.client.open_links())
-        except Exception as e:  # noqa: BLE001 - a listing shows what it can; logged
-            self._failed(f"couldn't list the open links: {e!r}")
-            linked = set()
-        ids = [n for n in dict.fromkeys([*routing.nodes(), *linked, *reversed(list(counters))]) if n != node.node_id]
-        ids = ids[:mesh.MAX_PEERS]
+        linked = self._linked()
+        ids = self._known(counters, linked)
+        now, monotonic = self.traffic.clock(), self.traffic.monotonic()  # wall time to show, monotonic to decide
         # All at once: attached to a shared instance, RnsPaths reads the interfaces from one RPC, not one each
         known = paths.infos(ids) if paths is not None else {}
         peers = []
@@ -69,6 +171,7 @@ class PeersFeature(Feature):
             counts = counters.get(node_id) or {}
             seniority = routing.seniority(node_id)
             path = known.get(node_id, mesh.NO_PATH)
+            recalled = self._recalled_heard(node_id)  # RNS's announce cache: one lookup for both times
             rate = None
             if node_id in linked:
                 try:
@@ -84,11 +187,15 @@ class PeersFeature(Feature):
                 "senior": seniority is not None and seniority >= node.config.provider_seniority,
                 "hops": path.hops, "interface": path.interface, "bitrate": path.bitrate,
                 "link": node_id in linked, "rate": rate,
-                "last_heard": counts.get("last_heard") or self._recalled_heard(node_id),
+                "last_heard": counts.get("last_heard") or recalled,
                 "last_active": counts.get("last_active"),
                 "banned": routing.is_banned(node_id),
                 **{key: counts.get(key, 0) for key in ("sent", "received", "requests", "answered", "refused",
                                                       "failed", "bad")},
+                "first_heard": _earliest(counts.get("first_heard"),
+                                         None if seniority is None else now - seniority, recalled),
+                "rtt": counts.get("rtt"), "rtt_at": counts.get("rtt_at"),
+                "online": mesh.online(node_id in linked, counts.get("last_seen"), monotonic),
             })
         peers.sort(key=lambda p: (p["hops"] if p["hops"] is not None else math.inf, p["node_id"]))
         return peers
@@ -146,10 +253,18 @@ class PeersFeature(Feature):
     def cli_commands(cls, commands, command):
         """rnfs peers [--json] and rnfs stats [--json]."""
         peers = command(commands, "peers", run_peers,
-                        "known nodes: mode, seniority, hops, interface, link rate, last heard, traffic")
+                        "known nodes: mode, seniority, hops, interface, link rate, last heard, traffic, "
+                        "round trip, online")
         peers.add_argument("--json", action="store_true", help="print JSON")
         stats = command(commands, "stats", run_stats, "traffic since start: totals, refusals, per interface")
         stats.add_argument("--json", action="store_true", help="print JSON")
+
+
+def _earliest(*times: float | None) -> float | None:
+    """The earliest of times that aren't None, or None. first_heard: each source (this run's counters, the routing
+    table, RNS's announce cache) knows of a time the peer had been heard by, so the earliest is the best answer."""
+    known = [value for value in times if value is not None]
+    return min(known) if known else None
 
 
 def _api_peers(handler):
@@ -197,22 +312,31 @@ def human_age(seconds: float | None) -> str:
     return f"{seconds // 86400:.0f}d"
 
 
+def human_rtt(seconds) -> str:
+    """A round-trip time like "85ms" or "2.4s", or "-" for None (or anything but a number)."""
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or not 0 <= seconds < math.inf:
+        return "-"
+    return f"{seconds * 1000:.0f}ms" if seconds < 1 else f"{seconds:.1f}s"
+
+
 def format_peers(peers: list[dict], now: float) -> list[str]:
-    """The `rnfs peers` table, one line per node, escaped (the daemon's fields mustn't drive the terminal)."""
+    """The `rnfs peers` table, one line per node, escaped (the daemon's fields mustn't drive the terminal). RTT and
+    ONLINE come last, so the older columns keep their places; a daemon before 0.2.0 sends neither ("-")."""
     lines = [f"{'NODE':<32} {'MODE':<7} {'TABLE':>6} {'HOPS':>4} {'INTERFACE':<20} {'RATE':>10} {'HEARD':>6} "
-             f"{'SENT':>9} {'RECV':>9} {'FAIL':>5}"]
+             f"{'SENT':>9} {'RECV':>9} {'FAIL':>5} {'RTT':>7} ONLINE"]
     for peer in peers:
         table = human_age(peer["seniority"]) if peer["in_table"] else "-"
         heard = human_age(now - peer["last_heard"]) if peer.get("last_heard") else "-"
         rate = human_rate(peer["rate"]) if peer["link"] else "-"
         interface = (peer.get("interface") or "-")[:20]
+        online = {True: "yes", False: "no"}.get(peer.get("online"), "-")
         flags = (" banned" if peer["banned"] else "") + (f" bad:{peer['bad']}" if peer.get("bad") else "")
         # Each text field escaped before it is padded, so the columns line up; the whole line again for the rest
         lines.append(printable(
             f"{printable(peer['node_id']):<32} {printable(peer['mode'] or '?'):<7} {table:>6} "
             f"{peer['hops'] if peer['hops'] is not None else '?':>4} {printable(interface):<20} "
             f"{rate:>10} {heard:>6} {human_size(peer['sent']):>9} {human_size(peer['received']):>9} "
-            f"{peer['failed']:>5}{flags}"))
+            f"{peer['failed']:>5} {human_rtt(peer.get('rtt')):>7} {online}{flags}"))
     return lines
 
 

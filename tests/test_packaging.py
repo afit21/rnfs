@@ -310,12 +310,15 @@ class DependencyLockTest(unittest.TestCase):
     """packaging/requirements.lock pins every dependency, with hashes, and the Flatpak uses only those."""
 
     def test_lock_covers_pyproject_dependencies(self):
-        """Each project dependency, lxmf included, is pinned to one version with sha256 hashes."""
+        """Each project dependency is pinned to one version with sha256 hashes. LXMF isn't one since 0.2.0, which
+        moved it out of rnfs into an app of its own: neither pyproject.toml nor the lock names it."""
         with open(os.path.join(REPO, "pyproject.toml"), "rb") as f:
             dependencies = tomllib.load(f)["project"]["dependencies"]
         lock = read_lock()
         names = [re.match(r"[A-Za-z0-9_.-]+", d).group(0).lower() for d in dependencies]
-        self.assertIn("lxmf", names)
+        self.assertIn("rns", names)
+        self.assertNotIn("lxmf", names)
+        self.assertNotIn("lxmf", lock)
         for name in names + ["cryptography", "cffi", "pyserial"]:
             self.assertIn(name, lock)
         for name, (version, hashes) in lock.items():

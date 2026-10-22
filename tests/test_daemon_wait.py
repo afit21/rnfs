@@ -131,7 +131,7 @@ class DaemonSignalTest(unittest.TestCase):
                 with open(os.path.join(rnfs_dir, "config"), "w", encoding="utf-8") as f:
                     f.write(RNS_CONFIG)
                 with open(os.path.join(rnfs_dir, "rnfs.toml"), "w", encoding="utf-8") as f:
-                    f.write("default_bootstrap = false\nlxmf_enabled = false\n")
+                    f.write("default_bootstrap = false\n")
                 api_port = free_port()
                 log_path = os.path.join(tmp.name, "daemon.log")
                 with open(log_path, "wb") as log:

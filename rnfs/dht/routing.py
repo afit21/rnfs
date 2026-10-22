@@ -2,14 +2,22 @@
 
 Only servers that proved reachable are stored. Full buckets keep their long-lived nodes, so an attacker
 with fresh identities can't take a table over; nodes that stop answering are dropped, and a dropped node
-that comes back soon regains its seniority. Bans (section 10) also live here.
+that comes back soon regains its seniority. Bans (section 10) also live here, and the node IDs of identities RNS
+blackholes count as banned while listed (blackholed).
 
 Lookups also ask the table which nodes are unreliable: those whose last max_failures queries or more all
 failed, in the table or not (a node dropped, or only named in other nodes' replies). Announces don't clear
 this, only an answer does, so a far node that keeps announcing but never accepts a link stops costing every
 lookup its connection timeout. Such a node may be queried again once its backoff has passed (AVOID_AFTER,
 doubling with each further failure up to AVOID_MAX), by one lookup at a time (may_retry).
+
+The table works on the monotonic clock, and is persisted through rnfs.dht.routing_state (which owns the state
+database, so this module stays free of it): every change to a node's entry, dropped seniority or ban is passed to
+the listener set with track(), and row() gives what is saved for a node, its times as wall clock; restore() loads
+saved rows at start, clamping times in the future to now. The nodes' failed queries in a row (unreliable) aren't
+saved.
 """
+import math
 import threading
 import time
 from collections import OrderedDict
@@ -21,6 +29,11 @@ from rnfs.constants import BUCKET_COUNT, ID_LENGTH, K, MISSED_ANNOUNCES
 AVOID_AFTER = 300.0  # seconds an unreliable node isn't retried after max_failures failed queries in a row ...
 AVOID_MAX = 3600.0  # ... doubling with each further failure up to this
 MAX_UNRELIABLE = 4096  # nodes whose failed queries are remembered; the least recently failed is forgotten first
+
+# What a saved row (row(), restore()) holds for a node
+IN_TABLE = 0  # in the table: first seen, last heard, failed queries since last heard
+DROPPED = 1  # dropped, its seniority kept: first seen, when dropped
+BANNED = 2  # banned: when the ban ends
 
 
 def distance(a: bytes, b: bytes) -> int:
@@ -39,6 +52,10 @@ def check_id(node_id: bytes):
         raise ValueError(f"node IDs and keys must be {ID_LENGTH} bytes")
 
 
+def _ignore(node_id: bytes):
+    """The default change listener: does nothing."""
+
+
 class _Entry:
     """A server in the table: when it was first seen and last heard, and its unanswered queries in a row."""
 
@@ -55,19 +72,22 @@ class _Entry:
 class RoutingTable:
     """BUCKET_COUNT buckets of up to K servers each, by distance from own_id. Thread-safe.
 
-    `clock` is monotonic seconds (nothing here is persisted). `admit(node_id)`, if given, must be True
-    for a node to be added: private mode passes a member check (section 3). It is asked without the table's
-    lock held, since it may block (on RNS).
+    `clock` is monotonic seconds, and `wall_clock` Unix time, which only saved rows use (row(), restore()).
+    `admit(node_id)`, if given, must be True for a node to be added: private mode passes a member check
+    (section 3). It is asked without the table's lock held, since it may block (on RNS).
     """
 
     def __init__(self, own_id: bytes, config: Config, clock: Callable[[], float] = time.monotonic,
-                 admit: Callable[[bytes], bool] | None = None):
+                 admit: Callable[[bytes], bool] | None = None, wall_clock: Callable[[], float] = time.time):
         """Empty table for the local node own_id, using config's announce_interval, max_failures, ban_time."""
         check_id(own_id)
         self.own_id = own_id
         self.config = config
         self.clock = clock
+        self.wall_clock = wall_clock
         self.admit = admit
+        # Told the node ID of each change to what row() gives, with the lock held (routing_state's RowStore)
+        self._changed: Callable[[bytes], object] = _ignore
         self._buckets: list[dict[bytes, _Entry]] = [{} for _ in range(BUCKET_COUNT)]
         # Both in the order their entries expire (when dropped, ban end), each popped and re-inserted when set, so
         # _prune only looks at the front of each
@@ -76,6 +96,14 @@ class RoutingTable:
         # Node ID -> [failed queries in a row, when it may be retried], for any node; only an answer clears it
         self._unanswered: OrderedDict[bytes, list] = OrderedDict()
         self._lock = threading.RLock()
+        # Node IDs banned for as long as RNS blackholes their identity (rnfs.network.blackhole.Blackhole.node_listed,
+        # set by the node): never blocks, and isn't saved
+        self.blackholed: Callable[[bytes], bool] = lambda node_id: False
+
+    @property
+    def lock(self) -> threading.RLock:
+        """The table's lock (reentrant): its saved state's RowStore takes it to read rows (row())."""
+        return self._lock
 
     @property
     def _silence_limit(self) -> float:
@@ -106,6 +134,7 @@ class RoutingTable:
             expired.append(node_id)
         for node_id in expired:
             del self._bans[node_id]
+            self._changed(node_id)
         expired = []
         for node_id, (_, dropped) in self._dropped.items():
             if now - dropped <= self._silence_limit:
@@ -113,11 +142,13 @@ class RoutingTable:
             expired.append(node_id)
         for node_id in expired:
             del self._dropped[node_id]
+            self._changed(node_id)
 
     def _set_dropped(self, node_id: bytes, first_seen: float, now: float):
         """Remember node_id's seniority as dropped now, at the end of _dropped's expiry order. Caller holds the lock."""
         self._dropped.pop(node_id, None)
         self._dropped[node_id] = (first_seen, now)
+        self._changed(node_id)
 
     def heard(self, node_id: bytes) -> bool:
         """Record that node_id proved to be a reachable server (server-mode announce, or answered /find; for an
@@ -148,13 +179,15 @@ class RoutingTable:
                     self._unanswered.pop(node_id, None)
                 now = self.clock()
                 self._prune(now)
-                if self._bans.get(node_id, now) > now:  # banned; an expired ban may be left (see _prune)
+                # Banned (an expired ban may be left: see _prune), or its identity blackholed by RNS
+                if self._bans.get(node_id, now) > now or self.blackholed(node_id):
                     return False
                 bucket = self._buckets[self.bucket_index(node_id)]
                 entry = bucket.get(node_id)
                 if entry is not None:
                     entry.last_heard = now
                     entry.failures = 0
+                    self._changed(node_id)
                     return False
                 if admitted:
                     return self._add(bucket, node_id, now)
@@ -180,6 +213,7 @@ class RoutingTable:
         if now - dropped > self._silence_limit:  # expired, but not yet pruned (see _prune)
             first_seen = now
         bucket[node_id] = _Entry(node_id, first_seen, now)
+        self._changed(node_id)
         return True
 
     def failed(self, node_id: bytes) -> bool:
@@ -199,6 +233,7 @@ class RoutingTable:
                 return False
             entry.failures += 1
             if entry.failures < self.config.max_failures:
+                self._changed(node_id)
                 return False
             del bucket[node_id]
             self._set_dropped(node_id, entry.first_seen, now)
@@ -248,6 +283,7 @@ class RoutingTable:
         with self._lock:
             self._buckets[self.bucket_index(node_id)].pop(node_id, None)
             self._dropped.pop(node_id, None)
+            self._changed(node_id)
 
     def ban(self, node_id: bytes):
         """Ban node_id for ban_time: dropped with its seniority, and ignored by heard() until the ban ends."""
@@ -258,15 +294,20 @@ class RoutingTable:
             self.remove(node_id)
             self._bans.pop(node_id, None)  # re-inserted last, keeping _bans in expiry order
             self._bans[node_id] = self.clock() + self.config.ban_time
+            self._changed(node_id)
 
     def is_banned(self, node_id: bytes) -> bool:
-        """True while node_id is banned; its announces and provider records are then ignored too."""
+        """True while node_id is banned, or RNS blackholes its identity (blackholed); its announces and provider
+        records are then ignored too."""
+        if self.blackholed(node_id):
+            return True
         with self._lock:
             until = self._bans.get(node_id)
             if until is None:
                 return False
             if until <= self.clock():
                 del self._bans[node_id]
+                self._changed(node_id)
                 return False
             return True
 
@@ -329,6 +370,13 @@ class RoutingTable:
             return 2
         return 0 if now - entry.first_seen >= min_age else 1
 
+    def join_order(self) -> list[bytes]:
+        """The servers in the table that haven't failed a query since last heard, longest known first: those a join
+        asks before bootstrap nodes (the node puts the better scored first, keeping this order between equals)."""
+        with self._lock:
+            entries = [e for bucket in self._buckets for e in bucket.values() if e.failures == 0]
+        return [e.node_id for e in sorted(entries, key=lambda e: (e.first_seen, e.node_id))]
+
     def contains(self, node_id: bytes) -> bool:
         """True if node_id is in the table."""
         with self._lock:
@@ -356,3 +404,104 @@ class RoutingTable:
         if not is_id(node_id) or node_id == self.own_id:
             return None
         return self._buckets[self.bucket_index(node_id)].get(node_id)
+
+    # Persistence (rnfs.dht.routing_state)
+
+    def track(self, changed: Callable[[bytes], object]):
+        """Tell changed(node_id), with the table's lock held, whenever what row(node_id) gives changes."""
+        with self._lock:
+            self._changed = changed
+
+    def row(self, node_id) -> tuple | None:
+        """What is saved for node_id: (node_id, IN_TABLE, first seen, last heard, failed queries since),
+        (node_id, DROPPED, first seen, when dropped, 0) or (node_id, BANNED, None, ban end, 0), times as wall clock;
+        None if the table holds nothing for it (or it isn't a node ID)."""
+        if not is_id(node_id) or node_id == self.own_id:
+            return None
+        with self._lock:
+            offset = self.wall_clock() - self.clock()
+            entry = self._buckets[self.bucket_index(node_id)].get(node_id)
+            if entry is not None:
+                return node_id, IN_TABLE, entry.first_seen + offset, entry.last_heard + offset, entry.failures
+            if node_id in self._dropped:
+                first_seen, dropped = self._dropped[node_id]
+                return node_id, DROPPED, first_seen + offset, dropped + offset, 0
+            if node_id in self._bans:
+                return node_id, BANNED, None, self._bans[node_id] + offset, 0
+            return None
+
+    def restore(self, rows: list[tuple]) -> list:
+        """Load rows row() gave (from the state database) into a table nothing has used yet; returns the node values
+        of the rows that no longer match what the table holds, so they are written again or deleted.
+
+        A time later than now (a clock since corrected backwards) counts as now, and a ban ends no later than
+        ban_time from now. Left out: rows that are malformed or of our own ID, dropped nodes whose seniority has
+        expired, bans that have ended, nodes admit() rejects (private mode: no longer members) and, in a full
+        bucket (after our identity changed), the nodes first seen last. Silent nodes are kept as they were saved:
+        /find replies leave them out until they are heard again, as before the restart."""
+        changed = []
+        parsed = []
+        for row in rows:
+            fields = _parse_row(row)
+            if fields is None or fields[0] == self.own_id:
+                changed.append(row[0] if row else None)
+            else:
+                parsed.append(fields)
+        if self.admit is not None:  # asked without the lock, as heard() does: it may block
+            for fields in [f for f in parsed if f[1] == IN_TABLE and not self.admit(f[0])]:
+                parsed.remove(fields)
+                changed.append(fields[0])
+        with self._lock:
+            wall_now, now = self.wall_clock(), self.clock()
+            offset = wall_now - now
+            dropped, bans = [], []
+            for node_id, state, first_seen, at, failures in sorted(parsed, key=lambda f: (f[2] or 0.0, f[0])):
+                clamped = min(at, wall_now), None if first_seen is None else min(first_seen, wall_now)
+                if state == BANNED:
+                    until = min(at, wall_now + self.config.ban_time)
+                    if until <= wall_now:
+                        changed.append(node_id)
+                        continue
+                    bans.append((until - offset, node_id))
+                    clamped = (until, None)
+                elif state == DROPPED:
+                    if wall_now - clamped[0] > self._silence_limit:
+                        changed.append(node_id)
+                        continue
+                    dropped.append((clamped[0] - offset, clamped[1] - offset, node_id))
+                else:
+                    bucket = self._buckets[self.bucket_index(node_id)]
+                    if len(bucket) >= K:
+                        changed.append(node_id)
+                        continue
+                    entry = bucket[node_id] = _Entry(node_id, clamped[1] - offset, clamped[0] - offset)
+                    entry.failures = failures
+                if clamped != (at, first_seen):
+                    changed.append(node_id)
+            for until, node_id in sorted(bans):  # in expiry order, as _prune expects
+                self._bans[node_id] = until
+            for dropped_at, first_seen, node_id in sorted(dropped):
+                self._dropped[node_id] = (first_seen, dropped_at)
+        return changed
+
+
+def _number(value) -> float | None:
+    """A saved time as a float, or None if it isn't a finite number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _parse_row(row) -> tuple | None:
+    """A saved row as (node ID, state, first seen or None, at, failures), or None if it is malformed."""
+    if not isinstance(row, (tuple, list)) or len(row) != 5 or not is_id(row[0]):
+        return None
+    node_id, state, first_seen, at, failures = row
+    at, first = _number(at), _number(first_seen)
+    if at is None or isinstance(state, bool) or state not in (IN_TABLE, DROPPED, BANNED):
+        return None
+    if state == BANNED:
+        return bytes(node_id), state, None, at, 0
+    if first is None or isinstance(failures, bool) or not isinstance(failures, int) or failures < 0:
+        return None
+    return bytes(node_id), state, first, at, failures

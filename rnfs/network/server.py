@@ -26,8 +26,8 @@ import RNS
 from RNS.vendor import umsgpack
 
 from rnfs.config import Config
-from rnfs.constants import (BLOCKS_PATH, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK, PIN_PATH,
-                            PROVIDE_PATH, RESPONSE_OVERHEAD)
+from rnfs.constants import (BLOCKS_PATH, FIND_PATH, KIB, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK, MIB, PIN_PATH,
+                            PROVIDE_PATH, RANGE_BZ2, RANGE_PATH, RESPONSE_OVERHEAD)
 from rnfs.content.cid import Cid
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_VERBOSE, LOG_WARNING, ThrottledLog, log, node_name, plural, size
 from rnfs.network import guards, protocol, rates
@@ -89,6 +89,12 @@ OVER_RATE_REFUSALS = 2 * MAX_REQUESTS_PER_LINK
 OVER_RATE_LOG_INTERVAL = 60.0  # seconds between log lines about requests over the rate limit
 # IncomingLinks.take_token outcomes
 REQUEST_OK, REQUEST_REFUSED, REQUEST_DROPPED = "ok", "refused", "dropped"
+# /range compression (section 7): bz2 costs about a hundred times what re-checking a block's hash does (about 5 ms for
+# 128 KiB on a desktop), so the node compresses at most COMPRESS_RATE bytes of ranges a second, in bursts of up to
+# COMPRESS_BURST, and sends the rest as they are. Only slow links ask for compression, whose ranges arrive a few KiB a
+# second at most, so it binds only on a requester asking for more than any slow link carries
+COMPRESS_RATE = 256 * KIB
+COMPRESS_BURST = 1 * MIB
 
 
 class Backend(Protocol):
@@ -109,6 +115,10 @@ class Backend(Protocol):
     def served_block_size(self, cid: Cid) -> int | None:
         """The stored length of the block served_block(cid) would return, or None if it isn't served (or isn't
         known). Lets /blocks stop at the block over its budget unread."""
+
+    def serves(self, cid: Cid) -> bool:
+        """True if served_block(cid) may return a block (it is provided and not denied), False if it can't: asked
+        before a request takes a response slot, so one for nothing served displaces no other response (REL-2)."""
 
     def remote_pin(self, identity_hash: bytes, cid: Cid, pin: bool) -> bool:
         """Accept (True) or refuse a /pin from the identity with this 16-byte hash."""
@@ -662,6 +672,31 @@ class Cooldowns:
             self.until.popitem(last=False)
 
 
+class CompressionBudget:
+    """The bytes /range may compress: a token bucket of burst bytes, refilled at rate bytes a second, starting full.
+    Thread-safe."""
+
+    def __init__(self, rate: float, burst: float, clock: Callable[[], float] = time.monotonic):
+        """A full bucket."""
+        self.rate = rate
+        self.burst = burst
+        self.clock = clock
+        self.tokens = float(burst)
+        self.updated = clock()
+        self.lock = threading.Lock()
+
+    def take(self, nbytes: int) -> bool:
+        """Spend nbytes if the bucket holds them; False (nothing spent) if not: send that range as it is."""
+        with self.lock:
+            now = self.clock()
+            self.tokens = min(float(self.burst), self.tokens + max(0.0, now - self.updated) * self.rate)
+            self.updated = now
+            if self.tokens < nbytes:
+                return False
+            self.tokens -= nbytes
+            return True
+
+
 class UploadPacer:
     """max_upload_rate between responses: a link's next response starts no sooner than bytes × 8 / cap
     seconds after the previous one started. Thread-safe."""
@@ -678,6 +713,18 @@ class UploadPacer:
             return
         with self.lock:
             self.next_start[link_id] = self.clock() + size * 8 / cap
+
+    def concluded(self, link_id: bytes, started: float, now: float):
+        """A response under the default cap, started at started, has concluded now: the next may start
+        UPLOAD_CAP_DIVISOR times the time it took after it started, if that is sooner than its estimate allowed. The cap
+        is half the link's rate, and the estimate it was set with may be far below what the link carried: one read
+        from small /range responses, where RNS's measurement is mostly its ramp-up, held a fast link's next response
+        back a minute after a 327 KB one took 8 s, and the requester, pacing by the time it took, failed the provider
+        (REL-12)."""
+        at = started + rates.UPLOAD_CAP_DIVISOR * max(0.0, now - started)
+        with self.lock:
+            if link_id in self.next_start and at < self.next_start[link_id]:
+                self.next_start[link_id] = at
 
     def wait_time(self, link_id: bytes) -> float:
         """Seconds until the next response on link_id may start."""
@@ -709,6 +756,7 @@ class RequestServer:
         self.incoming = IncomingLinks(config.max_incoming_links, clock)
         self.pacer = UploadPacer(clock)
         self.cooldowns = Cooldowns(config.blocks_cooldown, clock)
+        self.compression = CompressionBudget(COMPRESS_RATE, COMPRESS_BURST, clock)  # /range's bz2 (section 7)
         # mesh: airtime controls on /blocks and the traffic counters (shared with the client by the node)
         self.airtime = mesh.AirtimePolicy(config, clock)
         self.traffic = traffic if traffic is not None else mesh.Traffic()
@@ -720,8 +768,12 @@ class RequestServer:
         self.watched: set[bytes] = set()  # links whose outgoing Resource registrations we see
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
+        self.closing = False  # set by close(): the node is stopping, and every request is refused
         self.wake = threading.Event()
         self.pin_identities = config.remote_pin_set
+        # Identity hashes RNS blackholes (rnfs.network.blackhole.Blackhole.identity_listed, set by the node): requests
+        # on links identified as one are answered False
+        self.blackholed: Callable[[bytes], bool] = lambda identity_hash: False
         self.over_rate = 0  # requests over their link's rate limit, in all (refused or dropped)
         self.over_rate_log = ThrottledLog(OVER_RATE_LOG_INTERVAL, clock)
 
@@ -738,6 +790,7 @@ class RequestServer:
             PROVIDE_PATH: self._handle_provide,
             BLOCKS_PATH: self._handle_blocks,
             PIN_PATH: self._handle_pin,
+            RANGE_PATH: self._handle_range,  # rnfs 0.2.0
         }
         # Paths added by features (rnfs.features: Feature.requests), within the same per-link limit
         for path, handler in backend.feature_requests().items():
@@ -756,6 +809,12 @@ class RequestServer:
         """Stop the response monitor."""
         self.stop_event.set()
         self.wake.set()
+
+    def close(self):
+        """The node is stopping: refuse every request from now on (False), quietly. Its handlers would read state
+        that is being saved and closed, and failed at the end of every stop: a refusal sends the requester elsewhere
+        at once."""
+        self.closing = True
 
     # Incoming links
 
@@ -836,17 +895,23 @@ class RequestServer:
     # Handlers
 
     def _guarded(self, handler):
-        """Wrap handler with the link's rate limit (over it: False, or None, which RNS doesn't answer), the
-        private-mode membership check (False for a non-member), and an answer of False for an unexpected error
-        rather than leaving the requester waiting."""
+        """Wrap handler with False once the node is stopping (close), the link's rate limit (over it: False, or None,
+        which RNS doesn't answer), False for a link identified as an identity RNS blackholes, the private-mode membership check (False for a non-member), and
+        an answer of False for an unexpected error rather than leaving the requester waiting."""
         def response_generator(path, data, request_id, link_id, remote_identity, requested_at):
             """RNS's six-argument request handler signature."""
+            if self.closing:
+                return False  # the node is stopping (close)
             # First, before any parsing: the link's rate limit. None: RNS sends no answer
             allowed = self.incoming.take_token(link_id)
             if allowed != REQUEST_OK:
                 self._over_rate()
                 return False if allowed == REQUEST_REFUSED else None
             try:
+                if remote_identity is not None and self.blackholed(bytes(remote_identity.hash)):
+                    # RNS tears down a link identifying as a blackholed identity; one identified before it was listed
+                    log(f"refused {path} from a blackholed identity", LOG_VERBOSE)
+                    return False
                 if self.config.private and not self._is_member(remote_identity):
                     log(f"refused {path} from a non-member", LOG_VERBOSE)
                     return False
@@ -948,33 +1013,92 @@ class RequestServer:
         return self._in_slot(link_id, lambda: self.backend.remote_pin(remote_identity.hash, cid, pin) is True)
 
     def _handle_blocks(self, path, data, request_id, link_id, remote_identity):
-        """Answer /blocks within the per-link limit, the response pools, upload pacing and the budget."""
+        """Answer /blocks within the per-link limit, the response pools, upload pacing and the budget (_serve)."""
         parsed = protocol.parse_blocks_request(data)
+        if parsed is None:
+            return False
+        max_bytes, cids = parsed
+
+        def build(limit: int):
+            """The response: each block or None until the budget (the first served block always included)."""
+            entries = select_blocks(cids, self.backend.served_block, limit, self.backend.served_block_size)
+            served = sum(1 for entry in entries if entry is not None)
+            return (protocol.encode_blocks_response(entries), served > 0,
+                    f"{plural(served, 'block')} of {len(cids)} requested")
+
+        def unserved():
+            """The answer if no block asked for is served (each None), else None."""
+            if any(self.backend.serves(cid) for cid in cids):
+                return None
+            return protocol.encode_blocks_response([None] * len(cids))
+        return self._serve(BLOCKS_PATH, link_id, request_id, remote_identity, max_bytes, build, unserved)
+
+    def _handle_range(self, path, data, request_id, link_id, remote_identity):
+        """Answer /range (rnfs 0.2.0) as /blocks is answered (_serve): a byte range of one served block, sent whole as
+        a /blocks response's first block is, compressed if asked and smaller, within the compression budget."""
+        parsed = protocol.parse_range_request(data)
+        if parsed is None:
+            return False
+        cid, offset, max_bytes, flags = parsed
+
+        def build(limit: int):
+            """The answer: [size, encoding, bytes], [] if the block isn't served, False past its end. The range is
+            sent whole, whatever the budget left (limit), as /blocks's first served block is."""
+            block = self.backend.served_block(cid)
+            if block is None:
+                return [], False, f"nothing: {cid} isn't served"
+            if offset > len(block):
+                return False, False, f"offset {offset} is past the end of {cid} ({len(block)} bytes)"
+            data = block[offset:offset + protocol.range_length(len(block), offset, max_bytes)]
+            encoding, payload = protocol.RANGE_RAW, data
+            if flags & RANGE_BZ2 and data and self.compression.take(len(data)):
+                compressed = protocol.compress_range(data)
+                if len(compressed) < len(data):
+                    encoding, payload = RANGE_BZ2, compressed
+            what = f"{size(len(data))} of {cid} from byte {offset}" + (
+                f" (bz2: {size(len(payload))})" if encoding == RANGE_BZ2 else "")
+            return protocol.encode_range_response(len(block), encoding, payload), True, what
+        return self._serve(RANGE_PATH, link_id, request_id, remote_identity, max_bytes, build,
+                           lambda: None if self.backend.serves(cid) else [])
+
+    def _serve(self, path: str, link_id: bytes, request_id: bytes, remote_identity, max_bytes: int,
+               build: Callable[[int], tuple], unserved: Callable[[], object]):
+        """Answer a /blocks or /range request within the per-link limit, the response pools, upload pacing and the
+        budget: one path for both, so /range counts against everything /blocks does (section 7).
+
+        build(limit) makes the response once every check has passed, given the budget for blocks after the first
+        served one: (body, whether it carries blocks, what it is, for the log). A body of False refuses the request.
+        unserved() is the answer when nothing asked for is served (None if something is): sent at once, as one
+        packet, without a response slot, so a request for nothing can't displace a response in progress (REL-2).
+        """
         link = self._find_link(link_id)
-        if parsed is None or link is None:
+        if link is None:
             return False
         identity = bytes(remote_identity.hash) if remote_identity is not None else None
         if self.cooldowns.active(link_id, identity):
-            log("refused /blocks: that requester's last response made no progress", LOG_VERBOSE)
+            log(f"refused {path}: that requester's last response made no progress", LOG_VERBOSE)
             return False
         # mesh airtime controls: refused (False) at once, so the requester tries another provider
         refusal = self.airtime.refusal(mesh.interface_names(getattr(link, "attached_interface", None)))
         if refusal is not None:
             self.traffic.refused(refusal)
-            log(f"refused /blocks: {refusal.replace('_', ' ')}", LOG_VERBOSE)
+            log(f"refused {path}: {refusal.replace('_', ' ')}", LOG_VERBOSE)
             return False
-        max_bytes, cids = parsed
         if not self.incoming.start_request(link_id, blocks=True) and not self._after_previous(link, link_id):
-            log("refused /blocks: a response is still in progress on that link", LOG_VERBOSE)
+            log(f"refused {path}: a response is still in progress on that link", LOG_VERBOSE)
             return False
 
         response = None
         handed_over = False
         try:
+            nothing = unserved()
+            if nothing is not None:
+                log(f"{path}: sending nothing: none of what was asked for is served", LOG_VERBOSE)
+                return nothing
             # Refusals come first and at once: pacing, then the pools; only an accepted request waits
             wait = self.pacer.wait_time(link_id)
             if wait > MAX_PACING_WAIT:
-                log(f"refused /blocks: the link's upload cap allows the next response in {wait:.0f}s", LOG_VERBOSE)
+                log(f"refused {path}: the link's upload cap allows the next response in {wait:.0f}s", LOG_VERBOSE)
                 return False
             rate = self.rates.get(link_id)
             slow = rates.link_is_slow(link, rate, self.config)
@@ -990,7 +1114,7 @@ class RequestServer:
                 self._cancel(displaced, "made no progress; displaced by a new request" if displaced.idle
                              else "displaced by a new request")
             if response is None:
-                log(f"refused /blocks: every {'slow' if slow else 'fast'}-link response slot is busy", LOG_VERBOSE)
+                log(f"refused {path}: every {'slow' if slow else 'fast'}-link response slot is busy", LOG_VERBOSE)
                 return False
             if wait > 0:
                 self._pace(response, wait)
@@ -1007,11 +1131,14 @@ class RequestServer:
             if share is not None:
                 if share <= 0:
                     self.traffic.refused(mesh.REFUSED_BUDGET)
-                    log("refused /blocks: that requester's responses in flight hold half of upload_budget", LOG_VERBOSE)
+                    log(f"refused {path}: that requester's responses in flight hold half of upload_budget",
+                        LOG_VERBOSE)
                     return False
                 limit = min(limit, max(0, share - RESPONSE_OVERHEAD))
-            entries = select_blocks(cids, self.backend.served_block, limit, self.backend.served_block_size)
-            body = protocol.encode_blocks_response(entries)
+            body, carries, what = build(limit)
+            if body is False:
+                log(f"refused {path}: {what}", LOG_VERBOSE)
+                return False
             packed = protocol.packed_response_size(request_id, body)
             mdu = link.get_mdu() or protocol.DEFAULT_MDU
             single = packed <= mdu
@@ -1019,18 +1146,16 @@ class RequestServer:
             # The upload budget is charged for responses carrying blocks (answers of only None are tiny), as
             # they are sent: up front only a reservation of about one packet (its advertisement), or all of it
             # if it goes as one packet or its progress can't be followed
-            if any(entry is not None for entry in entries) and not self._admit(
-                    response, packed, packed if single or untracked else min(packed, mdu)):
+            if carries and not self._admit(response, packed, packed if single or untracked else min(packed, mdu)):
                 self.traffic.refused(mesh.REFUSED_BUDGET)
-                log(f"refused /blocks: {size(packed)} is over what is left of upload_budget", LOG_VERBOSE)
+                log(f"refused {path}: {size(packed)} is over what is left of upload_budget", LOG_VERBOSE)
                 return False
             if response.finished:
                 return False  # displaced while it was being built (_admit charged nothing, or _finish settled)
             with self.lock:
                 if link_id in self.links:  # a closed link's entry would never be forgotten
                     self.pacer.started(link_id, packed, cap)
-            served = sum(1 for entry in entries if entry is not None)
-            log(f"/blocks: sending {plural(served, 'block')} of {len(cids)} requested ({size(packed)})", LOG_VERBOSE)
+            log(f"{path}: sending {what} ({size(packed)})", LOG_VERBOSE)
             self.traffic.sent(node_id_for_identity(remote_identity) if remote_identity is not None else None,
                               mesh.interface_label(getattr(link, "attached_interface", None)), packed)
             if single:
@@ -1280,6 +1405,8 @@ class RequestServer:
         status = getattr(resource, "status", None)
         if first and status == RNS.Resource.COMPLETE:
             self.rates.record(response.link_id, response.size, self._expected_rate(link))
+            if self.config.max_upload_rate is None:
+                self.pacer.concluded(response.link_id, response.started, self.clock())
         elif first and status == RNS.Resource.REJECTED and not self._made_progress(response, resource):
             # Turned down at its advertisement or cancelled by its requester (on RNS 1.5.6 both arrive as
             # REJECTED) before a quarter of it was sent: no honest 0.1.5 fetcher does that, it closes the link.

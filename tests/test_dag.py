@@ -1,5 +1,8 @@
 """Tests for DAG node encoding and strict decoding (specification section 5)."""
+import random
+import struct
 import unittest
+from unittest import mock
 
 from RNS.vendor import umsgpack
 
@@ -173,6 +176,116 @@ class StrictDecodingTest(unittest.TestCase):
         block = pack([1, [[CHUNK.binary, 1]] * count])
         self.assertGreater(len(block), MAX_BLOCK_SIZE)
         self.assertInvalid(block)
+
+
+_ARRAYS = [(0x90, 15, ""), (0xDC, 2**16 - 1, ">H"), (0xDD, 2**32 - 1, ">I")]
+_UINTS = [(0x00, 127, ""), (0xCC, 2**8 - 1, ">B"), (0xCD, 2**16 - 1, ">H"), (0xCE, 2**32 - 1, ">I"),
+          (0xCF, 2**64 - 1, ">Q")]
+_STRS = [(0xA0, 31, ""), (0xD9, 2**8 - 1, ">B"), (0xDA, 2**16 - 1, ">H"), (0xDB, 2**32 - 1, ">I")]
+_BINS = [(0xC4, 2**8 - 1, ">B"), (0xC5, 2**16 - 1, ">H"), (0xC6, 2**32 - 1, ">I")]
+
+
+def _pack_with(value, choose) -> bytes:
+    """value packed as msgpack, each header's form chosen by choose(fitting), fitting being the forms (first type
+    byte, most it carries, struct format of what follows; fixed forms have "") that can carry it, shortest first."""
+
+    def header(forms, number: int) -> bytes:
+        tag, _, fmt = choose([form for form in forms if number <= form[1]])
+        return bytes([tag | number]) if not fmt else bytes([tag]) + struct.pack(fmt, number)
+
+    if isinstance(value, list):
+        return header(_ARRAYS, len(value)) + b"".join(_pack_with(item, choose) for item in value)
+    if isinstance(value, int):
+        return header(_UINTS, value)
+    data = value.encode("utf-8") if isinstance(value, str) else value
+    return header(_STRS if isinstance(value, str) else _BINS, len(data)) + data
+
+
+class ShortestHeaderTest(unittest.TestCase):
+    """decode() checks each header is the shortest form instead of encoding the node again: it must accept exactly
+    the blocks that a reader taking any header form, followed by a re-encode check, accepts."""
+
+    @staticmethod
+    def accepted(block: bytes) -> bool:
+        """Whether decode, without its memo, accepts block."""
+        try:
+            dag._decode(block)
+            return True
+        except InvalidDag:
+            return False
+
+    @staticmethod
+    def re_encodes(block: bytes) -> bool:
+        """Whether the reader taking any header form (no _SHORTEST minimum) reads block and the node re-encodes to
+        it: the check decode made before."""
+        with mock.patch.dict(dag._SHORTEST, dict.fromkeys(dag._SHORTEST, 0)):
+            try:
+                return dag.encode(dag._decode(block)) == block
+            except InvalidDag:
+                return False
+
+    def assertSame(self, block: bytes):
+        """decode accepts block exactly when the re-encode check does."""
+        self.assertEqual(self.accepted(block), self.re_encodes(block), block.hex())
+
+    def values(self) -> list:
+        """Nodes as plain values, at the edges of each header form: fixint/uint8/16/32/64 sizes, fixstr/str8 names
+        (str16 is too long for a name, but its header is read first), fixarray/array16 counts."""
+        sizes = [0, 127, 128, 255, 256, 2**16 - 1, 2**16, 2**32 - 1, 2**32]
+        return [
+            [1, [[CHUNK.binary, size] for size in sizes]],
+            [1, [[CHUNK.binary, 2**64 - 1]]],
+            [1, [[CHUNK.binary, 1]] * 15],
+            [1, [[CHUNK.binary, 1]] * 16],
+            [1, []],
+            [2, [["n" * 31, CHUNK.binary, 7, 0], ["o" * 32, NODE.binary, 300, 2], ["p" * 255, CHUNK.binary, 0, 1]]],
+            [2, [["x" * 256, CHUNK.binary, 1, 0]]],
+            [2, [[f"{n:03}", CHUNK.binary, n, 0] for n in range(17)]],
+            [3, [["a", NODE.binary, 2**40], ["é", NODE.binary, 128]]],
+            [2, []],
+        ]
+
+    def test_every_header_form(self):
+        """Each node with one header at a time written in each longer form, and with every header's form chosen
+        at random: accepted only when all are shortest, and exactly when the re-encode check accepts."""
+        rng = random.Random(5)
+        for value in self.values():
+            with self.subTest(value=str(value)[:60]):
+                valid = not (value[0] == 2 and value[1] and len(value[1][0][0]) > 255)  # all but the str16 name
+                self.assertEqual(self.accepted(pack(value)), valid)
+                headers = []
+                _pack_with(value, lambda fitting: headers.append(len(fitting)) or fitting[0])
+                for at, forms in enumerate(headers):
+                    for form in range(1, forms):
+                        seen = []
+
+                        def choose(fitting):
+                            """Shortest, but form for header at."""
+                            seen.append(None)
+                            return fitting[form] if len(seen) - 1 == at else fitting[0]
+
+                        block = _pack_with(value, choose)
+                        self.assertFalse(self.accepted(block))
+                        self.assertSame(block)
+                for _ in range(100):
+                    chosen = []
+                    block = _pack_with(value, lambda fitting: chosen.append(rng.randrange(len(fitting)))
+                                       or fitting[chosen[-1]])
+                    self.assertSame(block)
+                    if any(chosen):
+                        self.assertFalse(self.accepted(block))
+
+    def test_every_byte_changed(self):
+        """Every byte of small valid nodes set to every value, and every truncation and extension by a byte."""
+        blocks = [pack([2, [["ab", CHUNK.binary, 200, 0], ["c" * 33, NODE.binary, 70000, 2]]]),
+                  pack([3, [["a", NODE.binary, 2**33]]]), pack([1, [[CHUNK.binary, 5]]])]
+        for block in blocks:
+            for at in range(len(block)):
+                for byte in range(256):
+                    self.assertSame(block[:at] + bytes([byte]) + block[at + 1:])
+                self.assertSame(block[:at])
+                for byte in range(256):
+                    self.assertSame(block[:at] + bytes([byte]) + block[at:])
 
 
 class NameTest(unittest.TestCase):

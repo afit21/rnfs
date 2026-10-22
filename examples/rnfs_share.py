@@ -1,4 +1,4 @@
-"""Share a file or folder from a program with rnfs's public API, through either class (provisional until 0.2).
+"""Share a file or folder from a program with rnfs's public API, through either class (provisional until 1.0.0).
 
     python3 examples/rnfs_share.py --node ~/.rnfs-example PATH   # a node inside this program, beside its Reticulum
     python3 examples/rnfs_share.py --daemon PATH                 # the user's running daemon (rnfs daemon)

@@ -18,7 +18,7 @@ from rnfs.config import Config
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.errors import RnfsError
 from rnfs.names import NameManager, Record
-from tests.support import POSIX_MODES, FakeClock, failing_commits, state_rows, write_legacy
+from tests.support import PERMISSION_CHECKS, FakeClock, failing_commits, state_rows, write_legacy
 from tests.test_names import FakeNetwork, FakePins
 
 A, B, C = Cid.for_block(RAW, b"a"), Cid.for_block(RAW, b"b"), Cid.for_block(DAG, b"c")
@@ -157,8 +157,9 @@ class NamesFileTest(FileTests, MigrateNamesTest):
         self.assertEqual(self.rows("SELECT name, sequence, cid, heard FROM names_held ORDER BY name"),
                          sorted([(N[1], str(MAX), C.binary, 99.5), (self.site, "5", A.binary, 1234.0)]))
         self.assertEqual(manager.list(), [
-            {"alias": "moved", "name": self.moved.hex(), "cid": None, "sequence": 0},
-            {"alias": "site", "name": self.site.hex(), "cid": str(A), "sequence": 5}])
+            # Keys from before 0.2.0 count as never exported (name_exports has no row for them)
+            {"alias": "moved", "name": self.moved.hex(), "cid": None, "sequence": 0, "exported": False},
+            {"alias": "site", "name": self.site.hex(), "cid": str(A), "sequence": 5, "exported": False}])
         self.assertEqual((manager._published["moved"].imported, manager._published["site"].imported), (True, False))
         self.assertEqual(manager.record(N[1]), Record(MAX, C, 99.5))
         self.assertEqual(manager._gone, [("gone", B)])  # its pin is released once the node is set up
@@ -217,6 +218,18 @@ class NamesFileTest(FileTests, MigrateNamesTest):
         os.rmdir(path)
         for table in ("names_published", "names_held", "migrated"):
             self.assertEqual(self.rows(f"SELECT * FROM {table}"), [])
+
+    def test_file_nested_too_deeply_stops_startup(self):
+        """A names.json nested deeper than json can parse is refused as one that isn't JSON is (RnfsError, the file
+        left as it is), not with a RecursionError."""
+        text = "[[]]"
+        path = write_legacy(self.state, self.FILE, text=text)
+        # How a json that can't parse that deep fails (3.11-3.13; 3.14's parses about 100,000 levels)
+        with mock.patch("json.load", side_effect=RecursionError("deep")), \
+                self.assertRaisesRegex(RnfsError, "nested too deeply"):
+            self.manager()
+        with open(path, encoding="utf-8") as f:
+            self.assertTrue(f.read() == text)  # assertEqual would print all of it on a failure
 
     def database_files(self) -> list[str]:
         """The state database's files in the state directory."""
@@ -333,7 +346,7 @@ class FloorFileTest(FileTests, MigrateNamesTest):
         self.assertEqual(self.rows("SELECT * FROM name_floor"), [])
         self.assertEqual(self.rows("SELECT * FROM migrated"), [])
 
-    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks")
     def test_unreadable_file_stops_startup(self):
         """A name-floor.json that can't be read stops startup, as it did: a transient error isn't damage."""
         path = write_legacy(self.state, self.FILE, self.value())

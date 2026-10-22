@@ -21,7 +21,8 @@ FAKE_ONLY = {"record", "called", "put_file", "put_dir"}
 # FakeClient's: the CIDs a node was asked for
 CLIENT_FAKE_ONLY = {"asked"}
 # The PeerClient methods the fetcher and publisher call, which FakeClient (the client of their tests) must have
-CLIENT_USED = {"open_links", "rate_estimate", "link_mdu", "close_unless_used", "blocks", "provide"}
+CLIENT_USED = {"open_links", "rate_estimate", "link_mdu", "close_unless_used", "hold_link", "blocks", "provide",
+               "block_range"}
 
 
 def public_methods(cls) -> dict:

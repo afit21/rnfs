@@ -10,21 +10,22 @@ from collections import deque
 from unittest import mock
 
 from rnfs.config import Config
-from rnfs.constants import CHUNK_SIZE, MAX_BLOCK_SIZE, MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE, RESPONSE_OVERHEAD
+from rnfs.constants import CHUNK_SIZE, K, MAX_BLOCK_SIZE, MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE, RESPONSE_OVERHEAD
 from rnfs.content import builder, dag, walker
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.dag import Child, Entry, FileNode
 from rnfs.content import storage as storage_module
 from rnfs.content.storage import Storage
+from rnfs.dht import scores as scoring
 from rnfs.dht.routing import RoutingTable
 from rnfs.errors import InvalidDag, NotFound, StorageFull, TooLarge
-from rnfs import fetcher as fetcher_module
+from rnfs import fetcher as fetcher_module, mesh
 from rnfs.fetcher import Fetcher
 from rnfs.network import client as client_module, links, protocol, server
-from rnfs.network.client import BUSY, FAILED, OK, STALLED, BlocksResult
+from rnfs.network.client import BUSY, FAILED, LOST, OK, STALLED, BlocksResult
 from tests.fakes.client import BATCH, FakeClient
 from tests.fakes.log import quiet_log
-from tests.support import failing_commits, state_execute, state_rows
+from tests.support import FakeClock, failing_commits, state_execute, state_rows
 import tests.test_links as link_fakes  # a module, so its test cases don't run twice
 
 OWN = bytes(16)
@@ -35,10 +36,12 @@ setUpModule, tearDownModule = quiet_log()
 class FakeLookup:
     """A provider lookup whose runs report fixed providers."""
 
-    def __init__(self, runs: list[list[bytes]]):
-        """runs[i] is what the i-th run of find_providers reports."""
+    def __init__(self, runs: list[list[bytes]], listed: dict[bytes, set[bytes]] | None = None):
+        """runs[i] is what the i-th run of find_providers reports; listed[provider], the nodes whose answers listed
+        it (none by default)."""
         self.runs = runs
         self.count = 0
+        self.listed = listed or {}
 
     def find_providers(self, on_provider, should_stop=lambda: False):
         """Report this run's providers."""
@@ -51,6 +54,10 @@ class FakeLookup:
     def stop(self):
         """Nothing to wake."""
 
+    def listers(self, provider: bytes) -> set[bytes]:
+        """The nodes said to have listed provider."""
+        return set(self.listed.get(provider, ()))
+
     def allow_unknown(self, node_id: bytes) -> bool:
         """Every identity is known."""
         return True
@@ -58,6 +65,12 @@ class FakeLookup:
     def remaining(self) -> float:
         """Time is never up."""
         return 100.0
+
+    def closest_answered(self) -> list[bytes]:
+        """Some node answered (the search reached the DHT), unless a test said none did."""
+        return [] if self.unanswered else [P4]
+
+    unanswered = False  # set by a test: no node answered (the node is offline)
 
 
 class FetcherTest(unittest.TestCase):
@@ -75,17 +88,19 @@ class FetcherTest(unittest.TestCase):
         self.network: dict[Cid, bytes] = {}
         self.lookups: list[FakeLookup] = []
         self.runs: list[list[bytes]] = []
+        self.listed: dict[bytes, set[bytes]] = {}  # provider -> the nodes the lookups say listed it
         self.fetcher = self.make_fetcher()
 
     def make_fetcher(self, slow: bool = False) -> Fetcher:
         """A fetcher whose lookups report self.runs."""
         def make_lookup(key):
             """A new FakeLookup, remembered."""
-            lookup = FakeLookup(self.runs)
+            lookup = FakeLookup(self.runs, self.listed)
             self.lookups.append(lookup)
             return lookup
         fetcher = Fetcher(self.storage, self.client, self.config, OWN, self.routing, make_lookup, slow,
                           os.path.join(self.tmp.name, "state"), busy_delay=0.01)
+        fetcher.late_search = None  # these tests count the searches a fetch makes (LateSearchTest has it on)
         self.addCleanup(fetcher.close)
         return fetcher
 
@@ -126,6 +141,195 @@ class ProviderDiscoveryTest(FetcherTest):
         self.assertTrue(self.storage.is_complete(built.cid))
         self.assertEqual(len(self.lookups), 1)
 
+    def test_providers_of_records_held_here_are_used_while_the_search_runs(self):
+        """A record this node holds names a provider at once (over LoRa the laptop held an island record of a file and
+        still waited 51 s for its search to find the provider it named); the search still runs, so a record held here
+        can't hide other providers."""
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P1)
+        held = []
+        self.fetcher.held_providers = lambda key: held.append(key) or [P1, OWN]
+        self.fetch_all(built.cid)  # the search (no runs) finds nobody
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(held, [built.cid.key])
+        self.assertEqual(len(self.lookups), 1)
+        self.assertEqual(self.client.asked(P1)[0], built.cid)
+
+    def test_the_observer_is_told_the_providers_in_use_and_the_search(self):
+        """What a job shows: searching before any provider is known (minutes on a radio), each provider found, and the
+        search's end."""
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P1)
+        self.hold(P2)
+        self.runs.append([P1, P2])
+        for node_id in (P1, P2):
+            self.client.behaviour[node_id] = lambda cids: time.sleep(0.2)  # served once the search's end is handled
+        told = []
+
+        class Recorder(fetcher_module.Observer):
+            def providers(self, count, searching):
+                told.append((count, searching))
+        with fetcher_module.observing(Recorder()):
+            self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(told, [(0, True), (1, True), (2, True), (2, False)])
+        told.clear()
+        with fetcher_module.observing(Recorder()):
+            self.fetch_all(built.cid, from_node=P1)
+        self.assertEqual(told, [(1, False)])  # a fetch from a given node doesn't search
+
+    def test_a_failing_record_store_leaves_it_to_the_search(self):
+        built = self.file(os.urandom(CHUNK_SIZE))
+        self.hold(P2)
+        self.runs.append([P2])
+
+        def broken(key):
+            """The record store fails."""
+            raise OSError("disk gone")
+        self.fetcher.held_providers = broken
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+
+    def search_again_setup(self, slow: bool = False):
+        """A 24-chunk file P1 serves slowly (each request moves the fetch's clock on 30 s) and P2 quickly; the first
+        search finds P1 only, a second would find P2. Returns (the file, the lookups made)."""
+        if slow:
+            self.fetcher = self.make_fetcher(slow=True)
+        built = self.file(os.urandom(24 * CHUNK_SIZE))
+        self.hold(P1)
+        self.hold(P2)
+        now = [1000.0]
+        self.fetcher.clock = lambda: now[0]
+
+        def slow_link(cids):
+            """Served, but 30 s a request."""
+            now[0] += 30
+            return None
+        self.client.behaviour[P1] = slow_link
+        made = []
+
+        def make_lookup(key):
+            """The first search finds P1, any later one P2."""
+            lookup = FakeLookup([[P1]] if not made else [[P2]])
+            made.append(lookup)
+            return lookup
+        self.fetcher.make_lookup = make_lookup
+        return built, made
+
+    def test_a_long_fetch_searches_again_and_uses_what_it_finds(self):
+        """A 30 MB fetch over a 4-hop route ran 29 minutes at 18 KB/s while a node 2 hops away had the file: with fewer
+        providers than max_parallel, a fetch searches again a minute after its last search ended."""
+        built, made = self.search_again_setup()
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertGreaterEqual(len(made), 2)
+        self.assertTrue(self.client.asked(P2))  # the provider the second search found took part of the fetch
+
+    def test_a_slow_node_doesnt_search_again(self):
+        # A search is a minute of airtime on a radio
+        built, made = self.search_again_setup(slow=True)
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(len(made), 1)
+        self.assertEqual(self.client.asked(P2), [])
+
+    def test_searching_again_backs_off(self):
+        """60 s after a search ends, then twice as long each time, up to SEARCH_AGAIN_MAX."""
+        built = self.file(os.urandom(CHUNK_SIZE))
+        with self.fetcher.open(built.cid) as fetch:
+            now = [1000.0]
+            self.fetcher.clock = lambda: now[0]
+            started = []
+            fetch._start_lookup = lambda: started.append(now[0])
+            fetch._new_provider(P1)  # one provider, fewer than max_parallel
+            fetch._searched_at = now[0]
+            for wait in (60, 120, 240, 480, 600, 600):
+                before = len(started)
+                now[0] = fetch._searched_at + wait - 1
+                fetch._search_again()
+                self.assertEqual(len(started), before, wait)  # not yet
+                now[0] += 1
+                fetch._search_again()
+                self.assertEqual(len(started), before + 1, wait)
+                fetch._searched_at = now[0]  # that search ended at once
+            # A fetch of days keeps its first search and the latest few, not one a 10 minutes
+            first = fetch._lookups[0]
+            for _ in range(3 * fetcher_module.SEARCHES_KEPT):
+                now[0] = fetch._searched_at + fetcher_module.SEARCH_AGAIN_MAX
+                fetch._search_again()
+                fetch._searched_at = now[0]
+            self.assertEqual(len(fetch._lookups), 1 + fetcher_module.SEARCHES_KEPT)
+            self.assertIs(fetch._lookups[0], first)
+            self.assertIs(fetch._lookups[-1], fetch._lookup)
+
+    def test_a_provider_unreachable_once_is_asked_again(self):
+        """Over LoRa the one provider of a file was out of reach for a minute (its rnsd restarting): failed at its
+        first unanswered path request, it was never asked again, and the fetch failed though it was back by then."""
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P1)
+        tries = []
+
+        def back_after_one(cids):
+            """No path the first time."""
+            tries.append(cids)
+            return BlocksResult(FAILED, unsent=list(cids), reason="unreachable") if len(tries) == 1 else None
+        self.client.behaviour[P1] = back_after_one
+        self.runs.append([P1])
+        with mock.patch.object(fetcher_module, "UNREACHABLE_RETRY", 0.05):
+            self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertGreater(len(tries), 1)
+
+    def test_a_provider_unreachable_twice_in_a_row_fails(self):
+        built = self.file(os.urandom(CHUNK_SIZE))
+        self.hold(P1)
+        tries = []
+
+        def never(cids):
+            """No path, ever."""
+            tries.append(cids)
+            return BlocksResult(FAILED, unsent=list(cids), reason="unreachable")
+        self.client.behaviour[P1] = never
+        self.runs.append([P1])
+        with mock.patch.object(fetcher_module, "UNREACHABLE_RETRY", 0.05), self.assertRaises(NotFound):
+            self.fetch_all(built.cid)
+        self.assertEqual(len(tries), 2)
+
+    def test_a_fetch_whose_first_request_brought_the_root_searches_again_too(self):
+        """A remembered provider, asked first, brought the root: no search ran, and a long fetch from it still looks for
+        more providers, counting from the fetch's start."""
+        built, made = self.search_again_setup()
+        self.fetcher.remember(built.cid, P1)
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertGreaterEqual(len(made), 1)
+        self.assertTrue(self.client.asked(P2))
+
+    def test_no_search_again_once_every_provider_failed(self):
+        """With none left the fetch fails as before (a search that found nothing new isn't run again), rather than start
+        a whole new search because the wait for one had passed."""
+        built = self.file(os.urandom(CHUNK_SIZE))
+        with self.fetcher.open(built.cid) as fetch:
+            started = []
+            fetch._start_lookup = lambda: started.append(1)
+            fetch._fail(fetch._new_provider(P1), "test")
+            fetch._searched_at -= 10 * fetcher_module.SEARCH_AGAIN_MAX
+            fetch._search_again()
+            self.assertEqual(started, [])
+
+    def test_a_provider_waiting_out_a_delay_leaves_room_for_more(self):
+        built = self.file(os.urandom(CHUNK_SIZE))
+        self.config.max_parallel_providers = 2
+        self.fetcher = self.make_fetcher()
+        with self.fetcher.open(built.cid) as fetch:
+            started = []
+            fetch._start_lookup = lambda: started.append(1)
+            fetch._new_provider(P1)
+            fetch._new_provider(P2).busy_until = self.fetcher.clock() + 60  # unreachable, asked again later
+            fetch._searched_at -= 10 * fetcher_module.SEARCH_AGAIN_MAX
+            fetch._search_again()
+            self.assertEqual(started, [1])
+
     def test_open_link_nodes_are_asked_first(self):
         built = self.file(os.urandom(3 * CHUNK_SIZE))
         self.hold(P1)
@@ -133,6 +337,27 @@ class ProviderDiscoveryTest(FetcherTest):
         self.fetch_all(built.cid)
         self.assertTrue(self.storage.is_complete(built.cid))
         self.assertEqual(self.lookups, [])  # no lookup needed
+
+    def test_a_probe_that_brings_the_block_isnt_asked_for_it_again(self):
+        built = self.file(os.urandom(3 * CHUNK_SIZE))
+        self.hold(P1)
+        self.client.links = [P1]
+        self.fetch_all(built.cid)
+        asked = self.client.asked(P1)
+        self.assertEqual(asked[0], built.cid)
+        self.assertEqual(len(asked), len(set(asked)))  # the root once: the probe brought it
+        self.assertEqual(sorted(map(str, asked)), sorted(map(str, self.network)))
+
+    def test_a_probe_that_misses_leaves_the_block_to_the_lookup(self):
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P3)
+        self.client.links = [P1, P2]  # neither holds anything
+        self.runs.append([P3])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(self.client.asked(P1), [built.cid])
+        self.assertEqual(self.client.asked(P2), [built.cid])
+        self.assertEqual(self.client.asked(P3)[0], built.cid)
 
     def test_open_link_without_the_root_falls_back_to_lookup(self):
         built = self.file(os.urandom(3 * CHUNK_SIZE))
@@ -180,6 +405,198 @@ class ProviderDiscoveryTest(FetcherTest):
             for node_id in (P1, P2, P3):
                 fetch._add_provider(node_id)
             self.assertEqual([p.node_id for p in fetch._usable()], [P2, P1, P3])
+
+    def test_scores_order_providers_within_seniority_groups(self):
+        self.routing.heard(P2)
+        self.config.provider_seniority = 0  # everything in the routing table counts as long-known
+        for _ in range(8):
+            self.fetcher.scores.served(P3)  # well scored, but new: still after P2
+        self.fetcher.scores.served(P1)
+        self.fetcher.scores.served(P1)
+        four = bytes([4] * 16)
+        with self.fetcher.open(self.file(b"y").cid) as fetch:
+            for node_id in (four, P1, P2, P3):
+                fetch._add_provider(node_id)
+            self.assertEqual([p.node_id for p in fetch._usable()], [P2, P3, P1, four])
+
+
+class RememberTest(FetcherTest):
+    """Providers that served a root are asked first when it is fetched again; a search that found none isn't repeated
+    by a fetch that isn't explicit (section 7, Fetching a target, step 1)."""
+
+    LORA = mesh.PathInfo(1, "LoRa", 1200)
+
+    def setUp(self):
+        """A file of a few chunks; the fetcher's clock set by hand."""
+        super().setUp()
+        self.built = self.file(os.urandom(3 * CHUNK_SIZE))
+        self.now = [1000.0]
+        self.fetcher.clock = lambda: self.now[0]
+
+    def resolve(self, root: Cid, **kwargs):
+        """Fetch the root block only."""
+        with self.fetcher.open(root, **kwargs) as fetch:
+            fetch.resolve()
+
+    def test_a_provider_that_served_is_asked_first_without_a_lookup(self):
+        self.hold(P1)
+        self.runs.append([P1])
+        self.resolve(self.built.cid)  # the root, from the provider a lookup found
+        self.assertEqual(self.fetcher.remembered(self.built.cid), [P1])
+        self.client.requests.clear()
+        self.fetch_all(self.built.cid)  # its links closed since: no open link to ask
+        self.assertTrue(self.storage.is_complete(self.built.cid))
+        self.assertEqual(len(self.lookups), 1)  # no second lookup
+        self.assertEqual(self.client.requests[0][0], P1)
+
+    def test_only_providers_that_served_are_remembered(self):
+        self.hold(P2)
+        self.runs.append([P1, P3, P2])  # a /find reply's word isn't enough: P1 and P3 hold nothing
+        self.fetch_all(self.built.cid)
+        self.assertEqual(self.fetcher.remembered(self.built.cid), [P2])
+
+    def test_a_remembered_provider_that_answers_none_is_forgotten(self):
+        self.hold(P1)
+        self.runs.append([P1])
+        self.resolve(self.built.cid)
+        self.client.holdings[P1] = {}  # it unpinned it
+        self.hold(P2)
+        self.runs[:] = [[P2]]
+        self.fetch_all(self.built.cid)
+        self.assertTrue(self.storage.is_complete(self.built.cid))
+        self.assertEqual(len(self.lookups), 2)
+        self.assertEqual(self.fetcher.remembered(self.built.cid), [P2])
+        self.assertFalse(self.routing.is_banned(P1))  # not penalised: it was only asked first
+
+    def test_a_remembered_provider_that_fails_is_forgotten_and_a_busy_one_kept(self):
+        for status, kept in ((FAILED, False), (LOST, False), (BUSY, True)):
+            with self.subTest(status=status):
+                built = self.file(os.urandom(2 * CHUNK_SIZE) + status.encode())
+                self.client.behaviour.clear()
+                self.hold(P1)
+                self.runs[:] = [[P1]]
+                self.resolve(built.cid)
+                self.client.behaviour[P1] = lambda cids, status=status: BlocksResult(status, unsent=list(cids))
+                self.hold(P2)
+                self.runs[:] = [[P2]]
+                self.fetch_all(built.cid)
+                self.assertEqual(P1 in self.fetcher.remembered(built.cid), kept)
+
+    def test_a_provider_that_fails_during_a_fetch_is_forgotten(self):
+        self.hold(P1)
+        self.runs.append([P1])
+        self.resolve(self.built.cid)
+        root = self.network[self.built.cid]
+        self.client.holdings[P1] = {self.built.cid: root}  # the root, but none of its chunks
+        self.hold(P2)
+        self.client.links = [P2]
+        self.fetch_all(self.built.cid)
+        self.assertNotIn(P1, self.fetcher.remembered(self.built.cid))
+
+    def test_remembered_for_a_few_hours_and_never_once_banned(self):
+        self.fetcher.remember(self.built.cid, P1)
+        self.now[0] += fetcher_module.REMEMBER_FOR - 1
+        self.fetcher.remember(self.built.cid, P2)
+        self.assertEqual(self.fetcher.remembered(self.built.cid), [P2, P1])  # the most recent to serve first
+        self.now[0] += 1
+        self.assertEqual(self.fetcher.remembered(self.built.cid), [P2])
+        self.routing.ban(P2)
+        self.assertEqual(self.fetcher.remembered(self.built.cid), [])
+
+    def test_bounded(self):
+        for i in range(K + 5):
+            self.now[0] += 1
+            self.fetcher.remember(self.built.cid, bytes([i + 10]) * 16)
+        remembered = self.fetcher.remembered(self.built.cid)
+        self.assertEqual(remembered, [bytes([i + 10]) * 16 for i in reversed(range(5, K + 5))])  # the latest K
+        roots = [Cid.for_block(RAW, bytes([i])) for i in range(4)]
+        with mock.patch.object(fetcher_module, "MAX_REMEMBERED", 3), \
+                mock.patch.object(fetcher_module, "MAX_UNFOUND", 3):
+            for root in roots:
+                self.fetcher.remember(root, P1)
+                self.fetcher.note_unfound(root)
+            self.fetcher.remembered(roots[1])  # used: kept over roots[2]
+            self.fetcher.remember(self.built.cid, P1)
+            self.assertEqual([root for root in roots if self.fetcher.remembered(root)], [roots[1], roots[3]])
+            self.assertEqual([root for root in roots if self.fetcher.unfound(root) is not None], roots[1:])
+
+    def test_the_hint_then_remembered_providers_then_open_links(self):
+        for node_id in (P1, P2, P3):
+            self.hold(node_id)
+        self.fetcher.remember(self.built.cid, P2)
+        self.client.links = [P3, P2]
+        self.config.max_parallel_providers = 2
+        with self.fetcher.open(self.built.cid, hint=P4) as fetch:
+            fetch.resolve()
+        self.assertEqual(sorted(node for node, _ in self.client.requests[:2]), [P2, P4])  # P3 left out
+        self.assertEqual(self.client.asked(P3), [])
+
+    def test_a_fast_node_asks_no_remembered_provider_over_a_slow_link_first(self):
+        self.hold(P1)
+        self.hold(P2)
+        self.fetcher.remember(self.built.cid, P1)
+        self.fetcher.path_info = lambda node_id: self.LORA if node_id == P1 else mesh.NO_PATH
+        self.runs.append([P2])
+        self.fetch_all(self.built.cid)
+        self.assertEqual(self.client.asked(P1), [])  # the lookup over fast links first
+        self.assertEqual(len(self.lookups), 1)
+        self.assertIn(P1, self.fetcher.remembered(self.built.cid))  # kept: it wasn't asked
+
+    def test_a_slow_node_asks_its_one_remembered_provider_before_an_open_link(self):
+        self.config.max_parallel_providers = None  # its default: 1 on a slow node
+        self.fetcher = self.make_fetcher(slow=True)
+        self.fetcher.clock = lambda: self.now[0]
+        self.hold(P1)
+        self.hold(P2)
+        self.fetcher.remember(self.built.cid, P1)
+        self.client.links = [P2]
+        self.fetcher.path_info = lambda node_id: self.LORA
+        self.resolve(self.built.cid)
+        self.assertEqual(self.client.requests, [(P1, [self.built.cid])])
+        self.assertEqual(self.lookups, [])
+
+    def test_a_search_that_found_nothing_isnt_repeated_by_a_fetch_that_isnt_explicit(self):
+        self.runs.append([])
+        with self.assertRaises(NotFound):
+            self.resolve(self.built.cid, explicit=False)
+        self.assertEqual(len(self.lookups), 1)
+        self.now[0] += fetcher_module.UNFOUND_FOR - 1
+        with self.assertRaises(NotFound) as caught:
+            self.resolve(self.built.cid, explicit=False)  # a gateway reload
+        self.assertEqual(len(self.lookups), 1)
+        self.assertIn("a search 599s ago found none", str(caught.exception))
+        with self.assertRaises(NotFound):
+            self.resolve(self.built.cid)  # the user asks again: searched
+        self.assertEqual(len(self.lookups), 2)
+        self.now[0] += fetcher_module.UNFOUND_FOR
+        with self.assertRaises(NotFound):
+            self.resolve(self.built.cid, explicit=False)
+        self.assertEqual(len(self.lookups), 3)
+
+    def test_nodes_asked_first_are_still_asked(self):
+        self.runs.append([])
+        with self.assertRaises(NotFound):
+            self.resolve(self.built.cid, explicit=False)
+        self.hold(P1)
+        self.client.links = [P1]  # an open link that has it now
+        self.fetch_all(self.built.cid, explicit=False)
+        self.assertTrue(self.storage.is_complete(self.built.cid))
+        self.assertEqual(len(self.lookups), 1)
+        self.assertIsNone(self.fetcher.unfound(self.built.cid))  # it was found after all
+
+    def test_only_a_search_that_was_answered_and_found_nobody_counts(self):
+        FakeLookup.unanswered = True  # offline: no node answered
+        self.addCleanup(setattr, FakeLookup, "unanswered", False)
+        self.runs.append([])
+        with self.assertRaises(NotFound):
+            self.resolve(self.built.cid, explicit=False)
+        self.assertIsNone(self.fetcher.unfound(self.built.cid))
+        FakeLookup.unanswered = False
+        self.runs[:] = [[P1]]  # a provider found, which fails: someone provides it
+        with self.assertRaises(NotFound):
+            self.resolve(self.built.cid, explicit=False)
+        self.assertIsNone(self.fetcher.unfound(self.built.cid))
+        self.assertEqual(len(self.lookups), 2)
 
 
 class FailureRuleTest(FetcherTest):
@@ -242,6 +659,55 @@ class FailureRuleTest(FetcherTest):
         self.fetch_all(built.cid)
         self.assertEqual(len([n for n, _ in self.client.requests if n == P1]), 1)
 
+    def test_lost_request_is_retried_on_a_new_link(self):
+        built = self.file(os.urandom(3 * CHUNK_SIZE))
+        self.hold(P1)
+        answers = [BlocksResult(LOST, unsent=[built.cid], reason="no answer")]
+        self.client.behaviour[P1] = lambda cids: answers.pop() if answers else None
+        self.runs.append([P1])
+        with self.fetcher.open(built.cid) as fetch:
+            fetch.fetch_dag(fetch.resolve())
+            provider = fetch._providers[P1]
+            self.assertEqual((provider.failed, provider.lost), (False, 0))
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(self.client.closed, [P1])  # closed, so the retry goes out on a new link
+        self.assertEqual(self.client.asked(P1)[:2], [built.cid, built.cid])
+
+    def test_lost_max_failures_times_in_a_row_fails(self):
+        built = self.file(b"l" * 3000)
+        self.client.behaviour[P1] = lambda cids: BlocksResult(LOST, unsent=list(cids), reason="no answer")
+        self.runs.append([P1])
+        with self.assertRaises(NotFound):
+            self.fetch_all(built.cid)
+        self.assertEqual(len(self.client.requests), self.config.max_failures)
+        self.assertEqual(self.client.closed, [P1] * self.config.max_failures)
+
+    def test_another_provider_is_asked_while_a_lost_request_waits(self):
+        self.config.max_parallel_providers = 1
+        built = self.file(b"m" * 3000)
+        self.hold(P2)
+        self.client.behaviour[P1] = lambda cids: BlocksResult(LOST, unsent=list(cids), reason="no answer")
+        self.runs.append([P1, P2])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual([node for node, _ in self.client.requests], [P1, P2])
+
+    def test_an_answer_resets_the_lost_count(self):
+        self.config.max_parallel_providers = 1
+        built = self.file(os.urandom(6 * CHUNK_SIZE))
+        self.hold(P1)
+        # Two lost of every three requests: never max_failures in a row
+        count = [0]
+
+        def lossy(cids):
+            """Lose the first two requests of every three."""
+            count[0] += 1
+            return BlocksResult(LOST, unsent=list(cids), reason="no answer") if count[0] % 3 else None
+        self.client.behaviour[P1] = lossy
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+
     def test_bad_block_bans_the_provider(self):
         self.config.max_parallel_providers = 1
         built = self.file(b"b" * 3000)
@@ -258,6 +724,50 @@ class FailureRuleTest(FetcherTest):
         self.client.requests.clear()
         self.fetch_all(other.cid)
         self.assertEqual(self.client.asked(P1), [])
+
+
+class ScoreTest(FetcherTest):
+    """Local scores (section 6): raised by verified blocks and the answers that led to them, lowered by failures."""
+
+    def setUp(self):
+        """Scores on a clock that stands still, so none decays while a slow runner works through a fetch."""
+        super().setUp()
+        self.fetcher.scores.clock = FakeClock()
+
+    def test_verified_blocks_raise_the_provider_and_once_per_fetch_its_listers(self):
+        self.config.max_parallel_providers = 1
+        built = self.file(os.urandom(5 * CHUNK_SIZE))
+        self.hold(P1)
+        self.runs.append([P1])
+        self.listed[P1] = {P2, P3}
+        self.fetch_all(built.cid)
+        responses = len([n for n, _ in self.client.requests if n == P1])
+        self.assertGreater(responses, 1)
+        scores = self.fetcher.scores
+        self.assertAlmostEqual(scores.score(P1), responses * scoring.SERVED, places=4)
+        self.assertAlmostEqual(scores.score(P2), scoring.USEFUL_ANSWER, places=4)
+        self.assertAlmostEqual(scores.score(P3), scoring.USEFUL_ANSWER, places=4)
+
+    def test_failing_providers_and_bad_blocks_lower_scores(self):
+        self.config.max_parallel_providers = 1
+        built = self.file(b"f" * 3000)
+        self.hold(P3)
+        # (a failure other than no path: one of those is asked again a minute later before it counts)
+        self.client.behaviour[P1] = lambda cids: BlocksResult(FAILED, unsent=list(cids), reason="request failed")
+        self.client.behaviour[P2] = lambda cids: BlocksResult(OK, bad=[cids[0]], unsent=list(cids[1:]))
+        self.runs.append([P1, P2, P3])
+        self.listed[P2] = {P1}  # P1 listed P2, which sent nothing verified: no credit for that
+        self.fetch_all(built.cid)
+        scores = self.fetcher.scores
+        self.assertAlmostEqual(scores.score(P1), scoring.FAILED, places=4)
+        self.assertAlmostEqual(scores.score(P2), scoring.BAD_BLOCK + scoring.FAILED, places=4)
+        self.assertAlmostEqual(scores.score(P3), scoring.SERVED, places=4)
+
+    def test_scores_given_are_used(self):
+        scores = scoring.Scores()
+        fetcher = Fetcher(self.storage, self.client, self.config, OWN, self.routing, lambda key: None, False, None,
+                          scores=scores)
+        self.assertIs(fetcher.scores, scores)
 
 
 class PacingTest(FetcherTest):
@@ -287,6 +797,8 @@ class PacingTest(FetcherTest):
         # At the default cap, half the rate estimate, the next response may start 2 × 40 s after the last one
         self.assertEqual(self.provider.busy_until, self.now + 40)
         self.assertGreaterEqual(self.fetch._progress_at, self.now + 40)  # waiting isn't counted as hanging
+        # ...nor leaving the link idle: the sweep would close it, and its rate estimate (and this pacing) with it
+        self.assertEqual(self.client.held, [(P1, 40)])
 
     def test_response_progress_doesnt_cut_a_pacing_wait_short(self):
         self.result(OK, sent_at=self.now - 40, rate=50_000)
@@ -303,6 +815,7 @@ class PacingTest(FetcherTest):
         self.assertEqual(self.provider.busy_until, 0)
         self.result(OK, sent_at=self.now - 40, rate=None)
         self.assertEqual(self.provider.busy_until, 0)
+        self.assertEqual(self.client.held, [])
 
     def test_refusals_soon_after_serving_are_not_failures(self):
         self.result(OK, sent_at=self.now - 40, rate=50_000)
@@ -323,6 +836,16 @@ class PacingTest(FetcherTest):
         self.result(OK, sent_at=self.now - 40, rate=50_000)
         for _ in range(self.config.max_failures):
             self.result(BUSY, "cancelled")
+        self.assertTrue(self.provider.failed)
+
+    def test_closed_links_count_even_after_serving(self):
+        # A provider closing the link (no room for another incoming link) is busy, not pacing: counted, and failed only
+        # after max_failures in a row, each retried after the busy delay
+        self.result(OK, sent_at=self.now - 40, rate=50_000)
+        self.result(BUSY, "closed")
+        self.assertEqual((self.provider.busy, self.provider.failed), (1, False))
+        for _ in range(self.config.max_failures - 1):
+            self.result(BUSY, "closed")
         self.assertTrue(self.provider.failed)
 
     def test_paced_provider_isnt_dropped_meanwhile(self):
@@ -381,6 +904,545 @@ def old_take_batch(fetch, pending, node_id, wanted, mdu):
         batch.append(pending.popleft())
         total += guess
     return batch
+
+
+class SlowLinkTest(FetcherTest):
+    """Parallelism, probes and duplication follow each provider's link, not the node (section 7, item 7): a node
+    with a fast and a slow interface (a gateway) isn't slow, but its providers behind the slow one share one request
+    at a time, and nothing is probed or duplicated over a slow link."""
+
+    LORA = mesh.PathInfo(1, "LoRa", 1200)
+    OTHER_LORA = mesh.PathInfo(1, "LoRa 2", 1200)
+    TCP = mesh.PathInfo(1, "TCP", 10_000_000)
+
+    def paths(self, table: dict):
+        """Have path_info answer from table (nothing known for the rest)."""
+        self.fetcher.path_info = lambda node_id: table.get(node_id, mesh.NO_PATH)
+
+    def concurrency(self, groups: dict[bytes, str], company: bool = False) -> dict[str, int]:
+        """Serve every provider as usual, a little slowly, recording the most requests each group (by node) had in
+        flight at once. With company, a request waits (5 s at most) until its group has had two in flight at once,
+        so a slow runner starting the request threads late can't hide that they may overlap."""
+        lock = threading.Condition()
+        now: dict[str, int] = {}
+        most: dict[str, int] = {}
+
+        def serve(node_id):
+            """A behaviour counting node_id's group in flight while it answers."""
+            group = groups[node_id]
+
+            def behaviour(cids):
+                """Count, wait a little (or for company), and serve as usual."""
+                with lock:
+                    now[group] = now.get(group, 0) + 1
+                    most[group] = max(most.get(group, 0), now[group])
+                    lock.notify_all()
+                    if company:
+                        lock.wait_for(lambda: most[group] >= 2, timeout=5)
+                time.sleep(0.02)  # how long the provider takes to answer
+                with lock:
+                    now[group] -= 1
+                return None
+            return behaviour
+        for node_id in groups:
+            self.hold(node_id)
+            self.client.behaviour[node_id] = serve(node_id)
+        return most
+
+    def test_providers_behind_one_slow_interface_share_one_request(self):
+        built = self.file(os.urandom(24 * CHUNK_SIZE))
+        self.paths({P1: self.LORA, P2: self.LORA, P3: self.TCP, P4: self.OTHER_LORA})
+        most = self.concurrency({P1: "lora", P2: "lora", P3: "tcp", P4: "lora 2"})
+        self.config.max_parallel_providers = 4
+        self.runs.append([P1, P2, P3, P4])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(most["lora"], 1)  # P1 and P2: one at a time
+        self.assertEqual(set(most), {"lora", "tcp", "lora 2"})  # each interface was used
+
+    def test_a_slow_rate_estimate_shares_the_slot_of_an_unknown_interface(self):
+        built = self.file(os.urandom(12 * CHUNK_SIZE))
+        self.client.rate = 50_000  # every link measured slow; no path known
+        most = self.concurrency({P1: "all", P2: "all", P3: "all"})
+        self.runs.append([P1, P2, P3])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(most["all"], 1)
+
+    def test_a_fast_rate_estimate_is_its_own_slot(self):
+        built = self.file(os.urandom(24 * CHUNK_SIZE))
+        self.client.rate = 10_000_000  # measured fast, whatever the interface says
+        self.paths({P1: self.LORA, P2: self.LORA, P3: self.LORA})
+        most = self.concurrency({P1: "all", P2: "all", P3: "all"}, company=True)
+        self.storage.put(built.cid, self.network[built.cid])  # so the first request isn't the root's, alone
+        self.runs.append([P1, P2, P3])
+        self.fetch_all(built.cid)
+        self.assertGreater(most["all"], 1)
+
+    def test_a_slow_path_shares_a_slot(self):
+        built = self.file(os.urandom(12 * CHUNK_SIZE))
+        self.fetcher.slow_path = lambda node_id: node_id in (P1, P2)  # e.g. more than 3 hops away
+        most = self.concurrency({P1: "far", P2: "far", P3: "near"})
+        self.runs.append([P1, P2, P3])
+        self.fetch_all(built.cid)
+        self.assertEqual(most["far"], 1)
+
+    def test_open_links_over_slow_links_are_not_probed(self):
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        for node_id in (P1, P2, P3):
+            self.hold(node_id)
+        self.client.links = [P1, P2]
+        self.paths({P1: self.LORA, P2: self.TCP})
+        self.fetch_all(built.cid)
+        self.assertEqual(self.client.asked(P1), [])
+        self.assertEqual(self.client.requests[0], (P2, [built.cid]))
+        # Only slow links open: no probe, the lookup at once
+        self.client.links = [P1]
+        self.client.requests.clear()
+        other = self.file(os.urandom(CHUNK_SIZE))
+        self.hold(P3)
+        self.runs.append([P3])
+        self.fetch_all(other.cid)
+        self.assertEqual(self.client.asked(P1), [])
+        self.assertEqual(len(self.lookups), 1)
+
+    def test_a_slow_node_probes_one_open_link(self):
+        # Every link of a slow node is slow; one probe that hits saves a whole lookup over the radio
+        self.fetcher = self.make_fetcher(slow=True)
+        self.config.max_parallel_providers = None  # a slow node's default: one at a time
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        for node_id in (P1, P2):
+            self.hold(node_id)
+        self.client.links = [P1, P2]  # most recently used first
+        self.paths({P1: self.LORA, P2: self.LORA})
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(self.client.requests[0], (P1, [built.cid]))  # the one probe, which found the root
+        self.assertEqual(self.client.asked(P2), [])
+        self.assertEqual(self.lookups, [])
+
+    def test_nothing_is_duplicated_over_a_slow_link(self):
+        self.config.deadline_slack = 0.1
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        dripped = walker.expand(walker.root_expect(built.cid), self.network[built.cid])[0].cid  # P1 is asked first
+        released = threading.Event()
+        self.addCleanup(released.set)
+        for node_id in (P1, P2):
+            self.hold(node_id)
+
+        def drip(cids):
+            """Take a while over the dripped chunk."""
+            if dripped in cids:
+                released.wait(1.0)
+            return None
+        self.client.behaviour[P1] = drip
+        self.paths({P1: self.TCP, P2: self.LORA})  # the idle provider is behind the radio
+        self.runs.append([P1, P2])
+        self.fetch_all(built.cid)
+        self.assertEqual(self.client.asked(P1) + self.client.asked(P2),
+                         list(dict.fromkeys(self.client.asked(P1) + self.client.asked(P2))))  # nothing asked twice
+
+    def test_a_batch_on_a_measured_link_is_duplicated_after_one_and_a_half_times_its_expected_time(self):
+        self.config.deadline_slack = 1
+        self.client.rate = 1_000_000  # fast: a chunk takes about 0.52 s
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        chunk = walker.expand(walker.root_expect(built.cid), self.network[built.cid])[0]
+        now = [1000.0]
+        self.fetcher.clock = lambda: now[0]
+        release = threading.Event()
+        self.addCleanup(release.set)
+        for node_id in (P1, P2):
+            self.hold(node_id)
+            self.client.behaviour[node_id] = lambda cids: (release.wait(5), None)[1]
+        with self.fetcher.open(built.cid) as fetch:
+            providers = [fetch._new_provider(P1), fetch._new_provider(P2)]
+            wanted = {chunk.cid: [chunk]}
+            pending = fetcher_module._Pending([chunk.cid])
+            fetch._assign(pending, fetch._in_flight, {chunk.cid}, wanted, fetch.budget)
+            self.assertEqual(list(fetch._in_flight), [P1])
+            expected = fetch._expected[P1]
+            self.assertAlmostEqual(expected, chunk.size * 8 / 1_000_000)
+            # 10 s expected: duplicated after 15 s, not after deadline_slack
+            fetch._expected[P1] = 10.0
+            now[0] += 14
+            fetch._duplicate(providers, fetch._in_flight, 1, now[0])
+            self.assertEqual(list(fetch._in_flight), [P1])
+            now[0] += 2
+            fetch._duplicate(providers, fetch._in_flight, 1, now[0])
+            self.assertEqual(sorted(fetch._in_flight), [P1, P2])
+            # Without a rate estimate, deadline_slack alone
+            self.assertEqual(fetch._duplicate_after(P3), 1)
+            release.set()
+
+
+TEXT = (b"It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want "
+        b"of a wife. However little known the feelings or views of such a man may be on his first entering a "
+        b"neighbourhood, this truth is so well fixed in the minds of the surrounding families. ")
+
+
+def text_of(size: int) -> bytes:
+    """size bytes of English-like text, varied enough that bz2 doesn't make it vanish."""
+    rng = random.Random(size)
+    words = TEXT.split()
+    out = bytearray()
+    while len(out) < size:
+        out += b" ".join(rng.choice(words) for _ in range(12)) + b"\n"
+    return bytes(out[:size])
+
+
+class LateSearchTest(FetcherTest):
+    """An explicit fetch that found no provider searches once more before it fails: between cloud nodes a get of a CID
+    shared as it was added failed, its publisher's records not out yet (its publish lookup waited 24 s on a server
+    that didn't answer)."""
+
+    def setUp(self):
+        super().setUp()
+        self.fetcher.late_search = 0.0005  # of lookup_timeout: 0.3 s here
+        self.built = self.file(os.urandom(CHUNK_SIZE))
+        self.hold(P1)
+        self.searches: list[list[bytes]] = []  # what each new search finds, in turn (then nobody)
+
+        def make_lookup(key):
+            """A FakeLookup reporting the next of self.searches."""
+            lookup = FakeLookup([self.searches.pop(0) if self.searches else []])
+            self.lookups.append(lookup)
+            return lookup
+        self.fetcher.make_lookup = make_lookup
+
+    def test_records_out_by_the_late_search_are_found(self):
+        self.searches.extend([[], [P1]])  # nobody at first; the provider, once its records are out
+        self.fetch_all(self.built.cid)
+        self.assertTrue(self.storage.is_complete(self.built.cid))
+        self.assertEqual(len(self.lookups), 2)
+
+    def test_it_searches_once_more_only(self):
+        self.searches.extend([[], [], [P1]])
+        with self.assertRaises(NotFound):
+            self.fetch_all(self.built.cid)
+        self.assertEqual(len(self.lookups), 2)
+
+    def test_not_for_a_fetch_that_isnt_explicit(self):
+        self.searches.extend([[], [P1]])  # a gateway request: what nobody asked for just now fails at once
+        with self.assertRaises(NotFound):
+            self.fetch_all(self.built.cid, explicit=False)
+        self.assertEqual(len(self.lookups), 1)
+
+
+class RangeTransferTest(FetcherTest):
+    """/range (rnfs 0.2.0): large chunks over slow links come in ranges, compressed, into a partial block that a stall
+    doesn't lose; fast links keep /blocks; an older node's silence is learnt once, persisted, and costs one request."""
+
+    def ranges_of(self, node_id: bytes, cid: Cid) -> list[tuple[int, int, bool]]:
+        """(offset, max_bytes, compress) of every range node_id was asked for of cid."""
+        return [(offset, max_bytes, compress) for node, c, offset, max_bytes, compress in self.client.ranges
+                if node == node_id and c == cid]
+
+    def chunks(self, built) -> list[walker.Expect]:
+        """The chunk expectations under a built file's root."""
+        return walker.expand(walker.root_expect(built.cid), self.network[built.cid])
+
+    def test_a_slow_link_fetches_large_chunks_in_compressed_ranges(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        data = text_of(3 * CHUNK_SIZE)
+        built = self.file(data)
+        self.hold(P1)
+        self.runs.append([P1])
+        seen = []
+
+        class Recorder(fetcher_module.Observer):
+            def partial(self, cid, held):
+                seen.append(("partial", cid, held))
+
+            def block(self, cid, length, downloaded):
+                seen.append(("block", cid, length))
+        with fetcher_module.observing(Recorder()):
+            self.fetch_all(built.cid)
+        self.assertEqual(self.read(built.cid), data)
+        first = self.ranges_of(P1, self.chunks(built)[0].cid)
+        self.assertGreater(len(first), 1)  # several ranges, not one whole chunk
+        # Each range but the last reported (a job's progress), growing, before the block itself
+        cid = self.chunks(built)[0].cid
+        reported = [held for kind, c, held in seen if kind == "partial" and c == cid]
+        self.assertEqual(len(reported), len(first) - 1)
+        self.assertEqual(reported, sorted(reported))
+        self.assertLess(seen.index(("partial", cid, reported[-1])), seen.index(("block", cid, CHUNK_SIZE)))
+        self.assertEqual(first[0][:2], (0, self.config.min_rate_sample))  # no rate: what gives an estimate
+        for chunk in self.chunks(built):
+            self.assertTrue(all(compress for _, _, compress in self.ranges_of(P1, chunk.cid)))
+        # The root, a DAG node, came with /blocks; the later chunks' ranges were scaled by the compression achieved
+        self.assertEqual(self.ranges_of(P1, built.cid), [])
+        last = self.ranges_of(P1, self.chunks(built)[-1].cid)
+        self.assertGreater(last[0][1], 2 * self.config.min_rate_sample)
+        self.assertEqual(self.fetcher.ranges.partials.count(), 0)  # every partial dropped once its block is stored
+
+    def test_a_slow_nodes_probe_brings_a_single_chunk_file_in_compressed_ranges(self):
+        # On a radio the probe of an open link is most often what brings a small file (measured over LoRa: a 24 KB
+        # text sent whole with /blocks, 2.5 times the airtime bz2 needed)
+        self.fetcher = self.make_fetcher(slow=True)
+        self.config.max_parallel_providers = None
+        data = text_of(CHUNK_SIZE // 2)
+        built = self.file(data)
+        self.assertTrue(built.cid.is_raw)
+        self.hold(P1)
+        self.client.links = [P1]
+        self.fetcher.ranges.support.answered(P1)  # an open link to a node known to answer /range
+        self.fetch_all(built.cid)
+        self.assertEqual(self.read(built.cid), data)
+        asked = self.ranges_of(P1, built.cid)
+        self.assertGreater(len(asked), 1)
+        self.assertTrue(all(compress for _, _, compress in asked))
+        self.assertEqual(self.lookups, [])
+        self.assertEqual(self.fetcher.ranges.partials.count(), 0)
+
+    def test_a_probes_partial_from_a_node_already_a_provider_keeps_it(self):
+        """The lookup can find the node a probe went to before the probe's first range comes back: it stays a
+        provider, remembered, and owns the block it is sending; a second node's partial doesn't take it over."""
+        built = self.file(text_of(CHUNK_SIZE // 2))
+        cid = built.cid
+        with self.fetcher.open(cid) as fetch:
+            fetch._remembered_asked = {P1, P2}
+            self.fetcher.remember(cid, P1)
+            fetch._new_provider(P1)  # found by the lookup meanwhile
+            wanted = {cid: [walker.root_expect(cid)]}
+            for node_id in (P1, P2):
+                fetch._handle(node_id, [cid], BlocksResult(OK, partial={cid: 4096}), True, wanted, {}, {cid},
+                              fetch.budget)
+            self.assertEqual(fetch._owners[cid], P1)
+            self.assertIn(P1, self.fetcher.remembered(cid))
+            self.assertIn(P2, fetch._providers)
+
+    def test_an_open_link_not_known_to_answer_ranges_is_probed_with_blocks(self):
+        # An open link is only a guess: an older node's silence to a /range would hold the search up a request timeout
+        self.fetcher = self.make_fetcher(slow=True)
+        self.config.max_parallel_providers = None
+        built = self.file(text_of(CHUNK_SIZE // 2))
+        self.hold(P1)
+        self.client.links = [P1]
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(self.client.requests[0], (P1, [built.cid]))
+        self.assertEqual(self.ranges_of(P1, built.cid), [])
+
+    def test_a_probe_an_old_node_leaves_unanswered_is_asked_again_with_blocks(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        self.config.max_parallel_providers = None
+        data = text_of(CHUNK_SIZE // 2)
+        built = self.file(data)
+        self.hold(P1)
+        self.client.no_range.add(P1)  # an rnfs 0.1.x node, which served this root before (remembered)
+        self.fetcher.remember(built.cid, P1)
+        self.fetch_all(built.cid)
+        self.assertEqual(self.read(built.cid), data)
+        self.assertEqual(len(self.ranges_of(P1, built.cid)), 1)
+        self.assertEqual(self.client.requests, [(P1, [built.cid]), (P1, [built.cid])])  # the range, then /blocks
+        self.assertEqual(self.lookups, [])  # not a miss: no lookup
+        self.assertFalse(self.routing.is_banned(P1))
+
+    def test_a_probe_that_stalls_mid_block_is_resumed_by_its_node(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        self.config.max_parallel_providers = None
+        data = os.urandom(CHUNK_SIZE // 2)  # random: ranges of exactly min_rate_sample each
+        built = self.file(data)
+        self.hold(P1)
+        step = self.config.min_rate_sample
+        stalled = []
+
+        def stall_once(cid, offset, max_bytes, compress):
+            """The second range stalls once."""
+            if offset == step and not stalled:
+                stalled.append(offset)
+                return client_module.RangeResult(STALLED, reason="no progress for 120s")
+            return None
+        self.client.range_behaviour[P1] = stall_once
+        self.client.links = [P1]
+        self.fetcher.ranges.support.answered(P1)
+        self.fetch_all(built.cid)
+        self.assertEqual(self.read(built.cid), data)
+        offsets = [offset for offset, _, _ in self.ranges_of(P1, built.cid)]
+        self.assertEqual(offsets[:3], [0, step, step])  # the probe's range, the stalled one, and it again
+        self.assertEqual(len(offsets), len(set(offsets)) + 1)  # nothing held asked for again
+        self.assertEqual(self.lookups, [])
+
+    def test_a_fast_link_keeps_blocks(self):
+        built = self.file(os.urandom(3 * CHUNK_SIZE))
+        self.hold(P1)
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(self.client.ranges, [])
+
+    def test_small_chunks_and_dag_nodes_keep_blocks_on_a_slow_link(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        files = [(f"f{i}", builder.build_bytes(os.urandom(1000), self.put)) for i in range(5)]
+        built = builder.build_directory([Entry(name, file.cid, file.size, 0) for name, file in files], self.put)
+        self.hold(P1)
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertEqual(self.client.ranges, [])
+
+    def test_a_stall_mid_chunk_resumes_where_it_stopped(self):
+        """A range that stalls loses only itself: the chunk resumes from the bytes held, where /blocks would send the
+        whole chunk again."""
+        self.fetcher = self.make_fetcher(slow=True)
+        data = os.urandom(2 * CHUNK_SIZE)  # random: no compression, so the ranges are exactly min_rate_sample each
+        built = self.file(data)
+        chunk = self.chunks(built)[0].cid
+        self.hold(P1)
+        stalled = []
+
+        def stall_once(cid, offset, max_bytes, compress):
+            """The third range of the chunk stalls once (the link closed under it)."""
+            if cid == chunk and offset == 2 * self.config.min_rate_sample and not stalled:
+                stalled.append(offset)
+                return client_module.RangeResult(STALLED, reason="no progress for 120s")
+            return None
+        self.client.range_behaviour[P1] = stall_once
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertEqual(self.read(built.cid), data)
+        step = self.config.min_rate_sample
+        self.assertEqual([offset for offset, _, _ in self.ranges_of(P1, chunk)],
+                         [0, step, 2 * step, 2 * step, 3 * step])
+        # Bytes asked for again after the stall: the stalled range only (16 KiB), not the 32 KiB already held
+        offsets = [offset for offset, _, _ in self.ranges_of(P1, chunk)]
+        self.assertEqual(len(offsets) - len(set(offsets)), 1)
+
+    def test_an_old_providers_silence_costs_one_request_a_fetch_and_is_learnt_after_two(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        first, second = self.file(os.urandom(3 * CHUNK_SIZE)), self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P1)
+        self.client.no_range.add(P1)  # an rnfs 0.1.x node
+        self.runs.extend([[P1], [P1], [P1]])
+        self.fetch_all(first.cid)
+        self.assertEqual(len(self.client.ranges), 1)  # asked once, then /blocks for the rest of the fetch
+        self.assertTrue(self.storage.is_complete(first.cid))
+        self.assertIsNone(self.fetcher.ranges.support.answers(P1))  # one silence: maybe a lost packet
+        self.assertFalse(self.routing.is_banned(P1))  # not penalised: its silence isn't a failure
+        self.fetch_all(second.cid)
+        self.assertEqual(len(self.client.ranges), 2)  # the second silence in a row: learnt
+        self.assertTrue(self.storage.is_complete(second.cid))
+        self.assertIs(self.fetcher.ranges.support.answers(P1), False)
+        # Persisted: a restarted fetcher doesn't ask it again
+        self.fetcher.close()
+        self.fetcher = self.make_fetcher(slow=True)
+        self.assertIs(self.fetcher.ranges.support.answers(P1), False)
+        third = self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P1)
+        self.fetch_all(third.cid)
+        self.assertEqual(len(self.client.ranges), 2)
+
+    def test_one_lost_range_doesnt_mark_a_node_that_answers(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        first, second = self.file(os.urandom(2 * CHUNK_SIZE)), self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P1)
+        lost = []
+
+        def lose_one(cid, offset, max_bytes, compress):
+            """The first /range is lost on the way (RNS times it out with the link up)."""
+            if not lost:
+                lost.append(cid)
+                return client_module.RangeResult(LOST, silent=True, reason="no answer")
+            return None
+        self.client.range_behaviour[P1] = lose_one
+        self.runs.extend([[P1], [P1]])
+        self.fetch_all(first.cid)
+        self.assertTrue(self.storage.is_complete(first.cid))
+        self.assertIsNone(self.fetcher.ranges.support.answers(P1))
+        self.fetch_all(second.cid)  # ranges again, answered: the silence is forgotten
+        self.assertTrue(self.storage.is_complete(second.cid))
+        self.assertGreater(len(self.client.ranges), 1)
+        self.assertIs(self.fetcher.ranges.support.answers(P1), True)
+
+    def test_a_provider_that_stalled_gets_ranges_on_a_fast_link(self):
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        chunk = self.chunks(built)[0].cid
+        self.hold(P1)
+        answers = []
+
+        def stall_first(cids):
+            """The first /blocks with the chunk stalls."""
+            if chunk in cids and not answers:
+                answers.append(1)
+                return BlocksResult(STALLED, unsent=list(cids), reason="stalled")
+            return None
+        self.client.behaviour[P1] = stall_first
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        asked = self.ranges_of(P1, chunk)
+        self.assertTrue(asked)
+        self.assertTrue(all(not compress and max_bytes <= fetcher_module.STALLED_RANGE
+                            for _, max_bytes, compress in asked))
+
+    def test_a_provider_whose_responses_are_cut_gets_ranges(self):
+        """REL-19: between cloud nodes one route cut every 64 KiB /blocks response from a provider at the same point;
+        each counted as busy, and the provider failed after three, though ranges would have come through."""
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        chunk = self.chunks(built)[0].cid
+        self.hold(P1)
+
+        ranging = []
+
+        def cut(cids):
+            """Any /blocks with the chunk stops arriving partway (FakeClient asks this for a range too: not cut)."""
+            if ranging:
+                ranging.clear()
+                return None
+            if chunk in cids:
+                return BlocksResult(BUSY, unsent=list(cids), reason="cancelled")
+            return None
+
+        def range_of(cid, offset, max_bytes, compress):
+            """A range comes through: served as FakeClient serves it."""
+            ranging.append(cid)
+        self.client.behaviour[P1] = cut
+        self.client.range_behaviour[P1] = range_of
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        asked = self.ranges_of(P1, chunk)
+        self.assertTrue(asked)
+        self.assertTrue(all(max_bytes <= fetcher_module.STALLED_RANGE for _, max_bytes, _ in asked))
+
+    def test_a_block_held_in_part_is_left_to_its_provider(self):
+        self.config.max_parallel_providers = 2
+        self.fetcher = self.make_fetcher()
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        chunk = self.chunks(built)[0].cid
+        self.hold(P1)
+        self.hold(P2)
+        with self.fetcher.open(built.cid) as fetch:
+            fetch._new_provider(P1)
+            fetch._new_provider(P2)
+            fetch._owners[chunk] = P1
+            pending = fetcher_module._Pending([chunk, self.chunks(built)[1].cid])
+            self.assertEqual(fetch._others_owned(pending, P2), [chunk])  # P2 takes what follows
+            self.assertEqual(list(pending), [self.chunks(built)[1].cid])
+            pending.push_front([chunk])
+            self.assertEqual(fetch._others_owned(pending, P1), [])  # its owner takes it
+            fetch._fail(fetch._providers[P1], "test")
+            self.assertEqual(fetch._others_owned(pending, P2), [])  # a failed owner's blocks go to the others
+
+    def test_a_mismatching_block_from_ranges_bans_its_provider(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        data = os.urandom(2 * CHUNK_SIZE)
+        built = self.file(data)
+        chunk = self.chunks(built)[0].cid
+        forged = bytearray(self.network[chunk])
+        forged[-1] ^= 1
+        self.hold(P1)
+        self.client.holdings[P1][chunk] = bytes(forged)
+        self.hold(P2)
+        self.paths({})
+        self.runs.append([P1, P2])
+        self.config.max_parallel_providers = 1
+        self.fetch_all(built.cid)
+        self.assertEqual(self.read(built.cid), data)
+        self.assertTrue(self.routing.is_banned(P1))
+
+    def paths(self, table: dict):
+        """Have path_info answer from table (nothing known for the rest)."""
+        self.fetcher.path_info = lambda node_id: table.get(node_id, mesh.NO_PATH)
 
 
 class BatchTest(FetcherTest):
@@ -814,6 +1876,50 @@ class ReadAheadTest(FetcherTest):
         self.assertEqual(self.client.closed, [])
 
 
+class RangeWindowTest(FetcherTest):
+    """A byte-range read's window follows the providers' links: WINDOW chunks while one is over a fast link, else
+    SLOW_WINDOW (one chunk, one more asked for ahead), so the first byte over LoRa doesn't wait for 32 chunks."""
+
+    def setUp(self):
+        """A file of eight chunks, held by P1."""
+        super().setUp()
+        self.data = os.urandom(8 * CHUNK_SIZE)
+        self.built = self.file(self.data)
+        self.chunks = [child.cid for child in dag.decode(self.network[self.built.cid]).children]
+        self.hold(P1)
+        self.runs.append([P1])
+
+    def first_piece(self, path: mesh.PathInfo) -> list[Cid]:
+        """Read the file with P1 behind path; the CIDs asked for by the time the reader has its first bytes (and the
+        whole file read after)."""
+        self.fetcher.path_info = lambda node_id: path
+        with self.fetcher.open(self.built.cid) as fetch:
+            reader = fetch.read_range(fetch.resolve())
+            pieces = [next(reader)]
+            asked = self.client.asked(P1)
+            pieces.extend(reader)
+        self.assertEqual(b"".join(pieces), self.data)
+        return asked
+
+    def test_a_slow_link_reads_one_chunk_at_a_time_one_ahead(self):
+        asked = self.first_piece(mesh.PathInfo(1, "LoRa", 1200))
+        self.assertEqual(asked, [self.built.cid] + self.chunks[:2])
+
+    def test_a_fast_link_reads_a_full_window(self):
+        asked = self.first_piece(mesh.PathInfo(1, "TCP", 10_000_000))
+        self.assertEqual(sorted(asked), sorted([self.built.cid] + self.chunks))  # fewer than WINDOW: all of them
+
+    def test_with_no_provider_known_yet_the_first_window_is_small(self):
+        self.storage.put(self.built.cid, self.network[self.built.cid])  # the root stored: no provider asked for it
+        with self.fetcher.open(self.built.cid) as fetch:
+            reader = fetch.read_range(fetch.resolve())
+            pieces = [next(reader)]
+            self.assertEqual(self.client.asked(P1), self.chunks[:2])
+            pieces.extend(reader)  # P1 is known, over a link not known to be slow: the rest in one window
+            self.assertEqual(fetch._window(), fetcher_module.WINDOW)
+        self.assertEqual(b"".join(pieces), self.data)
+
+
 class ReadAheadLinkTest(unittest.TestCase):
     """An early-closing reader over the real PeerClient and LinkPool (RNS faked as in test_links): its link is torn
     down, which stops the response, unless another fetch has a request on it; it never cancels the response's
@@ -903,6 +2009,70 @@ class ReadAheadLinkTest(unittest.TestCase):
         self.assertEqual(len(link_fakes.FakeLink.created), 1)  # the one link, never closed
         self.assertEqual(link.status, link_fakes.FakeLink.ACTIVE)
         response.cancel.assert_not_called()
+
+
+class LossyLinkTest(unittest.TestCase):
+    """1 MiB fetches from one provider over the real PeerClient and LinkPool (RNS faked as in test_links), on a path
+    losing 5% of packets. RNS resends neither a request nor a link's request or proof: a lost request times out, a
+    lost link request or proof leaves the link unestablished. Before 0.2.0 the first lost request failed the only
+    provider, and with it more than half of these fetches (16 chunks and the root: 1 - 0.95^17); now a lost request
+    is retried on a new link and the provider fails only after max_failures in a row."""
+
+    LOSS = 0.05
+    TRIALS = 30
+
+    def setUp(self):
+        """A fetcher using a PeerClient whose links are FakeLinks; P1 serves whatever it is asked for, but each
+        request, and each link's request and proof, is lost with probability LOSS (a seeded draw, one at a time:
+        with one provider, one request is in flight at a time, so the draws come in the same order every run)."""
+        patcher = mock.patch.object(links, "RNS", link_fakes.fake_rns())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        link_fakes.FakeLink.created = []
+        link_fakes.FakeLink.establish_delay = 0.0
+        self.random = random.Random(5)
+        self.lock = threading.Lock()
+        self.network: dict[Cid, bytes] = {}
+
+        def lost() -> bool:
+            """One packet's fate."""
+            with self.lock:
+                return self.random.random() < self.LOSS
+
+        def respond(link, path, data):
+            """Serve every CID asked for, unless the request is lost: RNS then times it out."""
+            if lost():
+                return link_fakes.FAIL
+            return [self.network.get(Cid.from_bytes(binary)) for binary in data[1]]
+        link_fakes.FakeLink.responder = staticmethod(respond)
+        link_fakes.FakeLink.establishes = staticmethod(lambda link: not lost() and not lost())  # request, proof
+        self.addCleanup(setattr, link_fakes.FakeLink, "establishes", None)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = Config(rnfs_dir=tmp.name, slow="no")
+        self.storage = Storage(os.path.join(tmp.name, "blocks"), os.path.join(tmp.name, "state"), 10**9)
+        self.addCleanup(self.storage.close)
+        self.pool = links.LinkPool(object(), config)
+        self.addCleanup(self.pool.close_all)
+        self.fetcher = Fetcher(self.storage, client_module.PeerClient(self.pool, config), config, OWN,
+                               RoutingTable(OWN, config), lambda key: FakeLookup([[P1]]), busy_delay=0.01)
+        self.addCleanup(self.fetcher.close)
+
+    def test_a_lossy_link_fetches_a_mebibyte_from_one_provider(self):
+        failed = 0
+        for _ in range(self.TRIALS):
+            root = builder.build_bytes(os.urandom(1024 * 1024), self.network.__setitem__).cid
+            try:
+                with self.fetcher.open(root) as fetch:
+                    fetch.fetch_dag(fetch.resolve())
+            except NotFound:
+                failed += 1
+                continue
+            self.assertTrue(self.storage.is_complete(root))
+        # About 2% fail now (three losses in a row, each retry on a new link that may itself not be established);
+        # 56-58% did
+        self.assertLessEqual(failed, 2, f"{failed} of {self.TRIALS} fetches failed")
+        self.assertGreater(len(link_fakes.FakeLink.created), 1, "nothing was lost")
 
 
 class WalkTest(FetcherTest):
@@ -1084,6 +2254,24 @@ class LimitTest(FetcherTest):
         self.assertTrue(self.storage.is_complete(built.cid))
         self.assertFalse(self.storage.has(cached.cid))
         self.assertLessEqual(self.storage.used_bytes(), self.storage.max_storage)
+
+    def test_unpinned_fetch_makes_room_by_disk_allocation(self):
+        # On FAT32 each block takes a 32 KiB cluster: cache that is little in bytes but much on disk makes room
+        self.storage.allocation_unit = 32 * 1024  # nothing is stored yet, so there's no total to redo
+        small = [builder.build_bytes(b"%d" % i * 10, self.storage.put) for i in range(20)]
+        cached = builder.build_directory([Entry(f"{i:02d}", f.cid, f.size, 0) for i, f in enumerate(small)],
+                                         self.storage.put)
+        self.storage.record_fetch(cached.cid, [], cached.cid)
+        self.assertLess(self.storage.used_bytes(), 2000)
+        self.storage.max_storage = 25 * 32 * 1024  # the cache takes 21 clusters, the file 9 more
+        built = self.file(os.urandom(4 * CHUNK_SIZE))
+        self.hold(P1)
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertFalse(self.storage.has(cached.cid))
+        self.assertLess(self.storage.used_bytes() + 2000, self.storage.max_storage)  # bytes alone would have fit
+        self.assertLessEqual(self.storage.allocated_bytes(), self.storage.max_storage)
 
     def disk(self, free: int):
         """A mock disk_usage reporting free bytes on a 1 GiB filesystem (reserve: DISK_RESERVE_MIN)."""

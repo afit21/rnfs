@@ -2,10 +2,17 @@
 (tests/fixtures/rnfs-0.1.5, its state database holding rows in every table; see its README) keeps every row.
 
 The expectation is the fixture's expected.json, every table's rows as 0.1.5 left them. The current code may add
-rows and tables (its own schema steps), but none of 0.1.5's rows may change or go: the database upgrades, passes
-quick_check, sets nothing aside, and a second start changes nothing. The tables 0.1.5 created must also be
-exactly those a fresh database gets, so a released schema step edited in place (which a database 0.1.5 wrote
-would never see) fails here as well as in test_statedb's digest.
+rows and tables (its own schema steps), but none of 0.1.5's rows may change or go, except as upgraded() says:
+the two `lxmf:<address>` pins become `app:lxmf:<address>` (0.2.0's "lxmf_app_pins", the LXMF wrapper app's
+source), 0.2.0's provider store keeps no newcomer pool and no departed or evicted publishers, and the publisher's
+published and published_earlier rows become publish_items rows (PublishedRowsTest). The database
+upgrades, passes quick_check, sets nothing aside, and a second start changes nothing. The tables 0.1.5 created
+must also be exactly those a fresh database gets, so a released schema step edited in place (which a database
+0.1.5 wrote would never see) fails here as well as in test_statedb's digest.
+
+The blocks are written in the flat layout 0.1.6 left (blocks/<cid>); BlockLayoutTest checks they are moved into
+their subdirectories from that, from a move an earlier start left half done, with partial files left over, and
+when a move fails.
 
 The clock is the fixture's (expected.json's "now"), so no record has expired."""
 import functools
@@ -15,6 +22,7 @@ import json
 import os
 import shutil
 import sqlite3
+import struct
 import tempfile
 import time
 import unittest
@@ -22,17 +30,19 @@ from unittest import mock
 
 import RNS
 
+from rnfs import fsutil, statedb
 from rnfs import node as node_module
-from rnfs import statedb
 from rnfs.config import Config
 from rnfs.content import builder
-from rnfs.content.blockstore import BlockStore
+from rnfs.content.blockstore import PARTIAL_PREFIX, BlockStore, shard_of
+from rnfs.content.cid import Cid
 from rnfs.node import RnfsNode
-from tests.support import FakeClock, state_rows
+from rnfs.publisher import DhtKey
+from tests.support import FakeClock, pinned_entries, state_rows
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 from tests.test_statedb import RELEASED_0_1_5_STEPS
-from tests.test_upgrade_014 import NODE_ID, make_blocks
+from tests.test_upgrade_014 import NODE_ID, FlatBlockStore, make_blocks
 
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "rnfs-0.1.5")
 
@@ -80,6 +90,23 @@ def loadable(table: str, values: tuple) -> bool:
     return output is None or os.path.isabs(output)
 
 
+def upgraded(table: str, values: tuple) -> tuple | None:
+    """What a row of 0.1.5's becomes in this version (None: it goes). 0.2.0's step "lxmf_app_pins" rewrites a pin
+    source lxmf:<address> as app:lxmf:<address> (storage.LXMF_PREFIX). Its provider store (the step
+    "providers_on_disk") drops the newcomer pool and the memories of departed and evicted publishers, which went
+    with the per-publisher caps, replaced by the record budget and its storage tiers: a pooled record is no longer
+    pooled, and those memories are emptied. The publisher (the step "publisher_on_disk") keeps its state in
+    publish_items, a row per item: the published and published_earlier rows move there (PublishedRowsTest checks
+    each). Every other row is kept as it was."""
+    if table == "pins" and values[1].startswith("lxmf:"):
+        return (values[0], "app:" + values[1])
+    if table == "provider_records":
+        return (*values[:4], 0)
+    if table in ("provider_departed", "provider_evicted", "published", "published_earlier"):
+        return None
+    return values
+
+
 def tables(state_dir: str) -> dict[str, set[tuple]]:
     """Every row of every table of the state database."""
     names = [r[0] for r in state_rows(state_dir, "SELECT name FROM sqlite_master WHERE type = 'table'")]
@@ -95,12 +122,12 @@ def schema_sql(path: str) -> dict[str, str]:
         conn.close()
 
 
-class UpgradeTest(unittest.TestCase):
+class FixtureCase(unittest.TestCase):
     """A copy of the fixture under a temporary directory, with its blocks, started on with the clock at "now"."""
 
     def setUp(self):
-        """Copy the fixture and make its blocks; fake the wall clock, also for the stores that take it as an
-        argument."""
+        """Copy the fixture and make its blocks, in 0.1.6's flat layout; fake the wall clock, also for the stores
+        that take it as an argument."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = os.path.join(self.tmp.name, "rnfs")
@@ -110,7 +137,7 @@ class UpgradeTest(unittest.TestCase):
         os.makedirs(scratch)
         blocks = os.path.join(self.root, "blocks")
         self.built = make_blocks(blocks, scratch)
-        store = BlockStore(blocks)
+        store = FlatBlockStore(blocks)
         for data, name in _content().STREAMS:
             self.built.add(builder.add_stream(io.BytesIO(data), store.put, len(data), name).cid)
         self.state = os.path.join(self.root, "state")
@@ -124,11 +151,63 @@ class UpgradeTest(unittest.TestCase):
 
     def start(self) -> RnfsNode:
         """An offline node on the copy (stopped before the directory is removed)."""
-        config = Config(rnfs_dir=self.root, **EXPECTED["settings"])
-        config.validate()
+        # As a start reads them from rnfs.toml: max_records and the lxmf_* settings, retired in 0.2.0, are left out
+        # with a warning
+        config = Config.combine(self.root, EXPECTED["settings"])
+        self.assertEqual([warning.split(":")[0] for warning in config.warnings],
+                         ["ignoring lxmf_auto_fetch_from in rnfs.toml", "ignoring max_records in rnfs.toml"])
         node = RnfsNode.offline(config, NODE_ID, NetClient(), FakeNetwork())
         self.addCleanup(node.stop)
         return node
+
+
+class PublishedRowsTest(FixtureCase):
+    """0.2.0's step "publisher_on_disk" moves the publisher's rows into publish_items: each item's published row,
+    its earlier servers and its heal mark become one row, keyed by its DHT key, with the times as 0.1.5 wrote them;
+    the publisher computes each row's due time when it loads, from its republish interval."""
+
+    def test_published_rows_become_publish_items(self):
+        """Every published and published_earlier row of 0.1.5's is in its item's publish_items row, as written."""
+        db = statedb.connect(self.state)  # the schema steps, and nothing else
+        try:
+            rows = {item: (key, at, nodes, earlier, heal) for key, item, at, nodes, earlier, heal in db.query(
+                "SELECT key, item, at, nodes, earlier, heal FROM publish_items")}
+            self.assertEqual(db.query("SELECT COUNT(*) FROM published"), [(0,)])
+            self.assertEqual(db.query("SELECT COUNT(*) FROM published_earlier"), [(0,)])
+        finally:
+            db.close()
+        published = [row(values) for values in EXPECTED["tables"]["published"]]
+        earlier = [row(values) for values in EXPECTED["tables"]["published_earlier"]]
+        self.assertTrue(any(text.startswith("key:") for text, _, _ in published))
+        expected: dict[bytes, list] = {}
+        for text, at, nodes in published:
+            item, key = statedb._published_item(text)
+            expected[item] = [key, at, nodes, {}, 0]
+        for text, node, at in earlier:
+            item, key = statedb._published_item(text)
+            expected.setdefault(item, [key, None, b"", {}, 0])[3][node] = at
+        self.assertEqual({item: (key, at, nodes, earlier, heal) for item, (key, at, nodes, blob, heal) in rows.items()
+                          for earlier in [{blob[i:i + 16]: struct.unpack(">d", blob[i + 16:i + 24])[0]
+                                           for i in range(0, len(blob), 24)}]},
+                         {item: tuple(values) for item, values in expected.items()})
+        for item, (key, *_) in rows.items():
+            self.assertEqual(key, (DhtKey(item[1:]) if item[:1] == b"\0" else Cid.from_bytes(item)).key)
+
+    def test_the_publisher_reads_them(self):
+        """Started on the upgraded database, the publisher has what 0.1.5 published, due times computed from it."""
+        node = self.start()
+        states = node.publisher.states()
+        published = {Cid.parse(text) if not text.startswith("key:") else DhtKey(bytes.fromhex(text[4:])): (at, nodes)
+                     for text, at, nodes in map(row, EXPECTED["tables"]["published"])}
+        held = {item: (state["at"], b"".join(state["nodes"])) for item, state in states.items()
+                if state["at"] is not None}
+        self.assertEqual({item: value for item, value in published.items() if item in states}, held)
+        for item in held:
+            self.assertEqual(states[item]["due"], held[item][0] + node.publisher.interval_for(item))
+
+
+class UpgradeTest(FixtureCase):
+    """Every row 0.1.5 left is kept."""
 
     def test_fixture_is_complete(self):
         """The fixture is what its README says: 0.1.5's schema, rows in every table, the 0.1.5-only ones included,
@@ -152,15 +231,48 @@ class UpgradeTest(unittest.TestCase):
                          [("shared_folder_files",)])
 
     def test_every_row_is_kept(self):
-        """Every row 0.1.5 left is still there, unchanged, in every table."""
+        """Every row 0.1.5 left is still there, unchanged but as upgraded() says, in every table."""
         node = self.start()
         node.stop()
         found = tables(self.state)
         for table, rows in EXPECTED["tables"].items():
             with self.subTest(table=table):
                 self.assertIn(table, found)
-                expected = {row(values) for values in rows if loadable(table, row(values))}
-                self.assertEqual(expected - found[table], set())
+                expected = {upgraded(table, row(values)) for values in rows if loadable(table, row(values))}
+                self.assertEqual(expected - found[table] - {None}, set())
+        self.assertTrue(EXPECTED["tables"]["provider_departed"] and EXPECTED["tables"]["provider_evicted"])
+        self.assertEqual((found["provider_departed"], found["provider_evicted"]), (set(), set()))
+        self.assertEqual((found["published"], found["published_earlier"]), (set(), set()))
+        self.assertIn(1, {values[4] for values in map(row, EXPECTED["tables"]["provider_records"])})
+
+    def test_provider_standing_is_built(self):
+        """Each publisher with records gets a standing counting them; this node's records are in their own tier,
+        and the one publisher 0.1.5 saw refreshing a record for days is Earned. The node also records itself for
+        each entry it provides since 0.2.0 (provide_entries) that 0.1.5 didn't provide."""
+        node = self.start()
+        records = node.records
+        publishers = {row(values)[1] for values in EXPECTED["tables"]["provider_records"]}
+        tiers = {publisher: records.standing(publisher)["tier"] for publisher in publishers}
+        self.assertEqual(tiers.pop(NODE_ID), "own")
+        self.assertEqual(tiers.pop(bytes.fromhex("30" + "00" * 15)), "earned")
+        self.assertEqual(set(tiers.values()), {"newcomer"})
+        own = {row(values)[0] for values in EXPECTED["tables"]["provider_records"] if row(values)[1] == NODE_ID}
+        new = {cid.key for cid in pinned_entries(node.storage)} - own
+        self.assertTrue(new)
+        self.assertEqual(records.record_count(), len(EXPECTED["tables"]["provider_records"]) + len(new))
+        records._check_consistency()
+
+    def test_lxmf_pins_become_app_pins(self):
+        """The fixture's two lxmf:<address> pins (an auto-fetch sender's) are app:lxmf:<address> pins after the
+        upgrade, of the same CIDs, and no lxmf: source is left. No part of rnfs releases them since LXMF left it in
+        0.2.0: they are kept for an app called lxmf (tests/test_apps.py: removing that app releases them)."""
+        legacy = {row(values) for values in EXPECTED["tables"]["pins"] if values[1].startswith("lxmf:")}
+        self.assertEqual(len(legacy), 2)
+        node = self.start()
+        node.stop()
+        pins = tables(self.state)["pins"]
+        self.assertEqual({(cid, "app:lxmf:" + source[len("lxmf:"):]) for cid, source in legacy} - pins, set())
+        self.assertEqual({source for _, source in pins if source.startswith("lxmf:")}, set())
 
     def test_every_pin_is_complete(self):
         """Every pin, the deny list's own included, is complete: the stores agree with the blocks."""
@@ -198,6 +310,96 @@ class UpgradeTest(unittest.TestCase):
         db.close()
         fresh = schema_sql(os.path.join(self.tmp.name, "fresh", statedb.DB_FILE))
         self.assertEqual({name: fresh.get(name) for name in released}, released)
+
+
+class BlockLayoutTest(FixtureCase):
+    """The blocks, written in 0.1.6's flat layout, are moved into their subdirectories by the start, whatever state an
+    earlier start left the move in, and every pin stays complete."""
+
+    def flat_blocks(self) -> list[str]:
+        """The block files directly in blocks/."""
+        return sorted(name for name in os.listdir(self.blocks) if os.path.isfile(os.path.join(self.blocks, name))
+                      and not name.startswith(PARTIAL_PREFIX))
+
+    def check_complete(self, node: RnfsNode):
+        """Every pin is complete, and every block made is stored, in its subdirectory unless still flat."""
+        pins = node.storage.pins()
+        self.assertTrue(pins)
+        for cid in pins:
+            self.assertTrue(node.storage.is_complete(cid), cid)
+        for cid in self.built:
+            self.assertTrue(node.storage.has(cid), cid)
+
+    def in_shard(self, name: str) -> str:
+        """Where the block named name goes."""
+        return os.path.join(self.blocks, shard_of(name), name)
+
+    def setUp(self):
+        """As FixtureCase, noting the blocks directory and its flat blocks."""
+        super().setUp()
+        self.blocks = os.path.join(self.root, "blocks")
+        self.names = self.flat_blocks()
+        self.assertGreater(len(self.names), 10)
+
+    def test_flat_store(self):
+        node = self.start()
+        self.check_complete(node)
+        self.assertEqual(self.flat_blocks(), [])
+        for name in self.names:
+            self.assertTrue(os.path.isfile(self.in_shard(name)), name)
+
+    def test_sizes_are_saved_and_read_by_the_next_start(self):
+        # The first start lists every block (0.1.5 left no sizes); after its clean stop, the next one reads them
+        self.start().stop()
+        self.assertEqual(state_rows(self.state, "SELECT value FROM meta WHERE store = 'block_sizes'"), [(1,)])
+        self.assertEqual(len(state_rows(self.state, "SELECT cid FROM block_sizes")), len(self.names))
+        with mock.patch.object(BlockStore, "scan", side_effect=AssertionError("listed every block")):
+            node = self.start()
+        self.check_complete(node)
+
+    def test_half_moved_store(self):
+        # An earlier start stopped part way through the move; one block is in both places
+        for name in self.names[::2]:
+            os.makedirs(os.path.dirname(self.in_shard(name)), mode=0o700, exist_ok=True)
+            os.replace(os.path.join(self.blocks, name), self.in_shard(name))
+        shutil.copy(self.in_shard(self.names[0]), os.path.join(self.blocks, self.names[0]))
+        node = self.start()
+        self.check_complete(node)
+        self.assertEqual(self.flat_blocks(), [])
+
+    def test_leftover_partial_files(self):
+        # 0.1.6 left one directly in blocks/; a 0.2.0 start that crashed, one in a subdirectory
+        shard = os.path.dirname(self.in_shard(self.names[0]))
+        os.makedirs(shard, mode=0o700)
+        for partial in (os.path.join(self.blocks, PARTIAL_PREFIX + "old"), os.path.join(shard, PARTIAL_PREFIX + "new")):
+            with open(partial, "wb") as f:
+                f.write(b"half a block")
+        node = self.start()
+        self.check_complete(node)
+        self.assertEqual([name for name in os.listdir(self.blocks) if name.startswith(PARTIAL_PREFIX)], [])
+        self.assertEqual([name for name in os.listdir(shard) if name.startswith(PARTIAL_PREFIX)], [])
+
+    def test_failed_move(self):
+        # On Windows a scanner may hold a block open: it stays where it is, readable, until a later start moves it
+        stuck = self.names[0]
+        real_replace = fsutil.replace
+
+        def replace(src, dst):
+            """Refuse to move stuck."""
+            if os.path.basename(src) == stuck:
+                raise PermissionError(13, "in use", src)
+            real_replace(src, dst)
+
+        with mock.patch.object(fsutil, "replace", replace):
+            node = self.start()
+        self.check_complete(node)
+        self.assertEqual(self.flat_blocks(), [stuck])
+        self.assertIsNotNone(node.storage.get(Cid.parse(stuck)))
+        node.stop()
+        node = self.start()
+        self.check_complete(node)
+        self.assertEqual(self.flat_blocks(), [])
+        self.assertTrue(os.path.isfile(self.in_shard(stuck)))
 
 
 if __name__ == "__main__":

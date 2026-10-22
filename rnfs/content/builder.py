@@ -36,6 +36,7 @@ from rnfs.content.dag import Child, DirectoryNode, Entry, FileNode, IndexChild, 
 from rnfs.errors import TooLarge
 
 Put = Callable[[Cid, bytes], None]
+DirId = tuple[int, int]  # a directory's (st_dev, st_ino): the same directory, by whatever path or mount it is reached
 
 
 def NO_PUT(cid: Cid, block: bytes) -> None:
@@ -128,11 +129,19 @@ class BuildOptions:
     chunker: the name of the chunker cutting files (chunker.FIXED, the default, or FASTCDC); it decides their CIDs.
     check: called with each file's content SHA-256 once it is read, before the file's root node is stored; it may
     raise to stop the build (the deny list's file hashes). None checks nothing, and hashes nothing for it.
+    progress: called with the length of each read from a file of the tree being built (build_open: a path's files,
+    not a stream's), and with 0 for each directory entry met, so a walk over empty files reports too; it may raise
+    to stop the build (an add job's cancel). None reports nothing.
+    skip_dirs: the directories, by DirId, a walk skips with a warning and build_path refuses as its root: the rnfs dir
+    and its private subdirectories (shared_folder.private_dirs), so that another way to them, such as a bind mount,
+    isn't added (audit REV1). Empty skips nothing.
     Raises ValueError for an unknown chunker.
     """
 
     chunker: str = chunker.FIXED
     check: Callable[[bytes], None] | None = None
+    progress: Callable[[int], None] | None = None
+    skip_dirs: frozenset[DirId] = frozenset()
 
     def __post_init__(self):
         """Check the chunker's name (None is the default)."""
@@ -463,6 +472,16 @@ def listed_stat(item: os.DirEntry, path: str) -> os.stat_result:
 
 is_link = fsutil.is_link  # a symlink, junction or other link-like Windows reparse point
 
+# Why a directory in BuildOptions.skip_dirs is skipped or refused: the path check (shared_folder.refused_reason)
+# has passed, so it was reached by another path than the rnfs dir's own
+PRIVATE_DIR = ("it is the rnfs dir, or one of its subdirectories holding its keys and state, by another path (such as "
+               "a bind mount)")
+
+
+def is_skipped_dir(st: os.stat_result, skip_dirs: frozenset[DirId]) -> bool:
+    """True if st is the stat of a directory in skip_dirs (BuildOptions.skip_dirs)."""
+    return bool(skip_dirs) and stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) in skip_dirs
+
 
 def close(handle: Handle):
     """Close a handle from open_path or open_child."""
@@ -474,14 +493,23 @@ def build_path(path: str, put: Put, warnings: list[str], options: BuildOptions |
     """Build the file or directory at path, appending to warnings what was skipped (options as for build_file).
 
     The path itself is followed if it is a symlink (the user named it); inside a directory, hidden files
-    are included and symlinks, devices, sockets, FIFOs and invalid names are skipped with a warning.
-    Raises TooLarge for a tree deeper than MAX_DEPTH, ValueError if path is neither file nor directory.
+    are included and symlinks, devices, sockets, FIFOs, invalid names and the directories of options.skip_dirs are
+    skipped with a warning. Raises TooLarge for a tree deeper than MAX_DEPTH, ValueError if path is neither file nor
+    directory, or is one of options.skip_dirs.
     """
+    options = _resolve(options)
     handle, st = open_path(path)
     try:
+        check_root(st, path, options.skip_dirs)
         return build_open(handle, st, path, put, warnings, options=options)
     finally:
         close(handle)
+
+
+def check_root(st: os.stat_result, path: str, skip_dirs: frozenset[DirId]):
+    """Raise ValueError if the root of a build, at path and opened with the stat st, is one of skip_dirs."""
+    if is_skipped_dir(st, skip_dirs):
+        raise ValueError(f"refusing to add {display_path(path)}: {PRIVATE_DIR}")
 
 
 FileState = tuple[int, int, int, int, bool]
@@ -532,7 +560,27 @@ def build_open(handle: Handle, st: os.stat_result, path: str, put: Put, warnings
         return _build_cached(handle, put, kind, options, cache)
     # Reading a regular file never blocks, so O_NONBLOCK can stay; the caller keeps the descriptor
     with os.fdopen(handle, "rb", closefd=False) as f:
-        return build_file(f, put, kind=kind, options=options)
+        return build_file(counted(f, options.progress), put, kind=kind, options=options)
+
+
+class _Counted:
+    """A binary reader passing the length of each read on to progress (BuildOptions.progress)."""
+
+    def __init__(self, stream: BinaryIO, progress: Callable[[int], None]):
+        """Read from stream, reporting to progress."""
+        self.stream = stream
+        self.progress = progress
+
+    def read(self, size: int = -1) -> bytes:
+        """Up to size bytes of the stream, reported once read (progress may raise to stop the build)."""
+        data = self.stream.read(size)
+        self.progress(len(data))
+        return data
+
+
+def counted(stream: BinaryIO, progress: Callable[[int], None] | None) -> BinaryIO:
+    """stream, reporting the length of each read to progress if it is given (BuildOptions.progress)."""
+    return stream if progress is None else _Counted(stream, progress)
 
 
 def _build_cached(handle: Handle, put: Put, kind: int, options: BuildOptions, cache: FileCache) -> Built:
@@ -565,6 +613,8 @@ def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], dep
     child_height = 0
     children = list_directory(directory)
     for item in children:
+        if options.progress is not None:
+            options.progress(0)  # a cancel check even where no file is read (a tree of empty directories)
         child_path = os.path.join(path, item.name)
         shown = display_path(child_path)
         if not dag.is_valid_name(item.name):
@@ -576,6 +626,9 @@ def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], dep
             continue
         if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
             warnings.append(f"skipped {shown}: not a regular file or directory")
+            continue
+        if is_skipped_dir(st, options.skip_dirs):
+            warnings.append(f"skipped {shown}: {PRIVATE_DIR}")
             continue
         try:
             handle = open_child(directory, item.name, child_path, st)
@@ -596,6 +649,47 @@ def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], dep
         entries.append(Entry(item.name, child.cid, child.size, child.kind))
         child_height = max(child_height, child.height)
     return build_directory(entries, put, child_height)
+
+
+def tree_size(path: str, check: Callable[[], None] | None = None, skip_dirs: frozenset[DirId] = frozenset()) -> int:
+    """The bytes add_path would read at path: a regular file's size (path followed if a symlink, as the add follows
+    it), or the sizes of the regular files below a directory that _build_tree reads, which skips symlinks, other
+    types, invalid names and skip_dirs (BuildOptions.skip_dirs). An add job's total_bytes, measured before it reads
+    anything: files changing meanwhile make it an estimate. Unreadable directories count nothing (the add reports
+    them); check(), if given, is called for each entry and may raise (a job's cancel)."""
+    st = os.stat(path)
+    if stat.S_ISREG(st.st_mode):
+        return st.st_size
+    if not stat.S_ISDIR(st.st_mode):
+        return 0
+    total = 0
+    stack = [(path, 1)]
+    while stack:
+        directory, depth = stack.pop()
+        if depth > constants.MAX_DEPTH:
+            continue  # the add refuses it (TooLarge) when it gets there
+        try:
+            listing = os.scandir(directory)
+        except OSError:
+            continue
+        with listing:
+            for item in listing:
+                if check is not None:
+                    check()
+                if not dag.is_valid_name(item.name):
+                    continue
+                try:
+                    st = item.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_link(st):
+                    continue
+                if stat.S_ISREG(st.st_mode):
+                    total += st.st_size
+                elif stat.S_ISDIR(st.st_mode) and not (skip_dirs and is_skipped_dir(listed_stat(item, item.path),
+                                                                                     skip_dirs)):
+                    stack.append((item.path, depth + 1))
+    return total
 
 
 def hard_link_reason(links: int) -> str:

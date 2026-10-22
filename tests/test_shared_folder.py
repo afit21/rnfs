@@ -625,14 +625,14 @@ class SharedFolderTest(unittest.TestCase):
     @unittest.skipUnless(HAS_FIFO, "FIFOs (POSIX)")
     def test_fifos_never_block_the_scan(self):
         os.makedirs(os.path.join(self.files, "dir"))
-        os.mkfifo(os.path.join(self.files, "fifo"))
-        os.mkfifo(os.path.join(self.files, "dir", "fifo"))
+        os.mkfifo(os.path.join(self.files, "fifo"))  # noqa: TID251 - skipped without HAS_FIFO
+        os.mkfifo(os.path.join(self.files, "dir", "fifo"))  # noqa: TID251 - skipped without HAS_FIFO
         victim = self.write("victim", b"harmless")
 
         def swap():
             """Replace a file with a FIFO nobody writes to, after the scan checked it."""
             os.remove(victim)
-            os.mkfifo(victim)
+            os.mkfifo(victim)  # noqa: TID251 - skipped without HAS_FIFO
 
         with swap_on_open("victim", swap):
             pins = within(5, self.folder.scan)

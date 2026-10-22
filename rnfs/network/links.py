@@ -1,8 +1,11 @@
 """Outgoing RNS links to other nodes (specification section 3).
 
-- Requests to a node share one outgoing link, opened on demand and closed after link_idle_timeout without
-  traffic (Link.no_data_for()) or being handed out by LinkPool.get(). These links don't identify, so lookups
-  and downloads don't reveal who asks.
+- Requests to a node share one outgoing link, opened on demand and closed once idle: no request in progress, no data
+  (Link.no_data_for()) and not handed out by LinkPool.get() for its idle limit (idle_limit), nor held (LinkPool.hold: a
+  requester waiting out the provider's upload pacing, so the next response keeps the link's rate estimate). The idle
+  limit is link_idle_timeout for a link holding a rate estimate; any other closes just before RNS would send its first
+  keepalive, if that is sooner, since reopening it costs less than two keepalive pairs. These links don't identify, so
+  lookups and downloads don't reveal who asks.
 - A link goes only to a destination whose hash is the node ID asked for (rnfs.dht of the identity RNS
   recalls for it), so one identity can't pose as many node IDs by announcing other destinations.
 - Publishing and /pin use a separate link that identifies, closed when done.
@@ -14,13 +17,24 @@
   were sent (and wait no longer than that for a slot); /blocks has the fetcher's stall detection instead.
 - A request answered False on an identified link is retried once after identifying again, since
   Link.identify() is unacknowledged.
+- A shared link that has a path and identity but isn't established is remembered (LinkPool.unestablished): on a
+  lossy path its link request or proof may have been lost, so the fetcher tries again rather than give up on the
+  node (specification section 6, unanswered requests). One the node closes (closed_by_other: RNS's teardown_reason) is
+  a refusal (LinkPool.refused), not a failure.
 - A request that wouldn't fit one packet on its link isn't sent: RNS would send it as a Resource, which nodes
   refuse (network/guards.py) and RNS may compress.
+- Every path request goes through the node's budget (LinkPool.paths, network/paths.py), whose wait doesn't count
+  towards path_timeout; a link that fails to establish costs a turn of it, as RNS then requests the path again.
+- A response that arrives before RNS has registered its request is kept and handed over once it is (EarlyResponses):
+  RNS (1.5.6) adds a request's RequestReceipt to the link's pending requests only after Link.request has sent the
+  packet, and drops a response no pending request matches, so on a fast link (a 1 ms round trip, a busy process)
+  an answer could be lost and its request wait out RNS's whole timeout, 11 s at least.
 
 Everything here blocks its caller, so never call it from an RNS callback thread.
 """
 import threading
 import time
+from collections import OrderedDict
 from typing import Callable
 
 import RNS
@@ -30,6 +44,7 @@ from rnfs.constants import APP_NAME, DHT_ASPECT, MAX_REQUESTS_PER_LINK
 from rnfs import log as rnfs_log
 from rnfs.log import LOG_DEBUG, LOG_VERBOSE, LOG_WARNING, log, node_name, size
 from rnfs.network import guards, protocol, rates
+from rnfs.network.paths import PathRequests
 
 POLL_INTERVAL = 0.25  # how often a waiting request checks its link, progress and stall conditions
 CANCEL_GRACE = 2.0  # seconds a started response may be missing from the link's incoming Resources
@@ -41,6 +56,15 @@ RESPONSE_GRACE = protocol.REQUEST_TIMEOUT_WITHOUT_RTT
 LINK_TIMEOUT, INITIATOR_CLOSED, DESTINATION_CLOSED = (RNS.Link.TIMEOUT, RNS.Link.INITIATOR_CLOSED,
                                                        RNS.Link.DESTINATION_CLOSED)
 RECEIPT_FAILED = RNS.RequestReceipt.FAILED  # a request RNS gave up on
+MAX_NOT_ESTABLISHED = 1024  # nodes LinkPool remembers a link not established to (LinkPool.unestablished)
+# An idle link without a rate estimate is closed this many seconds, plus two round trips, before RNS's keepalive
+# interval has passed (idle_limit): room for the sweep's own timing
+KEEPALIVE_MARGIN = 1.0
+MIN_SWEEP_WAIT = 0.25  # the idle sweep runs at most this often, however soon a link is due
+# Responses no pending request matched (EarlyResponses): kept this many seconds, at most this many per link. One
+# arriving early is handed over within moments; the rest are late answers to requests RNS already gave up on
+EARLY_RESPONSE_LIFE = 30.0
+MAX_EARLY_RESPONSES = 16
 
 
 def close_reason(link) -> str:
@@ -49,18 +73,60 @@ def close_reason(link) -> str:
     reason = getattr(link, "teardown_reason", None)
     if reason == LINK_TIMEOUT:
         return "timed out"
-    ours = INITIATOR_CLOSED if getattr(link, "initiator", True) else DESTINATION_CLOSED
-    if reason == ours:
-        return "closed by this node"
-    if reason in (INITIATOR_CLOSED, DESTINATION_CLOSED):
+    if closed_by_other(link):
         return "closed by the other node"
+    if reason in (INITIATOR_CLOSED, DESTINATION_CLOSED):
+        return "closed by this node"
     return "closed"
+
+
+def closed_by_other(link) -> bool:
+    """True if the other node closed link (RNS's teardown_reason, which names the end by its role): for a link this
+    node opened, a server refusing it (no room for another incoming link) or going away. A refusal, not a failure
+    (specification section 6): the node is up."""
+    theirs = DESTINATION_CLOSED if getattr(link, "initiator", True) else INITIATOR_CLOSED
+    return getattr(link, "teardown_reason", None) == theirs
+
+
+def idle_limit(link_idle_timeout: float, keepalive, rtt, rated: bool) -> float:
+    """Seconds without data after which the idle sweep closes a shared link with nothing in progress.
+
+    The node that opens a link sends a keepalive once RNS's keepalive interval (RNS 1.5.6: max(5 s, RTT × 360 / 1.75),
+    at most 360 s; Link.keepalive) has passed without a packet either way, and the other node answers: on a 50 ms path a
+    pair every ~10 s, about 58 packets in link_idle_timeout (5 minutes), while reopening the link costs about 4. So a
+    link closes just before its first keepalive, if that is sooner than link_idle_timeout: KEEPALIVE_MARGIN and two
+    round trips early, since RNS counts the interval from the earlier of the last packet in and out (the request, for a
+    link that was waiting for an answer) and no_data_for from the later (the answer). A link holding a rate estimate
+    (rated: it carried /blocks responses) keeps link_idle_timeout, as does one whose keepalive interval isn't known:
+    closing it would take the estimate, and the provider's for its next response, with it (section 3, Links).
+    """
+    if rated or not _positive(keepalive):
+        return link_idle_timeout
+    early = keepalive - KEEPALIVE_MARGIN - 2 * (rtt if _positive(rtt) else 0.0)
+    return max(KEEPALIVE_MARGIN, min(link_idle_timeout, early))
+
+
+def _positive(value) -> bool:
+    """True if value is a finite positive number (not a bool)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value < float("inf")
+
+
+def timed_out(link) -> bool:
+    """True if link closed because it timed out (RNS heard nothing on it for too long), not closed by either end."""
+    return getattr(link, "teardown_reason", None) == LINK_TIMEOUT
 
 
 def _debug_logged() -> bool:
     """True if a LOG_DEBUG message is kept anywhere: RNS logs at debug level, or the debug log (which keeps
     every message, whatever RNS's loglevel) is on."""
     return RNS.loglevel >= LOG_DEBUG or rnfs_log._debug_sink is not None
+
+
+def _reticulum():
+    """The running Reticulum instance as this module's RNS knows it (None if none runs): the path-request budget's
+    ceiling reads its interface stats."""
+    reticulum = getattr(RNS, "Reticulum", None)
+    return reticulum.get_instance() if reticulum is not None else None
 
 
 def path_description(node_id: bytes) -> str:
@@ -95,6 +161,7 @@ class Exchange:
         # lost it in transit; the requester can't tell which
         self.cancelled = False
         self.receipt = None  # the RNS RequestReceipt, once sent
+        self.went_dead = False  # unanswered on a link that heard nothing meanwhile (Links._went_dead)
 
     # RNS callbacks: they run on RNS threads, so they only record and never block
 
@@ -104,7 +171,8 @@ class Exchange:
             self.expected_rate = receipt.link.get_expected_rate()
         except Exception:  # noqa: BLE001 - RNS internals: no rate if they fail
             self.expected_rate = None
-        self.response_size = receipt.response_size
+        # RNS sizes a one-packet response as its msgpack length less 2, so one of a byte ([], False) is -1
+        self.response_size = None if receipt.response_size is None else max(0, receipt.response_size)
         self.response = receipt.get_response()
         self.progress = 1.0
         self.answered = True
@@ -127,6 +195,56 @@ class Exchange:
             self.last_progress = now
 
 
+class EarlyResponses:
+    """Responses to requests on one RNS link that arrived before RNS registered the request (see the module
+    docstring): installed in place of the link's handle_response, which RNS looks up on the link for every response.
+    Thread-safe."""
+
+    def __init__(self, link, clock: Callable[[], float] = time.monotonic):
+        """Take over link's handle_response."""
+        self.link = link
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.kept: OrderedDict[bytes, tuple[float, tuple, dict]] = OrderedDict()  # request ID -> (when, arguments)
+        self.handle = link.handle_response  # RNS's own
+        link.handle_response = self.on_response
+
+    @classmethod
+    def install(cls, link) -> "EarlyResponses | None":
+        """An EarlyResponses for link, or None if link isn't one (a test's stand-in without RNS's pending requests)."""
+        if not isinstance(getattr(link, "pending_requests", None), list) or not callable(
+                getattr(link, "handle_response", None)):
+            return None
+        return cls(link)
+
+    def on_response(self, request_id, *args, **kwargs):
+        """Link.handle_response: handled by RNS if a pending request matches it, else kept for deliver()."""
+        with self.lock:
+            # Under the lock: deliver() looks for a kept response only once its request is pending, so a response
+            # is either seen pending here or kept before deliver() looks
+            if not any(getattr(pending, "request_id", None) == request_id
+                       for pending in list(self.link.pending_requests)):
+                now = self.clock()
+                self.kept[request_id] = (now, args, kwargs)
+                self.kept.move_to_end(request_id)
+                while self.kept and (len(self.kept) > MAX_EARLY_RESPONSES
+                                     or now - next(iter(self.kept.values()))[0] > EARLY_RESPONSE_LIFE):
+                    self.kept.popitem(last=False)
+                return None
+        return self.handle(request_id, *args, **kwargs)
+
+    def deliver(self, receipt) -> bool:
+        """Hand RNS the response kept for receipt's request, which Link.request has just registered: True if there
+        was one (its callbacks then run on this thread)."""
+        request_id = getattr(receipt, "request_id", None)
+        with self.lock:
+            kept = self.kept.pop(request_id, None)
+        if kept is None:
+            return False
+        self.handle(request_id, *kept[1], **kept[2])
+        return True
+
+
 class PeerLink:
     """One outgoing link to a node and the requests in progress on it."""
 
@@ -136,6 +254,7 @@ class PeerLink:
         self.identified = identified
         self.shared = shared
         self.link = None
+        self.early: EarlyResponses | None = None  # the link's responses that came before their request was registered
         self.rate: float | None = None  # rate estimate in bits/s (section 2)
         self.requests = 0
         self.blocks = 0
@@ -143,7 +262,12 @@ class PeerLink:
         # request if the link were closed now (PeerClient.close_unless_used)
         self.users: dict[int, int] = {}
         self.closed = False
+        # The node had a path and its identity, but the link wasn't established: its request or proof may have been
+        # lost on the way (LinkPool._open), rather than the node being out of reach
+        self.unestablished = False
+        self.refused = False  # the node closed the link before it was established at this end (closed_by_other)
         self.handed_out: float | None = None  # when LinkPool.get() last returned it (the pool's clock)
+        self.held_until: float | None = None  # LinkPool.hold: in use until then, as if handed out then
         self.cond = threading.Condition()
 
     def is_active(self) -> bool:
@@ -227,19 +351,34 @@ class PeerLink:
 class LinkPool:
     """Outgoing links: one shared link per node, plus one-shot identified links. Thread-safe."""
 
-    def __init__(self, identity: RNS.Identity, config: Config, clock: Callable[[], float] = time.monotonic):
-        """Empty pool; links identify as identity when they identify."""
+    def __init__(self, identity: RNS.Identity, config: Config, clock: Callable[[], float] = time.monotonic,
+                 paths: PathRequests | None = None):
+        """Empty pool; links identify as identity when they identify. paths is the node's path-request budget (default:
+        a new one over this module's RNS, which tests replace)."""
         self.identity = identity
         self.config = config
         self.clock = clock
+        self.paths = paths if paths is not None else PathRequests(transport=lambda: RNS.Transport, reticulum=_reticulum,
+                                                                  slow_bitrate=config.slow_bitrate)
         # Private mode links only to members: every link identifies, and an outsider mustn't learn who we are
         self.members = config.member_set
         self.shared: dict[bytes, PeerLink] = {}
         self.oneshot: set[PeerLink] = set()
         self.connecting: dict[bytes, threading.Event] = {}  # one thread opens a node's shared link at a time
+        # Nodes whose last shared link get() tried to open had a path and identity but wasn't established
+        self.not_established: set[bytes] = set()
+        # Nodes that closed the last shared link get() tried to open before it was established here (refused)
+        self.closed_by: set[bytes] = set()
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.sweeper: threading.Thread | None = None
+        # Set to run the idle sweep now: a request ended or a link was handed out, so a link may be due sooner than
+        # the sweep's next run (next_sweep), which the last sweep worked out from the links it kept
+        self.wake = threading.Event()
+        self.next_sweep = self._sweep_interval()
+        # Called with (node ID, seconds) for the round trip RNS measured on each link established, shared, one-shot
+        # (ping's) or identified, on the thread that opened it; PeerClient sets its traffic counters' (`rnfs peers`)
+        self.on_rtt: Callable[[bytes, float], None] | None = None
         # Reject response advertisements whose transfer outgrows their size (in the scope the node set)
         guards.install()
 
@@ -254,6 +393,7 @@ class LinkPool:
             peer = self.shared.get(node_id)
             if peer is not None and peer.is_active():
                 peer.handed_out = self.clock()  # under the lock, so sweep() sees it before closing the link
+                self.wake.set()  # it may now be due sooner than the sweep's next run
                 return peer
             if peer is not None:
                 del self.shared[node_id]
@@ -281,12 +421,48 @@ class LinkPool:
                 if opened and peer.is_active():
                     peer.handed_out = self.clock()
                     self.shared[node_id] = peer
+                for marked, flag in ((self.not_established, peer.unestablished), (self.closed_by, peer.refused)):
+                    if flag:
+                        if len(marked) >= MAX_NOT_ESTABLISHED:
+                            marked.clear()  # only the latest attempts matter; keeps it bounded
+                        marked.add(node_id)
+                    else:
+                        marked.discard(node_id)
                 self.connecting.pop(node_id, None)
             event.set()
         if not (opened and peer.is_active()):
             return None
         self._start_sweeper()
+        self.wake.set()  # a new link may be due before the sweep's next run
         return peer
+
+    def unestablished(self, node_id: bytes) -> bool:
+        """True if the last time get() tried to open a shared link to node_id (and returned None), the node had a path
+        and its identity but the link wasn't established: on a lossy path its request or proof may have been lost,
+        so the next try may well succeed (PeerClient counts it as a lost request)."""
+        with self.lock:
+            return node_id in self.not_established
+
+    def refused(self, node_id: bytes) -> bool:
+        """True if the last time get() tried to open a shared link to node_id (and returned None), the node closed it:
+        a refusal (closed_by_other), not a failure."""
+        with self.lock:
+            return node_id in self.closed_by
+
+    def await_path(self, node_id: bytes, timeout: float | None = None) -> bool:
+        """Wait up to timeout (path_timeout if None) for a path to node_id, requesting one in its turn if RNS has none
+        (as opening a link would): True once there is one. A lookup asks it before a query, to see how many hops the
+        path takes (rnfs.mesh.SlowPaths), on a node that isn't slow for PathRequests.candidate_wait. A wait shorter
+        than path_timeout isn't measured for it.
+        """
+        if RNS.Transport.has_path(node_id):
+            return True
+        wait = self.config.path_timeout if timeout is None else timeout
+        log(f"requesting a path to {node_name(node_id)}", LOG_VERBOSE)
+        if self.paths.await_path(node_id, wait, cancel=self.stop_event, measure=wait >= self.config.path_timeout):
+            return True
+        log(f"no path to {node_name(node_id)} after {wait:g}s")
+        return False
 
     def open_identified(self, node_id: bytes) -> PeerLink | None:
         """A new link to node_id that identifies, for publishing or /pin. Close it with close_link when done."""
@@ -309,7 +485,7 @@ class LinkPool:
         name = node_name(node_id)
         if not RNS.Transport.has_path(node_id):
             log(f"requesting a path to {name}", LOG_VERBOSE)
-        if not RNS.Transport.await_path(node_id, timeout=self.config.path_timeout):
+        if not self.paths.await_path(node_id, self.config.path_timeout, cancel=self.stop_event):
             log(f"no path to {name} after {self.config.path_timeout:g}s")
             return False
         if _debug_logged():  # RNS path lookups, only for a message that will be kept
@@ -342,9 +518,17 @@ class LinkPool:
         log(f"connecting to {name}", LOG_VERBOSE)
         started = time.monotonic()
         link = RNS.Link(destination, established_callback=lambda _: settled.set(), closed_callback=on_closed)
+        peer.early = EarlyResponses.install(link)
         peer.link = link
         timeout = getattr(link, "establishment_timeout", None) or self.config.path_timeout
         settled.wait(timeout + ESTABLISH_GRACE)
+        if link.status == RNS.Link.CLOSED and closed_by_other(link):
+            # The node refused it (no room for another incoming link, say): it is up, and RNS doesn't request the path
+            # again for a link that was established at its end
+            log(f"{name} closed the link as it was established", LOG_VERBOSE)
+            peer.mark_closed()
+            peer.refused = True
+            return False
         if link.status != RNS.Link.ACTIVE:
             route = path_description(node_id)
             why = (close_reason(link) if link.status == RNS.Link.CLOSED
@@ -352,16 +536,28 @@ class LinkPool:
             log(f"could not connect to {name}: {why}" + (f" ({route})" if route else ""))
             link.teardown()
             peer.mark_closed()
+            peer.unestablished = True
+            self.paths.charge(node_id)  # RNS now requests the path again by itself
             return False
 
         if peer.identified:
             link.identify(self.identity)
         rtt = getattr(link, "rtt", None)
         log(f"connected to {name}" + (f" (round trip {rtt * 1000:.0f} ms)" if rtt else ""), LOG_VERBOSE)
+        self._report_rtt(node_id, rtt)
         return True
 
+    def _report_rtt(self, node_id: bytes, rtt):
+        """Hand on_rtt the round trip of a link just established to node_id, if it is a finite, non-negative number
+        (RNS measures it on a link this node opens: the time from its request to the other node's proof)."""
+        listener = self.on_rtt
+        if listener is None or not isinstance(rtt, (int, float)) or isinstance(rtt, bool):
+            return
+        if 0 <= rtt < float("inf"):
+            listener(node_id, float(rtt))
+
     def _recall(self, node_id: bytes):
-        """The node's identity from RNS, asking for a path again (whose response carries it) if needed.
+        """The node's identity from RNS, asking for a path again (whose response carries it) in its turn if needed.
 
         A recall marks the destination used, which keeps it in RNS's known destinations for longer (and is
         an RPC of its own on a shared instance): right for a node being contacted, but not for each of the
@@ -370,13 +566,9 @@ class LinkPool:
         identity = RNS.Identity.recall(node_id)
         if identity is not None:
             return identity
-        RNS.Transport.request_path(node_id)
-        deadline = time.monotonic() + self.config.path_timeout
-        while time.monotonic() < deadline:
-            time.sleep(0.1)
-            found = RNS.Identity.recall(node_id, _no_use=True)
-            if found is not None:
-                return RNS.Identity.recall(node_id) or found
+        if self.paths.await_known(node_id, lambda: RNS.Identity.recall(node_id, _no_use=True) is not None,
+                                  self.config.path_timeout, cancel=self.stop_event):
+            return RNS.Identity.recall(node_id) or RNS.Identity.recall(node_id, _no_use=True)
         return None
 
     def identify(self, peer: PeerLink):
@@ -408,6 +600,18 @@ class LinkPool:
         with self.lock:
             return self.shared.get(node_id)
 
+    def hold(self, node_id: bytes, seconds: float) -> bool:
+        """Count the shared link to node_id as in use for seconds more (a requester waiting out a provider's upload
+        pacing before its next request): sweep() closes it only link_idle_timeout after that, whatever its idle limit.
+        False if there is no such link."""
+        with self.lock:
+            peer = self.shared.get(node_id)
+            if peer is None:
+                return False
+            until = self.clock() + max(0.0, seconds)
+            peer.held_until = until if peer.held_until is None else max(peer.held_until, until)
+            return True
+
     def close(self, node_id: bytes):
         """Tear down the shared link to node_id, if any (e.g. after a stalled transfer)."""
         self.close_link(self.shared_peer(node_id))
@@ -424,15 +628,26 @@ class LinkPool:
     def close_all(self):
         """Stop the idle sweeper and tear down every link."""
         self.stop_event.set()
+        self.wake.set()
         with self.lock:
             peers = list(self.shared.values()) + list(self.oneshot)
         for peer in peers:
             self.close_link(peer)
 
+    def idle_limit(self, peer: PeerLink) -> float:
+        """Seconds without data after which sweep() closes peer's link if nothing is in progress on it (idle_limit():
+        link_idle_timeout with a rate estimate, else at most until just before RNS's first keepalive)."""
+        link = peer.link
+        return idle_limit(self.config.link_idle_timeout, getattr(link, "keepalive", None), getattr(link, "rtt", None),
+                          peer.rate is not None)
+
     def sweep(self) -> int:
-        """Close shared links with no request in progress, no data and not handed out by get() for
-        link_idle_timeout. Returns how many."""
+        """Close shared links with no request in progress that have had no data and not been handed out by get() for
+        their idle limit (idle_limit), nor been held (hold) within link_idle_timeout. Returns how many. Sets
+        next_sweep: seconds until the next link kept may be due, at least MIN_SWEEP_WAIT and at most the sweep
+        interval (a request ending or a link handed out wakes the sweeper sooner)."""
         timeout = self.config.link_idle_timeout
+        wait = self._sweep_interval()
         with self.lock:
             peers = list(self.shared.values())
         idle = []
@@ -441,14 +656,24 @@ class LinkPool:
                 quiet = peer.link.no_data_for()
             except Exception:  # noqa: BLE001 - a link closing meanwhile is skipped
                 continue
-            if not peer.busy() and quiet >= timeout:
-                idle.append(peer)
+            if peer.busy():
+                continue  # its request ending wakes the sweeper
+            limit = self.idle_limit(peer)
+            if quiet >= limit:
+                idle.append((peer, limit))
+            else:
+                wait = min(wait, limit - quiet)
         closing = []
-        for peer in idle:
+        for peer, limit in idle:
             with self.lock:
                 # get() may have handed it out since (its caller is about to send a request): it marks the peer
                 # under this lock, and once the peer is out of the pool here no get() can return it
-                if peer.handed_out is not None and self.clock() - peer.handed_out < timeout:
+                now = self.clock()
+                if peer.handed_out is not None and now - peer.handed_out < limit:
+                    wait = min(wait, peer.handed_out + limit - now)
+                    continue
+                if peer.held_until is not None and now - peer.held_until < timeout:
+                    wait = min(wait, peer.held_until + timeout - now)
                     continue
                 if self.shared.get(peer.node_id) is peer:
                     del self.shared[peer.node_id]
@@ -456,7 +681,12 @@ class LinkPool:
         for peer in closing:
             log(f"closing idle link to {node_name(peer.node_id)}", LOG_VERBOSE)
             self.close_link(peer)
+        self.next_sweep = max(MIN_SWEEP_WAIT, wait)
         return len(closing)
+
+    def _sweep_interval(self) -> float:
+        """The longest the sweeper waits between sweeps: a quarter of link_idle_timeout, within 1 to 30 s."""
+        return max(1.0, min(30.0, self.config.link_idle_timeout / 4))
 
     def _start_sweeper(self):
         """Start the thread closing idle links, once."""
@@ -467,13 +697,20 @@ class LinkPool:
         self.sweeper.start()
 
     def _sweep_loop(self):
-        """Sweep idle links until close_all."""
-        interval = max(1.0, min(30.0, self.config.link_idle_timeout / 4))
-        while not self.stop_event.wait(interval):
+        """Sweep idle links until close_all: when the last sweep said the next link is due, or when woken."""
+        wait = self._sweep_interval()
+        while True:
+            self.wake.wait(wait)
+            # Cleared before sweeping: a request ending during the sweep wakes the next wait at once
+            self.wake.clear()
+            if self.stop_event.is_set():
+                return
             try:
                 self.sweep()
+                wait = self.next_sweep
             except Exception as e:  # noqa: BLE001 - the sweeper thread keeps running; logged
                 log(f"error closing idle links: {e}", LOG_WARNING)
+                wait = self._sweep_interval()
 
     # Queries
 
@@ -501,23 +738,25 @@ class LinkPool:
 
     def request(self, peer: PeerLink, path: str, data, blocks: bool = False, max_response_size: int | None = None,
                 watchdog: Callable[[Exchange, float], str | None] | None = None,
-                on_progress: Callable[[float], None] | None = None) -> Exchange:
+                on_progress: Callable[[float], None] | None = None, silence_expected: bool = False) -> Exchange:
         """Send one request on peer's link and wait for its outcome, within the per-link limits.
 
         watchdog(exchange, now) may return a reason to stop waiting (a stall). on_progress(fraction) is
         called from this thread, never an RNS one. A request other than /blocks gives up (.stalled set) once
         request_deadline has passed since it was sent, or if it waited that long for a slot. A request larger
-        than the link's packet MDU isn't sent (the exchange is returned unanswered).
+        than the link's packet MDU isn't sent (the exchange is returned unanswered). A request left unanswered on a
+        link that heard nothing meanwhile closes it (_went_dead), unless silence_expected: a /range to a node not known
+        to answer it, which an older node leaves unanswered on a working link.
         """
         peer.enter()
         try:
-            return self._request(peer, path, data, blocks, max_response_size, watchdog, on_progress)
+            return self._request(peer, path, data, blocks, max_response_size, watchdog, on_progress, silence_expected)
         finally:
             peer.leave()
 
     def _request(self, peer: PeerLink, path: str, data, blocks: bool, max_response_size: int | None,
                  watchdog: Callable[[Exchange, float], str | None] | None,
-                 on_progress: Callable[[float], None] | None) -> Exchange:
+                 on_progress: Callable[[float], None] | None, silence_expected: bool = False) -> Exchange:
         """request(), with the calling thread counted among the link's users."""
         exchange = Exchange(self.clock)
         deadline = None if blocks else self.request_deadline(peer)
@@ -550,13 +789,29 @@ class LinkPool:
                 return exchange
             exchange.receipt = receipt
             exchange.sent_at = exchange.last_progress = self.clock()
+            if peer.early is not None and peer.early.deliver(receipt):
+                log(f"{node_name(peer.node_id)} answered {path} before RNS had registered the request; handed the "
+                    f"answer over", LOG_VERBOSE)
             try:
                 self._wait(peer, path, exchange, receipt, deadline, watchdog, on_progress)
             finally:
                 self._log_outcome(peer, path, exchange)
+            if not silence_expected and self._went_dead(peer, exchange):
+                exchange.went_dead = True
+                # Nothing at all came back on the link while the request waited out RNS's timeout: the other end
+                # most likely lost it (its rnsd or a transport node on the way restarted), which RNS notices only at
+                # its keepalive, about 10 minutes on LoRa; meanwhile every request on it waited out its timeout too.
+                # This link (not one opened since) is closed, unless another request is using it, so the next one
+                # opens a link that works or fails fast
+                if not peer.used_by_others({threading.get_ident()}):
+                    self.close_link(peer)
+                    log(f"closed the link to {node_name(peer.node_id)}: nothing came back on it while {path} waited",
+                        LOG_VERBOSE)
             return exchange
         finally:
             peer.release(blocks)
+            if peer.shared:
+                self.wake.set()  # the link may be idle now: the sweep works out when it is due
 
     def _wait(self, peer: PeerLink, path: str, exchange: Exchange, receipt, deadline: float | None,
               watchdog: Callable[[Exchange, float], str | None] | None, on_progress: Callable[[float], None] | None):
@@ -593,6 +848,20 @@ class LinkPool:
                 break
         if exchange.answered and on_progress is not None and reported < 1.0:
             on_progress(1.0)
+
+    def _went_dead(self, peer: PeerLink, exchange: Exchange) -> bool:
+        """True if exchange went unanswered on peer's shared link (RNS gave up on it, nothing of an answer started)
+        while the link, still up at this end, received nothing at all from the other end since it was sent, not even a
+        keepalive: a link lost at the other end, rather than a request or answer lost on the way."""
+        if not peer.shared or exchange.answered or exchange.response_started is not None or exchange.sent_at is None:
+            return False
+        if getattr(exchange.receipt, "status", None) != RECEIPT_FAILED or not peer.is_active():
+            return False
+        try:
+            silent = peer.link.no_inbound_for()
+        except Exception:  # noqa: BLE001 - RNS internals: not known to be dead if they fail
+            return False
+        return silent > self.clock() - exchange.sent_at
 
     def _log_outcome(self, peer: PeerLink, path: str, exchange: Exchange):
         """Log, at LOG_DEBUG, how a request sent ended: answered (in what time, how large) or why not."""

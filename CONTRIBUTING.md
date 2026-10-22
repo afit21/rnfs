@@ -19,12 +19,12 @@ Compatibility rules every change keeps:
 ```sh
 git clone https://github.com/afit21/rnfs && cd rnfs
 python3 -m venv .venv && . .venv/bin/activate
-pip install --require-hashes --only-binary=:all: -r packaging/requirements.lock   # rns, lxmf and theirs
+pip install --require-hashes --only-binary=:all: -r packaging/requirements.lock   # rns and its dependencies
 pip install --require-hashes --only-binary=:all: -r packaging/build-tools.lock    # ruff, coverage, build, ...
 pip install --no-deps --no-build-isolation -e .
 ```
 
-The library and the CLI use the standard library besides RNS and LXMF; `rnfs.apiclient`, `rnfs.remote`
+The library and the CLI use the standard library besides RNS; `rnfs.apiclient`, `rnfs.remote`
 (rnfs.Client) and the modules they import never import RNS. Keep it that way.
 
 ## Tests
@@ -42,17 +42,23 @@ variables:
 
 | Variable | What it turns on |
 |---|---|
-| `RNFS_E2E=1` | Real daemons and real RNS over local TCP, driven through the CLI or the library. Run them with `RNFS_E2E=1 python3 -m unittest tests.test_e2e tests.test_client tests.test_embedded tests.security.test_h1_real_rns tests.security.test_m1_real_rns tests.security.test_h2_display_page_pins` (3 to 4 minutes). CI's end-to-end step lists every module gated on it, and `tests/test_packaging.py` fails if a new one is missing from that list. |
+| `RNFS_E2E=1` | Real daemons and real RNS over local TCP, driven through the CLI or the library. Run them with `RNFS_E2E=1 python3 -m unittest tests.test_e2e tests.test_client tests.test_embedded tests.security.test_h1_real_rns tests.security.test_m1_real_rns tests.security.test_h2_display_page_pins tests.test_nomadnet_e2e` (3 to 4 minutes). CI's end-to-end step lists every module gated on it, and `tests/test_packaging.py` fails if a new one is missing from that list. |
 | `RNFS_FUZZ_EXAMPLES=N` | A deeper, randomized run of `tests/security/test_fuzz_parsers.py` (e.g. 3000 examples per parser). That module needs hypothesis, which isn't one of rnfs's dependencies: without it every test there is skipped, as in CI. |
 | `RNFS_BENCH=1` | Prints the FastCDC chunking rate measured by `tests/test_chunker.py` (the test itself only checks a floor). |
+| `RNFS_ECLIPSE=1` | A larger run of `tests/test_eclipse.py` (identities placed next to a key: 2,000 servers, more keys, slow nodes too, about 1.5 minutes) that prints what it measured: findability under attack, false positives, `/find` and stores per search and publish. |
 
 `tests/bench_block_writes.py` is a benchmark, not a test: run it by hand on the disks that matter (its docstring
-says how, including on a Raspberry Pi SD card). Performance changes record their before and after numbers in
-CHANGELOG.md.
+says how, including on a Raspberry Pi SD card). So is `tests/bench_startup.py`, which times opening a large block
+store at startup (after a clean stop, after a crash, and the first start on 0.1.6's layout), and
+`tests/bench_publisher.py`, which measures what each provided key costs the publisher (memory, disk, writes per
+round) and how long a wake takes, and `tests/bench_refresh.py`, which times a start's first walk of every pin for
+what the node serves and provides (a store of about 565,000 blocks, a Gutenberg-like folder among its pins).
+Performance changes
+record their before and after numbers in CHANGELOG.md.
 
 `tests/interop.py` is a manual cross-version check, not a test either: it runs this tree's daemons against daemons
 of older releases over local TCP, in both directions, and prints a PASS/FAIL table (providers, get and cat,
-transfers with and without `max_upload_rate` checked for refusals, names, keepers, LXMF). Run it before a release
+transfers with and without `max_upload_rate` checked for refusals, names, keepers). Run it before a release
 with each supported old release extracted by `git archive`:
 
     mkdir -p /tmp/rnfs-0.1.5 && git archive v0.1.5 | tar -x -C /tmp/rnfs-0.1.5
@@ -72,6 +78,32 @@ Tests that guard compatibility, and must stay green:
 Never weaken or delete a test to make a change pass. If a change deliberately alters behaviour a test encodes,
 change the test in the same commit and say why in the commit message.
 
+### Tests on every OS
+
+CI runs every test on Linux, macOS and Windows, and nearly every CI failure so far was a test written and run only
+on Linux. So:
+- **Paths.** Compare a path the code resolved with one the test built through `tests.support.real()`: macOS
+  reaches the temp directory through `/private/var`, and Windows may name it `RUNNER~1`. Write `/` in an expected
+  path only where the code does.
+- **POSIX-only APIs** (`os.geteuid`, `os.fchmod`, `os.mkfifo`, `resource`, `fcntl`, signals Windows lacks, and the
+  rest of the list in `pyproject.toml`) fail ruff (TID251) unless the line says what guards it: `# noqa: TID251 -
+  <the guard>`. Skip a test with `tests/support.py`'s `POSIX_MODES`, `PERMISSION_CHECKS`, `IS_ROOT`, `HAS_FIFO` or
+  `CAN_SYMLINK`.
+- **Files.** Windows keeps no execute bit, can't remove or replace a file another handle has open (close stores,
+  databases and nodes before the temporary directory is removed), and reads `\` or `C:` in a name as a path; a link
+  to a directory needs `target_is_directory=True` and is removed with `os.rmdir` there. macOS refuses names that
+  aren't UTF-8, and paths over 1024 bytes.
+- **Time.** Wait for a condition with `support.wait_for(..., what=...)`, never a fixed sleep: without `what=` its
+  result is all that can fail, so a call that ignores it must name what it waits for (`tests/test_suite_rules.py`
+  checks). Leave upper bounds a wide margin (CI's macOS runners are several times slower than a desktop) and lower
+  bounds a tick of slack (Windows' clock ticks every 15.6 ms before Python 3.13).
+
+CI runs each test that failed once more, alone, in a fresh process (`tests/ci_run.py`, up to 5 of them): one that
+then passes doesn't fail the run, but is named in a warning on the run's page and summary. Fix it: it will fail
+again. To run CI on a branch before a pull request, use Actions > tests > Run workflow. Every push to any branch
+runs it too, so push work in progress often: a release that brings weeks of commits to macOS and Windows for the
+first time is what has made releases fail.
+
 ### Security regression tests
 
 Every security fix comes with a regression test in `tests/security/test_<id>_<what>.py` (for example
@@ -89,7 +121,8 @@ ruff check .
 ```
 
 A broad `except Exception` in `rnfs/` carries `# noqa: BLE001 - <why it must catch everything>`, an import that
-can't be at the top `# noqa: E402`, and RUF100 flags a `noqa` that suppresses nothing. The companion NomadNet
+can't be at the top `# noqa: E402`, a use of an API Windows lacks `# noqa: TID251 - <the guard>` ("Tests on every
+OS", above; the same holds in `rnfs/`), and RUF100 flags a `noqa` that suppresses nothing. The companion NomadNet
 pages (`companion-nomadnet-sites/*/index.mu`) are linted as Python. CI also fails on merge-conflict markers.
 
 Style: match the surrounding code. Every function has a docstring, comments say why rather than what, and lines
@@ -102,7 +135,7 @@ versions:
 
 | File | What | Regenerate with |
 |---|---|---|
-| `packaging/requirements.lock` | rnfs's runtime dependencies (rns, lxmf and theirs), every file PyPI has for each | `python3 -I packaging/update-lock.py [rns==X lxmf==Y ...]` (no arguments: the newest versions `pyproject.toml` allows) |
+| `packaging/requirements.lock` | rnfs's runtime dependencies (rns and its dependencies), every file PyPI has for each | `python3 -I packaging/update-lock.py [rns==X ...]` (no arguments: the newest versions `pyproject.toml` allows) |
 | `packaging/build-backend.lock`, `packaging/build-tools.lock` | setuptools; and build, twine, PyInstaller, ruff, coverage and their dependencies | `python3 -I packaging/update-lock.py --build pyinstaller==X ...` (run it on Linux with Python 3.12) |
 | `packaging/flatpak/python3-deps.json`, `build-sources.json` | the Flatpak's wheels, from the locks | `python3 -I packaging/flatpak/generate-sources.py` |
 
@@ -151,7 +184,14 @@ route touches these places:
    tested on both by `tests/test_public.py`.
 5. The CLI command, if any (`rnfs/cli.py`, or the feature's own commands), through `ApiConnection` rather than
    a hand-written path.
-6. Tests of the handler (`tests/test_api.py` or the feature's test file), and a CHANGELOG line.
+6. The OpenAPI reference, `docs/openapi.json`: the operation (method and path, `operationId`, a feature's
+   route tagged with and `x-rnfs-feature` naming its feature), its parameters or request body, its answer's
+   schema and the statuses it answers; `X-Rnfs-Pin-Key` if it pins for the caller; a new error code, event kind or
+   capability in `ErrorCode`, `EventKind` and `Event`, or `Capabilities`. A new field in `GET /api/status` goes
+   into the status part that produces it (`StatusCore` for the node's, `Status<Feature>` for a feature's; a new
+   feature adds a part to `Status`'s `allOf`). `tests/test_openapi.py` fails, naming it, on a route, code, kind
+   or capability missing, and its live checks on a field the answers carry that isn't documented.
+7. Tests of the handler (`tests/test_api.py` or the feature's test file), and a CHANGELOG line.
 
 ## Commits
 
@@ -174,7 +214,8 @@ Steps:
 1. Go through the checklist below.
 2. Set `__version__` in `rnfs/__init__.py` to X.Y.Z, change CHANGELOG.md's first heading from
    `## X.Y.Z (unreleased)` to `## X.Y.Z`, and update README's release links and file names
-   (`tests/test_packaging.py` checks the three agree).
+   (`tests/test_packaging.py` checks the three agree), and `info.version` in `docs/openapi.json`
+   (`tests/test_openapi.py`).
 3. Commit, let CI pass on `main`, then push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. The workflow
    refuses a tag that isn't `v` + `__version__`, and a CHANGELOG whose section for it is still marked
    unreleased.
@@ -195,8 +236,8 @@ Steps:
 - [ ] Every security fix has its `tests/security/test_<id>_*.py` regression test, and `tests/security/README.md`
       lists it.
 - [ ] CI runs every `RNFS_E2E` module. Lint passes.
-- [ ] Before and after numbers for the performance changes (a desktop NVMe disk and a Raspberry Pi SD card),
-      recorded in CHANGELOG.md.
+- [ ] Before and after numbers for the performance changes, on a desktop disk, recorded in CHANGELOG.md
+      (Raspberry Pi SD-card numbers aren't a release requirement).
 - [ ] specification.md updated for every change in behaviour, with its version and compatibility note at the top.
 - [ ] design.md updated for every change in how things work.
 - [ ] CHANGELOG.md's entry states whether the wire format or CIDs changed ("no wire-format or CID changes"),

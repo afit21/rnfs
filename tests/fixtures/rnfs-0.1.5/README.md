@@ -29,7 +29,8 @@ schema version (`user_version`, 16), the time the test runs at (`now`) and the s
   them for anything else.**
 - `files/notes.txt`: the shared folder's one entry.
 - `fixture_content.py`: the files 0.1.5 added on top of the 0.1.4 fixture's (data only). There is no `blocks/`:
-  the test adds both fixtures' files with the current code to make the blocks, so every pin is complete.
+  the test adds both fixtures' files with the current code to make the blocks, so every pin is complete, and
+  writes them in the flat layout 0.1.6 and earlier used (`blocks/<cid>`).
 
 Left out, as in the 0.1.4 fixture: the node identity (`storage/`), `lxmf/` router state, `api_token` and logs.
 No `rnfs.toml`: the settings are in `expected.json`.

@@ -12,8 +12,7 @@ that tree's own CLI:
 - old-cap/new-cap one node of each version with max_upload_rate set (CAP_RATE), the serving side of the paced
           transfer, and later the name publishers of the keeper scenario.
 
-Every scenario runs in both directions, "A -> B" meaning A serves (or publishes, or sends) and B fetches (or
-resolves, or receives):
+Every scenario runs in both directions, "A -> B" meaning A serves (or publishes) and B fetches (or resolves):
 
 - version    each daemon's `rnfs --version`, /api/status and imported rnfs come from the tree it was given.
 - providers  B finds A among the providers of a CID A added.
@@ -25,15 +24,21 @@ resolves, or receives):
              (a local TCP link's MTU is large).
 - bulk-cap,  bulk and small from the *-cap node of A's version, whose max_upload_rate paces every /blocks
   small-cap  response, single-packet ones included since 0.1.6 (NET-2): an honest fetcher must see no refusals.
+- ranges     (rnfs 0.2.0's /range) a node of this tree set slow = "yes" (new-slow, so it asks for chunks in
+             ranges over every link) fetches text files: from old, each of two fetches has one /range left
+             unanswered and falls back to /blocks, with no refusal, failure or ban on either side; the second
+             silence in a row marks the node as not answering, so a third fetch, after a restart (the answer is
+             persisted), asks no /range of it; from new, it gets the chunks in compressed ranges.
 - names      a name published on A resolves on B, and B's gateway serves a file through it.
 - keepers    publisher -> keeper -> resolver across versions (old-cap -> new -> a fresh old node, new-cap -> old
              -> a fresh new node): the keeper keeps the name, the publisher stops, then the resolver starts (so
              it never heard the name's announce) and must get the signed record by asking keepers, its log
              showing the keeper query that returned it.
-- lxmf       A sends B a link over LXMF; it arrives in B's inbox, A's outbox says delivered, and `inbox get`
-             fetches it.
+There is no LXMF scenario: this tree has no LXMF since 0.2.0, which moved it out of rnfs into an app of its own
+(the old releases still have it, but there is nothing to test between them and this tree). The rnfs link field
+an LXMF message carries is checked against the old releases' bytes by tests/test_wire.py.
 
-Usage, from a checkout (the Python that runs rnfs, with RNS and LXMF installed):
+Usage, from a checkout (the Python that runs rnfs, with RNS installed):
 
     git archive v0.1.5 | (mkdir -p /tmp/rnfs-0.1.5 && tar -x -C /tmp/rnfs-0.1.5)
     git archive v0.1.4 | (mkdir -p /tmp/rnfs-0.1.4 && tar -x -C /tmp/rnfs-0.1.4)
@@ -45,6 +50,7 @@ Daemon directories and logs go to a temporary directory, kept (and named) when s
 import argparse
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -64,6 +70,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KIB, MIB = 1024, 1024 * 1024
 BULK_SIZE = 3 * MIB // 2
 SMALL_FILES, SMALL_SIZE = 64, 4 * KIB
+TEXT_SIZE = 200 * KIB  # the ranges scenario's text files: about four chunks each
+UNANSWERED = "doesn't answer /range"  # what a fetching node of this tree logs as it learns a node doesn't
+SILENT_ONCE = "left /range unanswered once"  # ... and as a node leaves its first /range unanswered
 CAP_RATE = 2_000_000  # bits/s: max_upload_rate on the *-cap nodes, so BULK_SIZE takes seconds (4 to 6)
 # Lines in a fetching node's log that mean a provider let it down, and in a serving node's log that mean it
 # refused (or cooled down) a requester. Both need RNS's loglevel at 5 (verbose), which every node here runs at
@@ -282,10 +291,12 @@ class Network:
         for a, b in [(self.old_cap, self.new), (self.new_cap, self.old)]:
             self.check("small-cap", self.direction(a, b), self.small, a, b)
             self.check("bulk-cap", self.direction(a, b), self.bulk, a, b)
+        new_slow = self.daemon("new-slow", ROOT, self.new_label, NODE_CONFIG, self.tcp_port,
+                               SETTINGS + 'slow = "yes"\n', "--bootstrap", self.hub.node_id)
+        self.check("ranges", self.direction(self.old, new_slow) + " (slow)", self.ranges_old, self.old, new_slow)
+        self.check("ranges", self.direction(self.new, new_slow) + " (slow)", self.ranges_new, self.new, new_slow)
         for a, b in pairs:
             self.check("names", self.direction(a, b), self.names, a, b, added[a.name])
-        for a, b in pairs:
-            self.check("lxmf", self.direction(a, b), self.lxmf, a, b)
         # Last: the publishers (the *-cap nodes) are stopped on the way
         for publisher, keeper, resolver in [(self.old_cap, self.new, self.old), (self.new_cap, self.old, self.new)]:
             self.check("keepers", self.direction(publisher, keeper, resolver), self.keepers, publisher, keeper,
@@ -433,6 +444,73 @@ class Network:
             raise AssertionError(f"refusals or failures in an honest transfer: {detail}\n{lines}")
         return detail
 
+    def text_file(self) -> tuple[str, bytes]:
+        """A new file of TEXT_SIZE bytes of English-like text, which bz2 compresses about as books do: (path,
+        content)."""
+        rng = random.Random(self.counter)
+        words = ("the of and to a in that it was he his her with as had for you not be she which at on by all my "
+                 "have from is this but they were so one said what would there been their could more when no "
+                 "Elizabeth Darcy Bennet Jane Bingley sister mother letter house ball evening").split()
+        lines = []
+        while sum(len(line) + 1 for line in lines) < TEXT_SIZE:
+            lines.append(" ".join(rng.choice(words) for _ in range(rng.randrange(6, 14))).capitalize() + ".")
+        content = "\n".join(lines).encode()[:TEXT_SIZE]
+        path = self.unique("text")
+        with open(path, "wb") as f:
+            f.write(content)
+        return path, content
+
+    def text_transfer(self, a: Daemon, b: Daemon) -> tuple[str, list[str], list[str]]:
+        """b gets a text file a added, as honest_transfer checks it: (its detail, b's log lines and a's log lines
+        written meanwhile)."""
+        path, content = self.text_file()
+        cid = a.out("add", path)
+
+        def check(out):
+            with open(out, "rb") as f:
+                if f.read() != content:
+                    raise AssertionError("the bytes differ")
+
+        b_log, a_log = b.log_size(), a.log_size()
+        detail = self.honest_transfer(a, b, cid, check, TEXT_SIZE, f"{TEXT_SIZE // KIB} KiB of text")
+        return detail, b.log_since(b_log), a.log_since(a_log)
+
+    def ranges_old(self, a: Daemon, b: Daemon) -> str:
+        """b (this tree, slow) fetches from a (an old release) twice: in each, one /range is left unanswered and the
+        rest comes with /blocks, nothing refused, failed or banned on either side (checked by honest_transfer); the
+        second silence in a row teaches b that a doesn't answer /range, and after b restarts no /range goes to a."""
+        detail, b_lines, _ = self.text_transfer(a, b)
+        once = [line for line in b_lines if SILENT_ONCE in line]
+        learnt = [line for line in b_lines if UNANSWERED in line]
+        if (len(once), len(learnt)) != (1, 0):
+            raise AssertionError(f"{b.name}'s first fetch logged {len(once)} lines saying {SILENT_ONCE!r} and "
+                                 f"{len(learnt)} saying {UNANSWERED!r}, not 1 and 0: {detail}")
+        again, b_lines, _ = self.text_transfer(a, b)
+        learnt = [line for line in b_lines if UNANSWERED in line]
+        if len(learnt) != 1 or any(SILENT_ONCE in line for line in b_lines):
+            raise AssertionError(f"{b.name}'s second fetch logged {len(learnt)} lines saying {UNANSWERED!r}, not 1")
+        b.stop()
+        restarted = self.daemon(b.name, b.tree, b.label, NODE_CONFIG, self.tcp_port, SETTINGS + 'slow = "yes"\n',
+                                "--bootstrap", self.hub.node_id)
+        after, b_lines, _ = self.text_transfer(a, restarted)
+        asked = [line for line in b_lines if "/range" in line]
+        if asked:
+            raise AssertionError(f"{b.name} asked {a.name} /range again after a restart: {asked[:3]}")
+        return f"learnt after 2 silences ({learnt[0].split('rnfs ', 1)[-1][:60]}...); {detail}"
+
+    def ranges_new(self, a: Daemon, b: Daemon) -> str:
+        """b (this tree, slow) fetches a text file from a (this tree): a sends the chunks as /range answers, bz2
+        compressed, and b never takes a for a node that doesn't answer /range."""
+        b = next(daemon for daemon in reversed(self.daemons) if daemon.name == b.name)  # restarted by ranges_old
+        detail, b_lines, a_lines = self.text_transfer(a, b)
+        sent = [line for line in a_lines if "/range: sending" in line]
+        compressed = [line for line in sent if "bz2" in line]
+        if not compressed:
+            raise AssertionError(f"{a.name} sent {len(sent)} /range answers, {len(compressed)} compressed: {detail}")
+        if any(UNANSWERED in line for line in b_lines):
+            raise AssertionError(f"{b.name} took {a.name} for a node that doesn't answer /range")
+        return f"{len(sent)} /range answers, {len(compressed)} in bz2; {detail}"
+
     def names(self, a: Daemon, b: Daemon, added: dict) -> str:
         """A name a publishes resolves on b, and b's gateway serves a file through it."""
         alias = f"site-{self.counter}"
@@ -480,9 +558,9 @@ class Network:
 
         wait_for(resolver_has, 240, f"{resolver.name} to get the record from {keeper.name} with "
                                     f"{publisher.name} stopped")
-        # Every version logs each keeper query's outcome; the record must have come from one (the keeper being
-        # the only one left), not from an announce
-        asked = re.compile(rf"rnfs keepers: (asked \d+ of \d+ keepers of name {name}: [1-9]\d* verifying records?)")
+        # Every version logs each keeper query's outcome ("asked 2 of 2 keepers", or 0.1.3's "asked 2 keepers"); the
+        # record must have come from one (the keeper being the only one left), not from an announce
+        asked = re.compile(rf"rnfs keepers: (asked \d+ (?:of \d+ )?keepers of name {name}: [1-9]\d* verifying records?)")
         evidence = wait_for(lambda: next((m.group(1) for line in resolver.log_since(start)
                                           if (m := asked.search(line))), None), 180,
                             f"{resolver.name}'s log to show a keeper query that got the record")
@@ -490,40 +568,6 @@ class Network:
         if resolved != cid:
             raise AssertionError(f"{resolver.name} resolved {resolved!r}, not {cid}")
         return f"{keeper.name} kept it; with {publisher.name} stopped, a fresh {resolver.name} {evidence}"
-
-    def lxmf(self, a: Daemon, b: Daemon) -> str:
-        """a sends b a link over LXMF; b's inbox has it and `inbox get` fetches it."""
-        path, content = self.random_file(100 * KIB)
-        cid = a.out("add", path)
-        address = b.out("lxmf", "address").splitlines()[0]
-        note = f"from {a.name} {self.counter}"
-        self.counter += 1
-        wait_for(lambda: a.cli("send", address, cid, "-m", note, check=False).returncode == 0, 90,
-                 f"{a.name} to send {b.name} an LXMF message")
-
-        def arrived():
-            """The inbox number of the message carrying cid (a "#N ..." line, its links indented below it)."""
-            number = None
-            for line in b.out("inbox").splitlines():
-                if line.startswith("#"):
-                    number = line.split()[0].lstrip("#")
-                elif cid in line and number is not None:
-                    return number
-            return None
-
-        number = wait_for(arrived, 120, f"the message in {b.name}'s inbox")
-        inbox = b.out("inbox")
-        if note not in inbox:
-            raise AssertionError(f"the message text is missing from {b.name}'s inbox:\n{inbox}")
-        wait_for(lambda: "delivered" in a.out("outbox"), 90, f"{a.name}'s outbox to show the message delivered")
-        out = self.unique("lxmf")
-        fetched = b.out("inbox", "get", number, "-o", out).split()
-        if fetched and fetched[0] == "job":
-            b.out("jobs", "wait", fetched[1].rstrip(":"))
-        with open(out, "rb") as f:
-            if f.read() != content:
-                raise AssertionError("inbox get: the bytes differ")
-        return "sent, delivered, fetched from the inbox"
 
     # Reporting
 

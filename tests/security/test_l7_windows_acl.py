@@ -195,8 +195,7 @@ class RnfsDirTest(WindowsTestCase):
         node_module._make_private_dirs(self.root)
         # Created with it (CreateDirectoryW's security attributes), never set afterwards
         self.assertEqual(self.acl.created, [self.root, *(os.path.join(self.root, name)
-                                                         for name in ("state", "blocks", "storage", "names",
-                                                                      "lxmf"))])
+                                                         for name in ("state", "blocks", "storage", "names"))])
         self.assertEqual(self.acl.set_calls, [])
         self.assertTrue(self.private(self.root))
         self.assertEqual(self.messages(), "")

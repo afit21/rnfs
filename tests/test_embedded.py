@@ -263,6 +263,15 @@ HOST_CONFIG = """
     target_port = {port}
 """
 
+ALONE_CONFIG = """
+[reticulum]
+  enable_transport = No
+  share_instance = No
+[logging]
+  loglevel = 2
+[interfaces]
+"""
+
 APP = "rnfstest"  # the host programs' own app name
 BIG = 3_000_000  # over RNS's 1 MiB segment: a multi-segment Resource, and very compressible (zeros)
 REQUEST = 600_000  # a request over the link MDU, so RNS sends it as a Resource (one segment, compressible)
@@ -428,7 +437,7 @@ def run_host(configdir: str, rnfs_dir: str, peer_echo_hex: str, peer_dht_hex: st
             refused.append(reason)
         return reason
     guards.refusal = recording_refusal
-    # LXMF and the DHT mode are left to rnfs.Node's defaults: off, and client
+    # The DHT mode is left to rnfs.Node's default: client
     settings = {"default_bootstrap": False, "startup_announce_delay": 2, "path_timeout": WAIT}
     # A start failing late leaves nothing behind (its rnfs.dht destination above all), so the next one works
     from rnfs.node import RnfsNode
@@ -446,7 +455,6 @@ def run_host(configdir: str, rnfs_dir: str, peer_echo_hex: str, peer_dht_hex: st
         ("random", Cid.for_block(RAW, RANDOM_BLOCK)), ("zeros", Cid.for_block(RAW, ZERO_BLOCK)), ("big", BIG_CID))}
     results["compress_limit"] = RNS.Resource.AUTO_COMPRESS_MAX_SIZE
     results["lxmf_imported"] = "LXMF" in sys.modules
-    results["lxmf_network"] = node.internal.feature("lxmf").network is not None
     results["dht_mode"] = node.status().dht_mode
     print("EXERCISED", flush=True)
     sys.stdin.readline()  # the peer has finished with this process's destinations
@@ -459,6 +467,54 @@ def run_host(configdir: str, rnfs_dir: str, peer_echo_hex: str, peer_dht_hex: st
     results["after_stop"] = request(link, "/echo", b"x") if link is not None else None
     print("RESULT", json.dumps(results), flush=True)
     os._exit(0)
+
+
+def run_links_gate(configdir: str, rnfs_dir: str):
+    """A node on a Reticulum of its own without interfaces: whether its rnfs.dht destination accepted links while it
+    was set up, once it had started, and once it had stopped. Prints RESULT and a JSON object."""
+    import rnfs
+    from rnfs.node import RnfsNode
+
+    reticulum = RNS.Reticulum(configdir=configdir)
+    seen = {}
+    setup = RnfsNode._setup_or_close
+
+    def recording(node, *args, **kwargs):
+        """RnfsNode._setup_or_close, noting whether links were accepted meanwhile."""
+        seen["during_setup"] = node.destination.accepts_links()
+        return setup(node, *args, **kwargs)
+
+    with mock.patch.object(RnfsNode, "_setup_or_close", recording):
+        node = rnfs.Node(rnfs_dir, reticulum=reticulum, settings={"default_bootstrap": False})
+    destination = node.internal.destination
+    seen["started"] = destination.accepts_links()
+    node.close()
+    seen["stopped"] = destination.accepts_links()
+    print("RESULT", json.dumps(seen), flush=True)
+    os._exit(0)
+
+
+class LinkGateTest(unittest.TestCase):
+    """A node accepts links on its rnfs.dht destination only while it can answer requests on them."""
+
+    def test_no_links_while_the_node_is_set_up(self):
+        """RNS accepts a link to a destination as soon as it exists and drops requests without a handler: through a
+        node's setup (a minute on a large store, minutes at an upgrade's first start), every request other nodes sent
+        waited out its timeout. Links are refused until the request server is in place."""
+        directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(directory.cleanup)
+        configdir = os.path.join(directory.name, "rns")
+        os.makedirs(configdir)
+        with open(os.path.join(configdir, "config"), "w", encoding="utf-8") as f:
+            f.write(ALONE_CONFIG)
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONPATH": ROOT}
+        done = subprocess.run([sys.executable, os.path.abspath(__file__), "--links-gate", configdir,
+                               os.path.join(directory.name, "rnfs")], capture_output=True, encoding="utf-8",
+                              errors="replace", env=env, timeout=120)
+        lines = [line for line in done.stdout.splitlines() if line.startswith("RESULT ")]
+        self.assertTrue(lines, done.stdout + done.stderr)
+        self.assertEqual(json.loads(lines[-1][len("RESULT "):]), {"during_setup": False, "started": True,
+                                                                  "stopped": False})
 
 
 @unittest.skipUnless(os.environ.get("RNFS_E2E") == "1", "set RNFS_E2E=1 to run")
@@ -570,9 +626,8 @@ class HostProgramTest(unittest.TestCase):
                             or reason.startswith("rnfs responses are one segment")
                             for reason in host_results["refused"]), detail)  # nothing of the host's refused
 
-        # LXMF off: no LXMF objects, not even the module; the host's Reticulum survives the node's stop
+        # rnfs has no LXMF since 0.2.0: not even the module is loaded; the host's Reticulum survives the node's stop
         self.assertFalse(host_results["lxmf_imported"], detail)
-        self.assertFalse(host_results["lxmf_network"], detail)
         self.assertEqual(host_results["dht_mode"], "client", detail)
         self.assertTrue(host_results["reticulum_kept"], detail)
         self.assertEqual(host_results["after_stop"], BIG, detail)
@@ -583,5 +638,7 @@ if __name__ == "__main__":
         run_peer(sys.argv[2])
     elif sys.argv[1:2] == ["--host"]:
         run_host(*sys.argv[2:6])
+    elif sys.argv[1:2] == ["--links-gate"]:
+        run_links_gate(*sys.argv[2:4])
     else:
         unittest.main()

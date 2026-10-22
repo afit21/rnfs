@@ -1,8 +1,8 @@
 """rnfs: content-addressed file sharing over Reticulum (RNS).
 
-For programs (design.md, "Public API"). PROVISIONAL until rnfs 0.2 (API_STATUS): names, signatures and objects
-may still change. Two classes with the same methods, objects and exceptions, so a program switches by changing
-the line that constructs one:
+For programs (design.md, "Public API"). PROVISIONAL until rnfs 1.0.0 (API_STATUS): names, signatures and objects,
+and the local API (docs/openapi.json), may still change, in 0.2.x releases too. Two classes with the same methods,
+objects and exceptions, so a program switches by changing the line that constructs one:
 - rnfs.Node(rnfs_dir, reticulum=..., settings=...) runs a node inside the program, beside its own Reticulum;
 - rnfs.Client(rnfs_dir=None) uses the user's running daemon through its local API (it never loads RNS).
 Every public name is loaded when first used, so `import rnfs` loads nothing more, and RNS only with rnfs.Node.
@@ -18,23 +18,32 @@ api.py       local HTTP API; gateway.py the HTTP gateway
 debuglog.py  the debug log file (debug_log)
 cli.py       command line: run a daemon, or talk to one through its API
 interface.py, objects.py, embedded.py, remote.py: the public API (rnfs.Node, rnfs.Client)
+uris.py      rnfs: links (rnfs.Link, parse_uri, format_uri) and the LXMF link map (encode_field, decode_field)
 """
 
-__version__ = "0.1.6"
-API_STATUS = "provisional"  # the public API (rnfs.Node, rnfs.Client) may change until rnfs 0.2
+__version__ = "0.2.0"
+API_STATUS = "provisional"  # the public API (rnfs.Node, rnfs.Client) and the local API may change until 1.0.0
 
 # Public name -> the module defining it, imported on first use (PEP 562)
 _EXPORTS = {
     "Node": "rnfs.embedded",
     "Client": "rnfs.remote",
     **{name: "rnfs.objects" for name in ("Cid", "Added", "Written", "Entry", "Info", "Stat", "Pin", "Record",
-                                         "Status", "Collected", "Verified", "Exported", "Imported", "DenyState")},
-    **{name: "rnfs.interface" for name in ("Rnfs", "Name", "Names", "Job", "Jobs", "Deny", "Watch", "File")},
+                                         "Status", "Collected", "Verified", "Exported", "Imported", "DenyState",
+                                         "Peer", "Stats", "Contact", "Kept", "Followed", "Cached", "Uncached",
+                                         "Event", "EventBatch", "Capabilities", "Setting", "Settings",
+                                         "SettingsChange", "RemotePin", "ServedPin", "RemotePinUsage",
+                                         "ServedPins", "FolderSync")},
+    **{name: "rnfs.interface" for name in ("Rnfs", "Name", "Names", "Job", "Jobs", "Deny", "Watch", "File",
+                                           "Contacts", "Events")},
     **{name: "rnfs.errors" for name in ("RnfsError", "NotFound", "TooLarge", "InvalidDag", "StorageFull", "Busy",
                                         "Denied", "Cancelled", "Closed", "BlockMismatch", "SealError",
-                                        "NotRecipient")},
-    **{name: "rnfs.apiclient" for name in ("ApiError", "DaemonNotRunning", "ConnectionFailed", "TokenError",
-                                           "AuthFailed", "SettingsError", "BadRequest", "ServerError")},
+                                        "NotRecipient", "Unsupported")},
+    **{name: "rnfs.apiclient" for name in ("ApiError", "DaemonNotRunning", "DaemonStarting", "ConnectionFailed",
+                                           "TokenError", "AuthFailed", "SettingsError", "BadRequest", "ServerError",
+                                           "NoSuchEndpoint")},
+    # rnfs: links and the LXMF link map (specification section 13), the contract of LXMF apps and other clients
+    **{name: "rnfs.uris" for name in ("Link", "parse_uri", "format_uri", "encode_field", "decode_field")},
 }
 __all__ = ["API_STATUS", "__version__", *_EXPORTS]
 

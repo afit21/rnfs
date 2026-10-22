@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 
-from rnfs import cli, denylist
+from rnfs import cli, denylist, fetcher
 from rnfs.api import ApiServer
 from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE
@@ -25,7 +25,7 @@ from rnfs.network import protocol
 from rnfs.network.server import select_blocks
 from tests.support import failing_commits, state_execute, state_rows
 from tests.test_api import raw_request
-from tests.test_node import A_ID, B_ID, NodeTest, setUpModule, tearDownModule  # noqa: F401 - RNS's loglevel
+from tests.test_node import A_ID, B_ID, NodeTest, _CancelAfter, setUpModule, tearDownModule  # noqa: F401 - RNS's loglevel
 from tests.test_providers import recorded_writes, rows_written
 
 IDENTITY = bytes(range(16))
@@ -376,6 +376,26 @@ class ServeAndProvideTest(DenyNodeTest):
         with self.assertRaises(NotFound):
             b"".join(self.b.read(str(cid)))  # B finds A as the provider, which answers "not held"
 
+    def test_a_hash_entry_stops_a_one_block_file_as_its_cid_does(self):
+        """A file of one block has its content's hash as its CID's digest, so a hash entry stops it everywhere a CID
+        entry does: it was refused when read, yet still served whole by /blocks and provided (a cloud node's deny list
+        by hash: a 0.1.6 node fetched it from it with get --from)."""
+        data = b"one block, denied by its hash"
+        cid = self.shared(data)
+        self.a.publisher.publish_due()
+        self.assertIn(cid, self.a.publisher.provided())
+        self.deny(self.a, "sha256:" + hashlib.sha256(data).hexdigest())
+        self.assertTrue(self.a.deny.denies(cid))
+        self.assertIsNone(self.a.backend.served_block(cid))
+        self.assertNotIn(cid, self.a.publisher.provided())
+        with self.assertRaises(NotFound):
+            b"".join(self.b.read(str(cid)))
+        # A file of several chunks is still served chunk by chunk (only reading it whole is refused): deny its CID
+        big = os.urandom(3 * CHUNK_SIZE)
+        root = self.shared(big)
+        self.deny(self.a, "sha256:" + hashlib.sha256(big).hexdigest())
+        self.assertFalse(self.a.deny.denies(root))
+
     def test_not_provided_and_withdrawn(self):
         """A pin that is, or holds, a denied block stops being provided, and its record is withdrawn."""
         root = Cid.parse(self.a.add_path(self.tree())["cid"])
@@ -647,6 +667,19 @@ class SourceTest(DenyNodeTest):
         self.assertEqual(c.deny.accepted()[source], good)
         self.assertEqual(c.deny.entry_count(source), 1)
         self.assertEqual(c.storage.pinned_by(DENY), {good})
+
+    def test_a_fetch_cut_short_keeps_its_progress(self):
+        """A list whose fetch fails (here cut short) keeps what it got as a cached fetch; the next check resumes."""
+        version = self.publish_list(*[Cid.for_block(RAW, i.to_bytes(4, "big")) for i in range(2500)])
+        c = self.node_with(str(version))
+        with fetcher.observing(_CancelAfter(2)):
+            self.assertFalse(self.check(c, str(version)))
+        self.assertEqual(c.storage.cached_fetches(), [(version, (), version)])
+        kept = c.storage.stat(version)["local_blocks"]
+        self.assertGreaterEqual(kept, 2)
+        self.assertLess(kept, c.storage.stat(version)["blocks"])
+        self.assertTrue(self.check(c, str(version)))
+        self.assertEqual(c.storage.pins()[version], {DENY})
 
     def test_removed_source_is_forgotten(self):
         """A source no longer in deny_lists at start stops applying, and its pin is released."""

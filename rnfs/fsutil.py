@@ -27,6 +27,9 @@ PARTIAL_PREFIX = ".partial-"
 # Seconds slept between attempts while Windows reports a file in use: about 1 s in all
 RETRY_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.2, 0.25)
 
+# The least allocation_unit gives: what ext4, APFS and NTFS allocate a file's data in by default
+MIN_ALLOCATION_UNIT = 4096
+
 _REPARSE_JUNCTION = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
 # Reparse tags with this bit are name surrogates: they stand for another file or directory (symlinks,
 # junctions, WSL symlinks), unlike placeholders such as OneDrive's that hold the file itself
@@ -80,7 +83,7 @@ def lock_exclusive(path: str) -> int:
                     raise
                 raise BlockingIOError(errno.EAGAIN, f"{path} is locked by another process") from e
         else:
-            import fcntl
+            import fcntl  # noqa: TID251 - the POSIX branch; msvcrt on Windows
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # BlockingIOError when another process holds it
         os.ftruncate(fd, 0)
         os.lseek(fd, 0, os.SEEK_SET)
@@ -101,10 +104,45 @@ def unlock(fd: int):
             os.lseek(fd, LOCK_OFFSET, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         else:
-            import fcntl
+            import fcntl  # noqa: TID251 - the POSIX branch; msvcrt on Windows
             fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:
         pass  # closing releases it too
+    finally:
+        os.close(fd)
+
+
+def lock_held(path: str) -> bool:
+    """True if a process holds lock_exclusive()'s lock on path; False if none does, or path is missing.
+
+    Found out by taking a shared lock (Windows: the same byte's lock) for an instant, writing nothing, where
+    lock_exclusive() would rewrite the holder's process ID. A lock_exclusive() at that same instant fails as if
+    the lock were held, so ask only when a holder is likely (lock_holder()'s process runs). Raises OSError if path
+    can't be opened or its lock tested."""
+    try:
+        fd = os.open(path, os.O_RDONLY | O_NOFOLLOW | O_BINARY)
+    except FileNotFoundError:
+        return False
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            os.lseek(fd, LOCK_OFFSET, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBRLCK, 1)
+            except OSError as e:
+                if e.errno in (errno.EACCES, errno.EDEADLK):  # as in lock_exclusive: another process holds it
+                    return True
+                raise
+            os.lseek(fd, LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            return False
+        import fcntl  # noqa: TID251 - the POSIX branch; msvcrt on Windows
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
     finally:
         os.close(fd)
 
@@ -213,7 +251,7 @@ def final_path(fd: int) -> str | None:
             return None  # no /proc mounted
         return path if path.startswith("/") else None  # e.g. "anon_inode:[...]": not a file at a path
     if sys.platform == "darwin":
-        import fcntl
+        import fcntl  # noqa: TID251 - macOS only
         if hasattr(fcntl, "F_GETPATH"):
             return os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
     return None
@@ -249,6 +287,49 @@ def _windows_final_path(fd: int) -> str:
         size = length + 1  # the buffer was too small, and length is what it needs
 
 
+def allocated(size: int, unit: int) -> int:
+    """What size bytes take on a filesystem allocating unit bytes at a time: rounded up, and one unit for nothing,
+    since an empty file or a directory takes a block file, an inode or a directory record."""
+    return max(-(-size // unit), 1) * unit
+
+
+def allocation_unit(path: str) -> int:
+    """The bytes the filesystem holding path (which must exist) allocates a file's data in (its fragment or cluster
+    size), at least MIN_ALLOCATION_UNIT: a smaller unit doesn't make an entry cheaper than that, since a file or
+    directory costs an inode or a directory record too. MIN_ALLOCATION_UNIT if it can't be read."""
+    unit = 0
+    try:
+        if hasattr(os, "statvfs"):
+            result = os.statvfs(path)  # noqa: TID251 - guarded by the hasattr: not on Windows
+            unit = result.f_frsize or result.f_bsize
+        elif os.name == "nt":
+            unit = _windows_cluster_size(path)
+    except (OSError, AttributeError, ValueError):
+        pass
+    return max(unit, MIN_ALLOCATION_UNIT)
+
+
+def _windows_cluster_size(path: str) -> int:
+    """allocation_unit on Windows: the cluster size of path's volume (GetVolumePathNameW, GetDiskFreeSpaceW)."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    volume_path = kernel32.GetVolumePathNameW
+    volume_path.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+    volume_path.restype = wintypes.BOOL
+    free_space = kernel32.GetDiskFreeSpaceW
+    free_space.argtypes = (wintypes.LPCWSTR, *(ctypes.POINTER(wintypes.DWORD),) * 4)
+    free_space.restype = wintypes.BOOL
+    root = ctypes.create_unicode_buffer(1024)
+    if not volume_path(os.path.abspath(path), root, len(root)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    sectors, sector_size, free, total = (wintypes.DWORD() for _ in range(4))
+    if not free_space(root.value, ctypes.byref(sectors), ctypes.byref(sector_size), ctypes.byref(free),
+                      ctypes.byref(total)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return sectors.value * sector_size.value
+
+
 def is_link(st: os.stat_result) -> bool:
     """True for a symlink, a Windows directory junction (which stat reports as a directory, yet it links) or any
     other Windows reparse point that stands for another file (a name surrogate); st is from lstat."""
@@ -274,14 +355,14 @@ def check_owned_fd(path: str, fd: int, info: os.stat_result, what: str) -> str |
         if reason is None:
             return None
         return f"{what} {path} was accessible to other users ({reason}); restricted it to you and SYSTEM"
-    if info.st_uid != os.geteuid():
+    if info.st_uid != os.geteuid():  # noqa: TID251 - Windows returned above
         raise PermissionError(f"{what} {path} belongs to another user (uid {info.st_uid})")
     mode = stat.S_IMODE(info.st_mode)
     if not mode & 0o077:
         return None
     private = 0o700 if directory else 0o600
     try:
-        os.fchmod(fd, private)
+        os.fchmod(fd, private)  # noqa: TID251 - Windows returned above
     except OSError as e:
         raise PermissionError(f"{what} {path} is accessible to other users (mode {mode:o}) and can't be "
                               f"restricted: {e.strerror or e}") from None
@@ -386,7 +467,7 @@ MAX_COMBINING_RUN = 2  # combining marks kept in a row (some scripts stack two);
 
 
 def printable_label(text) -> str:
-    """text, a label someone else chose (an LXMF display name), escaped as printable() does, and also where it
+    """text, a label someone else chose (e.g. a display name), escaped as printable() does, and also where it
     could pass for another label or for none: backslashes (so it can't spell out an escape), the blank fillers,
     a combining mark that follows no printed character (it would join what was printed before) or makes more
     than MAX_COMBINING_RUN in a row, and a label of nothing but spaces. Not for paths: printable() keeps a
@@ -427,7 +508,7 @@ def unsafe_name_reason(name: str) -> str | None:
 def safe_default_name(name, fallback):
     """name if it is fit to be an output name chosen without asking the user, else fallback.
 
-    The name comes from someone else (a DAG entry, a sealed name, an LXMF link), so beyond being one
+    The name comes from someone else (a DAG entry, a sealed name), so beyond being one
     plain path component here it must be printable and not hidden: a dotfile such as .bash_login or
     .npmrc written into the current directory unnoticed could change how other programs behave. Nor may
     it start with "-", which a later shell command would read as an option.

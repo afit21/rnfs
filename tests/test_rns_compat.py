@@ -1,10 +1,10 @@
-"""The installed RNS and LXMF still have every internal rnfs relies on.
+"""The installed RNS still has every internal rnfs relies on.
 
-rnfs reads private attributes of RNS and LXMF objects, replaces some of their methods, passes undocumented
-keywords and depends on data layouts neither documents, none of which their version numbers promise to keep.
-INTERNALS lists each one with the rnfs module relying on it, so a dependency bump (Dependabot, a lock update, a
-user's own environment) fails here, naming the module to update, rather than at runtime. Written against RNS
-1.5.6 and LXMF 1.2.0.
+rnfs reads private attributes of RNS objects, replaces some of their methods, passes undocumented keywords and
+depends on data layouts RNS doesn't document, none of which its version numbers promise to keep. INTERNALS lists
+each one with the rnfs module relying on it, so a dependency bump (Dependabot, a lock update, a user's own
+environment) fails here, naming the module to update, rather than at runtime. Written against RNS 1.5.6 (LXMF's
+internals left with the LXMF feature, in 0.2.0).
 
 Nothing here starts Reticulum: objects are built offline (Transport.register_destination patched out), and
 the process-wide state touched (Identity.known_destinations) is restored.
@@ -17,7 +17,6 @@ import re
 import sys
 import tempfile
 import textwrap
-import threading
 import time
 import types
 import unittest
@@ -25,23 +24,21 @@ from collections.abc import Callable
 from typing import NamedTuple
 from unittest import mock
 
-import LXMF
 import RNS
-from LXMF import LXMRouter
 from RNS.vendor import umsgpack
 
 from rnfs import mesh, names
 from rnfs.constants import ID_LENGTH
 from rnfs.content import seal
 from rnfs.content.cid import RAW, Cid
-from rnfs.features import keepers, lxmf
-from rnfs.network import guards, protocol, rates
+from rnfs.features import keepers
+from rnfs.network import guards, paths, protocol, rates
 
 
 class Internal(NamedTuple):
     module: str  # the rnfs modules that rely on it, under rnfs/ and separated by ", "
-    surface: str  # what of RNS or LXMF it relies on
-    check: Callable[[], None]  # raises if the installed RNS or LXMF doesn't provide it
+    surface: str  # what of RNS it relies on
+    check: Callable[[], None]  # raises if the installed RNS doesn't provide it
 
 
 INTERNALS = [
@@ -87,6 +84,9 @@ INTERNALS = [
                               "is_response=True, auto_compress=auto_compress)",
                               "RNS.Resource(packed_response, self, request_id=request_id, is_response=True, "
                               "auto_compress=auto_compress)"))),
+    Internal("ranges.py, network/client.py", "Link.handle_request sending nothing for a request whose path has no "
+             "handler (how a node before 0.2.0 meets /range: the requester learns from the silence, rnfs.ranges), "
+             "and answering one that has", lambda: _unhandled_path_unanswered()),
     Internal("network/server.py", "Link.register_outgoing_resource(resource), looked up on the link (and so "
              "replaceable per link) when a Resource is advertised",
              lambda: (_params(RNS.Link.register_outgoing_resource, "resource"),
@@ -118,6 +118,28 @@ INTERNALS = [
              "and link_id (set_link_id); Link.ACTIVE, CLOSED, TRAFFIC_TIMEOUT_FACTOR",
              lambda: (_assigns(RNS.Link.__init__, "status", "rtt", "traffic_timeout_factor", "attached_interface"),
                       _has(RNS.Link, "ACTIVE", "CLOSED", "TRAFFIC_TIMEOUT_FACTOR", "set_link_id"))),
+    Internal("network/links.py", "Link.rtt measured on a link this node opens, from its request to the proof, "
+             "before the established callback runs (LinkPool.on_rtt reads it once established, for `rnfs peers`)",
+             lambda: _source(RNS.Link.validate_proof, "self.rtt = time.time() - self.request_time",
+                             "self.callbacks.link_established")),
+    Internal("network/links.py", "Link.keepalive: the interval after which the node that opened a link sends a "
+             "keepalive (answered by the other end) when no packet has crossed it either way, max(KEEPALIVE_MIN, "
+             "rtt × KEEPALIVE_MAX / KEEPALIVE_MAX_RTT) capped at KEEPALIVE_MAX (5 s, 360 s, 1.75 s), and keepalives "
+             "not counted by no_data_for (idle_limit closes an idle link before its first one)",
+             lambda: (_assigns(RNS.Link.__init__, "keepalive", "rtt"),
+                      _true((RNS.Link.KEEPALIVE_MIN, RNS.Link.KEEPALIVE_MAX, RNS.Link.KEEPALIVE_MAX_RTT)
+                            == (5, 360, 1.75), "keepalive constants changed"),
+                      _source(RNS.Link._Link__update_keepalive,
+                              "self.keepalive = max(min(self.rtt * (Link.KEEPALIVE_MAX / Link.KEEPALIVE_MAX_RTT), "
+                              "Link.KEEPALIVE_MAX), Link.KEEPALIVE_MIN)"),
+                      _source(RNS.Link._Link__watchdog_job,
+                              "if now >= last_inbound + self.keepalive or now >= self.last_outbound + self.keepalive:",
+                              "if self.initiator and now >= self.last_keepalive + self.keepalive:",
+                              "self.send_keepalive()"),
+                      _source(RNS.Link.had_outbound, "if not is_keepalive: self.last_data = self.last_outbound"),
+                      _source(RNS.Link._Link__receive,
+                              "if packet.context != RNS.Packet.KEEPALIVE: self.last_data = self.last_inbound"),
+                      _source(RNS.Link.no_data_for, "return time.time() - self.last_data"))),
 
     # Requests
     Internal("network/links.py, network/server.py", "Link.request's own timeout, rtt × traffic_timeout_factor + "
@@ -134,6 +156,22 @@ INTERNALS = [
     Internal("network/links.py", "RequestReceipt link, response_size, get_response() and get_progress()",
              lambda: (_assigns(RNS.RequestReceipt.__init__, "link", "response_size"),
                       _has(RNS.RequestReceipt, "get_response", "get_progress"))),
+    Internal("network/links.py, network/nomadnet.py", "a response packet handed to self.handle_response (looked "
+             "up on the link, so replaceable per link: EarlyResponses) with (request_id, response_data, "
+             "response_size, response_transfer_size, metadata, update_sizes, check_size), which answers the "
+             "link.pending_requests entry of that request_id; Link.request registering the RequestReceipt "
+             "(request_id its packet's truncated hash) only after sending the packet",
+             lambda: (_params(RNS.Link.handle_response, "request_id", "response_data", "response_size",
+                              "response_transfer_size", "metadata", "update_sizes", "check_size"),
+                      _source(RNS.Link._Link__receive,
+                              "self.handle_response(request_id, response_data, transfer_size, transfer_size, "
+                              "update_sizes=True, check_size=True)"),
+                      _source(RNS.Link.handle_response, "for pending_request in self.pending_requests:",
+                              "if pending_request.request_id == request_id:"),
+                      _source(RNS.Link.request, "packet_receipt = request_packet.send()",
+                              "return RequestReceipt(self, packet_receipt=packet_receipt"),
+                      _source(RNS.RequestReceipt.__init__, "self.hash = packet_receipt.truncated_hash",
+                              "self.request_id = self.hash", "self.link.pending_requests.append(self)"))),
     Internal("network/protocol.py", "request framing [time.time(), truncated path hash, data] (umsgpack packs a "
              "float in 9 bytes), response framing [request_id, response] with truncated-hash request IDs",
              lambda: (_source(RNS.Link.request, "unpacked_request = [time.time(), request_path_hash, data]",
@@ -146,8 +184,17 @@ INTERNALS = [
     # Identities and announces RNS remembers
     Internal("node.py, names.py, features/peers.py", "Identity.known_destinations entries: [time heard, packet "
              "hash, public key, app_data, ...]", lambda: _known_destinations()),
-    Internal("names.py", "Transport.path_table entries holding, at IDX_PT_RANDBLOBS, the random blobs of the "
-             "announces the path was taken from, a blob added only for an announce not heard before; "
+    Internal("node.py", "Destination.accepts_links(False) makes Destination.incoming_link_request drop a link "
+             "request (no link is made), and accepts_links(True) accept them again",
+             lambda: (_source(RNS.Destination.incoming_link_request, "if self.accept_link_requests:",
+                              "RNS.Link.validate_request(self, data, packet)"),
+                      _source(RNS.Destination.accepts_links, "self.accept_link_requests = True",
+                              "self.accept_link_requests = False"))),
+    Internal("node.py", "announce handlers called only for an announce that takes the path (should_add), and only "
+             "after its path table entry is written, so the path's newest emission is that announce's",
+             lambda: _handlers_after_path()),
+    Internal("names.py, node.py", "Transport.path_table entries holding, at IDX_PT_RANDBLOBS, the random blobs of "
+             "the announces the path was taken from, a blob added only for an announce not heard before; "
              "Transport.timebase_from_random_blobs, their newest emission time",
              lambda: (_true(sys.modules["RNS.Transport"].IDX_PT_RANDBLOBS == names._PATH_RANDOM_BLOBS,
                             "IDX_PT_RANDBLOBS moved"),
@@ -175,7 +222,8 @@ INTERNALS = [
     Internal("features/keepers.py, names.py", "Transport.get_cached_packet(packet_hash, packet_type=\"announce\") and the "
              "signed announce in it: public key, name hash, random hash (emission time in its last 5 bytes), "
              "ratchet, signature, app_data", lambda: _cached_announce()),
-    Internal("names.py", "announce handlers with five parameters get announce_packet_hash and is_path_response",
+    Internal("names.py, network/announces.py", "announce handlers with five parameters get announce_packet_hash and "
+             "is_path_response",
              lambda: _source(RNS.Transport, "len(inspect.signature(handler.received_announce).parameters) == 5",
                              "announce_packet_hash=packet.packet_hash",
                              "is_path_response=packet.context == RNS.Packet.PATH_RESPONSE")),
@@ -195,6 +243,15 @@ INTERNALS = [
                               "'interface': str(RNS.Transport.path_table[dst_hash][5])"),
                       _source(RNS.Reticulum.get_next_hop_if_name,
                               "return str(RNS.Transport.next_hop_interface(destination))"))),
+    Internal("mesh.py", "Transport.path_table entries holding the hop count at IDX_PT_HOPS and the interface at "
+             "IDX_PT_RVCD_IF; get_path_table(max_hops) entries {hash, hops, interface}, within max_hops (RnsPaths.scan)",
+             lambda: (_true(sys.modules["RNS.Transport"].IDX_PT_HOPS == mesh.PATH_TABLE_HOPS, "IDX_PT_HOPS moved"),
+                      _true(sys.modules["RNS.Transport"].IDX_PT_RVCD_IF == mesh.PATH_TABLE_INTERFACE,
+                            "IDX_PT_RVCD_IF moved"),
+                      _params(RNS.Reticulum.get_path_table, "max_hops"),
+                      _source(RNS.Reticulum.get_path_table, "'hops': path_hops",
+                              "if max_hops == None or path_hops <= max_hops:",
+                              "rpc_connection.send_bytes(mp.packb({'get': 'path_table', 'max_hops': max_hops}))"))),
     Internal("mesh.py, network/rates.py", "Reticulum.get_interface_stats() {\"interfaces\": [{name, short_name, "
              "type, status, bitrate}]}, with LocalServerInterface and LocalClientInterface types",
              lambda: (_source(RNS.Reticulum.get_interface_stats, "ifstats['name'] = str(interface)",
@@ -203,87 +260,120 @@ INTERNALS = [
                               "ifstats['status'] = interface.online", "ifstats['bitrate'] = interface.bitrate",
                               "stats['interfaces'] = interfaces"),
                       _has(RNS.Interfaces.LocalInterface, *rates.LOCAL_INTERFACE_TYPES))),
+    Internal("network/paths.py", "Transport.PATH_REQUEST_MI; await_path(destination_hash, timeout) and "
+             "request_path(destination_hash) sending one request; Transport.jobs requesting a path again after a link "
+             "that never established, at most every PATH_REQUEST_MI; get_interface_stats() entries {hash, type, status, "
+             "outgoing_pr_frequency, parent_interface_hash}",
+             lambda: (_true(RNS.Transport.PATH_REQUEST_MI == paths.PATH_REQUEST_MI, "PATH_REQUEST_MI changed"),
+                      _params(RNS.Transport.await_path, "destination_hash", "timeout"),
+                      _params(RNS.Transport.request_path, "destination_hash"),
+                      _source(RNS.Transport.await_path, "if Transport.has_path(destination_hash): return True",
+                              "else: Transport.request_path(destination_hash, on_interface=on_interface)"),
+                      _source(RNS.Transport.jobs, "Transport.expire_path(link.destination.hash)",
+                              "if time.time() - last_path_request > Transport.PATH_REQUEST_MI:"),
+                      _source(RNS.Reticulum.get_interface_stats, "ifstats['hash'] = interface.get_hash()",
+                              "ifstats['parent_interface_hash'] = interface.parent_interface.get_hash()",
+                              "ifstats['outgoing_pr_frequency'] = interface.outgoing_pr_frequency()",
+                              "ifstats['type'] = str(type(interface).__name__)",
+                              "ifstats['status'] = interface.online"))),
+    Internal("network/paths.py", "request_path(destination_hash, on_interface, tag) sending on that interface alone "
+             "(the packet's attached_interface, the only filter _outbound applies to a path request going out), as RNS "
+             "itself forwards a local client's request; await_path(on_interface=); next_hop_interface giving the path "
+             "table entry's interface; Transport.interfaces and local_client_interfaces; an Interface's OUT, online, "
+             "detached, parent_interface, spawned_interfaces and bitrate",
+             lambda: (_params(RNS.Transport.request_path, "destination_hash", "on_interface", "tag"),
+                      _params(RNS.Transport.await_path, "on_interface"),
+                      _source(RNS.Transport.request_path, "attached_interface = on_interface",
+                              "packet.is_outbound_pr = True"),
+                      _source(RNS.Transport._outbound,
+                              "if packet.attached_interface: potential_interfaces = [packet.attached_interface]",
+                              "if packet.attached_interface != None and interface != packet.attached_interface: "
+                              "continue"),
+                      _source(RNS.Transport.path_request,
+                              "Transport.request_path(destination_hash, interface, tag = request_tag)"),
+                      _source(RNS.Transport.next_hop_interface,
+                              "return Transport.path_table[destination_hash][IDX_PT_RVCD_IF]"),
+                      _has(RNS.Transport, "interfaces", "local_client_interfaces"),
+                      _assigns(RNS.Interfaces.Interface.Interface.__init__, "online", "detached", "parent_interface",
+                               "spawned_interfaces", "bitrate"),
+                      _has(RNS.Interfaces.Interface.Interface, "OUT"))),
+
+    Internal("network/channel.py", "Reticulum.get_interface_stats() entries {airtime_short, airtime_long, "
+             "channel_load_short, channel_load_long} from an interface's r_airtime_* and r_channel_load_*, which "
+             "RNodeInterface starts at 0.0 and sets in percent; a shared instance's RPC answering interface_stats with "
+             "its own get_interface_stats()",
+             lambda: (_source(RNS.Reticulum.get_interface_stats,
+                              "if hasattr(interface, 'r_airtime_short'): ifstats['airtime_short'] = "
+                              "interface.r_airtime_short",
+                              "if hasattr(interface, 'r_airtime_long'): ifstats['airtime_long'] = interface.r_airtime_long",
+                              "if hasattr(interface, 'r_channel_load_short'): ifstats['channel_load_short'] = "
+                              "interface.r_channel_load_short",
+                              "if hasattr(interface, 'r_channel_load_long'): ifstats['channel_load_long'] = "
+                              "interface.r_channel_load_long",
+                              "rpc_connection.send_bytes(mp.packb({'get': 'interface_stats'}))"),
+                      _source(RNS.Reticulum.rpc_loop,
+                              "if path == 'interface_stats': self.rpc_return(conn, self.get_interface_stats())"),
+                      _assigns(_rnode().__init__, r_airtime_short="0.0", r_airtime_long="0.0",
+                               r_channel_load_short="0.0", r_channel_load_long="0.0"),
+                      _source(_rnode(), "self.r_airtime_short = ats/100.0", "self.r_airtime_long = atl/100.0",
+                              "self.r_channel_load_short = cus/100.0", "self.r_channel_load_long = cul/100.0"))),
+
+    Internal("network/paths.py", "Transport.PATH_REQUEST_TIMEOUT, RNS's own wait for a path (the shortest "
+             "candidate_wait), and await_path blocking until the path is there or the timeout passes",
+             lambda: (_true(RNS.Transport.PATH_REQUEST_TIMEOUT == paths.PATH_REQUEST_TIMEOUT,
+                            "PATH_REQUEST_TIMEOUT changed"),
+                      _source(RNS.Transport.await_path, "while not Transport.has_path(destination_hash) and time.time() "
+                              "< timeout: time.sleep(0.05)", "return Transport.has_path(destination_hash)"))),
+
+    # Why a link closed
+    Internal("network/links.py, network/client.py", "Link.teardown_reason naming the end that closed a link by its "
+             "role: teardown() sets INITIATOR_CLOSED at the opener (DESTINATION_CLOSED at the other end), a LINKCLOSE "
+             "received sets DESTINATION_CLOSED at the opener, the watchdog sets TIMEOUT",
+             lambda: (_true((RNS.Link.TIMEOUT, RNS.Link.INITIATOR_CLOSED, RNS.Link.DESTINATION_CLOSED) == (1, 2, 3),
+                            "teardown reasons changed"),
+                      _source(RNS.Link.teardown, "if self.initiator: self.teardown_reason = Link.INITIATOR_CLOSED",
+                              "else: self.teardown_reason = Link.DESTINATION_CLOSED"),
+                      _source(RNS.Link.teardown_packet, "if self.initiator: self.teardown_reason = "
+                              "Link.DESTINATION_CLOSED", "else: self.teardown_reason = Link.INITIATOR_CLOSED"),
+                      _source(RNS.Link._Link__watchdog_job, "self.teardown_reason = Link.TIMEOUT"))),
+
+    # Blackholed identities
+    Internal("network/blackhole.py", "Reticulum.get_blackholed_identities() returning Transport.blackholed_identities "
+             "({identity hash: {source, until, reason}}), through a shared instance by the blackholed_identities RPC; "
+             "Destination.hash(identity hash, app, aspects) taking a 16-byte identity hash",
+             lambda: (_source(RNS.Reticulum.get_blackholed_identities,
+                              "rpc_connection.send_bytes(mp.packb({'get': 'blackholed_identities'}))",
+                              "else: return RNS.Transport.blackholed_identities"),
+                      _source(RNS.Reticulum.rpc_loop, "if path == 'blackholed_identities': "
+                              "self.rpc_return(conn, self.get_blackholed_identities())"),
+                      _source(RNS.Transport.blackhole_identity,
+                              "entry = {'source': Transport.identity.hash, 'until': until, 'reason': reason}",
+                              "Transport.blackholed_identities[identity_hash] = entry"),
+                      _true(isinstance(RNS.Transport.blackholed_identities, dict), "not a dict"),
+                      _true(RNS.Destination.hash(bytes(16), "rnfs", "dht")
+                            == RNS.Destination.hash(_identity_with_hash(bytes(16)), "rnfs", "dht"),
+                            "Destination.hash of an identity hash differs from the identity's"))),
+    Internal("network/blackhole.py, network/server.py", "RNS itself tearing down an incoming link that identifies as a "
+             "blackholed identity (Link LINKIDENTIFY, before remote_identified), and dropping its announces "
+             "(Identity.validate_announce)",
+             lambda: (_source(RNS.Link._Link__receive, "if RNS.Reticulum.get_instance().is_blackholed(identity.hash):",
+                              "self.teardown()"),
+                      _source(RNS.Identity.validate_announce,
+                              "if announced_identity.hash in RNS.Transport.blackholed_identities:"))),
 
     # Sealed files
     Internal("content/seal.py", "RNS.Cryptography.hkdf(length, derive_from, salt, context), "
              "AES.AES_256_CBC.encrypt/decrypt(data, key, iv), and Identity.encrypt of a content key being "
              "WRAPPED_KEY_SIZE bytes", lambda: _crypto()),
 
-    # LXMF
-    Internal("features/lxmf.py", "LXMRouter(identity, storagepath, delivery_limit, autopeer), keeping its state "
-             "in storagepath/lxmf and setting signal handlers through signal.signal",
-             lambda: (_params(LXMRouter.__init__, "identity", "storagepath", "delivery_limit", "autopeer"),
-                      _assigns(LXMRouter.__init__, storagepath="storagepath + '/lxmf'"),
-                      _source(LXMRouter.__init__, "signal.signal(signal.SIGINT, self.sigint_handler)",
-                              "signal.signal(signal.SIGTERM, self.sigterm_handler)"))),
-    Internal("features/lxmf.py", "LXMRouter.get_announce_app_data(destination_hash), looked up on the router "
-             "when announcing, and its layout [display name, stamp cost, supported functions]",
-             lambda: _announce_app_data()),
-    Internal("features/lxmf.py", "LXMRouter.delivery_resource_transfer_began(resource), looked up on the router "
-             "when a delivery link is established; Link.set_resource_started_callback",
-             lambda: (_params(LXMRouter.delivery_resource_transfer_began, "resource"),
-                      _source(LXMRouter.delivery_link_established,
-                              "link.set_resource_started_callback(self.delivery_resource_transfer_began)"),
-                      _has(RNS.Link, "set_resource_started_callback"))),
-    Internal("features/lxmf.py", "LXMRouter.delivery_resource_advertised(resource), looked up on the router "
-             "when a delivery link is established and given the ResourceAdvertisement, whose get_segments() "
-             "is its l and i its segment index",
-             lambda: (_params(LXMRouter.delivery_resource_advertised, "resource"),
-                      _source(LXMRouter.delivery_link_established,
-                              "link.set_resource_callback(self.delivery_resource_advertised)"),
-                      _source(RNS.Link, "if self.callbacks.resource(resource_advertisement)"),
-                      _source(RNS.ResourceAdvertisement.get_segments, "return self.l"),
-                      _source(RNS.ResourceAdvertisement.unpack, "adv.i = dictionary['i']"))),
-    Internal("features/lxmf.py", "LXMRouter.request_messages_from_propagation_node(identity, max_messages), "
-             "called again through the router once the propagation node link is up",
-             lambda: (_params(LXMRouter.request_messages_from_propagation_node, "identity", "max_messages"),
-                      _source(LXMRouter.request_messages_from_propagation_node,
-                              "self.request_messages_from_propagation_node(identity, "
-                              "self.propagation_transfer_max_messages)"))),
-    Internal("features/lxmf.py", "LXMRouter propagation_transfer_state, outbound_propagation_link, "
-             "delivery_destinations; PR_* order: PR_IDLE < PR_PATH_REQUESTED..PR_RESPONSE_RECEIVED < PR_COMPLETE "
-             "< every failure",
-             lambda: (_assigns(LXMRouter.__init__, "propagation_transfer_state", "outbound_propagation_link",
-                               delivery_destinations="{}"),
-                      _true(LXMRouter.PR_IDLE < LXMRouter.PR_PATH_REQUESTED < LXMRouter.PR_LINK_ESTABLISHING
-                            < LXMRouter.PR_LINK_ESTABLISHED < LXMRouter.PR_REQUEST_SENT < LXMRouter.PR_RECEIVING
-                            < LXMRouter.PR_RESPONSE_RECEIVED < LXMRouter.PR_COMPLETE
-                            < min(LXMRouter.PR_NO_PATH, LXMRouter.PR_LINK_FAILED, LXMRouter.PR_TRANSFER_FAILED,
-                                  LXMRouter.PR_NO_IDENTITY_RCVD, LXMRouter.PR_NO_ACCESS, LXMRouter.PR_FAILED),
-                            "PR_* states reordered"))),
-    Internal("features/lxmf.py", "LXMRouter cancel_propagation_node_requests(), acknowledge_sync_completion("
-             "reset_state=), set_outbound_propagation_node, register_delivery_identity(identity, display_name=), "
-             "register_delivery_callback, handle_outbound, announce, exit_handler",
-             lambda: (_params(LXMRouter.acknowledge_sync_completion, "reset_state"),
-                      _params(LXMRouter.register_delivery_identity, "identity", "display_name"),
-                      _has(LXMRouter, "cancel_propagation_node_requests", "set_outbound_propagation_node",
-                           "register_delivery_callback", "handle_outbound", "announce", "exit_handler"))),
-    Internal("features/lxmf.py", "propagation node announce data: pn_announce_data_is_valid, enabled flag at "
-             "index 2", lambda: _propagation_announce()),
-    Internal("features/lxmf.py", "LXMessage(destination, source, content, title=, fields=, desired_method=); "
-             "packed as destination hash, source hash, ...; unpack_from_bytes; signature_validated, "
-             "unverified_reason SOURCE_UNKNOWN, packed, hash, timestamp, title and content (bytes), fields, "
-             "method, state, progress", lambda: _message_round_trip()),
-    Internal("features/lxmf.py", "LXMessage state and method values (STATE_NAMES, METHOD_NAMES); "
-             "FIELD_CUSTOM_TYPE, FIELD_CUSTOM_DATA",
-             lambda: (_true({getattr(LXMF.LXMessage, name.upper()): name for name in lxmf.STATE_NAMES.values()}
-                            == lxmf.STATE_NAMES, "states renumbered"),
-                      _true({getattr(LXMF.LXMessage, name.upper()): name for name in lxmf.METHOD_NAMES.values()}
-                            == lxmf.METHOD_NAMES, "methods renumbered"),
-                      _true((LXMF.FIELD_CUSTOM_TYPE, LXMF.FIELD_CUSTOM_DATA)
-                            == (lxmf.FIELD_CUSTOM_TYPE, lxmf.FIELD_CUSTOM_DATA), "custom fields renumbered"))),
-    Internal("features/lxmf.py", "Resource get_data_size(), get_transfer_size(), get_segments(), cancel() and "
-             "link on the propagation node link's Resources; a foreign Link takes rnfs_bounded",
-             lambda: (_has(RNS.Resource, "get_data_size", "get_transfer_size", "get_segments", "cancel"),
-                      setattr(_incoming_link(), "rnfs_bounded", True))),
 ]
 
 
 class RnsCompatTest(unittest.TestCase):
-    """INTERNALS against the installed RNS and LXMF."""
+    """INTERNALS against the installed RNS."""
 
     def test_internals(self):
-        versions = f"RNS {RNS.__version__}, LXMF {LXMF.__version__}"
+        versions = f"RNS {RNS.__version__}"
         for internal in INTERNALS:
             with self.subTest(internal.surface):
                 try:
@@ -364,6 +454,19 @@ def _destination(app: str, *aspects: str, identity=None, direction=RNS.Destinati
         return RNS.Destination(identity or RNS.Identity(), direction, RNS.Destination.SINGLE, app, *aspects)
 
 
+def _identity_with_hash(identity_hash: bytes):
+    """An object Destination.hash takes as an RNS.Identity whose hash is identity_hash."""
+    identity = RNS.Identity(create_keys=False)
+    identity.hash = identity_hash
+    return identity
+
+
+def _rnode():
+    """RNS's RNodeInterface class (imported here: other tests needn't load the serial interfaces)."""
+    from RNS.Interfaces.RNodeInterface import RNodeInterface
+    return RNodeInterface
+
+
 def _incoming_link():
     """An incoming Link to an rnfs.dht destination, as RNS makes one for a link request (not established)."""
     return RNS.Link(owner=_destination("rnfs", "dht"))
@@ -427,6 +530,37 @@ def _advertisement_round_trip():
         _true(reason == refused, f"guards.refusal: {reason}")
 
 
+def _unhandled_path_unanswered():
+    """Link.handle_request, on an active incoming link, sends nothing for a request whose path has no handler (as an
+    rnfs 0.1.x node meets /range), and answers one whose path has one."""
+    destination = _destination("rnfs", "dht")
+    link = RNS.Link(owner=destination)
+    link.destination = destination
+    link.link_id = bytes(16)
+    link.mdu = RNS.Link.MDU
+    link.status = RNS.Link.ACTIVE
+    sent = []
+    request = [time.time(), RNS.Identity.truncated_hash(protocol.RANGE_PATH.encode("utf-8")), [b"x", 0, 1, 0]]
+    class Recorded(RNS.Packet):
+        """A packet noted rather than sent."""
+
+        def __init__(self, *args, **kwargs):
+            sent.append(args)
+
+        def send(self):
+            return None
+    with mock.patch.object(RNS, "Packet", Recorded), \
+            mock.patch.object(RNS, "Resource", lambda *args, **kwargs: sent.append(args)):
+        link.handle_request(bytes(16), request)
+        _true(sent == [], "a request for a path without a handler was answered")
+        with mock.patch.object(RNS.Transport, "register_destination"):
+            destination.register_request_handler(protocol.RANGE_PATH, lambda path, data, request_id, link_id,
+                                                 identity, requested_at: False, allow=RNS.Destination.ALLOW_ALL)
+        link.handle_request(bytes(16), request)
+        _true(len(sent) == 1, "a request for a path with a handler wasn't answered")
+    _source(RNS.Link.handle_request, "if path_hash in self.destination.request_handlers:")
+
+
 def _dht_link_names():
     """guards.is_dht_link on real Destinations and an incoming Link."""
     identity = RNS.Identity()
@@ -487,6 +621,19 @@ def _recall():
                     raise AssertionError("recall without _no_use and without Reticulum didn't raise AttributeError")
 
 
+def _handlers_after_path():
+    """Transport._inbound writes an announce's path table entry, inside `if should_add:`, before it calls the
+    announce handlers, which are inside that block too."""
+    written, handlers = (_normal("Transport.path_table[packet.destination_hash] = path_table_entry"),
+                         _normal("for handler in Transport.announce_handlers:"))
+    for node in ast.walk(_tree(RNS.Transport._inbound)):
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "should_add":
+            code = _normal(ast.unparse(node))
+            if -1 < code.find(written) < code.find(handlers):
+                return
+    raise AssertionError("announce handlers no longer run inside `if should_add:`, after the path is written")
+
+
 def _cached_announce():
     """An rnfs.name announce, cached as Transport caches it, read back as names reads it and verified as keepers
     does."""
@@ -529,67 +676,6 @@ def _crypto():
     token = wrapped.encrypt(key)
     _true(len(token) == seal.WRAPPED_KEY_SIZE, f"a wrapped key is {len(token)} bytes")
     _true(identity.decrypt(token) == key, "Identity.decrypt round trip")
-
-
-# LXMF round trips
-
-
-def _announce_app_data():
-    """rnfs's announce data reads back in LXMF as LXMF's own does, minus compression support."""
-    for name in ("display_name_from_app_data", "stamp_cost_from_app_data", "compression_support_from_app_data"):
-        _has(LXMF, name)
-    _params(LXMRouter.get_announce_app_data, "destination_hash")
-    _source(LXMRouter.announce, "app_data=self.get_announce_app_data(destination_hash)")
-    _source(LXMRouter.register_delivery_identity, "self.get_announce_app_data(delivery_destination.hash)")
-    destination_hash = os.urandom(16)
-    router = types.SimpleNamespace(delivery_destinations={
-        destination_hash: types.SimpleNamespace(display_name="rnfs node", stamp_cost=8)})
-    ours = lxmf.LxmfNetwork._announce_app_data(types.SimpleNamespace(router=router, msgpack=umsgpack),
-                                               destination_hash)
-    theirs = LXMRouter.get_announce_app_data(router, destination_hash)
-    _true(umsgpack.unpackb(ours)[:2] == umsgpack.unpackb(theirs)[:2], f"{ours!r} isn't laid out as {theirs!r}")
-    _true((LXMF.display_name_from_app_data(ours), LXMF.stamp_cost_from_app_data(ours),
-           LXMF.compression_support_from_app_data(ours)) == ("rnfs node", 8, False), "LXMF reads it differently")
-
-
-def _propagation_announce():
-    """LXMF's propagation node announce data, enabled and not, as heard_propagation_node reads it."""
-    node = types.SimpleNamespace(LXMF=LXMF, msgpack=umsgpack, _lock=threading.Lock(), _propagation_nodes={})
-    destination_hash = os.urandom(16)
-    for enabled in (True, False):
-        router = types.SimpleNamespace(
-            propagation_node=enabled, from_static_only=False, propagation_stamp_cost=16,
-            propagation_stamp_cost_flexibility=3, peering_cost=18, propagation_per_transfer_limit=256,
-            propagation_per_sync_limit=10240, get_propagation_node_announce_metadata=lambda: {})
-        app_data = LXMRouter.get_propagation_node_app_data(router)
-        _true(LXMF.pn_announce_data_is_valid(app_data), "LXMF's own announce data isn't valid")
-        lxmf.LxmfNetwork.heard_propagation_node(node, destination_hash, app_data)
-        _true((destination_hash in node._propagation_nodes) == enabled, f"enabled {enabled} not read as such")
-
-
-def _message_round_trip():
-    """An LXMessage packed and unpacked, its sender unknown and then known, as LxmfNetwork reads it."""
-    sender = _destination("lxmf", "delivery")
-    recipient = _destination("lxmf", "delivery", direction=RNS.Destination.OUT)
-    fields = {lxmf.FIELD_CUSTOM_TYPE: lxmf.CUSTOM_TYPE}
-    message = LXMF.LXMessage(recipient, sender, "text", title="title", fields=fields,
-                             desired_method=LXMF.LXMessage.DIRECT)
-    _true((message.state, message.progress) == (LXMF.LXMessage.GENERATING, 0.0), "a new message's state")
-    message.pack()
-    packed = bytes(message.packed)
-    _true(packed[ID_LENGTH:2 * ID_LENGTH] == sender.hash, "the source hash isn't at packed[16:32]")
-    instance = types.SimpleNamespace(is_blackholed=lambda identity: False, _used_destination_data=lambda h: None)
-    with mock.patch.object(RNS.Transport, "register_destination"), _Remembered() as known:
-        unknown = LXMF.LXMessage.unpack_from_bytes(packed)
-        _true(not unknown.signature_validated and unknown.unverified_reason == LXMF.LXMessage.SOURCE_UNKNOWN
-              and bytes(unknown.packed) == packed, "a message from an unknown sender")
-        known.remember(sender)
-        with mock.patch.object(RNS.Reticulum, "get_instance", return_value=instance):
-            received = LXMF.LXMessage.unpack_from_bytes(packed)
-    _true(received.signature_validated, "a signed message from a known sender doesn't validate")
-    _true((bytes(received.source_hash), bytes(received.hash), received.title, received.content, received.fields)
-          == (sender.hash, bytes(message.hash), b"title", b"text", fields), "the received message's fields")
-    _true(isinstance(received.timestamp, float) and hasattr(received, "method"), "timestamp and method")
 
 
 if __name__ == "__main__":

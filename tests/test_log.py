@@ -40,6 +40,51 @@ class LogTest(unittest.TestCase):
         self.assertEqual(len(capped["warnings"]), log.MAX_WARNINGS + 1)
 
 
+class SlowStepTest(unittest.TestCase):
+    """log.SlowStep: a start step says what it does once it takes a while, that it still is, and how long it took."""
+
+    def setUp(self):
+        """Lines recorded instead of logged."""
+        self.lines = []
+        self.logged = threading.Condition()
+
+        def record(message, level):
+            """Keep the line, and wake a test waiting for lines."""
+            with self.logged:
+                self.lines.append((message, level))
+                self.logged.notify_all()
+        patcher = mock.patch.object(log, "log", record)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def wait_for(self, count: int):
+        """Wait (5 s at most) until count lines were logged."""
+        with self.logged:
+            self.assertTrue(self.logged.wait_for(lambda: len(self.lines) >= count, timeout=5), self.lines)
+
+    def test_a_quick_step_says_nothing(self):
+        with log.SlowStep("walking", "walked", after=5) as step:
+            pass
+        self.assertFalse(step.said)
+        self.assertEqual(self.lines, [])
+
+    def test_a_slow_step_says_what_it_does_that_it_still_is_and_how_long_it_took(self):
+        with log.SlowStep("walking the blocks", "walked the blocks", after=0, interval=0.01) as step:
+            self.wait_for(2)
+        self.assertTrue(step.said)
+        texts = [text for text, _ in self.lines]
+        self.assertEqual(texts[0], "walking the blocks (on a large node this takes a while)")
+        self.assertTrue(texts[1].startswith("still walking the blocks: "), texts[1])
+        self.assertRegex(texts[-1], r"^walked the blocks in \d+ s$")
+        self.assertTrue(all(level == log.LOG_NOTICE for _, level in self.lines))
+
+    def test_a_step_that_fails_doesnt_say_it_was_done(self):
+        with self.assertRaises(ValueError), log.SlowStep("walking", "walked", after=0, interval=60):
+            self.wait_for(1)
+            raise ValueError("broken")
+        self.assertEqual([text for text, _ in self.lines], ["walking (on a large node this takes a while)"])
+
+
 class ThrottledLogTest(unittest.TestCase):
     """log.ThrottledLog: a line at most every interval, counting the ones left out."""
 

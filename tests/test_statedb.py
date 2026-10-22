@@ -16,12 +16,15 @@ import RNS
 
 from rnfs import statedb
 from rnfs.errors import RnfsError
-from tests.support import POSIX_MODES, failing_commits, state_execute, state_rows, write_legacy
+from tests.support import PERMISSION_CHECKS, POSIX_MODES, failing_commits, state_execute, state_rows, write_legacy
 
 # The schema steps rnfs 0.1.5 released: a database 0.1.5 wrote has them already, so an edit to one would never
 # reach it. Never change this digest: append a step instead.
 RELEASED_0_1_5 = "50bd4ec20bbf10e408a9313cb168d35915af0f9d2afcf850d812dd1a7b7fb72b"
 RELEASED_0_1_5_STEPS = 16
+# And the steps 0.1.6 released (the first 17: 0.1.5's and shared_folder_files)
+RELEASED_0_1_6 = "32a8242dd4ac7b5974e98208b6c00c31b95ef00c7fc7756b77bf8bb58c42447f"
+RELEASED_0_1_6_STEPS = 17
 
 _saved_loglevel = RNS.loglevel
 
@@ -111,12 +114,71 @@ class OpenTest(StateDbTest):
         self.assertEqual(db.query("SELECT cid, source FROM pins"), [(b"x", "user")])
         self.assertEqual(db.query("SELECT count(*) FROM lxmf_messages"), [(0,)])
 
+    def test_an_upgrade_is_said(self):
+        """Upgrading an existing database is logged before and after (on a large one it takes minutes of a start);
+        creating a new one isn't."""
+        with mock.patch.object(statedb, "SCHEMA", statedb.SCHEMA[:2]):
+            statedb.connect(self.state).close()
+        with mock.patch.object(statedb, "log") as log:
+            self.connect()
+        said = [call.args[0] for call in log.call_args_list]
+        self.assertTrue(said[0].startswith("upgrading the state database"), said)
+        self.assertIn(f"{len(statedb.SCHEMA) - 2} steps", said[0])
+        self.assertTrue(said[1].startswith("upgraded the state database in"), said)
+        with tempfile.TemporaryDirectory() as fresh, mock.patch.object(statedb, "log") as log:
+            statedb.connect(fresh).close()
+        self.assertEqual([call for call in log.call_args_list if "upgrad" in call.args[0]], [])
+
+    def test_lxmf_pins_become_app_pins(self):
+        """The 0.2.0 step "lxmf_app_pins" rewrites valid lxmf:<address> pins as app:lxmf:<address>, the LXMF wrapper
+        app's; other sources, and lxmf: ones that aren't valid (which storage deletes at load, as before), are left
+        as they are; one whose new form the CID already has is dropped rather than stopping the upgrade."""
+        address, other = "a0" * 16, "b1" * 16
+        step = next(number for number, (label, _) in enumerate(statedb.SCHEMA) if label == "lxmf_app_pins")
+        with mock.patch.object(statedb, "SCHEMA", statedb.SCHEMA[:step]):
+            db = statedb.connect(self.state)
+            with db.transaction() as tx:
+                tx.executemany("INSERT INTO pins (cid, source) VALUES (?, ?)", [
+                    (b"a", "lxmf:" + address), (b"a", "user"), (b"b", "lxmf:" + other), (b"c", "lxmf:xyz"),
+                    (b"c", "LXMF:" + address), (b"c", "lxmf:" + address.upper()), (b"c", "follow:" + address),
+                    (b"d", "lxmf:" + address), (b"d", "app:lxmf:" + address)])
+            db.close()
+        db = self.connect()
+        self.assertEqual(set(db.query("SELECT cid, source FROM pins")), {
+            (b"a", "app:lxmf:" + address), (b"a", "user"), (b"b", "app:lxmf:" + other), (b"c", "lxmf:xyz"),
+            (b"c", "LXMF:" + address), (b"c", "lxmf:" + address.upper()), (b"c", "follow:" + address),
+            (b"d", "app:lxmf:" + address)})
+
+    def test_infinite_provider_times_upgrade_as_newcomers(self):
+        """The 0.2.0 step "providers_on_disk" builds a standing for a publisher whose times 0.1.x kept infinite (a
+        damaged providers.json): infinity minus infinity is NaN, which is Newcomer, not a NULL tier failing NOT NULL
+        and every start with it. Finite times get the standing they always did."""
+        step = next(number for number, (label, _) in enumerate(statedb.SCHEMA) if label == "providers_on_disk")
+        inf, now, day = float("inf"), 1_700_000_000.0, 86400
+        publishers = [bytes([n]) * 16 for n in range(1, 4)]
+        with mock.patch.object(statedb, "SCHEMA", statedb.SCHEMA[:step]):
+            db = statedb.connect(self.state)
+            with db.transaction() as tx:
+                tx.executemany("INSERT INTO provider_publishers VALUES (?, ?)",
+                               zip(publishers, (inf, now - 5 * day, now - 5 * day), strict=True))
+                tx.executemany("INSERT INTO provider_records VALUES (?, ?, ?, ?, 0)", [
+                    (b"\xaa" * 16, publishers[0], now, inf), (b"\xaa" * 16, publishers[1], inf, inf),
+                    (b"\xaa" * 16, publishers[2], now - 5 * day, now)])
+            db.close()
+        db = self.connect()
+        self.assertEqual(db.query("SELECT publisher, records, tier, days FROM provider_standing ORDER BY publisher"),
+                         [(publishers[0], 1, 0, 0), (publishers[1], 1, 0, 0), (publishers[2], 1, 1, 3)])
+        self.assertEqual(db.query("PRAGMA user_version"), [(len(statedb.SCHEMA),)])
+
     def test_released_steps_are_unchanged(self):
         """The steps 0.1.5 released are exactly as released (statedb.SCHEMA's comment): new steps are appended."""
         released = statedb.SCHEMA[:RELEASED_0_1_5_STEPS]
         self.assertTrue(all(isinstance(step, str) for _, steps in released for step in steps))
         digest = hashlib.sha256(json.dumps([[label, list(steps)] for label, steps in released]).encode()).hexdigest()
         self.assertEqual(digest, RELEASED_0_1_5)
+        released = statedb.SCHEMA[:RELEASED_0_1_6_STEPS]
+        digest = hashlib.sha256(json.dumps([[label, list(steps)] for label, steps in released]).encode()).hexdigest()
+        self.assertEqual(digest, RELEASED_0_1_6)
 
     def test_callable_step_runs_in_the_upgrade_transaction(self):
         """A step's callable gets the upgrade's transaction: its writes commit with the step, and a raise rolls the
@@ -179,7 +241,7 @@ class OpenTest(StateDbTest):
         self.assertIn("is damaged", str(caught.exception))
         self.assertNotIn(self.path, statedb.open_databases())
 
-    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks")
     def test_unwritable_directory_isnt_called_damage(self):
         """A database that can't be opened for writing (a read-only state directory) stops startup with what
         failed, not as damaged with advice to start over, and is left as it was."""
@@ -319,6 +381,19 @@ class TransactionTest(StateDbTest):
         (text,), = db.query("SELECT name FROM pin_names")
         self.assertEqual(statedb.load(text), value)
         self.assertIn("é \U0001f600", text)
+
+    def test_load_refuses_text_nested_too_deeply_as_damage(self):
+        """Text nested deeper than json can parse (a damaged row: dump() never writes it) raises ValueError, which
+        the stores handle as a row that isn't JSON, not RecursionError, which none catches."""
+        for text in ("[" * 100000, "[" * 100000 + "]" * 100000, '{"a":' * 100000):
+            with self.subTest(text=text[:5]):
+                try:
+                    statedb.load(text)  # Python 3.14's json parses this deep: a value, which the row checks judge
+                except ValueError:
+                    pass  # and not a RecursionError, which nothing catches
+        # As a json that can't go this deep raises (3.11-3.13): taken for damage
+        with mock.patch("json.loads", side_effect=RecursionError("too deep")), self.assertRaises(ValueError):
+            statedb.load("[[]]")
 
 
 class RowStoreTest(StateDbTest):
@@ -613,7 +688,18 @@ class MigrateTest(StateDbTest):
                 self.assertEqual(state_rows(self.state, "SELECT * FROM migrated"), [])
         self.assertTrue(os.path.exists(os.path.join(self.state, "test.json.damaged.2")))
 
-    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    def test_file_nested_too_deeply_is_moved_aside(self):
+        """A file nested deeper than json can parse is damage, moved to .damaged like one that isn't JSON, rather
+        than a RecursionError that stops every start."""
+        path = write_legacy(self.state, "test.json", text="[[]]")
+        # How a json that can't parse that deep fails (3.11-3.13; 3.14's parses about 100,000 levels)
+        with mock.patch.object(statedb, "log") as log, mock.patch("json.load", side_effect=RecursionError("deep")):
+            self.connect(TEST_LEGACY).close()
+        self.assertTrue(os.path.exists(path + ".damaged"))
+        self.assertEqual(state_rows(self.state, "SELECT * FROM migrated"), [])
+        self.assertTrue(any("nested too deeply" in call.args[0] for call in log.call_args_list))
+
+    @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks")
     def test_unreadable_file_stops_startup_unless_allowed(self):
         """A file that can't be read (not damage) stops startup and is left for the next start; one marked
         unreadable_ok is logged and skipped instead."""

@@ -143,7 +143,7 @@ class SettingsFileTest(unittest.TestCase):
 
     @unittest.skipUnless(HAS_FIFO, "FIFOs")
     def test_fifo_is_refused_without_blocking(self):
-        os.mkfifo(self.path, 0o600)
+        os.mkfifo(self.path, 0o600)  # noqa: TID251 - skipped without HAS_FIFO
         outcome = []
 
         def load():
@@ -171,7 +171,7 @@ class SettingsFileTest(unittest.TestCase):
 
     def test_settings_of_another_user_are_refused(self):
         self.write(mode=0o644)
-        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
+        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):  # noqa: TID251 - class needs POSIX_MODES
             self.assertIn("belongs to another user", self.refused())
         self.assertEqual(self.mode(self.path), 0o644)  # not someone else's file to change
 
@@ -222,7 +222,7 @@ class ReticulumConfigTest(unittest.TestCase):
         self.assertEqual(self.mode(), 0o600)
 
     def test_config_of_another_user_is_refused(self):
-        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
+        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):  # noqa: TID251 - class needs POSIX_MODES
             with self.assertRaisesRegex(PermissionError, "belongs to another user"):
                 Config.load(self.dir, reticulum_dir=self.dir)
 

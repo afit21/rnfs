@@ -3,7 +3,9 @@
 A denied CID isn't fetched, read, stored, served to /blocks (answered as not held) or provided, whether it is a
 root or anywhere inside the DAG being fetched. A file-hash entry (`sha256:<hex>`) matches a file whose content
 hashes to it; that is only known once the content is read, so it is checked where content is assembled (get,
-cat, the gateway, add, archive import), after the blocks have been fetched.
+cat, the gateway, add, archive import), after the blocks have been fetched. A file of one block has the hash as its
+raw CID's digest, so that CID is denied too (`cids` holds it): such a file isn't fetched, stored, served or provided
+either.
 
 Entries come from the local list (`rnfs deny add` / `rm`; the deny_entries table) and from the deny lists named
 in the deny_lists setting, which rnfs/features/deny.py fetches and follows. The deny_lists table records the
@@ -336,6 +338,9 @@ class DenyList(NoDenyList):
         for list_cids, list_digests in self._lists.values():
             cids |= list_cids
             digests |= list_digests
+        # A file of one block is its CID's own content: its hash names the raw CID too, which every CID check (fetch,
+        # store, /blocks, providing) then refuses, so the hash entry stops it as a CID entry does (spec section 8)
+        cids |= {Cid.raw_of_digest(digest).binary for digest in digests}
         if cids != self.cids:
             self.cids = frozenset(cids)
         if digests != self.hashes:

@@ -37,8 +37,12 @@ def modules(rnfs_root: str | None = None) -> types.SimpleNamespace:
     import rnfs
     from rnfs import constants, names
     from rnfs.content import cid
-    from rnfs.features import keepers, lxmf
+    from rnfs.features import keepers
     from rnfs.network import announces, protocol
+    try:
+        from rnfs import uris as lxmf  # where the LXMF field is defined since 0.2.0
+    except ImportError:
+        from rnfs.features import lxmf  # the trees generate.py runs on: 0.1.3 and 0.1.4
     if rnfs_root is not None:
         assert rnfs.__file__.startswith(rnfs_root), rnfs.__file__
     return types.SimpleNamespace(RNS=RNS, umsgpack=umsgpack, rnfs=rnfs, constants=constants, names=names, cid=cid,

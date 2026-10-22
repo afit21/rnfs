@@ -3,10 +3,12 @@ import http.server
 import inspect
 import io
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -17,6 +19,7 @@ from rnfs.apiclient import (ApiConnection, ApiError, AuthFailed, BadRequest, Bus
 from rnfs.config import DEFAULT_API_PORT
 from rnfs import errors
 from tests.support import POSIX_MODES, free_port, real
+from tests.test_fsutil import hold_lock
 from tests.test_api import FakeNode
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -159,6 +162,228 @@ class DirectoryTest(unittest.TestCase):
         ApiConnection(self.tmp, port=1)  # not read when the port is given
 
 
+class DaemonFileTest(unittest.TestCase):
+    """daemon.json: what a running daemon writes about itself, which clients read before rnfs.toml."""
+
+    def setUp(self):
+        """An empty rnfs dir."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.path = apiclient.daemon_info_path(self.tmp)
+
+    def write(self, info, mode: int = 0o600):
+        """Write daemon.json as the daemon does (cli.write_daemon_info), then set its mode."""
+        cli.write_daemon_info(self.path, info)
+        os.chmod(self.path, mode)
+
+    def test_port_comes_from_the_running_daemon(self):
+        """A daemon.json of a running process gives the port, even where rnfs.toml can't be read (a newer
+        setting); the port given still wins."""
+        with open(os.path.join(self.tmp, "rnfs.toml"), "w", encoding="utf-8") as f:
+            f.write("a_setting_from_the_future = 1\n")
+        self.write({"pid": os.getpid(), "api_port": 9555, "version": "0.2.0"})
+        self.assertEqual(apiclient.read_daemon_info(self.tmp)["version"], "0.2.0")
+        self.assertEqual(ApiConnection(self.tmp).port, 9555)
+        self.assertEqual(ApiConnection(self.tmp, port=1).port, 1)
+        self.assertEqual(ApiConnection(self.tmp).daemon_info()["api_port"], 9555)
+
+    def test_unusable_files_are_ignored(self):
+        """A daemon.json that doesn't parse, lacks the port, is too large or names a process that has ended is
+        ignored, and rnfs.toml gives the port."""
+        for info in ({"pid": os.getpid()}, {"pid": os.getpid(), "api_port": "9555"},
+                     {"pid": os.getpid(), "api_port": 70000}, ["not", "an", "object"]):
+            with self.subTest(info=info):
+                self.write(info)
+                self.assertIsNone(apiclient.read_daemon_info(self.tmp))
+                self.assertEqual(ApiConnection(self.tmp).port, DEFAULT_API_PORT)
+        with open(self.path, "wb") as f:
+            f.write(b"{" + b" " * apiclient.MAX_DAEMON_FILE + b"}")
+        self.assertIsNone(apiclient.read_daemon_info(self.tmp))
+        if POSIX_MODES:
+            ended = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True,
+                                   text=True, timeout=60).stdout.strip()
+            self.write({"pid": int(ended), "api_port": 9555})
+            self.assertIsNone(apiclient.read_daemon_info(self.tmp))
+
+    @unittest.skipUnless(POSIX_MODES, "POSIX permission bits")
+    def test_a_file_others_can_write_is_not_trusted(self):
+        """One other users could have written, or a symlink, is ignored."""
+        self.write({"pid": os.getpid(), "api_port": 9555}, mode=0o622)
+        self.assertIsNone(apiclient.read_daemon_info(self.tmp))
+        os.chmod(self.path, 0o600)
+        os.rename(self.path, self.path + ".real")
+        os.symlink(self.path + ".real", self.path)
+        self.assertIsNone(apiclient.read_daemon_info(self.tmp))
+
+    def test_windows_process_check(self):
+        """On Windows a process is alive unless OpenProcess finds none (ERROR_INVALID_PARAMETER) or it has exited;
+        one that can't be opened (another user's) or a failing call counts as alive. Run with kernel32 stood in."""
+        import ctypes
+
+        class Kernel32:
+            """kernel32's three calls, answering as a process in state does."""
+
+            def __init__(self, state):
+                self.state, self.closed = state, []
+                self.OpenProcess, self.GetExitCodeProcess, self.CloseHandle = (
+                    mock.Mock(side_effect=self.open), mock.Mock(side_effect=self.exit_code),
+                    mock.Mock(side_effect=self.closed.append))
+
+            def open(self, access, inherit, pid):
+                """A handle, or 0 with the last error set."""
+                if self.state in ("none", "denied"):
+                    Kernel32.error = 87 if self.state == "none" else 5
+                    return 0
+                return 1234
+
+            def exit_code(self, handle, code):
+                """STILL_ACTIVE (259) while running, else 0."""
+                if self.state == "failing":
+                    return 0
+                code._obj.value = 259 if self.state == "running" else 0
+                return 1
+
+        for state, alive in (("running", True), ("exited", False), ("none", False), ("denied", True),
+                             ("failing", True)):
+            with self.subTest(state=state):
+                kernel32 = Kernel32(state)
+                with mock.patch.object(ctypes, "WinDLL", create=True, return_value=kernel32), \
+                        mock.patch.object(ctypes, "get_last_error", create=True, side_effect=lambda: Kernel32.error):
+                    self.assertIs(apiclient._windows_process_alive(4321), alive)
+                if state not in ("none", "denied"):
+                    self.assertEqual(kernel32.closed, [1234])  # the handle is always closed
+        with mock.patch.object(ctypes, "WinDLL", create=True, side_effect=OSError("no kernel32")):
+            self.assertTrue(apiclient._windows_process_alive(4321))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "reads /proc")
+    def test_a_process_exited_but_not_reaped_isnt_alive(self):
+        """A daemon a container's init doesn't wait for stays a zombie: rnfs stop waited its whole timeout for it."""
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            deadline = time.monotonic() + 10
+            while not apiclient._zombie(child.pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(apiclient._zombie(child.pid))
+            self.assertFalse(apiclient._process_alive(child.pid))
+        finally:
+            child.wait()
+        self.assertTrue(apiclient._process_alive(os.getpid()))
+        self.assertFalse(apiclient._zombie(os.getpid()))
+
+    def test_removed_only_by_its_own_daemon(self):
+        """cli.remove_daemon_info leaves a daemon.json another process wrote."""
+        self.write({"pid": os.getpid() + 1, "api_port": 9555})
+        cli.remove_daemon_info(self.path, os.getpid())
+        self.assertTrue(os.path.exists(self.path))
+        self.write({"pid": os.getpid(), "api_port": 9555})
+        cli.remove_daemon_info(self.path, os.getpid())
+        self.assertFalse(os.path.exists(self.path))
+
+
+class AppSupportTest(ClientTestCase):
+    """The client side of what 0.2.0 added for apps: error codes, capabilities, events and shutdown."""
+
+    def test_error_codes(self):
+        """An error carries the daemon's code; an unknown endpoint is NoSuchEndpoint (a NotFound), as is an older
+        daemon's, told by its message; something the daemon can't do is Unsupported."""
+        with self.assertRaises(apiclient.NoSuchEndpoint) as raised:
+            self.api.get("/api/nope")
+        self.assertEqual((raised.exception.status, raised.exception.code), (404, "no_such_endpoint"))
+        self.assertIsInstance(raised.exception, NotFound)
+        with self.assertRaises(NotFound) as raised:
+            self.api.stat("bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertNotIsInstance(raised.exception, apiclient.NoSuchEndpoint)
+        old = apiclient.error_for(404, "no such API endpoint: /api/events")
+        self.assertIsInstance(old, apiclient.NoSuchEndpoint)
+        self.assertIsNone(apiclient.error_for(404, "no provider found").code)
+        self.assertIsInstance(apiclient.error_for(404, "x", "unsupported"), errors.Unsupported)
+        with self.assertRaises(apiclient.Unsupported):
+            self.api.shutdown()
+
+    def test_capabilities_and_events(self):
+        """capabilities() lists the daemon's; {} from one without the endpoint. events() long-polls the log."""
+        self.assertIn("events", self.api.capabilities()["capabilities"])
+        with mock.patch.object(self.api, "get", side_effect=apiclient.NoSuchEndpoint("no such API endpoint", 404)):
+            self.assertEqual(self.api.capabilities(), {})
+        start = self.api.events()
+        self.node.events.publish("cache", change="removed", cids=[], count=0)
+        result = self.api.events(after=start["next"], kinds=["cache"], wait=1)
+        self.assertEqual([event["kind"] for event in result["events"]], ["cache"])
+        self.assertEqual(result["epoch"], start["epoch"])
+
+    def test_shutdown_waits_until_stopped(self):
+        """shutdown(wait=) returns True once the API no longer answers; False while it still does."""
+        stopping = threading.Event()
+        server = ApiServer(self.node, 0, token=self.server.token, shutdown=stopping.set)
+        server.start()
+        self.addCleanup(server.stop)
+        api = ApiConnection(self.tmp, port=server.port)
+        threading.Thread(target=lambda: stopping.wait(10) and server.stop(), daemon=True).start()
+        self.assertTrue(api.shutdown(wait=10))
+        self.assertTrue(stopping.is_set())
+        stopping.clear()
+        still = ApiServer(self.node, 0, token=self.server.token, shutdown=stopping.set)
+        still.start()
+        self.addCleanup(still.stop)
+        self.assertFalse(ApiConnection(self.tmp, port=still.port).shutdown(wait=0.5))
+
+    def test_shutdown_waits_for_the_process(self):
+        """When daemon.json names the port, shutdown(wait=) also waits for that process to end (it saves its state
+        and releases the rnfs dir after its API stops), so a daemon started next can take the dir."""
+        daemon = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(daemon.wait)
+        self.addCleanup(daemon.kill)
+        stopping = threading.Event()
+        server = ApiServer(self.node, 0, token=self.server.token, shutdown=stopping.set)
+        server.start()
+        self.addCleanup(server.stop)
+        cli.write_daemon_info(apiclient.daemon_info_path(self.tmp), {"pid": daemon.pid, "api_port": server.port})
+        threading.Thread(target=lambda: stopping.wait(10) and server.stop(), daemon=True).start()
+        api = ApiConnection(self.tmp, port=server.port)
+        self.assertFalse(api.shutdown(wait=0.5))  # the API stopped; the process runs on
+        self.assertFalse(api._stopped(daemon.pid, 1))
+        daemon.kill()
+        daemon.wait()  # reaped, so the process is gone
+        self.assertTrue(api._stopped(daemon.pid, 1))
+
+    def test_a_silent_listener_cannot_hold_shutdown(self):
+        """Each status poll is bounded by what is left of wait: a listener that accepts and never answers can't
+        hold shutdown(wait=) past it."""
+        stopping = threading.Event()
+        server = ApiServer(self.node, 0, token=self.server.token, shutdown=stopping.set)
+        server.start()
+        self.addCleanup(server.stop)
+        api = ApiConnection(self.tmp, port=server.port)
+        silent = socket.socket()
+        silent.bind(("127.0.0.1", 0))
+        silent.listen()
+        self.addCleanup(silent.close)
+        real_call = api.call
+
+        def call(method, path, *args, **kwargs):
+            """The shutdown itself reaches the daemon; every poll after it a listener that never answers."""
+            if path == "/api/shutdown":
+                return real_call(method, path, *args, **kwargs)
+            api.port = silent.getsockname()[1]
+            return real_call(method, path, *args, **kwargs)
+
+        with mock.patch.object(api, "call", side_effect=call):
+            began = time.monotonic()
+            api.shutdown(wait=1)
+        self.assertLess(time.monotonic() - began, 5)
+
+    def test_a_stalled_body_is_connection_failed(self):
+        """A body that stops arriving within the call's timeout raises ConnectionFailed, never a bare
+        TimeoutError (Stream.read and read_all)."""
+        response = mock.Mock(getheader=lambda name: "10")
+        response.read.side_effect = TimeoutError("timed out")
+        with self.assertRaises(ConnectionFailed):
+            apiclient.Stream(response).read(5)
+        with self.assertRaises(ConnectionFailed):
+            apiclient.read_all(response)
+
+
 class OperationsTest(ClientTestCase):
     """The main operations, each one request answered as the API documents."""
 
@@ -198,6 +423,9 @@ class OperationsTest(ClientTestCase):
         self.assertEqual(self.api.fetch(directory, output)["cid"], directory)
         with open(os.path.join(output, "a.txt"), "rb") as f:
             self.assertEqual(f.read(), b"abc")
+        self.assertEqual(self.node.called("get")[-1][1], {"from_node": None})  # no_extract only when set
+        self.api.fetch(directory, os.path.join(self.tmp, "tar"), no_extract=True)
+        self.assertEqual(self.node.called("get")[-1][1], {"from_node": None, "no_extract": True})
         self.assertEqual(self.api.info(directory)["type"], "directory")
         self.assertEqual(self.api.ls(directory), [{"name": "a.txt", "kind": "file", "size": 3, "cid": file_cid}])
         self.assertEqual(self.api.stat(f"{directory}/a.txt")["size"], 3)
@@ -251,6 +479,21 @@ class OperationsTest(ClientTestCase):
         self.assertEqual(self.api.providers(cid), ["cd" * 16])
         self.assertEqual(self.api.ping("cd" * 16), 0.25)
         self.assertIsNone(self.api.ping("ff" * 16))
+
+    def test_remote_pin_status(self):
+        """pin_remote_ls sends only the parameters given; pin_remote_served; a daemon with only the POST (before
+        0.2.0) answers the GET 405, which is NoSuchEndpoint here."""
+        cid = self.node.put_file(b"abc")
+        self.assertEqual(self.api.pin_remote_ls()[0]["state"], "waiting")
+        self.assertEqual(self.api.pin_remote_ls("ab" * 16, cid, check=True)[0]["state"], "done")
+        self.assertEqual(self.node.called("pin_remote_ls"),
+                         [((None, None), {}), ((bytes.fromhex("ab" * 16), cid), {"check": True})])
+        self.assertEqual(self.api.pin_remote_served()["usage"][0]["quota"], 100)
+        with mock.patch.dict(ApiHandler.ROUTES):
+            del ApiHandler.ROUTES[("GET", "/api/pin/remote")]
+            with self.assertRaises(apiclient.NoSuchEndpoint) as raised:
+                self.api.pin_remote_ls()
+        self.assertEqual(raised.exception.code, "no_such_endpoint")
 
     def test_name_keys(self):
         """name_export, name_rm and name_import (the key as the body) (ND4)."""
@@ -378,13 +621,16 @@ class ProofTest(ClientTestCase):
         self.assertEqual(clients[2][1], clients[3][1])
         self.assertNotEqual(clients[0][1], clients[2][1])
 
-    def test_daemon_closing_every_connection(self):
-        """A daemon before 0.1.5 closes the proof's connection: the request goes on a new one."""
+    def test_daemon_before_0_1_5_is_refused(self):
+        """A daemon before 0.1.5 (which closes the proof's connection) is refused before the token is sent: since
+        0.2.0 the request no longer goes on a new connection."""
         seen = self.tokens_seen()
         with mock.patch.object(self.server.server.RequestHandlerClass, "PROOF_ROUTE", None), \
                 mock.patch("rnfs.api.__version__", "0.1.4"):
-            self.assertEqual(self.api.status()["node_id"], self.node.status()["node_id"])
-        self.assertEqual(seen, [("/api/status", None), ("/api/status", self.server.token)])
+            with self.assertRaises(ApiError) as raised:
+                self.api.status()
+        self.assertIn("too old for this client", str(raised.exception))
+        self.assertEqual(seen, [("/api/status", None)])
 
     def test_newer_daemon_closing_the_connection(self):
         """A daemon of 0.1.5 or later that closes the proof's connection gets nothing more (API-4)."""
@@ -443,6 +689,203 @@ class ProofTest(ClientTestCase):
         self.assertEqual(self.api.daemon_version, refused[0])
 
 
+class AppClientTest(ClientTestCase):
+    """An ApiConnection (and rnfs.Client) as an app: app= with token= or token_file=."""
+
+    def setUp(self):
+        """The node gets a real app registry holding app "wiki"; its token is also in <tmp>/wiki_token."""
+        super().setUp()
+        from rnfs.apps import AppRegistry
+        self.node.apps = AppRegistry(os.path.join(self.tmp, "state"))
+        self.addCleanup(self.node.apps.close)
+        self.app_token = self.node.apps.add("wiki")["token"]
+        self.app_file = os.path.join(self.tmp, "wiki_token")
+        cli.write_token(self.app_file, self.app_token)
+
+    def app_headers_seen(self) -> list:
+        """A list collecting (path, X-Rnfs-App, X-Rnfs-Api) of every request the server handles from now on."""
+        seen = []
+        original = self.server.server.RequestHandlerClass.dispatch
+
+        def spy(handler):
+            """Record the request, then handle it."""
+            seen.append((handler.path.split("?")[0], handler.headers["X-Rnfs-App"], handler.headers["X-Rnfs-Api"]))
+            original(handler)
+        patcher = mock.patch.object(self.server.server.RequestHandlerClass, "dispatch", spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return seen
+
+    def test_app_with_its_token(self):
+        """Given or in a file, the app's token proves the daemon and passes; X-Rnfs-App names the app on the proof
+        and the request; the API token file isn't read."""
+        os.unlink(self.token_file)
+        seen = self.app_headers_seen()
+        for api in (ApiConnection(self.tmp, port=self.server.port, app="wiki", token=self.app_token),
+                    ApiConnection(self.tmp, port=self.server.port, app="wiki", token_file=self.app_file)):
+            self.assertEqual(api.status()["node_id"], self.node.status()["node_id"])
+            self.assertEqual(api.token, self.app_token)
+        self.assertEqual(seen, [("/api/status", "wiki", None), ("/api/status", "wiki", self.app_token)] * 2)
+
+    def test_client_as_an_app(self):
+        """rnfs.Client takes app and token too."""
+        import rnfs
+        with rnfs.Client(self.tmp, port=self.server.port, app="wiki", token=self.app_token) as client:
+            self.assertEqual(client.node_id, self.node.node_id)
+            self.assertEqual(client.api.app, "wiki")
+
+    def test_wrong_or_removed_app_fails_the_proof(self):
+        """A token that isn't the app's, or an app there isn't (removed), fails the proof: AuthFailed naming the
+        app, and the token is never sent."""
+        seen = self.app_headers_seen()
+        for api in (ApiConnection(self.tmp, port=self.server.port, app="wiki", token="not its token"),
+                    ApiConnection(self.tmp, port=self.server.port, app="other", token=self.app_token)):
+            with self.assertRaises(AuthFailed) as raised:
+                api.post("/api/gc")
+            self.assertIn(f"app {api.app}'s token", str(raised.exception))
+        api = ApiConnection(self.tmp, port=self.server.port, app="wiki", token_file=self.app_file)
+        api.status()
+        self.node.apps.remove("wiki")
+        with self.assertRaises(AuthFailed):
+            api.post("/api/gc")
+        self.assertEqual([token for path, _, token in seen if path != "/api/status"], [])
+        self.assertEqual(self.node.called("gc"), [])
+
+    def test_app_needs_its_token(self):
+        """An app without token or token_file, an empty token, or both, is refused before anything is sent; a
+        missing app token file says how to make one."""
+        for kwargs in ({"app": "wiki"}, {"app": "wiki", "token": ""}, {"app": "wiki", "token": " "},
+                       {"app": "wiki", "token": "t", "token_file": self.app_file}, {"token": 7}, {"app": "",
+                                                                                                "token": "t"}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                ApiConnection(self.tmp, port=self.server.port, **kwargs)
+        missing = ApiConnection(self.tmp, port=self.server.port, app="wiki", token_file=self.app_file + ".gone")
+        with self.assertRaises(TokenError) as raised:
+            missing.status()
+        self.assertIn("rnfs app add wiki", str(raised.exception))
+
+    def test_managing_apps(self):
+        """apps, app_add and app_rm with the CLI's token; an app's connection is refused them (AuthFailed,
+        "forbidden")."""
+        self.assertEqual([app["name"] for app in self.api.apps()], ["wiki"])
+        added = self.api.app_add("gallery")
+        gallery = ApiConnection(self.tmp, port=self.server.port, app="gallery", token=added["token"])
+        self.assertEqual(gallery.status()["node_id"], self.node.status()["node_id"])
+        with self.assertRaises(BadRequest):
+            self.api.app_add("gallery")
+        for call in (gallery.apps, lambda: gallery.app_add("mine"), lambda: gallery.app_rm("wiki")):
+            with self.assertRaises(AuthFailed) as raised:
+                call()
+            self.assertEqual(raised.exception.code, "forbidden")
+        self.assertEqual(self.api.app_rm("gallery"), {"released": 0})
+        with self.assertRaises(NotFound):
+            self.api.app_rm("gallery")
+        self.assertEqual([app["name"] for app in self.api.apps()], ["wiki"])
+
+    def test_impostor_gets_no_app_token(self):
+        """A listener that can't prove it knows the app's token gets only the challenge (and the app's name)."""
+        received = []
+        impostor = ProofTest.impostor(self, received)
+        api = ApiConnection(self.tmp, port=impostor, app="wiki", token=self.app_token)
+        with self.assertRaises(AuthFailed):
+            api.post("/api/gc")
+        self.assertEqual(len(received), 1)
+        self.assertNotIn("X-Rnfs-Api", received[0][1])
+        self.assertEqual(received[0][1]["X-Rnfs-App"], "wiki")
+
+
+class TimeoutTest(ClientTestCase):
+    """Timeouts per call (timeout=) and per thread (using_timeout), over the connection's own."""
+
+    def slow_jobs(self, delay: float = 1.0):
+        """Make GET /api/jobs/get answer delay seconds late (the server's log quiet: answering a client that timed
+        out fails)."""
+        original = self.node.jobs.get
+
+        def slow(job_id, wait):
+            """The job, late."""
+            time.sleep(delay)
+            return original(job_id, wait)
+        for patcher in (mock.patch.object(self.node.jobs, "get", slow), mock.patch("rnfs.api.log")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_calls_own_timeout(self):
+        """A call's timeout= bounds it alone: the slow answer raises ConnectionFailed for it, while a call without
+        one (the connection has none) waits for it."""
+        self.slow_jobs()
+        started = time.monotonic()
+        with self.assertRaises(ConnectionFailed) as raised:
+            self.api.get("/api/jobs/get", id="0123abcd", timeout=0.3)
+        self.assertLess(time.monotonic() - started, 0.9)
+        self.assertIn("didn't answer within its timeout (0.3 seconds)", str(raised.exception))
+        self.assertEqual(self.api.get("/api/jobs/get", id="0123abcd")["state"], "done")
+        with self.assertRaises(ConnectionFailed):
+            self.api.call("GET", "/api/jobs/get", params={"id": "0123abcd"}, timeout=0.3)
+
+    def test_none_lifts_the_connections_timeout(self):
+        """A connection's timeout bounds every call but one given timeout=None, or made inside
+        using_timeout(None)."""
+        self.slow_jobs()
+        api = ApiConnection(self.tmp, port=self.server.port, timeout=0.3)
+        with self.assertRaises(ConnectionFailed):
+            api.job("0123abcd")
+        self.assertEqual(api.get("/api/jobs/get", id="0123abcd", timeout=None)["state"], "done")
+        with api.using_timeout(None):
+            self.assertEqual(api.job("0123abcd")["state"], "done")
+        self.assertEqual(api.effective_timeout(), 0.3)
+
+    def test_using_timeout_is_the_threads_own(self):
+        """using_timeout bounds this thread's requests only: another thread's, sent meanwhile, waits for its
+        answer. It nests, the outer timeout back on leaving the inner block, and none after the outer."""
+        self.slow_jobs()
+        inside, other = threading.Event(), []
+
+        def request():
+            """A request sent while the main thread is inside using_timeout."""
+            inside.wait(5)
+            other.append(self.api.job("0123abcd")["state"])
+        thread = threading.Thread(target=request)
+        thread.start()
+        with self.api.using_timeout(0.3):
+            inside.set()
+            with self.assertRaises(ConnectionFailed):
+                self.api.job("0123abcd")
+            with self.api.using_timeout(None):
+                self.assertEqual(self.api.job("0123abcd")["state"], "done")
+            self.assertEqual(self.api.effective_timeout(), 0.3)
+            self.assertEqual(self.api.effective_timeout(5), 5)  # a call's own comes first
+        thread.join(10)
+        self.assertEqual(other, ["done"])
+        self.assertIsNone(self.api.effective_timeout())
+
+    def test_proof_within_the_timeout(self):
+        """Connecting and proving take at most the call's timeout, when shorter than PROOF_TIMEOUT: a listener
+        that never answers holds a call only that long."""
+        listener = socket.socket()
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)  # connections complete in the backlog; nothing is ever read or answered
+        api = ApiConnection(self.tmp, port=listener.getsockname()[1])
+        started = time.monotonic()
+        with self.assertRaises(ConnectionFailed):
+            api.get("/api/status", timeout=0.5)
+        with api.using_timeout(0.5), self.assertRaises(ConnectionFailed):
+            api.status()
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual((api._proof_timeout(None), api._proof_timeout(100), api._proof_timeout(2)),
+                         (apiclient.PROOF_TIMEOUT, apiclient.PROOF_TIMEOUT, 2))
+
+    def test_timeouts_are_checked(self):
+        """A timeout is None or a positive number: anything else is ValueError, before anything is sent."""
+        for bad in (0, -1, True, "5", float("inf"), float("nan")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.api.get("/api/status", timeout=bad)
+                with self.assertRaises(ValueError), self.api.using_timeout(bad):
+                    pass
+
+
 class ErrorTest(ClientTestCase):
     """Every failure is a typed ApiError with the message the CLI prints."""
 
@@ -452,6 +895,39 @@ class ErrorTest(ClientTestCase):
             ApiConnection(self.tmp, port=free_port()).version()
         self.assertIn("no daemon is running", str(raised.exception))
         self.assertIsNone(raised.exception.status)
+        self.assertNotIsInstance(raised.exception, apiclient.DaemonStarting)
+
+    def test_daemon_starting(self):
+        """Nothing on the port, but a process holds the rnfs dir's lock (a daemon opening a large block store
+        before its API listens): DaemonStarting, a DaemonNotRunning, naming that process."""
+        holder = hold_lock(os.path.join(self.tmp, "daemon.lock"))
+        try:
+            with self.assertRaises(apiclient.DaemonStarting) as raised:
+                ApiConnection(self.tmp, port=free_port()).version()
+            self.assertIsInstance(raised.exception, DaemonNotRunning)
+            self.assertEqual(raised.exception.pid, holder.pid)
+            self.assertIn(f"the daemon (process {holder.pid}) is starting", str(raised.exception))
+            self.assertEqual(apiclient.dir_holder(self.tmp), holder.pid)
+        finally:
+            holder.stdin.close()
+            holder.wait(30)
+            holder.stdout.close()
+        # Once it has gone, the lock file is left, naming it: no daemon is running
+        self.assertIsNone(apiclient.dir_holder(self.tmp))
+        with self.assertRaises(DaemonNotRunning) as raised:
+            ApiConnection(self.tmp, port=free_port()).version()
+        self.assertNotIsInstance(raised.exception, apiclient.DaemonStarting)
+
+    def test_lock_of_a_process_gone_isnt_tested(self):
+        """A lock file naming a process that has ended isn't tested (testing it could make a daemon starting at that
+        moment fail), nor is one naming this process (its own Node)."""
+        for pid in (os.getpid(), 2**22 + 12345):
+            with self.subTest(pid=pid):
+                with open(os.path.join(self.tmp, "daemon.lock"), "w", encoding="ascii") as f:
+                    f.write(f"{pid}\n")
+                with mock.patch.object(apiclient.fsutil, "lock_held", side_effect=AssertionError("tested")), \
+                        mock.patch.object(apiclient, "_process_alive", return_value=pid == os.getpid()):
+                    self.assertIsNone(apiclient.dir_holder(self.tmp))
 
     def test_missing_token(self):
         """No token file: TokenError, and the request isn't sent."""
@@ -459,6 +935,23 @@ class ErrorTest(ClientTestCase):
         with self.assertRaises(TokenError) as raised:
             self.api.post("/api/gc")
         self.assertIn("no API token", str(raised.exception))
+        self.assertEqual(self.node.called("gc"), [])
+
+    def test_no_token_file_while_the_daemon_starts(self):
+        """The daemon writes its token once its API is up: while a process holds the rnfs dir (a slow start, minutes
+        on a small node as RNS's transport starts), a request is told the daemon is starting, not to start one."""
+        os.unlink(self.token_file)
+        holder = hold_lock(os.path.join(self.tmp, "daemon.lock"))
+        try:
+            with self.assertRaises(apiclient.DaemonStarting) as raised:
+                self.api.post("/api/gc")
+            self.assertEqual(raised.exception.pid, holder.pid)
+        finally:
+            holder.stdin.close()
+            holder.wait(30)
+            holder.stdout.close()
+        with self.assertRaises(TokenError):  # nobody holds it: as before
+            self.api.post("/api/gc")
         self.assertEqual(self.node.called("gc"), [])
 
     @unittest.skipUnless(POSIX_MODES, "Unix permissions")

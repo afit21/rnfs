@@ -10,6 +10,7 @@ after the rounds settle every node the publisher thinks holds the CID must hold 
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import RNS
 
@@ -17,6 +18,7 @@ from rnfs.config import Config
 from rnfs.content import builder
 from rnfs.content.storage import USER, Storage
 from rnfs.dht.providers import ProviderStore
+from rnfs import publisher as publisher_module
 from rnfs.publisher import Publisher
 from tests.support import FakeClock
 from tests.test_publisher import FakeClient, FakeLookup
@@ -45,10 +47,12 @@ class HoldingClient(FakeClient):
         super().__init__()
         self.held: dict[bytes, set[bytes]] = {}
         self.before = lambda index: None  # called with the request's index in self.calls, before it is applied
+        self.before_node = lambda node_id: None  # called with the node a request goes to, before it is applied
 
     def provide(self, node_id, keys, withdrawn):
-        """Run the hook, then apply the request as a responder does: withdrawals first, then stores."""
+        """Run the hooks, then apply the request as a responder does: withdrawals first, then stores."""
         self.before(len(self.calls))
+        self.before_node(node_id)
         recorded = super().provide(node_id, keys, withdrawn)
         held = self.held.setdefault(node_id, set())
         held -= set(withdrawn)
@@ -67,7 +71,7 @@ class WithdrawRaceTest(unittest.TestCase):
         config = Config(rnfs_dir=self.tmp.name, republish_interval=1000)
         self.storage = Storage(os.path.join(self.tmp.name, "blocks"), state, 10**9)
         self.addCleanup(self.storage.close)
-        self.records = ProviderStore(1000, None)
+        self.records = ProviderStore(None)
         self.client = HoldingClient()
         self.clock = FakeClock(1_000_000.0)
         self.publisher = Publisher(OWN, config, self.storage, self.records, self.client,
@@ -101,14 +105,17 @@ class WithdrawRaceTest(unittest.TestCase):
         """What is wrong once settled with the CID provided: records the publisher counts on that are gone."""
         key = self.cid.key
         found = []
-        published = self.publisher._published.get(self.cid)
-        for node_id in (published[1] if published else []):
+        state = self.publisher.states().get(self.cid)  # the servers of its last round (none if cut short)
+        for node_id in (state["nodes"] if state else []):
             if key not in self.client.held.get(node_id, set()):
                 found.append(f"{node_id.hex()[:4]} was sent a withdrawal after storing it")
         if OWN not in self.records.providers(key):
             found.append("the node's own record is gone")
         return found
 
+    # The interleavings below are of requests sent one at a time (as slow nodes send them), so a request's index
+    # says what has been sent; test_unpin_and_repin_while_sending_in_parallel covers other nodes' parallel sends
+    @mock.patch.object(publisher_module, "PROVIDE_PARALLEL", 1, create=True)
     def test_unpin_and_repin_during_the_first_send(self):
         """The reviewer's interleaving: both happen just before the round's first /provide."""
         def before(index):
@@ -124,6 +131,7 @@ class WithdrawRaceTest(unittest.TestCase):
         # the node's own record
         self.assertEqual(self.problems(), [])
 
+    @mock.patch.object(publisher_module, "PROVIDE_PARALLEL", 1, create=True)
     def test_every_interleaving_of_unpin_and_repin_with_the_sends(self):
         """Unpin before request i and re-pin before request j >= i of round 2, or after it ends (j == end)."""
         first = len(NODES)  # requests of round 1
@@ -151,6 +159,30 @@ class WithdrawRaceTest(unittest.TestCase):
         # NEW-1: fails until the invariant holds for every interleaving
         self.assertEqual(failures, [])
 
+    def test_unpin_and_repin_while_sending_in_parallel(self):
+        """Every node's request in flight at once (other nodes send up to PROVIDE_PARALLEL at once): unpinning and
+        re-pinning just before any one node's request still leaves every node the publisher counts on holding it."""
+        failures = []
+        for target in NODES:
+            with self.subTest(before=target.hex()[:4]):
+                self.setUp()
+
+                def before_node(node_id, target=target):
+                    if node_id == target:
+                        self.unpin()
+                        self.repin()
+                self.client.before_node = before_node
+                with mock.patch.object(publisher_module, "PROVIDE_PARALLEL", len(NODES), create=True):
+                    self.publisher.publish_due()  # round 2
+                self.client.before_node = lambda node_id: None
+                self.settle()
+                self.assertIn(self.cid, self.publisher.provided())
+                found = self.problems()
+                if found:
+                    failures.append(f"unpin and repin before {target.hex()[:4]}: {found}")
+        self.assertEqual(failures, [])
+
+    @mock.patch.object(publisher_module, "PROVIDE_PARALLEL", 1, create=True)
     def test_no_withdrawal_follows_a_store_to_the_same_node(self):
         """Section 6's MUST, read off the requests: once settled with the CID provided, no node got a withdrawal
         of its key in a later request than a store of it."""

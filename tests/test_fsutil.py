@@ -330,6 +330,31 @@ class SafeDefaultNameTest(unittest.TestCase):
         self.assertEqual(fsutil.printable(5), "5")
 
 
+class AllocationUnitTest(unittest.TestCase):
+    """allocation_unit: the filesystem's fragment or cluster size, at least MIN_ALLOCATION_UNIT."""
+
+    def test_the_real_filesystem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            unit = fsutil.allocation_unit(tmp)
+        self.assertGreaterEqual(unit, fsutil.MIN_ALLOCATION_UNIT)
+        self.assertEqual(unit % 512, 0)
+
+    def test_large_and_small_units_and_failures(self):
+        def statvfs(units):
+            """An os.statvfs giving f_frsize units (raising OSError for None)."""
+            def answer(path):
+                """The statvfs result."""
+                if units is None:
+                    raise OSError("unsupported")
+                return types.SimpleNamespace(f_frsize=units, f_bsize=4096)
+            return answer
+
+        for units, expected in ((128 * 1024, 128 * 1024), (1024, fsutil.MIN_ALLOCATION_UNIT),
+                                (None, fsutil.MIN_ALLOCATION_UNIT), (0, fsutil.MIN_ALLOCATION_UNIT)):
+            with self.subTest(units), mock.patch.object(os, "statvfs", statvfs(units), create=True):
+                self.assertEqual(fsutil.allocation_unit("."), expected)
+
+
 
 class LockTest(unittest.TestCase):
     """lock_exclusive and lock_holder, across processes as daemons use them."""
@@ -388,6 +413,26 @@ class LockTest(unittest.TestCase):
                 fsutil.unlock(fd)
         close.assert_called_once_with(fd)
         self.lock()
+
+    def test_lock_held_tells_without_taking_it_or_writing(self):
+        """lock_held is True while another process holds the lock, False before and after; it changes nothing in
+        the file (the holder's process ID stays) and leaves the lock free for the next lock_exclusive."""
+        self.assertFalse(fsutil.lock_held(self.path))  # no file at all
+        self.assertFalse(os.path.exists(self.path))  # and none made
+        holder = hold_lock(self.path)
+        try:
+            with open(self.path, "rb") as f:
+                written = f.read()
+            self.assertTrue(fsutil.lock_held(self.path))
+            with open(self.path, "rb") as f:
+                self.assertEqual(f.read(), written)
+            self.assertEqual(fsutil.lock_holder(self.path), holder.pid)
+        finally:
+            holder.stdin.close()
+            holder.wait(30)
+            holder.stdout.close()
+        self.assertFalse(fsutil.lock_held(self.path))
+        self.lock()  # testing it left nothing held
 
     def test_holder_of_a_file_without_a_process_id_is_unknown(self):
         """lock_holder gives None for a missing or unreadable lock file."""

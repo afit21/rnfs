@@ -727,9 +727,10 @@ class KeepersFeature(Feature):
         A record below the sequence NameManager already holds is refused: a keeper could otherwise hand this
         node an old, validly signed record to serve until a newer one is heard.
         """
-        known = self.node.names.record(record.name)
-        if known is not None and record.sequence < known.sequence:
-            _log(f"refused record {record.sequence} of name {record.name.hex()}: sequence {known.sequence} is known")
+        # The floor counts too: a name resolved before whose record has left the table (REL-14)
+        known = self.node.names.known_sequence(record.name)
+        if known is not None and record.sequence < known:
+            _log(f"refused record {record.sequence} of name {record.name.hex()}: sequence {known} is known")
             return False
         first = self.store.get(record.name) is None
         if not self.store.offer(record):
@@ -960,11 +961,11 @@ class KeepersFeature(Feature):
         return now if before is None else max(now, before.get(node_id, 3))
 
     def _known_sequence(self, name: bytes) -> int | None:
-        """The highest sequence this node knows for name (record held by NameManager, or kept), or None."""
+        """The highest sequence this node knows for name (NameManager's record or floor, or kept), or None."""
         known = []
-        record = self.node.names.record(name)
-        if record is not None:
-            known.append(record.sequence)
+        sequence = self.node.names.known_sequence(name)
+        if sequence is not None:
+            known.append(sequence)
         kept = self.store.get(name)
         if kept is not None:
             known.append(kept.sequence)

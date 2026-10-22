@@ -2,11 +2,14 @@
 (tests/fixtures/rnfs-0.1.4, every one of its 17 JSON state files populated; see its README) holds every record.
 
 Each store's state in memory is compared with the fixture's files read here with plain json, so the expectation
-comes from the fixture itself. The only differences allowed are those the 0.1.4 load made too: outbox messages
-not finished are failed (LXMF doesn't persist its queue), and the node's own provider records are stored again
-(the publisher records itself for everything it provides). Then: each file is kept as <name>.migrated, none is
-set aside as damaged, the migrated table counts each file's records, a second start changes nothing, and a
-restart keeps everything.
+comes from the fixture itself. The only differences allowed are those the 0.1.4 load made too: the node's own
+provider records are stored again (the publisher records itself for everything it provides); and 0.2.0's own: the
+departed and evicted publishers providers.json remembers aren't imported, and the newcomer pool's records are no
+longer pooled (0.2.0's record budget and storage tiers replaced both). The LXMF inbox and outbox, which no store of
+0.2.0 reads (LXMF moved out of rnfs into an app of its own), are compared as the state database holds them, kept
+for that app: exactly as 0.1.4 wrote them. Then: each file is kept as <name>.migrated, none is set aside as
+damaged, the migrated table counts each file's records, a second start changes nothing, and a restart keeps
+everything.
 
 The clock is the fixture's T0 plus a day (generate.py), so no record has expired."""
 import functools
@@ -26,11 +29,11 @@ from rnfs import node as node_module
 from rnfs import statedb
 from rnfs.config import Config
 from rnfs.content import builder
-from rnfs.content.blockstore import BlockStore
+from rnfs.content.blockstore import matches
 from rnfs.content.cid import Cid
-from rnfs.features import lxmf
+from rnfs.content.storage import upgraded_source
 from rnfs.node import RnfsNode
-from tests.support import FakeClock, state_rows
+from tests.support import FakeClock, pinned_entries, state_rows
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 
@@ -38,12 +41,12 @@ FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "
 T0 = 1792054800.0  # the fake clock generate.py wrote the fixture at (records span T0 - 3 days to T0 + 1 hour)
 NOW = T0 + 86400.0
 NODE_ID = bytes.fromhex("4e0de1d04e0de1d04e0de1d04e0de1d0")  # generate.py's NODE_ID
-# generate.py's SETTINGS: nothing in the fixture is filtered out by configuration
+# generate.py's SETTINGS: nothing in the fixture is filtered out by configuration. max_records and the lxmf_*
+# settings are retired in 0.2.0: start() leaves them out with a warning, as a start does with an rnfs.toml holding them
 SETTINGS = {"remote_pin_identities": ["0123456789abcdef0123456789abcdef"],
             "lxmf_auto_fetch_from": ["a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"], "max_records": 40, "slow": "no",
             "path_timeout": 2, "lookup_timeout": 2}
 LEGACY = [item.file for item in statedb.LEGACY]
-UNFINISHED_ERROR = "the daemon stopped before it was delivered"
 
 _saved_loglevel = RNS.loglevel
 
@@ -72,10 +75,33 @@ def _content():
     return module
 
 
+class FlatBlockStore:
+    """Blocks as rnfs 0.1.6 and earlier stored them: one file per CID directly in the blocks directory,
+    blocks/<cid>. The upgrade tests write their blocks so, rather than through the current BlockStore, so that
+    they start on a directory exactly as those versions left it."""
+
+    def __init__(self, directory: str):
+        """A store writing into directory (created if missing)."""
+        self.directory = directory
+        os.makedirs(directory, exist_ok=True)
+
+    def path(self, cid: Cid) -> str:
+        """Where 0.1.6 stored the block for cid."""
+        return os.path.join(self.directory, str(cid))
+
+    def put(self, cid: Cid, block: bytes):
+        """Store block under cid, as 0.1.6's BlockStore.put left it (its temporary file renamed away)."""
+        if not matches(cid, block):
+            raise ValueError(f"block does not match {cid}")
+        with open(self.path(cid), "wb") as f:
+            f.write(block)
+
+
 def make_blocks(blocks_dir: str, scratch: str) -> set[Cid]:
-    """Store in blocks_dir the blocks of everything 0.1.4 added to the fixture, built by the current code (the
-    fixture keeps no blocks); the roots built. The CIDs must be those 0.1.4 recorded, as no CID changed."""
-    content, store, roots = _content(), BlockStore(blocks_dir), set()
+    """Store in blocks_dir, in 0.1.6's flat layout (FlatBlockStore), the blocks of everything 0.1.4 added to the
+    fixture, built by the current code (the fixture keeps no blocks); the roots built. The CIDs must be those
+    0.1.4 recorded, as no CID changed."""
+    content, store, roots = _content(), FlatBlockStore(blocks_dir), set()
     for data, name in content.STREAMS:
         roots.add(builder.add_stream(io.BytesIO(data), store.put, len(data), name).cid)
 
@@ -102,12 +128,6 @@ def make_blocks(blocks_dir: str, scratch: str) -> set[Cid]:
 def cids(texts) -> list[Cid]:
     """CIDs from their text."""
     return [Cid.parse(text) for text in texts]
-
-
-def unfinished(message: dict) -> bool:
-    """An outbox message not finished when the daemon stopped (as LxmfFeature tells them at start)."""
-    return message["state"] not in lxmf.FINAL_STATES and not (message["method"] == "propagated"
-                                                                and message["state"] == "sent")
 
 
 def loadable_jobs() -> list[dict]:
@@ -140,8 +160,9 @@ class UpgradeTest(unittest.TestCase):
 
     def start(self) -> RnfsNode:
         """An offline node on the copy (stopped before the directory is removed)."""
-        config = Config(rnfs_dir=self.root, **SETTINGS)
-        config.validate()
+        config = Config.combine(self.root, SETTINGS)
+        self.assertEqual([warning.split(":")[0] for warning in config.warnings],
+                         ["ignoring lxmf_auto_fetch_from in rnfs.toml", "ignoring max_records in rnfs.toml"])
         node = RnfsNode.offline(config, NODE_ID, NetClient(), FakeNetwork())
         self.addCleanup(node.stop)
         return node
@@ -154,8 +175,12 @@ class UpgradeTest(unittest.TestCase):
     # Each store's state against the fixture
 
     def check_pins(self, node: RnfsNode):
-        """Every pin with every source, and each complete: the current code built the same CIDs (make_blocks)."""
-        expected = {Cid.parse(text): set(sources) for text, sources in fixture("pins.json")["pins"].items()}
+        """Every pin with every source, and each complete: the current code built the same CIDs (make_blocks). The
+        two lxmf:<address> pins (an auto-fetch sender's) become app:lxmf:<address> since rnfs 0.2.0, the LXMF
+        wrapper app's source (storage.upgraded_source, as the schema step "lxmf_app_pins" for the pins table)."""
+        expected = {Cid.parse(text): {upgraded_source(source) for source in sources}
+                    for text, sources in fixture("pins.json")["pins"].items()}
+        self.assertEqual(sum(source.startswith("app:lxmf:") for sources in expected.values() for source in sources), 2)
         self.assertEqual(node.storage.pins(), expected)
         roots = {Cid.parse(root) for root, _, _ in fixture("cache.json")["fetches"]}
         self.assertLessEqual(roots, self.built)
@@ -193,33 +218,47 @@ class UpgradeTest(unittest.TestCase):
         expected = fixture("published.json")
         self.assertTrue(any(item.startswith("key:") for item in expected["published"]))
         publisher = node.publisher
-        self.assertEqual({str(item): [when, [n.hex() for n in nodes]]
-                          for item, (when, nodes) in publisher._published.items()}, expected["published"])
-        self.assertEqual({str(item): {n.hex(): when for n, when in nodes.items()}
-                          for item, nodes in publisher._earlier.items() if nodes}, expected["earlier"])
+        states = publisher.states()
+        self.assertEqual({str(item): [state["at"], [n.hex() for n in state["nodes"]]]
+                          for item, state in states.items() if state["at"] is not None}, expected["published"])
+        self.assertEqual({str(item): {n.hex(): when for n, when in state["earlier"].items()}
+                          for item, state in states.items() if state["earlier"]}, expected["earlier"])
         self.assertEqual({n.hex(): sorted(k.hex() for k in keys) for n, keys in publisher._withdrawals.items()
                           if keys}, expected["withdraw"])
-        # What 0.1.4 provided is still provided: every published CID and key
+        # What 0.1.4 provided is still provided: every published CID and key; and since 0.2.0 (provide_entries, on
+        # by default) the files and folders inside its complete pins too, not published yet
+        entries = pinned_entries(node.storage) - {Cid.parse(text) for text in expected["published"]
+                                                   if not text.startswith("key:")}
+        self.assertTrue(entries)
+        self.assertEqual(publisher.provided_entries(), entries)
         self.assertEqual({str(c) for c in publisher.provided()} | {"key:" + k.hex() for k in publisher.provided_keys()},
-                         set(expected["published"]))
+                         set(expected["published"]) | {str(c) for c in entries})
 
     def check_providers(self, node: RnfsNode):
-        """Publishers, records in the main store and the pool, departed and evicted publishers; the node's own
-        records are stored again at start (last stored now)."""
+        """Every publisher's first-seen time and every record, those of 0.1.4's newcomer pool included (no longer
+        pooled), each publisher with a standing built from them; the node's own records are stored again at start
+        (last stored now), in their own tier, with one for each entry it provides since 0.2.0 (provide_entries). The
+        departed and evicted publishers 0.1.4 remembered are not imported: 0.2.0 keeps no such memories (spec section
+        6)."""
         expected = fixture("providers.json")
         records = node.records
-        self.assertEqual({p.hex(): entry.first_seen for p, entry in records._publishers.items()},
-                         expected["publishers"])
+        with records._lock:
+            held, standings = records._merged()
+        self.assertEqual({p.hex(): standing.first_seen for p, standing in standings.items()}, expected["publishers"])
         own = NODE_ID.hex()
-        self.assertEqual({(k.hex(), p.hex()): [r.first_stored, r.last_stored, int(r.pooled)]
-                          for k, by in records._records.items() for p, r in by.items()},
-                         {(k, p): [first, NOW if p == own else last, pooled]
-                          for k, p, first, last, pooled in expected["records"]})
+        records_expected = {(k, p): [first, NOW if p == own else last] for k, p, first, last, _ in expected["records"]}
+        entries = {(cid.key.hex(), own): [NOW, NOW] for cid in pinned_entries(node.storage)}
+        self.assertTrue(set(entries) - set(records_expected))
+        self.assertEqual({(k.hex(), p.hex()): [first, last] for (k, p), (first, last) in held.items()},
+                         entries | records_expected)
         self.assertTrue(any(pooled for *_, pooled in expected["records"]))
-        self.assertEqual([[p.hex(), seen, at] for p, (seen, at) in records._departed.items()], expected["departed"])
-        self.assertEqual(sorted([p.hex(), seen, at] for p, (seen, at) in records._evicted.items()),
-                         sorted(expected["evicted"]))
         self.assertTrue(expected["departed"] and expected["evicted"])
+        self.assertEqual(state_rows(self.state, "SELECT * FROM provider_departed UNION ALL"
+                                                " SELECT * FROM provider_evicted"), [])
+        for publisher, standing in standings.items():
+            self.assertEqual(standing.records, sum(p == publisher for _, p in held), publisher.hex())
+        self.assertEqual(records.standing(NODE_ID)["tier"], "own")
+        records._check_consistency()
 
     def check_names(self, node: RnfsNode):
         """Names published (one imported, never published here) with their keys, and the records held."""
@@ -271,23 +310,26 @@ class UpgradeTest(unittest.TestCase):
                           for nick, (kind, ident) in node.feature("contacts")._contacts.items()},
                          fixture("contacts.json")["contacts"])
 
+    def box(self, box: str) -> tuple[list[dict], int]:
+        """The LXMF box's records in the state database (rnfs.lxmf_messages), oldest first, and its next id."""
+        db = statedb.connect(self.state)
+        try:
+            rows = db.query("SELECT id, record FROM lxmf_messages WHERE box = ? ORDER BY id", (box,))
+            return [statedb.load(record) for _, record in rows], db.meta(box, "next_id")
+        finally:
+            db.close()
+
     def check_inbox(self, node: RnfsNode):
         """Every inbox message with its exact text (non-BMP characters included) and auto-fetch results, and
         the next id."""
         expected = fixture("lxmf_inbox.json")
-        inbox = node.feature("lxmf").inbox
-        self.assertEqual(inbox.entries(), expected["messages"])
-        self.assertEqual(inbox._next_id, expected["next_id"])
+        self.assertEqual(self.box("inbox"), (expected["messages"], expected["next_id"]))
 
     def check_outbox(self, node: RnfsNode):
-        """Every outbox message with its exact text; those not finished are failed now."""
+        """Every outbox message with its exact text, those not finished too (as they were: nothing loads them)."""
         expected = fixture("lxmf_outbox.json")
-        messages = [{**message, "state": "failed", "error": UNFINISHED_ERROR} if unfinished(message) else message
-                    for message in expected["messages"]]
-        self.assertTrue(any(map(unfinished, expected["messages"])))
-        outbox = node.feature("lxmf").outbox
-        self.assertEqual(outbox.entries(), messages)
-        self.assertEqual(outbox._next_id, expected["next_id"])
+        self.assertTrue(any(message["state"] in ("outbound", "sending") for message in expected["messages"]))
+        self.assertEqual(self.box("outbox"), (expected["messages"], expected["next_id"]))
 
     def check_all(self, node: RnfsNode):
         """Every store's check."""

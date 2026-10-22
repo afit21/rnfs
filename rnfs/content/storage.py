@@ -1,8 +1,10 @@
 """Storage: blocks, pins, cached fetches, protection and eviction (specification section 8). No RNS dependency.
 
 - Pins are recursive and held by sources: "user", "folder", "name:<alias>", "remote:<identity hash>", "deny" (the
-  deny lists' own blocks), and the features' "follow:" and "lxmf:". A pin lasts while any source holds it. Pins
-  are never evicted.
+  deny lists' own blocks), "app:<app>" and "app:<app>:<key>" (pins an app made with its API token, rnfs.apps),
+  and the features' "follow:". The LXMF feature of rnfs before 0.2.0 pinned with "lxmf:<sender>", which 0.2.0's
+  upgrade rewrote as "app:lxmf:<sender>": an app called lxmf holds them. A pin lasts while any source holds it.
+  Pins are never evicted.
 - Cache is everything else. Each cached fetch is recorded as root + path + target, which keeps the path's
   nodes and the target's DAG; fetches are evicted least recently used first when storage exceeds
   max_storage, and gc() evicts them all.
@@ -13,37 +15,59 @@
 - max_storage is soft: no fetch is refused for it, and storage may exceed it while fetches run or when
   pins alone fill it. The hard bound is the disk: check_disk() refuses blocks that would leave less than
   DISK_RESERVE free on the filesystem holding the blocks.
+- max_storage counts what the blocks take on disk (allocated_bytes): each block's size rounded up to the block
+  store's allocation unit (fsutil.allocation_unit, read once at the start), since each is a file of its own and
+  a small one takes a whole cluster (16-32 KiB on FAT32). used_bytes, the quotas and stat count block bytes.
 
 Pins and cache records are persisted in the state database (rnfs.statedb), and only read from it at startup:
 each pin and release at once, as one row inserted or deleted and committed durably (after the blocks it keeps
 are synced), and cache records (which change on every fetch) by save(), which the node calls periodically and
-at shutdown, writing only the records changed since the last save. Thread-safe: one lock guards the
+at shutdown, writing only the records changed since the last save. The block index (every block's size) is kept
+there too, written with both, and loaded at the next start only if close() saved it whole (_index): otherwise every
+block is listed. Thread-safe: one lock guards the
 indexes; long walks run outside it: completeness walks are discarded if blocks were deleted meanwhile, and
 eviction, gc and the size queries read the DAG nodes they will walk beforehand (_warm), deciding what to delete
 (or counting) under the lock, where a DAG memoised as complete is taken whole rather than walked again.
 """
 import itertools
+import math
 import os
+import re
 import shutil
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Callable, Iterator
 
-from rnfs import denylist, ids, statedb
-from rnfs.constants import MIB
+from rnfs import denylist, fsutil, ids, statedb
+from rnfs.constants import MAX_BLOCK_SIZE, MIB
 from rnfs.content import blockstore, dag, walker
 from rnfs.content.blockstore import BlockStore
 from rnfs.content.cid import Cid
 from rnfs.content.dag import DirectoryNode, IndexNode
-from rnfs.errors import BlockMismatch, Denied, InvalidDag, NotFound, StorageFull
-from rnfs.log import LOG_ERROR, LOG_VERBOSE, log, plural, size
+from rnfs.errors import BlockMismatch, Closed, Denied, InvalidDag, NotFound, StorageFull
+from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, SlowStep, log, plural, size
 
 USER, FOLDER = "user", "folder"
+SIZES_STORE = "block_sizes"  # its meta value "clean": 1 once close() saved the block_sizes table whole
 DENY = denylist.SOURCE  # the deny lists' own blocks (rnfs/features/deny.py)
 NAME_PREFIX, REMOTE_PREFIX = "name:", "remote:"
-LXMF_PREFIX = "lxmf:"
+APP_PREFIX = "app:"
+# The pins the LXMF feature of rnfs before 0.2.0 made: lxmf:<sender address> (LEGACY_LXMF_PREFIX), which 0.2.0,
+# whose LXMF moved out of rnfs into an app of its own, made app:lxmf:<sender address>: an app called lxmf holds them
+# (rnfs app add lxmf; rnfs app rm lxmf releases them). Its schema step rewrote the pins table's, and import_pins
+# rewrites those of an older pins.json, imported after that step
+LXMF_PREFIX = APP_PREFIX + "lxmf:"
+LEGACY_LXMF_PREFIX = "lxmf:"
+# An app's name (rnfs app add): an alias's characters (names.check_alias) in lowercase, so it never holds ":" and
+# two apps never differ only by case. Pin rows are checked against these and one that fails is deleted when
+# loaded, so what they accept mustn't narrow
+APP_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+# The key an app may give its pins (app:<app>:<key>), so it can hold and release groups of its own; ":" allowed, so
+# a key may nest (the name before it holds none)
+PIN_KEY = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 MAX_CACHE_RECORDS = 10_000  # cached fetches remembered; past this the least recently used record is dropped
 MISSING_MEMO = 10_000  # incomplete DAGs whose missing block dag_blocks remembers; past this the oldest is forgotten
 EVICT_MARGIN = 32  # eviction frees max_storage / EVICT_MARGIN more than it must, so it runs rarely
@@ -57,9 +81,10 @@ WRITE_QUEUE = 32  # blocks a writer holds waiting to be written, at most (2 MiB 
 DAMAGED = object()  # Storage._node's answer for a stored DAG node that is unreadable or no longer matches its CID
 MISSING = object()  # Storage._read_node's answer for a block that isn't stored (or was deleted meanwhile)
 _NO_MEMO = object()  # a memo's answer for a key it has no entry for (None is a memoised answer)
+_NO_ENTRIES: frozenset = frozenset()  # dag_entries of a file, shared by every one memoised
 
-# The ID in a remote:, follow: or lxmf: pin source, as bytes.hex() writes it: exactly what loaded before rnfs.ids, as
-# a pin row that fails is deleted
+# The ID in a remote: or follow: pin source, as bytes.hex() writes it: exactly what loaded before rnfs.ids, as a pin
+# row that fails is deleted
 _IDENTITY_HASH = ids.HEX16_LOWER
 
 
@@ -80,10 +105,48 @@ def check_source(source: str):
     # follow:<name>: the latest target of a followed name (rnfs/features/follow.py)
     if isinstance(source, str) and source.startswith("follow:") and _IDENTITY_HASH.fullmatch(source[len("follow:"):]):
         return
-    # lxmf:<LXMF address>: links auto-fetched from that sender (rnfs/features/lxmf.py)
-    if isinstance(source, str) and source.startswith(LXMF_PREFIX) and _IDENTITY_HASH.fullmatch(source[len(LXMF_PREFIX):]):
+    # app:<app>[:<key>]: pins an app made through the API with its token (rnfs/apps.py), and the app:lxmf:<sender>
+    # pins the LXMF feature of rnfs before 0.2.0 left (LXMF_PREFIX)
+    if isinstance(source, str) and app_of(source) is not None:
         return
     raise ValueError(f"invalid pin source {source!r}")
+
+
+def check_app_name(name) -> str:
+    """name if it is a valid app name (APP_NAME), else ValueError."""
+    if not isinstance(name, str) or not APP_NAME.fullmatch(name):
+        raise ValueError(f"invalid app name {name!r}: 1-64 characters of a-z, 0-9, '.', '_' and '-', starting with a "
+                         f"letter or digit")
+    return name
+
+
+def app_source(name: str, key: str | None = None) -> str:
+    """The pin source of app name's pins, of its group key if given: app:<name>[:<key>]. Raises ValueError for a
+    name or key that isn't valid."""
+    check_app_name(name)
+    if key is None:
+        return APP_PREFIX + name
+    if not isinstance(key, str) or not PIN_KEY.fullmatch(key):
+        raise ValueError(f"invalid pin key {key!r}: 1-128 characters of A-Z, a-z, 0-9, '.', '_', ':' and '-'")
+    return f"{APP_PREFIX}{name}:{key}"
+
+
+def is_own_source(source) -> bool:
+    """True if source pins the user's own content: the user's pins (user), the shared folder's (folder), those of a
+    name this node publishes (name:<alias>) and an app's (app:<app>[:<key>]); not those another node asked for
+    (remote:<identity>), a followed name's (follow:<name>) or the deny lists' own blocks (deny)."""
+    return isinstance(source, str) and (source in (USER, FOLDER) or source.startswith(NAME_PREFIX)
+                                        or app_of(source) is not None)
+
+
+def app_of(source) -> str | None:
+    """The app whose pin source this is (app:<app> or app:<app>:<key>), or None if it is no valid app source."""
+    if not isinstance(source, str) or not source.startswith(APP_PREFIX):
+        return None
+    name, colon, key = source[len(APP_PREFIX):].partition(":")
+    if not APP_NAME.fullmatch(name) or (colon and not PIN_KEY.fullmatch(key)):
+        return None
+    return name
 
 
 def name_source(alias: str) -> str:
@@ -97,9 +160,19 @@ def remote_source(identity_hash: bytes | str) -> str:
     return REMOTE_PREFIX + text
 
 
+def upgraded_source(source):
+    """source as rnfs 0.2.0 writes it: a valid lxmf:<address> (LEGACY_LXMF_PREFIX) becomes app:lxmf:<address>, as
+    the schema step "lxmf_app_pins" rewrote the pins table's; anything else is returned as it is."""
+    if isinstance(source, str) and source.startswith(LEGACY_LXMF_PREFIX) \
+            and _IDENTITY_HASH.fullmatch(source[len(LEGACY_LXMF_PREFIX):]):
+        return LXMF_PREFIX + source[len(LEGACY_LXMF_PREFIX):]
+    return source
+
+
 def import_pins(value: dict, tx) -> int:
     """Import pins.json (statedb.migrate): its pins replace the pins table, each record checked as rnfs 0.1.4
-    loaded it (an invalid one is logged and skipped). Returns the number of pins imported."""
+    loaded it (an invalid one is logged and skipped), lxmf: sources rewritten as the schema did those of the pins
+    table (upgraded_source: the files are imported after the schema steps). Returns the number of pins imported."""
     tx.execute("DELETE FROM pins")
     count = 0
     for text, sources in value.get("pins", {}).items():
@@ -107,6 +180,7 @@ def import_pins(value: dict, tx) -> int:
             cid = Cid.parse(text)
             if not isinstance(sources, list):
                 raise TypeError("sources aren't a list")
+            sources = [upgraded_source(source) for source in sources]
             for source in sources:
                 check_source(source)
             # Inside the try: a source SQLite can't store (a lone surrogate) is an invalid record too
@@ -268,22 +342,46 @@ class Storage:
     def __init__(self, blocks_dir: str, state_dir: str, max_storage: int):
         """Open storage, indexing the blocks on disk and loading pins and cache records from state_dir."""
         self._lock = threading.RLock()
-        self.blocks = BlockStore(blocks_dir)
         self.state_dir = os.path.expanduser(state_dir)
         self._db = statedb.connect(self.state_dir)
         self.max_storage = max_storage
         self._save_lock = threading.Lock()  # keeps cache saves in order without holding _lock while writing
 
-        self._sizes: dict[Cid, int] = dict(self.blocks.scan())
+        # The index of stored blocks: CID -> size. Kept in the block_sizes table too, rows changed but not yet
+        # written in _sizes_dirty (a size, or None for a deleted block), written whenever pins or cache records are
+        # saved; the table is trusted at the next start only if close() saved it whole (_index)
+        self._sizes: dict[Cid, int] = {}
+        self._sizes_dirty: dict[Cid, int | None] = {}
+        self._writing = 0  # blocks put() is writing to disk outside the lock
+        self._closed = False  # close() ran: nothing is stored or deleted any more
+        try:
+            self._sizes = self._index(blocks_dir)
+        except BaseException:
+            self._db.close()
+            raise
         self._used = sum(self._sizes.values())
+        self._allocated = sum(map(self._allocation, self._sizes.values()))
         self._pins: dict[Cid, set[str]] = {}
+        # When each pinned CID was first pinned by any source (Unix time; pin_times); one pinned before rnfs 0.2.0
+        # has none
+        self._added: dict[Cid, float] = {}
         self._pinned: frozenset[Cid] | None = None  # pinned_cids(), built when asked; None again once pins change
+        self._own_pinned: frozenset[Cid] | None = None  # own_pinned_cids(), the same way, once any source changes
+        # Called as pin_listener(change, cids, source) once pins of source were added ("added") or released
+        # ("removed") and saved, and as cache_listener(change, cids) with the targets of cache records added
+        # ("added"), dropped ("removed") or retargeted (both), each with the lock held: the node's "pin" and "cache"
+        # events. Must only queue (rnfs.events)
+        self.pin_listener = None
+        self.cache_listener = None
         self._cache: OrderedDict[CacheKey, Cid] = OrderedDict()  # oldest first
         self._sessions: list[Session] = []
         self._links: dict[Cid, tuple[Cid, ...]] = {}  # children of stored DAG nodes; CIDs never change content
         # Where a path step leads from a stored DAG node: node -> {name: _step_in's answer}; memoised like _links
         self._steps: dict[Cid, dict[str, tuple[Cid, bool] | None]] = {}
         self._complete: dict[Cid, frozenset[Cid]] = {}  # dag_blocks memo, complete DAGs only
+        # dag_entries memo: the entries of each of _complete's DAGs, found by the same walk (_NO_ENTRIES for a
+        # file); kept and forgotten with _complete
+        self._complete_entries: dict[Cid, frozenset[Cid]] = {}
         self._complete_bytes: dict[Cid, int] = {}  # dag_bytes memo: the bytes of _complete's DAGs, as asked for
         # dag_blocks memo for incomplete DAGs: root -> a block of its DAG found missing. A CID's content never
         # changes, so the DAG is incomplete for as long as that block isn't stored (checked at each lookup)
@@ -307,6 +405,83 @@ class Storage:
 
     # Persistence
 
+    def _index(self, blocks_dir: str) -> dict[Cid, int]:
+        """Open the block store and index its blocks: from the block_sizes table if the last stop was clean (so
+        startup needn't list every block), else by listing them all (also at the first start of rnfs 0.2.0), the
+        table then written again. The clean mark is cleared, durably, before anything changes on disk, and set
+        again only by close()."""
+        clean = self._db.meta(SIZES_STORE, "clean")
+        if clean == 1:
+            with self._db.transaction(durable=True) as tx:
+                statedb.set_meta(tx, SIZES_STORE, "clean", 0)
+        self.blocks = BlockStore(blocks_dir, report=lambda text: log(f"storage: {text}", LOG_NOTICE))
+        # What the blocks' filesystem allocates a file in, read once: the filesystem under a directory rnfs keeps
+        # open doesn't change while it runs, and a stat per block would cost a syscall each
+        self.allocation_unit = fsutil.allocation_unit(self.blocks.directory)
+        sizes = self._load_sizes() if clean == 1 else None
+        if sizes is not None:
+            # Blocks found directly in blocks/: those a failed move left there are in the table, but an older rnfs
+            # run since may have stored more
+            for cid, length in self.blocks.found_flat.items():
+                if cid not in sizes:
+                    sizes[cid] = self._sizes_dirty[cid] = length
+            return sizes
+        if clean == 0:
+            log("storage: listing every stored block, since rnfs didn't stop cleanly last time", LOG_NOTICE)
+        # At the first start of 0.2.0 (no mark yet) this lists every block quietly, unless it takes a while: on a
+        # large store, minutes, right after the move out of the flat layout
+        with SlowStep("storage: listing every stored block to record its size", "storage: listed every stored block"):
+            sizes = dict(self.blocks.scan(tidy=True))
+            # Only the rows that differ are written: after a crash most are right, and reading them back and comparing
+            # costs less than rewriting them all (a third less with a million blocks)
+            saved = self._load_sizes(quiet=True)
+            with self._db.transaction() as tx:
+                if saved is None:
+                    tx.execute("DELETE FROM block_sizes")
+                    saved = {}
+                tx.executemany("DELETE FROM block_sizes WHERE cid = ?",
+                               [(cid.binary,) for cid in saved.keys() - sizes])
+                tx.executemany("INSERT OR REPLACE INTO block_sizes (cid, size) VALUES (?, ?)",
+                               [(cid.binary, length) for cid, length in sizes.items() if saved.get(cid) != length])
+                statedb.set_meta(tx, SIZES_STORE, "clean", 0)
+        return sizes
+
+    def _load_sizes(self, quiet: bool = False) -> dict[Cid, int] | None:
+        """The block_sizes table, or None if a row doesn't parse (a database edited by hand): then every block is
+        listed instead, and the table written again whole. quiet: the blocks are being listed anyway, so a bad row
+        isn't logged."""
+        sizes = {}
+        for binary, length in self._db.query("SELECT cid, size FROM block_sizes"):
+            try:
+                cid = Cid.from_bytes(binary)
+            except (ValueError, TypeError):
+                cid = None
+            if cid is None or type(length) is not int or not 0 <= length <= MAX_BLOCK_SIZE:
+                if not quiet:
+                    log(f"storage: ignoring the saved block sizes (invalid row {binary!r} {length!r}); listing "
+                        "every stored block", LOG_ERROR)
+                return None
+            sizes[cid] = length
+        return sizes
+
+    def _take_sizes(self) -> dict[Cid, int | None]:
+        """The block_sizes rows changed since they were last written, to be written now (lock held)."""
+        dirty, self._sizes_dirty = self._sizes_dirty, {}
+        return dirty
+
+    def _restore_sizes(self, dirty: dict[Cid, int | None]):
+        """Keep the rows a failed write didn't write for the next one, unless changed since (lock held)."""
+        for cid, length in dirty.items():
+            self._sizes_dirty.setdefault(cid, length)
+
+    @staticmethod
+    def _write_sizes(tx, dirty: dict[Cid, int | None]):
+        """Write the block_sizes rows changed (dirty, from _take_sizes) in transaction tx."""
+        tx.executemany("DELETE FROM block_sizes WHERE cid = ?",
+                       [(cid.binary,) for cid, length in dirty.items() if length is None])
+        tx.executemany("INSERT OR REPLACE INTO block_sizes (cid, size) VALUES (?, ?)",
+                       [(cid.binary, length) for cid, length in dirty.items() if length is not None])
+
     def _load(self):
         """Load pins and cache records; rows that don't parse are logged and deleted, as are cache records past
         MAX_CACHE_RECORDS."""
@@ -320,6 +495,18 @@ class Storage:
                 bad_pins.append((binary, source))
                 continue
             self._pins.setdefault(cid, set()).add(source)
+        stale_times = []
+        for binary, added in self._db.query("SELECT cid, added FROM pin_times"):
+            try:
+                cid = Cid.from_bytes(binary)
+            except (ValueError, TypeError):
+                cid = None
+            # A time without its pin is deleted: they are written in one transaction, so only a pin row refused
+            # above (or a database edited by hand) leaves one
+            if cid in self._pins and isinstance(added, (int, float)) and math.isfinite(added):
+                self._added[cid] = float(added)
+            else:
+                stale_times.append((binary,))
         bad_cache = []
         for root, path, target, used in self._db.query("SELECT root, path, target, used FROM cache ORDER BY used"):
             try:
@@ -333,24 +520,38 @@ class Storage:
         capped = [_cache_row(key) for key in list(self._cache)[:max(0, len(self._cache) - MAX_CACHE_RECORDS)]]
         self._cap_cache()
         self._cache_dirty.clear()
-        if bad_pins or bad_cache or capped:
+        if bad_pins or bad_cache or capped or stale_times:
             with self._db.transaction() as tx:
                 tx.executemany("DELETE FROM pins WHERE cid = ? AND source = ?", bad_pins)
                 tx.executemany("DELETE FROM cache WHERE root = ? AND path = ?", bad_cache + capped)
+                tx.executemany("DELETE FROM pin_times WHERE cid = ?", stale_times)
 
-    def _save_pins(self, source: str, added=(), removed=()):
-        """Persist source's new pins of added and releases of removed, durably (called with the lock held)."""
-        self.blocks.sync()  # so pins saved never outlast the blocks they keep
-        with self._db.transaction(durable=True) as tx:
-            tx.executemany("INSERT OR IGNORE INTO pins (cid, source) VALUES (?, ?)",
-                           [(cid.binary, source) for cid in added])
-            tx.executemany("DELETE FROM pins WHERE cid = ? AND source = ?", [(cid.binary, source) for cid in removed])
+    def _save_pins(self, source: str, added=(), removed=(), first=(), at: float = 0.0, gone=()):
+        """Persist source's new pins of added and releases of removed, durably, with the CIDs first pinned at
+        all now (first, at time at) and no longer pinned at all (gone) (called with the lock held). The block
+        sizes changed since they were last written are written with them."""
+        sizes = self._take_sizes()
+        try:
+            self.blocks.sync()  # so pins saved never outlast the blocks they keep
+            with self._db.transaction(durable=True) as tx:
+                tx.executemany("INSERT OR IGNORE INTO pins (cid, source) VALUES (?, ?)",
+                               [(cid.binary, source) for cid in added])
+                tx.executemany("INSERT OR IGNORE INTO pin_times (cid, added) VALUES (?, ?)",
+                               [(cid.binary, at) for cid in first])
+                tx.executemany("DELETE FROM pin_times WHERE cid = ?", [(cid.binary,) for cid in gone])
+                tx.executemany("DELETE FROM pins WHERE cid = ? AND source = ?",
+                               [(cid.binary, source) for cid in removed])
+                self._write_sizes(tx, sizes)
+        except BaseException:
+            self._restore_sizes(sizes)
+            raise
 
     def save(self):
-        """Persist the cache records changed since the last save, least recently used first."""
+        """Persist the cache records changed since the last save, least recently used first, and the block sizes
+        changed."""
         with self._save_lock:
             with self._lock:
-                if not self._cache_dirty:
+                if not self._cache_dirty and not self._sizes_dirty:
                     return
                 dirty, self._cache_dirty = self._cache_dirty, set()
                 # The records changed since the last save are the most recently used (each change moved its
@@ -363,18 +564,47 @@ class Storage:
                 gone = [_cache_row(key) for key in dirty if key not in self._cache]
             try:
                 self.blocks.sync()
-                with self._db.transaction() as tx:
-                    tx.executemany("DELETE FROM cache WHERE root = ? AND path = ?", gone)
-                    tx.executemany("INSERT OR REPLACE INTO cache (root, path, target, used) VALUES (?, ?, ?, ?)",
-                                   rows)
+                # The sizes are taken and written under the lock, so a pin saved meanwhile (which writes them too)
+                # can't have its newer rows overwritten by older ones. A row may be written before its block's
+                # name is synced: the table is only trusted after a clean stop, which syncs first
+                with self._lock:
+                    sizes = self._take_sizes()
+                    try:
+                        with self._db.transaction() as tx:
+                            tx.executemany("DELETE FROM cache WHERE root = ? AND path = ?", gone)
+                            tx.executemany("INSERT OR REPLACE INTO cache (root, path, target, used) "
+                                           "VALUES (?, ?, ?, ?)", rows)
+                            self._write_sizes(tx, sizes)
+                    except BaseException:
+                        self._restore_sizes(sizes)
+                        raise
             except BaseException:
                 with self._lock:
                     self._cache_dirty |= dirty
                 raise
 
     def close(self):
-        """Release the state database (the node calls this once it has saved everything at shutdown)."""
-        self._db.close()
+        """Release the state database (the node calls this once it has saved everything at shutdown), first saving
+        the block sizes whole and marking them clean, so the next start loads them rather than listing every
+        block. Not marked if a put is still writing (a thread that outlived the node's stop) or a partial file
+        may be left: the next start lists every block. Nothing is stored or deleted afterwards."""
+        try:
+            with self._lock:
+                if self._closed:
+                    return
+                self._closed = True
+                if self._writing or self.blocks.untidy:
+                    return
+                sizes = self._take_sizes()
+                try:
+                    self.blocks.sync()
+                    with self._db.transaction(durable=True) as tx:
+                        self._write_sizes(tx, sizes)
+                        statedb.set_meta(tx, SIZES_STORE, "clean", 1)
+                except OSError as e:
+                    log(f"storage: couldn't save the block sizes ({e}); the next start lists every block", LOG_ERROR)
+        finally:
+            self._db.close()
 
     # Blocks
 
@@ -411,21 +641,31 @@ class Storage:
         self._put(cid, block, protected=False)
 
     def _put(self, cid: Cid, block: bytes, protected: bool):
-        """Store a block; protected if a session already lists it, so it can't be garbage."""
+        """Store a block; protected if a session already lists it, so it can't be garbage. Raises Closed once
+        close() has run."""
         if self.deny.denies(cid):
             raise Denied(f"{cid} is on this node's deny list")
         with self._lock:
+            if self._closed:
+                raise Closed("storage is closed")  # a block stored now would be missing from the saved sizes
             stored = cid in self._sizes
+            if not stored:
+                self._writing += 1
         if stored:
             # Verified all the same, so callers (archive import) never count unchecked bytes as supplied
             if not blockstore.matches(cid, block):
                 raise BlockMismatch(f"block does not match {cid}")
             return
-        self.blocks.put(cid, block)  # verifies; outside the lock, since it writes to disk
+        try:
+            self.blocks.put(cid, block)  # verifies; outside the lock, since it writes to disk
+        finally:
+            with self._lock:
+                self._writing -= 1
         with self._lock:
             if cid not in self._sizes:
-                self._sizes[cid] = len(block)
+                self._sizes[cid] = self._sizes_dirty[cid] = len(block)
                 self._used += len(block)
+                self._allocated += self._allocation(len(block))
                 self._changes += 1
                 if not protected:
                     self._maybe_garbage = True
@@ -434,6 +674,15 @@ class Storage:
         """Bytes of every stored block."""
         with self._lock:
             return self._used
+
+    def allocated_bytes(self) -> int:
+        """What every stored block takes on disk (_allocation of each one's size): what max_storage bounds."""
+        with self._lock:
+            return self._allocated
+
+    def _allocation(self, length: int) -> int:
+        """What a block of length bytes takes on disk: a file of its own, so rounded up to the allocation unit."""
+        return fsutil.allocated(length, self.allocation_unit)
 
     def block_count(self) -> int:
         """Number of stored blocks."""
@@ -472,9 +721,11 @@ class Storage:
             if not added:
                 return
             self._changes += 1
-            self._pinned = None
+            self._pinned = self._own_pinned = None
+            now = time.time()
+            first = [cid for cid in added if self._pins[cid] == {source}]  # pinned by nothing else before
             try:
-                self._save_pins(source, added=added)
+                self._save_pins(source, added=added, first=first, at=now)
             except BaseException:
                 # Not saved (a full or failing disk): not pinned, so memory says what the database does
                 for cid in added:
@@ -482,8 +733,11 @@ class Storage:
                     sources.discard(source)
                     if not sources:
                         del self._pins[cid]
-                self._pinned = None
+                self._pinned = self._own_pinned = None
                 raise
+            for cid in first:  # a pin another source held already keeps its first time (or its lack of one)
+                self._added[cid] = now
+            self._tell(self.pin_listener, "added", added, source)
 
     def unpin(self, cid: Cid, source: str) -> bool:
         """Release source's hold on cid; True if it held it. Blocks go at the next evict() or gc()."""
@@ -493,17 +747,44 @@ class Storage:
                 return False
             sources.discard(source)
             self._changes += 1
+            self._own_pinned = None
             if not sources:
                 del self._pins[cid]
                 self._maybe_garbage = True
                 self._pinned = None
+            gone = [cid] if cid not in self._pins else []
             try:
-                self._save_pins(source, removed=[cid])
+                self._save_pins(source, removed=[cid], gone=gone)
             except BaseException:
                 self._pins.setdefault(cid, set()).add(source)  # still pinned, as the database says
-                self._pinned = None
+                self._pinned = self._own_pinned = None
                 raise
+            if gone:
+                self._added.pop(cid, None)
+            self._tell(self.pin_listener, "removed", [cid], source)
             return True
+
+    def _tell(self, listener, *args):
+        """Call a pin or cache listener, if set (lock held); one that fails is logged, never raised: the change
+        it reports is made and saved already."""
+        if listener is None:
+            return
+        try:
+            listener(*args)
+        except Exception as e:  # noqa: BLE001 - see above
+            log(f"storage: a change listener failed: {e!r}", LOG_ERROR)
+
+    def pin_added(self, cid: Cid) -> float | None:
+        """When cid was first pinned (Unix time; None if not pinned, or pinned before rnfs 0.2.0 recorded it)."""
+        with self._lock:
+            return self._added.get(cid) if cid in self._pins else None
+
+    def pin_order(self, cids) -> list[Cid]:
+        """cids (pinned CIDs) oldest pin first: by when each was first pinned, those pinned before rnfs 0.2.0
+        recorded it (and any not pinned) first, then by CID, so the order is the same at every call."""
+        with self._lock:
+            added = self._added
+            return sorted(cids, key=lambda cid: (added.get(cid, 0.0) if cid in self._pins else 0.0, cid.binary))
 
     def pins(self) -> dict[Cid, set[str]]:
         """Every pin and its sources (a copy)."""
@@ -517,6 +798,15 @@ class Storage:
             if self._pinned is None:
                 self._pinned = frozenset(self._pins)
             return self._pinned
+
+    def own_pinned_cids(self) -> frozenset[Cid]:
+        """Every CID pinned by a source of the user's own content (is_own_source), whatever else pins it: the same
+        frozenset until a pin's sources change."""
+        with self._lock:
+            if self._own_pinned is None:
+                self._own_pinned = frozenset(cid for cid, sources in self._pins.items()
+                                             if any(is_own_source(source) for source in sources))
+            return self._own_pinned
 
     def pinned_by(self, source: str) -> set[Cid]:
         """CIDs held by source."""
@@ -563,6 +853,10 @@ class Storage:
         self._cache[key] = target
         self._cache.move_to_end(key)
         self._cache_dirty.add(key)
+        if previous != target:
+            if previous is not None:  # a retargeted record (rare: a path whose name now leads elsewhere)
+                self._tell(self.cache_listener, "removed", [previous])
+            self._tell(self.cache_listener, "added", [target])
 
     def _drop_records(self, keys) -> list[Cid]:
         """Remove the records of keys, with the bookkeeping every removal needs: the save deletes their rows
@@ -575,6 +869,9 @@ class Storage:
         if targets:
             self._maybe_garbage = True
             self._cache_generation += 1
+            # One per target of the records dropped, as cache_ls lists records: another record may still lead to
+            # the same target, which a client reloading the list then sees
+            self._tell(self.cache_listener, "removed", list(dict.fromkeys(targets)))
         return targets
 
     def _cap_cache(self) -> set[Cid]:
@@ -754,13 +1051,17 @@ class Storage:
         with self._lock:
             links = dict(self._links)
             steps = {cid: dict(names) for cid, names in self._steps.items()} if paths else {}
+            # A DAG memoised as complete is taken whole by the walk (_reach): nothing of it needs reading. After a
+            # start, what is provided has been (the first refresh's dag_blocks), so the first collection reads
+            # (almost) nothing: on a node with 857k blocks a sealed folder's unpack waited 3 minutes for it
+            complete = set(self._complete)
         found_links: dict[Cid, tuple[Cid, ...]] = {}
         found_steps: dict[tuple[Cid, str], tuple[Cid, bool] | None] = {}
         seen: set[Cid] = set()
         stack = list(roots)
         while stack:
             cid = stack.pop()
-            if cid in seen or cid.is_raw:
+            if cid in seen or cid.is_raw or cid in complete:
                 continue
             seen.add(cid)
             listed = links.get(cid)
@@ -823,8 +1124,10 @@ class Storage:
         matches the disk; it is left out of deleted, and the next collection tries again.
         """
         deleted: set[Cid] = set()
-        freed = 0
+        freed = released = 0  # bytes, and what they took on disk
         deferred = False
+        if self._closed:
+            return deleted, freed  # the sizes are saved: the blocks stay, and are collected after the next start
         for cid in cids:
             if cid in self._sizes:
                 if self.blocks.delete(cid) is None:
@@ -832,14 +1135,20 @@ class Storage:
                     deferred = True
                     continue
                 deleted.add(cid)
-                freed += self._sizes.pop(cid)
+                length = self._sizes.pop(cid)
+                freed += length
+                released += self._allocation(length)
+                self._sizes_dirty[cid] = None
                 self._links.pop(cid, None)
                 self._steps.pop(cid, None)
                 self._reported_damaged.discard(cid)
         if deleted:
             self._used -= freed
+            self._allocated -= released
             self._generation += 1
             self._complete = {root: blocks for root, blocks in self._complete.items() if not blocks & deleted}
+            self._complete_entries = {root: entries for root, entries in self._complete_entries.items()
+                                      if root in self._complete}
             self._complete_bytes = {root: n for root, n in self._complete_bytes.items() if root in self._complete}
         if deleted or deferred:
             # A deleted DAG node no longer reaches its children; a deferred block is still garbage
@@ -858,8 +1167,9 @@ class Storage:
         return deleted, freed
 
     def _evict_to(self, limit: int) -> tuple[set[Cid], int, int]:
-        """Delete unreached blocks, then cached fetches least recently used first, until at most limit bytes
-        are stored or nothing evictable is left; returns (deleted, bytes freed, records evicted) (lock held).
+        """Delete unreached blocks, then cached fetches least recently used first, until the blocks take at most
+        limit bytes on disk (allocated_bytes) or nothing evictable is left; returns (deleted, bytes freed, records
+        evicted) (lock held).
 
         One walk: what pins and sessions reach, then each record's own blocks from the most recently used
         down, keeping records while everything kept fits; the older ones are evicted.
@@ -871,7 +1181,8 @@ class Storage:
         # What pins and sessions don't reach, rather than what they do: the bytes kept follow from it with one
         # pass over the stored blocks, and the blocks to delete are what is left of it once records are kept
         dead = self._sizes.keys() - live
-        kept = self._used - sum(map(self._sizes.__getitem__, dead))
+        allocation = self._allocation
+        kept = self._allocated - sum(allocation(self._sizes[cid]) for cid in dead)
         partial: set[Cid] = set()  # path nodes kept without the rest of their DAG: see _reach
         records = list(self._cache.items())  # oldest first
         keep = 0
@@ -879,7 +1190,7 @@ class Storage:
             reached = self._reach({target}, live, damaged, partial)
             path = self._path_cids(root, names, damaged) - live
             more = reached | path
-            more_bytes = sum(map(self._sizes.__getitem__, more))
+            more_bytes = sum(allocation(self._sizes[cid]) for cid in more)
             if kept + more_bytes > limit:
                 break
             live |= more
@@ -903,9 +1214,20 @@ class Storage:
         Raises NotFound if a block is missing, InvalidDag if the DAG breaks a reader check. A missing block is
         remembered (_missing), so asking again while it is still missing walks nothing.
         """
+        return self._complete_dag(cid)[0]
+
+    def dag_entries(self, cid: Cid) -> frozenset[Cid]:
+        """The CIDs directory entries name anywhere in cid's DAG, which must be completely stored and valid: every
+        file and folder below it (not chunks, file nodes or index nodes); none for a file. Found by dag_blocks' walk
+        and memoised with it, so a DAG dag_blocks walked isn't read again. Raises as dag_blocks."""
+        return self._complete_dag(cid)[1]
+
+    def _complete_dag(self, cid: Cid) -> tuple[frozenset[Cid], frozenset[Cid]]:
+        """(dag_blocks, dag_entries) of cid: the DAG walked once, every occurrence of each block checked, and
+        memoised unless a block was deleted meanwhile."""
         with self._lock:
             if cid in self._complete:
-                return self._complete[cid]
+                return self._complete[cid], self._complete_entries[cid]
             missing = self._missing.get(cid)
             if missing is not None:
                 if missing not in self._sizes:
@@ -913,31 +1235,37 @@ class Storage:
                 del self._missing[cid]  # stored since: walk again
             generation = self._generation
         found: set[Cid] = set()
+        entries: set[Cid] = set()  # what the directory nodes met list (each directory's entries, through its index)
+        # The DAG node expectations checked. Raw blocks' aren't kept: checking one again (its stored length against
+        # the expectation) costs no more than looking it up, and they are most of a large DAG's blocks
         seen: set[walker.Expect] = set()
         stack = [walker.root_expect(cid)]
         while stack:
             expect = stack.pop()
-            if expect in seen:
-                continue
-            seen.add(expect)
             if expect.cid.is_raw:
                 length = self.block_size(expect.cid)
                 if length is None:
                     self._lacks(cid, expect.cid)
                 walker.check_raw(expect, length)  # stored blocks were verified, so their length is enough
             else:
+                if expect in seen:
+                    continue
+                seen.add(expect)
                 block = self.get(expect.cid)
                 if block is None:
                     self._lacks(cid, expect.cid)
-                stack.extend(walker.expand(expect, block))
+                node = walker.decode_checked(expect, block)  # a DAG node, as its CID isn't raw
+                if isinstance(node, DirectoryNode):
+                    entries.update(entry.cid for entry in node.entries)
+                stack.extend(walker.children(expect, node))
             found.add(expect.cid)
-        result = frozenset(found)
+        result = frozenset(found), frozenset(entries) if entries else _NO_ENTRIES
         with self._lock:
             # A deletion during the walk may have removed a block already counted
             if self._generation == generation:
-                self._complete[cid] = result
+                self._complete[cid], self._complete_entries[cid] = result
             else:
-                gone = next((block for block in result if block not in self._sizes), None)
+                gone = next((block for block in result[0] if block not in self._sizes), None)
                 if gone is not None:
                     self._lacks(cid, gone, f"a block of {cid} was deleted")
         return result
@@ -997,6 +1325,48 @@ class Storage:
                 uncached = set(self._drop_records(dropped)) - set(self._cache.values())
                 deleted, freed = self._collect() if dropped else (set(), 0)
                 stats.update(uncached=uncached, removed_blocks=len(deleted), freed_bytes=freed)
+                return deleted
+
+        stats["incomplete"] = self._newly_incomplete(targets, act)
+        return stats
+
+    def uncache(self, cids: set[Cid]) -> dict:
+        """Drop every cached fetch leading to one of cids (cache rm), then delete every block nothing reaches, as
+        gc() does for every fetch. A pin of the same content keeps its blocks.
+
+        Returns {"uncached": set[Cid] targets no longer cached, "removed_records", "removed_blocks", "freed_bytes"
+        (the records' own blocks), "unreferenced_blocks", "unreferenced_bytes" (blocks nothing reached before, an
+        unpinned add's say, collected with them), "incomplete": set[Cid] no longer complete}.
+        """
+        with self._lock:
+            records = {key: target for key, target in self._cache.items() if target in cids}
+            targets = self._targets()
+        if not records:
+            return {"uncached": set(), "removed_records": 0, "removed_blocks": 0, "freed_bytes": 0,
+                    "unreferenced_blocks": 0, "unreferenced_bytes": 0, "incomplete": set()}
+        stats = {}
+
+        def act(before: dict[Cid, frozenset[Cid]]) -> set[Cid]:
+            """Drop the records still leading to one of cids and collect; the blocks deleted."""
+            with self._lock:
+                rest = dict(self._cache)
+                roots = self._roots()
+            # What stays is walked without the lock first, as in gc(), so the collection under it reads little
+            self._warm(roots | {target for target in rest.values() if target not in cids},
+                       [key for key, target in rest.items() if key[1] and target not in cids])
+            with self._lock:
+                self._add_memoised(before)
+                # Blocks nothing reached before the records were dropped are collected with them, but aren't theirs:
+                # counted apart, or the content just unpinned was reported as the first CID's own blocks
+                orphans = {cid: self._sizes[cid] for cid in self._sizes.keys() - self._live()}
+                dropped = [key for key, target in self._cache.items() if target in cids]
+                uncached = set(self._drop_records(dropped)) - set(self._cache.values())
+                deleted, freed = self._collect() if dropped else (set(), 0)
+                stray = deleted & orphans.keys()
+                stray_bytes = sum(orphans[cid] for cid in stray)
+                stats.update(uncached=uncached, removed_records=len(dropped), removed_blocks=len(deleted) - len(stray),
+                             freed_bytes=freed - stray_bytes, unreferenced_blocks=len(stray),
+                             unreferenced_bytes=stray_bytes)
                 return deleted
 
         stats["incomplete"] = self._newly_incomplete(targets, act)
@@ -1065,15 +1435,16 @@ class Storage:
                               f"{size(reserve)} reserve free ({size(usage.free)} free)")
 
     def evict(self, needed: int = 0) -> set[Cid]:
-        """Enforce max_storage, leaving room for needed more bytes: delete unreached blocks, then cached
-        fetches least recently used first. Evicts a margin more, so it needn't run again at once.
+        """Enforce max_storage over what the blocks take on disk (allocated_bytes), leaving room for needed more
+        bytes: delete unreached blocks, then cached fetches least recently used first. Evicts a margin more, so it
+        needn't run again at once.
 
         Returns pins and cached targets that were complete and no longer are, for withdrawal.
         """
         def wanted() -> bool:
             """Whether eviction has anything to do (lock held)."""
             # With nothing evictable, don't walk everything to find that out again
-            return self._used + needed > self.max_storage and (bool(self._cache) or self._maybe_garbage)
+            return self._allocated + needed > self.max_storage and (bool(self._cache) or self._maybe_garbage)
 
         with self._lock:
             if not wanted():

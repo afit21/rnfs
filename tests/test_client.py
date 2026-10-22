@@ -20,9 +20,10 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from rnfs.config import Config  # noqa: E402
-from rnfs.constants import BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, KIB, MAX_BLOCK_SIZE, PIN_PATH, PROVIDE_PATH  # noqa: E402
+from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, KIB, MAX_BLOCK_SIZE, PIN_PATH,  # noqa: E402
+                            PROVIDE_PATH, RANGE_BZ2, RANGE_PATH)
 from rnfs.content.cid import RAW, Cid  # noqa: E402
-from rnfs.network import client, links, protocol  # noqa: E402
+from rnfs.network import client, links, paths, protocol  # noqa: E402
 
 import tests.test_links as fakes  # noqa: E402  (a module, so its test cases don't run twice)
 from tests.support import free_port  # noqa: E402
@@ -113,6 +114,7 @@ class PeerClientTest(unittest.TestCase):
         self.assertEqual(self.call(lambda: self.client.find(NODE, KEY)), ([KEY], [NODE]))
 
     def test_find_unreachable(self):
+        links.RNS.Transport.has_path = lambda node_id: False
         links.RNS.Transport.await_path = lambda node_id, timeout: False
         self.assertIsNone(self.call(lambda: self.client.find(NODE, KEY)))
 
@@ -146,6 +148,7 @@ class PeerClientTest(unittest.TestCase):
         self.assertEqual([len(data[0]) for path, data, _ in link.requests], [22, 22, 22])  # one retry
 
     def test_provide_without_a_link_reports_nothing_sent(self):
+        links.RNS.Transport.has_path = lambda node_id: False
         links.RNS.Transport.await_path = lambda node_id, timeout: False
         self.assertEqual(self.call(lambda: self.client.provide(NODE, [KEY], [])), set())
 
@@ -188,6 +191,7 @@ class PeerClientTest(unittest.TestCase):
         peer.link.expected_rate = 80_000
         self.call(lambda: self.client.blocks(NODE, [cid]))
         self.assertEqual(self.client.rate_estimate(NODE), 80_000)
+        self.assertEqual(self.client.traffic.peer(NODE)["link_rate"], 80_000)  # the last link's, for slow paths
         self.call(lambda: self.client.blocks(NODE, [cid]))
         # response_target (60 s) at 80 kbit/s
         self.assertEqual(peer.link.requests[1][1][0], 600_000)
@@ -199,6 +203,7 @@ class PeerClientTest(unittest.TestCase):
         peer.link.expected_rate = 80_000
         self.call(lambda: self.client.blocks(NODE, [cid]))
         self.assertIsNone(self.client.rate_estimate(NODE))
+        self.assertIsNone(self.client.traffic.peer(NODE)["link_rate"])
 
     def test_blocks_elapsed_counts_from_sending(self):
         """A /blocks result's elapsed time runs from sending the request, not from opening the link."""
@@ -218,6 +223,87 @@ class PeerClientTest(unittest.TestCase):
         self.assertLess(result.elapsed, 0.5)  # opening the link isn't counted
         self.respond(lambda link, path, data: False)
         self.assertIsNone(self.call(lambda: self.client.blocks(NODE, [cid])).elapsed)
+
+    # /range (rnfs 0.2.0)
+
+    def serve_ranges(self, block: bytes, compress_answers: bool = False):
+        """Answer /range as a 0.2.0 node would from block (bz2 when asked and compress_answers)."""
+        def answer(link, path, data):
+            """[size, encoding, bytes] for the range asked."""
+            self.assertEqual(path, RANGE_PATH)
+            _, offset, max_bytes, flags = data
+            part = block[offset:offset + max_bytes]
+            if flags & RANGE_BZ2 and compress_answers:
+                return protocol.encode_range_response(len(block), RANGE_BZ2, protocol.compress_range(part))
+            return protocol.encode_range_response(len(block), 0, part)
+        self.respond(answer)
+
+    def test_range_brings_part_then_the_whole_verified_block(self):
+        cid, block = block_of(40 * KIB, 1)
+        self.serve_ranges(block)
+        first = self.call(lambda: self.client.block_range(NODE, cid, b"", 16 * KIB))
+        self.assertEqual((first.status, first.size, first.data, first.block), (client.OK, 40 * KIB, block[:16 * KIB],
+                                                                               None))
+        path, data, max_response_size = fakes.FakeLink.created[0].requests[0]
+        self.assertEqual((path, data), (RANGE_PATH, [cid.binary, 0, 16 * KIB, 0]))
+        self.assertEqual(max_response_size, 17 * KIB)
+        last = self.call(lambda: self.client.block_range(NODE, cid, block[:32 * KIB], 16 * KIB, block_size=40 * KIB))
+        self.assertEqual((last.status, last.data, last.block, last.bad), (client.OK, block[32 * KIB:], block, False))
+        self.assertEqual(fakes.FakeLink.created[0].requests[1][1], [cid.binary, 32 * KIB, 16 * KIB, 0])
+        self.assertEqual(self.client.traffic.peer(NODE)["received"], 40 * KIB)  # counted once verified
+
+    def test_range_compressed(self):
+        data = b"a line of text that repeats itself, as text does\n" * 400
+        cid = Cid.for_block(RAW, data)
+        self.serve_ranges(data, compress_answers=True)
+        result = self.call(lambda: self.client.block_range(NODE, cid, b"", len(data), compress=True))
+        self.assertEqual((result.block, result.compressed), (data, True))
+        self.assertEqual(fakes.FakeLink.created[0].requests[0][1][3], RANGE_BZ2)
+
+    def test_range_mismatch_is_bad(self):
+        cid, block = block_of(1000, 1)
+        self.serve_ranges(b"x" + block[1:])
+        result = self.call(lambda: self.client.block_range(NODE, cid, b"", 1000))
+        self.assertEqual((result.status, result.bad, result.block), (client.OK, True, None))
+        self.assertEqual(self.client.traffic.peer(NODE)["bad"], 1)
+
+    def test_range_unserved_busy_and_malformed(self):
+        cid, block = block_of(1000, 1)
+        for answer, status, missing in (([], client.OK, True), (False, client.BUSY, False),
+                                        ([1000, 0, b"short"], client.FAILED, False),
+                                        ([999, 0, block[:100]], client.FAILED, False),  # not the size known
+                                        ([1000, RANGE_BZ2, block[:100]], client.FAILED, False),  # not asked for
+                                        ([b"a", b"b"], client.FAILED, False), ("x", client.FAILED, False)):
+            with self.subTest(answer=answer):
+                self.respond(lambda link, path, data: answer)
+                result = self.call(lambda: self.client.block_range(NODE, cid, b"", 100, block_size=1000))
+                self.assertEqual((result.status, result.missing, result.data), (status, missing, b""))
+
+    def test_range_left_unanswered_is_silent(self):
+        # What a node before 0.2.0 does: RNS times the request out with the link up
+        self.respond(lambda link, path, data: fakes.FAIL)
+        cid = block_of(10, 1)[0]
+        result = self.call(lambda: self.client.block_range(NODE, cid, b"", 10))
+        self.assertEqual((result.status, result.silent), (client.LOST, True))
+        self.assertTrue(self.client.has_link(NODE))  # the link is fine: /blocks goes on it next
+        self.assertEqual(self.client.traffic.peer(NODE)["failed"], 0)  # not the node's failure
+        # A link the node closed under it isn't silence: a refusal, as for /blocks
+        self.close_under_request(links.DESTINATION_CLOSED)
+        result = self.call(lambda: self.client.block_range(NODE, cid, b"", 10))
+        self.assertEqual((result.status, result.reason, result.silent), (client.BUSY, "closed", False))
+
+    def test_range_stall_closes_link(self):
+        self.respond(lambda link, path, data: fakes.Stall(50_000))
+        cid = block_of(10, 1)[0]
+        result = self.call(lambda: self.client.block_range(NODE, cid, b"", 10))
+        self.assertEqual(result.status, client.STALLED)
+        self.assertFalse(self.client.has_link(NODE))
+
+    def test_hold_link(self):
+        self.assertFalse(self.client.hold_link(NODE, 60))  # no link to hold
+        peer = self.call(lambda: self.pool.get(NODE))
+        self.assertTrue(self.client.hold_link(NODE, 60))
+        self.assertIsNotNone(peer.held_until)
 
     def test_link_mdu(self):
         self.assertIsNone(self.client.link_mdu(NODE))
@@ -239,12 +325,117 @@ class PeerClientTest(unittest.TestCase):
         result = self.call(lambda: self.client.blocks(NODE, [cid]))
         self.assertEqual((result.status, result.unsent), (client.BUSY, [cid]))
 
-    def test_blocks_malformed_or_unanswered(self):
+    def test_blocks_malformed_fails(self):
         cid = block_of(10, 1)[0]
-        for answer in ([b"a", b"b"], "x", fakes.FAIL, []):
+        for answer in ([b"a", b"b"], "x", []):
             with self.subTest(answer=answer):
                 self.respond(lambda link, path, data: answer)
                 self.assertEqual(self.call(lambda: self.client.blocks(NODE, [cid])).status, client.FAILED)
+
+    def test_blocks_timed_out_is_lost(self):
+        # RNS gave up on the request with the link up: its packet or its answer's was lost, most likely
+        self.respond(lambda link, path, data: fakes.FAIL)
+        cid = block_of(10, 1)[0]
+        result = self.call(lambda: self.client.blocks(NODE, [cid]))
+        self.assertEqual((result.status, result.unsent), (client.LOST, [cid]))
+        self.assertTrue(self.client.has_link(NODE))  # the fetcher decides whether to close it
+
+    def test_a_request_unanswered_on_a_silent_link_is_lost(self):
+        """Nothing came back on the link while it waited: the link is closed for it (Links._went_dead), which is how a
+        lone lost request looks over LoRa, so the provider is asked again on a new link rather than failed."""
+        def silent(link, path, data):
+            """Hear nothing on the link, and leave the request unanswered."""
+            link.silence = 10_000.0
+            return fakes.FAIL
+        self.respond(silent)
+        for request in (lambda: self.client.blocks(NODE, [block_of(10, 1)[0]]),
+                        lambda: self.client.block_range(NODE, block_of(10, 1)[0], b"", 1024, answers=True)):
+            result = self.call(request)
+            self.assertEqual(result.status, client.LOST)
+            self.assertFalse(self.client.has_link(NODE))
+
+    def close_under_request(self, reason):
+        """Respond by closing the link with RNS's teardown reason (None: closed by this node's teardown())."""
+        def answer(link, path, data):
+            """Close the link instead of answering."""
+            link.teardown_reason = reason
+            link.teardown()
+            return fakes.SILENT
+        self.respond(answer)
+
+    def test_blocks_on_a_link_that_timed_out_is_lost(self):
+        self.close_under_request(links.LINK_TIMEOUT)
+        result = self.call(lambda: self.client.blocks(NODE, [block_of(10, 1)[0]]))
+        self.assertEqual(result.status, client.LOST)
+
+    def test_blocks_on_a_link_closed_by_this_node_fails(self):
+        self.close_under_request(links.INITIATOR_CLOSED)
+        result = self.call(lambda: self.client.blocks(NODE, [block_of(10, 1)[0]]))
+        self.assertEqual(result.status, client.FAILED)
+
+    def test_blocks_on_a_link_the_provider_closed_is_busy(self):
+        # A server with no room for another incoming link closes it (RNS: DESTINATION_CLOSED at the opener): a
+        # refusal, retried on a new link after the busy delay, as a False is
+        self.close_under_request(links.DESTINATION_CLOSED)
+        result = self.call(lambda: self.client.blocks(NODE, [block_of(10, 1)[0]]))
+        self.assertEqual((result.status, result.reason), (client.BUSY, "closed"))
+        self.assertEqual(self.client.traffic.snapshot()["totals"]["refused"], 1)
+
+    def find_closed(self, node_id: bytes = NODE) -> tuple:
+        """/find to NODE on a thread: (its answer, closed_by_node(node_id) on that thread afterwards)."""
+        return self.call(lambda: (self.client.find(NODE, KEY), self.client.closed_by_node(node_id)))
+
+    def test_find_on_a_link_the_server_closed_is_a_refusal(self):
+        """closed_by_node tells the lookup's failure callback, on the querying thread, that the server closed the link:
+        not counted against it (specification section 6)."""
+        self.close_under_request(links.DESTINATION_CLOSED)
+        self.assertEqual(self.find_closed(), (None, True))
+        self.assertEqual(self.find_closed(KEY), (None, False))  # asked about another node
+        self.assertFalse(self.client.closed_by_node(NODE))  # another thread
+        self.assertEqual(self.client.traffic.snapshot()["totals"]["refused"], 2)
+        for reason in (links.LINK_TIMEOUT, links.INITIATOR_CLOSED):
+            with self.subTest(reason=reason):
+                self.close_under_request(reason)
+                self.assertEqual(self.find_closed(), (None, False))
+        self.respond(lambda link, path, data: [[KEY], [NODE]])
+        self.assertEqual(self.find_closed(), (([KEY], [NODE]), False))
+
+    def test_link_closed_as_it_is_established_is_a_refusal(self):
+        def refuse(link):
+            """The server tears the link down as it establishes it."""
+            link.teardown_reason = links.DESTINATION_CLOSED
+            link.teardown()
+            return True
+        fakes.FakeLink.establishes = staticmethod(refuse)
+        self.addCleanup(setattr, fakes.FakeLink, "establishes", None)
+        charged = self.pool.paths.charged
+        self.assertEqual(self.find_closed(), (None, True))
+        self.assertTrue(self.pool.refused(NODE) and not self.pool.unestablished(NODE))
+        self.assertEqual(self.pool.paths.charged, charged)  # RNS doesn't ask for the path again
+        result = self.call(lambda: self.client.blocks(NODE, [block_of(10, 1)[0]]))
+        self.assertEqual((result.status, result.reason), (client.BUSY, "closed"))
+        fakes.FakeLink.establishes = None
+        self.respond(lambda link, path, data: [[KEY], [NODE]])
+        self.assertIsNotNone(self.call(lambda: self.client.find(NODE, KEY)))
+        self.assertFalse(self.pool.refused(NODE))
+
+    def test_blocks_link_not_established_is_lost_no_path_fails(self):
+        cid = block_of(10, 1)[0]
+        self.respond(lambda link, path, data: [None])
+        fakes.FakeLink.establishes = staticmethod(lambda link: False)
+        self.addCleanup(setattr, fakes.FakeLink, "establishes", None)
+        result = self.call(lambda: self.client.blocks(NODE, [cid]))
+        self.assertEqual((result.status, result.reason), (client.LOST, "link not established"))
+        fakes.FakeLink.establishes = None  # established now: what get() last saw is forgotten
+        self.assertEqual(self.call(lambda: self.client.blocks(NODE, [cid])).status, client.OK)
+        self.pool.close(NODE)
+        # A budget that hasn't seen the failed link: after one, the pool waits path_timeout for the path RNS requests
+        # again by itself (network/paths.py) rather than failing at once
+        self.pool.paths = paths.PathRequests(transport=lambda: links.RNS.Transport, reticulum=lambda: None)
+        links.RNS.Transport.has_path = lambda node_id: False
+        links.RNS.Transport.await_path = lambda node_id, timeout: False
+        result = self.call(lambda: self.client.blocks(NODE, [cid]))
+        self.assertEqual((result.status, result.reason), (client.FAILED, "unreachable"))
 
     def test_blocks_empty_answer_is_a_failure(self):
         # An honest node always answers at least the first CID, so an empty answer is malformed: as OK it
@@ -264,6 +455,31 @@ class PeerClientTest(unittest.TestCase):
         self.assertIn("no progress", result.reason)
         self.assertEqual(fakes.FakeLink.created[0].status, fakes.FakeLink.CLOSED)
         self.assertFalse(self.client.has_link(NODE))
+
+    def test_a_stall_leaves_the_link_to_a_request_waiting_for_its_slot(self):
+        """REL-7: closing the link for a stalled response failed every other request on it outright (one waiting for the
+        /blocks slot came back failed, and its fetch failed the provider). It is left to them; one that wasn't sent
+        because the link closed meanwhile is lost, asked again on a new link, not failed."""
+        first, second = block_of(10, 1)[0], block_of(10, 2)[0]
+        served = {second: block_of(10, 2)[1]}
+        self.respond(lambda link, path, data: fakes.Stall(10_000) if first.binary in data[1]
+                     else protocol.encode_blocks_response([served.get(Cid.from_bytes(c)) for c in data[1]]))
+        results = {}
+        stalled = threading.Thread(target=lambda: results.__setitem__("first", self.client.blocks(NODE, [first])))
+        stalled.start()
+        time.sleep(0.2)  # its /blocks holds the link's slot
+        results["second"] = self.call(lambda: self.client.blocks(NODE, [second]))
+        stalled.join(5)
+        self.assertEqual(results["first"].status, client.STALLED)
+        self.assertEqual((results["second"].status, list(results["second"].blocks)), (client.OK, [second]))
+        self.assertEqual(len(fakes.FakeLink.created), 1)  # the same link served it
+
+    def test_a_request_not_sent_as_its_link_closed_is_lost(self):
+        self.respond(lambda link, path, data: [None])
+        peer = self.call(lambda: self.pool.get(NODE))
+        exchange = links.Exchange(time.monotonic)
+        self.pool.close_link(peer)
+        self.assertTrue(client.PeerClient._lost(peer, exchange))
 
     def peer_with_incoming(self, incoming):
         """Open the shared link, giving it an incoming_resources list like RNS's."""
@@ -340,6 +556,8 @@ CLIENT_CONFIG = """
 
 E2E_BLOCKS = [(60_000, seed) for seed in range(4)] + [(500, 99)]  # sizes and seeds of the served blocks
 E2E_MISSING = 1234  # seed of a block nobody serves
+# A compressible block the server serves too, which the client fetches in compressed /range requests (rnfs 0.2.0)
+E2E_TEXT = b"".join(b"line %d of a text that compresses well, as text does\n" % i for i in range(2000))[:100_000]
 
 
 def start_reticulum(configdir: str):
@@ -354,6 +572,7 @@ class E2EBackend:
     def __init__(self):
         """Serve the integration test's blocks."""
         self.blocks = dict(block_of(size, seed) for size, seed in E2E_BLOCKS)
+        self.blocks[Cid.for_block(RAW, E2E_TEXT)] = E2E_TEXT
         self.records: dict[bytes, list[bytes]] = {}
         self.lock = threading.Lock()
 
@@ -379,6 +598,10 @@ class E2EBackend:
     def served_block(self, cid):
         """The served block for cid, if any."""
         return self.blocks.get(cid)
+
+    def serves(self, cid):
+        """Whether a block is served for cid."""
+        return cid in self.blocks
 
     def remote_pin(self, identity_hash, cid, pin):
         """Accept or refuse a remote pin."""
@@ -456,6 +679,16 @@ def run_e2e_client(configdir: str, server_hex: str):
     results["verified"] = all(cid.verify(block) for cid, block in received.items())
     results["missing"] = [str(cid) for cid in missing]
     results["rate"] = peers.rate_estimate(server_id)
+    # /range (rnfs 0.2.0): the text block in compressed ranges of 16 KiB, each checked and the whole verified
+    text_cid, held, ranges = Cid.for_block(RAW, E2E_TEXT), b"", []
+    for _ in range(20):
+        answer = peers.block_range(server_id, text_cid, held, 16 * KIB, compress=True)
+        ranges.append([answer.status, len(answer.data), answer.wire, answer.compressed])
+        if answer.status != client.OK or answer.block is not None:
+            break
+        held += answer.data
+    results["ranges"] = ranges
+    results["range_block"] = answer.block == E2E_TEXT
     results["ping"] = peers.ping(server_id)
     deadline = time.monotonic() + 15
     while server_id not in heard and time.monotonic() < deadline:
@@ -539,6 +772,12 @@ class TwoNodeTest(unittest.TestCase):
         self.assertIsInstance(results["ping"], float)
         self.assertTrue(results["heard_server"])
         self.assertEqual(results["mode"], 1)
+        # /range over real RNS: compressed ranges (single packets and Resources, both past the guards' precheck)
+        # rebuild the block, verified; each range's bytes on the wire well under its bytes
+        self.assertTrue(results["range_block"], results["ranges"])
+        self.assertTrue(all(status == client.OK and compressed for status, _, _, compressed in results["ranges"]),
+                        results["ranges"])
+        self.assertLess(sum(wire for _, _, wire, _ in results["ranges"]), len(E2E_TEXT) // 3)
         # The server found its response Resources and recorded the link's rate when they completed
         self.assertGreaterEqual(server_state["rates"], 1)
         self.assertEqual(server_state["responses"], 0)

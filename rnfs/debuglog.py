@@ -1,6 +1,6 @@
 """The debug log file (setting `debug_log`, or `daemon --debug-log`): <rnfs dir>/debug.log, for diagnosing a daemon.
 
-- It begins with the daemon's version, then the Python, RNS and LXMF versions, the platform, and the settings
+- It begins with the daemon's version, then the Python and RNS versions, the platform, and the settings
   that differ from the defaults. Each start moves the previous run's file to debug.log.1; past MAX_SIZE the file
   is moved there too and a new one begun, also with the version first, so the two hold at most 2 × MAX_SIZE.
 - Every rnfs message at every level, whatever verbosity the console shows (rnfs.log hands each one here), with
@@ -84,11 +84,9 @@ class DebugLog:
         winacl.make_private(self.path)  # Windows ignores the mode; elsewhere this does nothing
         self._size = 0
         now = time.strftime("%Y-%m-%d %H:%M:%S %z")
-        lxmf = _package_version("lxmf")
         for line in (f"rnfs {__version__} debug log, " + (f"continued {now} (earlier lines: {DEBUG_LOG_FILE}.1)"
                                                          if continued else f"started {now} (pid {os.getpid()})"),
-                     f"Python {platform.python_version()} on {platform.platform()}; RNS {_package_version('rns')}; "
-                     f"LXMF {lxmf or 'not installed'}",
+                     f"Python {platform.python_version()} on {platform.platform()}; RNS {_package_version('rns')}",
                      f"settings other than the defaults: {self.settings}"):
             self._put(printable(line) + "\n")
 

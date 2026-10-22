@@ -24,7 +24,7 @@ _passing = threading.local()
 
 def log(message: str, level: int = LOG_INFO):
     """Log message with an "rnfs" prefix at the given RNS loglevel, non-printable characters escaped."""
-    # Messages carry remote-chosen names (DAG entries, LXMF links, request paths): escaping here, once,
+    # Messages carry remote-chosen names (DAG entries, request paths): escaping here, once,
     # keeps escape sequences and fake newlines out of every log line without each caller remembering
     text = printable(message)
     sink = _debug_sink
@@ -82,6 +82,49 @@ class ThrottledLog:
         skipped = self.due()
         if skipped is not None:
             log(message + (f" ({skipped} more since the last)" if skipped else ""), level)
+
+
+class SlowStep:
+    """A step of a start that takes minutes on a large node, said in the log while it runs (a context manager): once
+    it has taken `after` seconds, what it is doing, then every `interval` seconds that it is still at it, and at the
+    end how long it took. A quick one logs nothing. So a start busy with it isn't taken for a hung one, as one silent
+    for minutes was (a node with 857k blocks spent 80 s working out what it provides, before its API answered)."""
+
+    def __init__(self, doing: str, done: str, after: float = 10.0, interval: float = 30.0,
+                 level: int = LOG_NOTICE, clock: Callable[[], float] = time.monotonic):
+        """doing: what the step does, said once it has taken after seconds ("working out what this node
+        provides"); done: what it did, said with the time it took ("worked out what this node provides")."""
+        self.doing, self.done, self.after, self.interval, self.level, self.clock = \
+            doing, done, after, interval, level, clock
+        self._finished = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.said = False  # set once doing was logged (read after the step)
+        self._started = 0.0
+
+    def __enter__(self):
+        """Start timing the step."""
+        self._started = self.clock()
+        self._thread = threading.Thread(target=self._watch, name="rnfs-slow-step", daemon=True)
+        self._thread.start()
+        return self
+
+    def _watch(self):
+        """Say what the step does after `after` seconds, and that it still is every interval, until it ends."""
+        if self._finished.wait(self.after):
+            return
+        self.said = True
+        log(f"{self.doing} (on a large node this takes a while)", self.level)
+        while not self._finished.wait(self.interval):
+            log(f"still {self.doing}: {self.clock() - self._started:.0f} s so far", self.level)
+
+    def __exit__(self, *exc):
+        """The step ended: stop watching, and say how long it took if it was said to be under way."""
+        self._finished.set()
+        if self._thread is not None:
+            self._thread.join()
+        if self.said and exc[0] is None:
+            log(f"{self.done} in {self.clock() - self._started:.0f} s", self.level)
+        return False
 
 
 def node_name(node_id: bytes | None) -> str:

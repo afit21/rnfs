@@ -2,12 +2,14 @@
 import contextlib
 import http.server
 import io
+import json
 import os
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -16,6 +18,7 @@ from rnfs.api import ApiServer
 from rnfs.content.cid import RAW, Cid
 from tests.support import CAN_SYMLINK, POSIX_MODES, free_port, real
 from tests.test_api import FakeNode
+from tests.test_fsutil import hold_lock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -100,6 +103,7 @@ class ParsingTest(unittest.TestCase):
                      ["pin", "remote", "rm", node, cid], ["gc"], ["verify"], ["providers", cid], ["ping", node],
                      ["name", "create", "a"], ["name", "rm", "a"], ["name", "export", "a"], ["name", "import", "a"],
                      ["name", "list"], ["name", "publish", "a", cid], ["name", "resolve", node],
+                     ["name", "sync", "a", "f"], ["name", "unsync", "a"], ["name", "syncs", "--json"],
                      ["export", cid, "-o", "f"], ["import", "f"], ["status"], ["daemon"]):
             self.assertTrue(callable(cli.build_parser().parse_args(argv).run), argv)
 
@@ -225,6 +229,66 @@ class ContentCommandTest(CliTestCase):
 
 class OtherCommandTest(CliTestCase):
 
+    def test_pin_label_and_cache(self):
+        """pin label sets and clears a label; cache ls lists downloads (names escaped), cache rm evicts them."""
+        cid = self.node.put_file(b"abc")
+        self.ok("pin", "add", cid)
+        self.assertEqual(self.ok("pin", "label", cid, "my file"), f"{cid}  my file\n")
+        self.assertEqual(self.ok("pin", "label", cid), f"{cid}: label cleared\n")
+        self.assertEqual([args for args, _ in self.node.called("pin_label")], [(cid, "my file"), (cid, None)])
+        self.node.cached.add(cid)
+        self.assertEqual(self.ok("cache", "ls"), f"{cid} 1 B\n")
+        self.assertEqual(json.loads(self.ok("cache", "ls", "--json"))[0]["cid"], cid)
+        self.assertEqual(self.ok("cache", "rm", cid), f"{cid}: removed 1 blocks, freed 1 bytes\n")
+        code, _, err = self.run_cli("cache", "rm", cid)
+        self.assertEqual((code, err.strip()), (1, f"rnfs: {cid} is not in the cache"))
+
+    def test_url(self):
+        """url prints a target's site URL, from the base32 CID or a name, for the running daemon's gateway port
+        or else rnfs.toml's; nicks and invalid targets are refused. It never calls the daemon."""
+        from rnfs.content.cid import to_base36
+        raw = str(Cid.for_block(RAW, b"x"))
+        node = self.node.put_dir({"a b": raw})
+        label, dag_label = to_base36(Cid.parse(raw)), to_base36(Cid.parse(node))
+        self.assertEqual(self.ok("url", raw), f"http://{label}.rnfs.localhost:8789/\n")
+        self.assertEqual(self.ok("url", f"{node}/a b/c?#%"),
+                         f"http://{dag_label}.rnfs.localhost:8789/a%20b/c%3F%23%25\n")
+        self.assertEqual(self.ok("url", f"{node}/sub/"), f"http://{dag_label}.rnfs.localhost:8789/sub/\n")
+        self.assertEqual(self.ok("url", "AB" * 16 + "/index.html"),
+                         f"http://{'ab' * 16}.name.localhost:8789/index.html\n")
+        for target in ("mysite", "b", label, f"{raw}//x", "ab" * 15):
+            code, out, err = self.run_cli("url", target)
+            self.assertEqual((code, out), (1, b""), target)
+            self.assertTrue(err.startswith("rnfs: "), err)
+        # rnfs.toml's port, then a running daemon's (daemon.json)
+        with open(os.path.join(self.tmp, "rnfs.toml"), "w") as f:
+            f.write("gateway_port = 9000\n")
+        self.assertEqual(self.ok("url", raw), f"http://{label}.rnfs.localhost:9000/\n")
+        cli.write_daemon_info(os.path.join(self.tmp, "daemon.json"), {"pid": os.getpid(), "api_port": 9001,
+                                                                       "gateway_port": 9002})
+        self.assertEqual(self.ok("url", raw), f"http://{label}.rnfs.localhost:9002/\n")
+        os.remove(os.path.join(self.tmp, "daemon.json"))
+        with open(os.path.join(self.tmp, "rnfs.toml"), "w") as f:
+            f.write("gateway_port = 0\n")
+        code, _, err = self.run_cli("url", raw)
+        self.assertEqual(code, 1)
+        self.assertIn("gateway_port is 0", err)
+        self.assertEqual(self.node.calls, [])
+
+    def test_stop(self):
+        """stop asks the daemon to stop and waits until its API no longer answers; a daemon that can't be
+        stopped through its API is reported."""
+        code, _, err = self.run_cli("stop", "--wait", "1")
+        self.assertEqual(code, 1)
+        self.assertIn("can't be stopped through its API", err)
+        stopping = threading.Event()
+        server = ApiServer(self.node, 0, token=self.server.token, shutdown=stopping.set)
+        server.start()
+        self.addCleanup(server.stop)
+        threading.Thread(target=lambda: stopping.wait(10) and server.stop(), daemon=True).start()
+        with mock.patch("rnfs.api.log"):  # the daemon's own log line, which goes to stdout here
+            self.assertEqual(self.ok("stop", port=server.port), "rnfs: the daemon stopped\n")
+
     def test_pins(self):
         cid = self.node.put_file(b"abc")
         self.assertEqual(self.ok("pin", "add", cid), cid + "\n")
@@ -240,6 +304,23 @@ class OtherCommandTest(CliTestCase):
                          [(bytes.fromhex("ab" * 16), cid, True), (bytes.fromhex("ab" * 16), cid, False)])
         self.assertEqual(self.run_cli("pin", "remote", "add", "ff" * 16, cid)[0], 1)
 
+    def test_remote_pin_status(self):
+        """pin remote ls lists the pins asked for (filtered, --check passed on, --json), --served those served and
+        each identity's usage."""
+        cid = self.node.put_file(b"abc")
+        out = self.ok("pin", "remote", "ls")
+        self.assertRegex(out, rf"^{'ab' * 16}  bafkreie  waiting  asked \d+d ago\n$")
+        out = self.ok("pin", "remote", "ls", "ab" * 16, cid, "--check")
+        self.assertRegex(out, rf"^{'ab' * 16}  {cid}  done  asked \d+d ago, checked \d+d ago\n$")
+        self.assertEqual(self.node.called("pin_remote_ls"),
+                         [((None, None), {}), ((bytes.fromhex("ab" * 16), cid), {"check": True})])
+        self.assertEqual(json.loads(self.ok("pin", "remote", "ls", "--json"))[0]["state"], "waiting")
+        out = self.ok("pin", "remote", "ls", "--served").splitlines()
+        self.assertEqual(out[0], f"{'cd' * 16}: 5 B of 100 B used, 1 pinned, 0 waiting")
+        self.assertRegex(out[1], rf"^{'cd' * 16}  bafkreie  dropped \(quota\)  \d+d ago: too big$")
+        self.assertEqual(json.loads(self.ok("pin", "remote", "ls", "--served", "--json"))["quota"], 100)
+        self.assertEqual(self.run_cli("pin", "remote", "ls", "--served", "--check")[0], 1)
+
     def test_maintenance_and_network(self):
         cid = self.node.put_file(b"abc")
         self.assertEqual(self.ok("gc"), "removed 3 blocks, freed 300 bytes\n")
@@ -250,6 +331,79 @@ class OtherCommandTest(CliTestCase):
         self.assertEqual(self.ok("ping", "cd" * 16), "round-trip time 250 ms\n")
         self.assertEqual(self.run_cli("ping", "ff" * 16)[0], 1)
         self.assertIn(f"node_id: {bytes(range(16)).hex()}", self.ok("status"))
+
+    def test_status_network(self):
+        """status prints every field as "name: value", and what the node sees of the network as a few lines at the
+        end; a daemon without those fields (before 0.2.0) gets none of them."""
+        tier = {"records": 0, "share": 0.0, "floor": 0.3, "refused_hour": 0, "refused_day": 0, "evicted_hour": 0,
+                "evicted_day": 0}
+        status = {"node_id": "ab" * 16, "private": False, "known_nodes": 57, "records": 7105, "partition": True,
+                  "partition_since": time.time() - 2 * 3600 - 300,
+                  "network": {"size_estimate": 1240, "size_samples": 16, "density_checked_hour": 48,
+                              "density_flagged_hour": 2, "density_checked_day": 1104, "density_flagged_day": 9},
+                  "record_store": {"bytes": 3 * 1024 * 1024, "budget": 1024 ** 3, "capacity": 7_000_000,
+                                   "full": True, "publishers": 141, "own_records": 5,
+                                   "tiers": {"known": {**tier, "records": 100, "share": 0.0001},
+                                             "earned": {**tier, "records": 6000, "share": 0.0009, "floor": 0.6},
+                                             "newcomer": {**tier, "records": 1000, "share": 0.1429, "floor": 0.1,
+                                                          "refused_hour": 3, "refused_day": 40, "evicted_hour": 1,
+                                                          "evicted_day": 12}}}}
+        with mock.patch.object(self.node, "status", return_value=status):
+            out = self.ok("status").splitlines()
+        self.assertEqual(out[:6], [f"node_id: {'ab' * 16}", "private: False", "known_nodes: 57", "records: 7105",
+                                   "partition: True", f"partition_since: {status['partition_since']}"])
+        self.assertEqual(out[6:], [
+            "network_size: about 1240 DHT servers (estimated from 16 lookups); 57 servers in the routing table",
+            "density_check: fired on 2 of 48 checks in the last hour, 9 of 1104 in the last day",
+            "partition_for: 2 h 5 min",
+            "record_store: 3.0 MiB of 1.0 GiB (room for 7000000 records), full; 7105 records (5 this node's) from 141 "
+            "publishers",
+            "record_tiers: known 100 (0.0%, floor 30%), earned 6000 (0.1%, floor 60%), newcomer 1000 (14.3%, floor "
+            "10%)",
+            "records_refused: 3 in the last hour, 40 in the last day (newcomer 40)",
+            "records_evicted: 1 in the last hour, 12 in the last day (newcomer 12)"])
+        status["network"]["size_estimate"] = None
+        status["network"]["size_samples"] = 3
+        with mock.patch.object(self.node, "status", return_value=status):
+            self.assertIn("network_size: not estimated yet (3 of the 8 complete lookups it needs); 57 servers in the "
+                          "routing table", self.ok("status").splitlines())
+        older = {key: value for key, value in status.items() if key not in ("network", "record_store", "partition")}
+        with mock.patch.object(self.node, "status", return_value=older):
+            self.assertEqual(self.ok("status").splitlines(), [f"{key}: {value}" for key, value in older.items()])
+
+    def test_status_clock(self):
+        """status prints clock_offset and announces_held as fields, and warns on stderr of a clock estimated over 5
+        minutes behind and of names whose announces are held; not within 5 minutes, never of a clock ahead (a
+        negative clock_offset, which an earlier 0.2.0 build reported: late announces look the same), nor from a
+        daemon before 0.2.0."""
+        status = {"node_id": "ab" * 16, "announces_held": ["site", "blog"], "clock_offset": 3720}
+        with mock.patch.object(self.node, "status", return_value=status):
+            code, out, err = self.run_cli("status")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.decode().splitlines(), [f"node_id: {'ab' * 16}", "announces_held: site, blog",
+                                                     "clock_offset: 3720"])
+        self.assertEqual(err.splitlines(), [
+            "rnfs: warning: this node's clock seems to be 1 h 2 min behind, going by the announces it hears; set it "
+            "right",
+            "rnfs: warning: the announces of site, blog are held until the clock passes their last announce (RNS would "
+            "drop them)"])
+        for quiet in ({"node_id": "ab" * 16, "announces_held": [], "clock_offset": -300},
+                      {"node_id": "ab" * 16, "announces_held": [], "clock_offset": -7200},
+                      {"node_id": "ab" * 16, "announces_held": [], "clock_offset": None}, {"node_id": "ab" * 16}):
+            with mock.patch.object(self.node, "status", return_value=quiet):
+                self.assertEqual(self.run_cli("status")[2], "")
+
+    def test_publish_held(self):
+        """name publish warns, on stderr, of an announce held for the clock, after saying it published."""
+        cid = self.node.put_file(b"abc")
+        name = self.ok("name", "create", "site").strip()
+        original = self.node.name_publish
+        reason = "announce held: this node's clock is 10 min behind the name's last announce"
+        with mock.patch.object(self.node, "name_publish",
+                               lambda alias, target: {**original(alias, target), "announce_held": reason}):
+            code, out, err = self.run_cli("name", "publish", "site", cid)
+        self.assertEqual((code, out.decode()), (0, f"published {cid} as {name} (sequence 1)\n"))
+        self.assertEqual(err, f"rnfs: warning: {reason}\n")
 
     def test_names(self):
         cid = self.node.put_file(b"abc")
@@ -274,6 +428,22 @@ class OtherCommandTest(CliTestCase):
         self.ok("name", "rm", "copy")
         self.assertNotIn("copy\t", self.ok("name", "list"))
 
+    def test_name_sync(self):
+        """name sync sends the folder made absolute; syncs lists the syncs (and as JSON); unsync stops one, and fails
+        for a name not synced."""
+        self.ok("name", "create", "site")
+        os.makedirs(os.path.join(self.tmp, "site"))
+        with contextlib.chdir(self.tmp):
+            self.assertIn("syncing", self.ok("name", "sync", "site", "site"))
+        ((alias, path),) = [args for args, _ in self.node.called("name_sync")]
+        self.assertEqual((alias, real(path)), ("site", real(os.path.join(self.tmp, "site"))))
+        self.assertEqual(self.ok("name", "syncs"), f"site\tnew\t-\t{path}\n")
+        self.assertEqual([entry["alias"] for entry in json.loads(self.ok("name", "syncs", "--json"))], ["site"])
+        self.ok("name", "unsync", "site")
+        self.assertEqual(self.ok("name", "syncs"), "")
+        self.assertEqual(self.run_cli("name", "unsync", "site")[0], 1)
+        self.assertEqual(self.run_cli("name", "sync", "site", os.path.join(self.tmp, "missing"))[0], 1)
+
     def test_archives(self):
         cid = self.node.put_file(b"abc")
         with contextlib.chdir(self.tmp):
@@ -287,6 +457,21 @@ class OtherCommandTest(CliTestCase):
         code, _, err = self.run_cli("status", port=free_port())
         self.assertEqual(code, 1)
         self.assertIn("no daemon is running", err)
+
+    def test_daemon_starting(self):
+        # The daemon locks its rnfs dir before opening the block store, and its API listens only after
+        holder = hold_lock(os.path.join(self.tmp, "daemon.lock"))
+        try:
+            for command in (("status",), ("pin", "ls")):
+                with self.subTest(command=command):
+                    code, _, err = self.run_cli(*command, port=free_port())
+                    self.assertEqual(code, 1)
+                    self.assertIn(f"the daemon (process {holder.pid}) is starting", err)
+                    self.assertNotIn("no daemon is running", err)
+        finally:
+            holder.stdin.close()
+            holder.wait(30)
+            holder.stdout.close()
 
     def test_sends_api_header_and_host(self):
         # The server would answer 403 otherwise; check the exact header anyway
@@ -362,6 +547,17 @@ class OtherCommandTest(CliTestCase):
         self.assertEqual(raised.exception.code, "rnfs: the rnfs dir isn't private")
         self.assert_unlocked()
 
+    def test_daemon_writes_its_log_a_line_at_a_time(self):
+        """Under systemd stdout is a pipe, which Python buffers in blocks: the daemon's log lines would reach the
+        journal hours late. The daemon makes stdout line-buffered before anything else."""
+        from rnfs.errors import RnfsError
+        stdout = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+        self.assertFalse(stdout.line_buffering)
+        with mock.patch("sys.stdout", stdout), mock.patch("rnfs.node.RnfsNode", side_effect=RnfsError("test")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.main(["--dir", self.tmp, "daemon"])
+        self.assertTrue(stdout.line_buffering)
+
     def test_debug_log_that_cant_open_fails_cleanly(self):
         """A debug log that can't be written is a message, and the daemon.lock taken before it is let go."""
         with mock.patch("rnfs.debuglog.start", side_effect=OSError("disk full")), \
@@ -375,6 +571,69 @@ class OtherCommandTest(CliTestCase):
         hold the lock, and on Windows keep the temp dir from being removed)."""
         fd = fsutil.lock_exclusive(os.path.join(self.tmp, cli.LOCK_FILE))
         os.close(fd)
+
+
+class AppCommandTest(CliTestCase):
+    """rnfs app add, ls and rm."""
+
+    def setUp(self):
+        """The FakeNode gets a real app registry."""
+        super().setUp()
+        from rnfs.apps import AppRegistry
+        self.node.apps = AppRegistry(os.path.join(self.tmp, "state"))
+        self.addCleanup(self.node.apps.close)
+        quiet = mock.patch("rnfs.apps.log")  # the daemon's own log lines, which go to stdout here
+        quiet.start()
+        self.addCleanup(quiet.stop)
+
+    def test_add_prints_the_token_once(self):
+        """app add prints only the token on stdout (for scripts) and on stderr that the app can do anything the
+        CLI can, managing apps included in effect; the token works as the app's."""
+        code, out, err = self.run_cli("app", "add", "wiki")
+        self.assertEqual(code, 0, err)
+        token = out.decode().strip()
+        self.assertEqual(out.decode(), token + "\n")
+        self.assertTrue(self.node.apps.verify("wiki", token))
+        self.assertIn("can do anything this command line can", err)
+        self.assertIn("in effect manage apps too", err)
+        self.assertIn("rnfs app rm wiki", err)
+
+    def test_add_writes_the_token_to_a_new_private_file(self):
+        """-o writes the token to a new file only this user can read, which read_token accepts; an existing one is
+        refused before any app is added."""
+        from rnfs import apiclient
+        path = os.path.join(self.tmp, "wiki_token")
+        out = self.ok("app", "add", "wiki", "-o", path)
+        self.assertEqual(out, f"app wiki: its token is in {path}\n")
+        token = apiclient.read_token(path, "wiki")
+        self.assertTrue(self.node.apps.verify("wiki", token))
+        if POSIX_MODES:
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        code, _, err = self.run_cli("app", "add", "notes", "-o", path)
+        self.assertEqual((code, err.strip()), (1, f"rnfs: {path} already exists"))
+        self.assertNotIn("notes", self.node.apps)
+
+    def test_unwritable_output_leaves_no_app(self):
+        """An -o that can't be written removes the app again: nobody would have its token."""
+        path = os.path.join(self.tmp, "no such dir", "token")
+        code, _, err = self.run_cli("app", "add", "wiki", "-o", path)
+        self.assertEqual(code, 1)
+        self.assertIn("app wiki was not added", err)
+        self.assertEqual(self.node.apps.list(), [])
+
+    def test_ls_and_rm(self):
+        """app ls lists names and when added (--json too); app rm revokes one; errors are the daemon's."""
+        self.node.apps.add("wiki")
+        self.node.apps.add("notes")
+        lines = self.ok("app", "ls").splitlines()
+        self.assertEqual([line.split("\t")[0] for line in lines], ["notes", "wiki"])
+        self.assertEqual([app["name"] for app in json.loads(self.ok("app", "ls", "--json"))], ["notes", "wiki"])
+        self.assertEqual(self.ok("app", "rm", "wiki"), "removed app wiki, releasing 0 pins\n")
+        code, _, err = self.run_cli("app", "rm", "wiki")
+        self.assertEqual((code, err.strip()), (1, "rnfs: no app called wiki"))
+        code, _, err = self.run_cli("app", "add", "Bad")
+        self.assertEqual(code, 1)
+        self.assertIn("invalid app name", err)
 
 
 class TokenTest(CliTestCase):
