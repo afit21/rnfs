@@ -23,11 +23,7 @@ No centralized servers
 
 <img width="700" alt="rnfs demo" src="https://raw.githubusercontent.com/afit21/rnfs/refs/heads/main/rnfsgifcompressed.gif" />
 
-Publish sites with no central server
-
-<img width="700" alt="image" src="https://github.com/user-attachments/assets/c832721a-5868-44bd-a96a-3702f15cb609" />
-
-Embed content on Nomadnet sites
+Embed content on Nomadnet sites by linking to a CID
 (Browser has to support rnfs to see this)
 
 <img width="705" height="572" alt="image" src="https://github.com/user-attachments/assets/684f74bc-e11a-47ce-9b87-628a4b03168e" />
