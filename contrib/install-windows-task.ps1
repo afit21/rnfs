@@ -100,10 +100,13 @@ $CmdArguments = '/d /v:off /s /c ""' + $Rnfs + '" daemon >> "' + $Log + '" 2>&1"
 $Script = @'
 # Written by rnfs's contrib\install-windows-task.ps1; the "rnfs daemon" task runs it at logon.
 # Runs the daemon, appending its output to the log, and restarts it 10 s after it exits with an error,
-# giving up after 5 such exits in 10 minutes. A clean exit (code 0) ends the task.
+# giving up after 5 such exits in 10 minutes. A clean exit (code 0) ends the task; code 75 is the daemon asked to
+# restart (POST /api/restart), which starts it again at once and counts as no failure.
 $log = __RNFS_LOG__
 $arguments = __RNFS_CMD_ARGUMENTS__
 $failures = @()
+# Tells the daemon who started it (daemon.json's started_by), and so that it can restart by exiting with 75
+$env:RNFS_STARTED_BY = "windows_task"
 while ($true) {
     $info = New-Object System.Diagnostics.ProcessStartInfo
     $info.FileName = Join-Path $env:SystemRoot "System32\cmd.exe"
@@ -114,6 +117,7 @@ while ($true) {
     $process.WaitForExit()
     $code = $process.ExitCode
     if ($code -eq 0) { exit 0 }
+    if ($code -eq 75) { continue }
     $now = Get-Date
     $failures = @($failures | Where-Object { ($now - $_).TotalMinutes -lt 10 }) + $now
     if ($failures.Count -ge 5) {

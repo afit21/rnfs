@@ -1899,7 +1899,7 @@ class Fetch:
             # Not a lossy link: the node sent something other than what was asked for (section 10)
             log(f"banning {node_name(node_id)}: it sent {plural(len(result.bad), 'block')} not matching "
                 "the CID requested", LOG_WARNING)
-            self.fetcher.routing.ban(node_id)
+            self.fetcher.routing.ban(node_id, "it sent a block not matching the CID requested")
             self.fetcher.scores.bad_block(node_id)
             if provider is None:
                 provider = self._new_provider(node_id)

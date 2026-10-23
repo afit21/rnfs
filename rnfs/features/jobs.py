@@ -22,6 +22,11 @@ or import job; `rnfs jobs` lists, shows, waits for, cancels and clears jobs.
   add_nomadnet, with name and identify among its options too (NOMADNET_OPTIONS). Its total_bytes is the answer's
   advertised size once a Resource brings it, done_bytes what has arrived, its rate bytes received; cancelling it, or
   the node stopping, closes its link at the fetch's next poll. A resumed one fetches a new snapshot.
+- Uploads (0.2.1): POST /api/add/stream and /api/import/stream run as a job while they read their body
+  (uploading), so the CLI and other apps see them: running from the start, kind add or import with "stream" (and
+  "stream_name", the add's origin or name), done_bytes the bytes read, total_bytes the Content-Length (None if
+  chunked), cancellable (the request is answered 409 cancelled at its next read). They take no job slot, are never
+  saved and never resumed (their data is the request's): a restart forgets them.
 - Every change of a job's state (queued, running, done, failed, cancelled, and forgotten: "removed") and, at
   most once a second (EVENT_INTERVAL), a running job's progress is published as a "job" event (rnfs.events) with
   the job's state and progress fields (Job.event; the job's kind as "job_kind", an event's "kind" being "job"),
@@ -70,7 +75,7 @@ import sys
 import threading
 import time
 from collections import deque
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from typing import Callable
 
 from rnfs import fsutil, ids
@@ -141,6 +146,10 @@ class Job:
         self.source = source  # what a pin, add or import job pins with: kept so a resumed job pins the same
         self.nomadnet = nomadnet  # an add job's NomadNet link, which it adds instead of a path
         self.retry = retry  # queued again when its content isn't found (rnfs.retry)
+        # An upload the API reads (0.2.1, JobsFeature.uploading): running from the start, never saved or resumed;
+        # stream_name names it (the add's origin or name), None for one unnamed
+        self.stream = False
+        self.stream_name: str | None = None
         self.state = QUEUED
         self.created = time.time() if created is None else created
         self.started: float | None = None  # when the latest run started
@@ -180,6 +189,8 @@ class Job:
         """What the job works on, for messages: its target, or an add's or import's path or NomadNet link."""
         if self.target is not None:
             return self.target
+        if self.stream:
+            return self.stream_name or "(upload)"
         return self.nomadnet if self.nomadnet is not None else str(self.path)
 
     # Observer (rnfs.fetcher.Observer), called on the job's thread
@@ -334,6 +345,9 @@ class Job:
             record["source"] = self.source
         if self.nomadnet is not None:
             record["nomadnet"] = self.nomadnet
+        if self.stream:  # an upload (0.2.1): shown, never saved
+            record["stream"] = True
+            record["stream_name"] = self.stream_name
         if self.retry:
             record["retry"] = True
         if self.retry_since is not None:
@@ -595,17 +609,18 @@ class JobsFeature(Feature):
         statedb.delete_rows(db, "jobs", ("id",), bad)
 
     def _row(self, job_id: str) -> tuple | None:
-        """job_id's jobs row, or None once it is forgotten (lock held)."""
+        """job_id's jobs row, or None once it is forgotten, or for an upload, which is never saved (lock held)."""
         from rnfs import statedb
         job = self._jobs.get(job_id)
-        return None if job is None else (job_id, job.position, statedb.dump(job.to_record()))
+        return None if job is None or job.stream else (job_id, job.position, statedb.dump(job.to_record()))
 
     def save(self):
         """Save the jobs changed since the last save, and forget those gone, durably (a queued job must survive a
         crash); running jobs whose progress changed too (the node calls this periodically, keeping saved progress
         recent). Each change is noted with _store.changed(job ID), under the lock."""
         with self._lock:
-            self._store.changed(*(job_id for job_id, job in self._jobs.items() if job.state == RUNNING))
+            self._store.changed(*(job_id for job_id, job in self._jobs.items()
+                                  if job.state == RUNNING and not job.stream))
         self._store.save()
 
     def _save_quietly(self):
@@ -715,7 +730,8 @@ class JobsFeature(Feature):
         with self._lock:
             if not self._started or self._stop_event.is_set():
                 return False
-            running = sum(1 for job in self._jobs.values() if job.state == RUNNING)
+            # Uploads run on their request's thread, taking no job slot
+            running = sum(1 for job in self._jobs.values() if job.state == RUNNING and not job.stream)
             now = time.time()
             for job in self._jobs.values():
                 if running >= self.max_jobs:
@@ -981,6 +997,52 @@ class JobsFeature(Feature):
         if not self._schedule():  # else saved as it started
             self._save_quietly()
         return job.to_dict()
+
+    @contextmanager
+    def uploading(self, kind: str, name: str | None, total: int | None, source: str = USER):
+        """A job for an upload the API reads as it adds (POST /api/add/stream, kind "add") or imports
+        (POST /api/import/stream, "import") it (0.2.1), so the CLI and other apps see it: listed and followed as any
+        job from the start (running, its progress the bytes read: total its Content-Length, None if chunked) and
+        cancellable, but never saved, and never resumed (its data is the request's), nor taking a job slot. Yields
+        the Job: the caller counts each read with job.read(n), which raises Cancelled once the job is cancelled (or
+        the node stops), and sets job.result. Leaving it marks the job done, cancelled (if it was) or failed, with
+        the error. Raises Busy when MAX_ACTIVE jobs are queued or running."""
+        from rnfs.errors import Busy
+        with self._lock:
+            if sum(1 for job in self._jobs.values() if job.state in ACTIVE) >= MAX_ACTIVE:
+                raise Busy(f"{MAX_ACTIVE} jobs are already queued or running")
+            job_id = secrets.token_hex(4)
+            while job_id in self._jobs:
+                job_id = secrets.token_hex(4)
+            job = Job(job_id, kind, None, source=source)
+            job.stream, job.stream_name = True, name
+            job.stop_event = self._stop_event
+            job.on_progress = self._publish
+            job.total_bytes = total
+            job.begin_run()
+            self._jobs[job_id] = job
+        self._publish(job)
+        state, error = FAILED, None
+        try:
+            yield job
+            state = DONE
+        except BaseException as e:
+            if job.cancelled():
+                state = CANCELLED
+            error = str(e) or type(e).__name__
+            raise
+        finally:
+            with self._lock:
+                job.state, job.error = state, None if state == DONE else error
+                job.result = _capped(job.result) if job.result is not None and state == DONE else None
+                job.finished = time.time()
+                if state == DONE and job.total_bytes is None:
+                    job.total_bytes = job.done_bytes
+                self._cap_finished()
+            self._publish(job)
+            job.ended.set()
+            _log(f"job {job.id} ({job.kind} upload {job.subject}) {state}" + (f": {error}" if error and state != DONE
+                                                                                 else ""))
 
     def _job(self, job_id: str) -> Job:
         """The job with this ID. Raises NotFound."""

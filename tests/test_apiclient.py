@@ -12,6 +12,7 @@ import time
 import unittest
 from unittest import mock
 
+from rnfs import api as api_module
 from rnfs import apiclient, cli
 from rnfs.api import ApiHandler, ApiServer
 from rnfs.apiclient import (ApiConnection, ApiError, AuthFailed, BadRequest, Busy, ConnectionFailed, DaemonNotRunning,
@@ -328,6 +329,24 @@ class AppSupportTest(ClientTestCase):
         self.addCleanup(still.stop)
         self.assertFalse(ApiConnection(self.tmp, port=still.port).shutdown(wait=0.5))
 
+    def test_restart_waits_for_a_new_run(self):
+        """restart(wait=) returns True once the daemon answers with another run's events epoch; False while the
+        old run still answers."""
+        from rnfs.events import EventLog
+
+        def restart():
+            """Start "again": a new run's event log, as a new process has."""
+            self.node.events = EventLog()
+
+        server = ApiServer(self.node, 0, token=self.server.token, restart=lambda: threading.Timer(0.3, restart).start())
+        server.start()
+        self.addCleanup(server.stop)
+        self.assertTrue(ApiConnection(self.tmp, port=server.port).restart(wait=10))
+        stuck = ApiServer(self.node, 0, token=self.server.token, restart=lambda: None)
+        stuck.start()
+        self.addCleanup(stuck.stop)
+        self.assertFalse(ApiConnection(self.tmp, port=stuck.port).restart(wait=0.5))
+
     def test_shutdown_waits_for_the_process(self):
         """When daemon.json names the port, shutdown(wait=) also waits for that process to end (it saves its state
         and releases the rnfs dir after its API stops), so a daemon started next can take the dir."""
@@ -466,6 +485,15 @@ class OperationsTest(ClientTestCase):
         self.assertEqual(len(self.api.import_archive("archive")["roots"]), 1)
         self.assertTrue(os.path.isabs(self.node.called("import_archive")[0][0][0]))
         self.assertEqual(self.api.gc(), {"removed_blocks": 3, "freed_bytes": 300})
+        self.assertIs(self.api.gc(dry_run=True)["dry_run"], True)
+        self.assertEqual(self.node.called("gc")[-1], ((), {"dry_run": True}))
+        # A daemon without the capability (before 0.2.1) would ignore dry_run and collect: it isn't asked
+        calls = len(self.node.called("gc"))
+        with mock.patch.object(api_module, "CAPABILITIES", tuple(c for c in api_module.CAPABILITIES
+                                                                 if c != "gc_dry_run")):
+            with self.assertRaises(errors.Unsupported):
+                self.api.gc(dry_run=True)
+        self.assertEqual(len(self.node.called("gc")), calls)
         self.assertEqual(self.api.verify()["bad"], [])
 
     def test_remote_pins_providers_and_ping(self):
@@ -479,6 +507,27 @@ class OperationsTest(ClientTestCase):
         self.assertEqual(self.api.providers(cid), ["cd" * 16])
         self.assertEqual(self.api.ping("cd" * 16), 0.25)
         self.assertIsNone(self.api.ping("ff" * 16))
+        self.assertEqual(self.api.ping_info("ff" * 16)["reason"], "no_path")
+
+    def test_streamed_ping_and_providers(self):
+        """ping_stream and providers_stream: lines as they come, the last with done; an error line raises."""
+        self.assertEqual([line.get("stage") for line in self.api.ping_stream("cd" * 16)],
+                         ["path", "identity", "link", None])
+        cid = self.node.put_file(b"abc")
+        self.node.provider_map[cid] = [bytes.fromhex("cd" * 16)]
+        self.assertEqual(list(self.api.providers_stream(cid)),
+                         [{"provider": "cd" * 16}, {"providers": ["cd" * 16], "done": True}])
+
+        def ping_info(node_id, on_stage=None):
+            on_stage("path")
+            raise NotFound("gone")
+
+        self.node.ping_info = ping_info
+        lines = self.api.ping_stream("cd" * 16)
+        self.assertEqual(next(lines), {"stage": "path"})
+        with self.assertRaises(NotFound) as raised:
+            next(lines)
+        self.assertEqual((raised.exception.status, raised.exception.code), (404, "not_found"))
 
     def test_remote_pin_status(self):
         """pin_remote_ls sends only the parameters given; pin_remote_served; a daemon with only the POST (before

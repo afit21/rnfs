@@ -87,11 +87,15 @@ def _check_folder(path) -> str:
 class NameSync:
     """The node's synced names (see the module docstring)."""
 
-    def __init__(self, names, storage, config, check=lambda: None, clock=time.time, monotonic=time.monotonic):
+    def __init__(self, names, storage, config, check=lambda: None, clock=time.time, monotonic=time.monotonic,
+                 on_change=None):
         """Syncs publishing through names (a NameManager), importing into storage; config gives scan_interval,
         the rnfs dir (root) the folders may not lead into and the state directory. check() gives the deny list's
         file-hash check for a scan's builds (node._hash_check). clock is the wall clock (publish times are
-        persisted), monotonic times scans and settling."""
+        persisted), monotonic times scans and settling. on_change(entry, removed) (0.2.1: the node's "name_sync"
+        events) is told of a sync started or stopped (removed True) and of each change of a sync's state, reason or
+        published root, with the sync's entry(), no lock held; it must only queue."""
+        self.on_change = on_change
         self._names = names
         self._storage = storage
         self._config = config
@@ -188,7 +192,12 @@ class NameSync:
                 self._syncs[alias] = entry
                 self._write(alias)
                 log(f"{LABEL}: syncing {display_path(path)} to name {alias}", LOG_NOTICE)
+                changed = True
+            else:
+                changed = False
             result = self._entry(alias, entry)
+        if changed:
+            self._changed(dict(result))
         if self._config.private:
             result["warning"] = PRIVATE_NAME_WARNING  # each publish's announce reaches outsiders (section 3)
         self._wake.set()
@@ -207,7 +216,9 @@ class NameSync:
                 return False
             self._write(alias)
             self._warned_private.discard(alias)
+            gone = self._entry(alias, entry)
         log(f"{LABEL}: stopped syncing {display_path(entry.path)} to name {alias}", LOG_NOTICE)
+        self._changed(gone, removed=True)
         self._wake.set()  # the thread forgets its files
         return True
 
@@ -215,6 +226,19 @@ class NameSync:
         """Every sync's entry, by alias."""
         with self._lock:
             return [self._entry(alias, entry) for alias, entry in sorted(self._syncs.items())]
+
+    def _changed(self, entry: dict, removed: bool = False):
+        """Tell on_change of a sync's entry (no lock held); its failure is logged, never the sync's."""
+        if self.on_change is not None:
+            try:
+                self.on_change(entry, removed)
+            except Exception as e:  # noqa: BLE001 - a listener only queues; logged
+                log(f"{LABEL}: telling of a change failed: {e!r}", LOG_WARNING)
+
+    @staticmethod
+    def _shape(entry: _Sync) -> tuple:
+        """What a change of tells on_change: the sync's state, reason and published root."""
+        return entry.state, entry.reason, entry.published
 
     def _entry(self, alias: str, entry: _Sync) -> dict:
         """The API's form of a sync (lock held): {"alias", "path", "state", "reason", "root" (the folder's root as
@@ -278,6 +302,8 @@ class NameSync:
         """Import entry's folder and publish alias's name to it if it is time to."""
         options = builder.BuildOptions(chunker.FASTCDC, check=self._check(),
                                        skip_dirs=shared_folder.private_dirs(self._config.root))
+        with self._lock:
+            before = self._shape(entry)
         with self._storage.protect() as session:  # the import's blocks, until it is published
             root, reason = self._import(alias, entry, options, session)
             target = self._target(alias)
@@ -291,6 +317,10 @@ class NameSync:
                     publish = self._decide(alias, entry, root, reason, target or None)
                 if publish is not None:
                     self._publish(alias, entry, publish)
+                with self._lock:
+                    after = self._entry(alias, entry) if self._shape(entry) != before else None
+        if after is not None:
+            self._changed(after)
 
     def _target(self, alias: str) -> Cid | None | bool:
         """What alias's name points at now (None: nothing yet), or False if there is no such name (its key was

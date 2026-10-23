@@ -2179,23 +2179,24 @@ are local conveniences, not part of the protocol.
 | `pin add <cid>[/path] [--background]`, `pin rm <cid>`, `pin ls [<cid>] [--json]`, `pin label <cid> [<label>]` | Manage pins; `ls` shows their sources, whether each is a sealed file (`sealed`: true, false, or null when its stored blocks can't tell), and a local name: the pin's label if it has one, else where it was added from on this machine (recorded locally, never sent; for a sealed file too), the shared-folder entry, or what a stored directory holds. `--json` also gives each pin's `label`, `origin` (where it was added from, kept apart from the label), `size` (as its root block states it), `entries` (a directory's entry count) and `added` (when first pinned, by any source; null for pins made before rnfs 0.2.0). `label` sets a pin's label (local only, lasting while the CID is pinned); without a label it clears it |
 | `cache ls [--json]`, `cache rm <cid>…` | The cached fetches (downloads not pinned, section 8), most recently used first, with their size, completeness and whether the same content is pinned; `rm` evicts those leading to a CID now, deleting the blocks nothing else needs, as `gc` does for all of them |
 | `pin remote add\|rm <node ID> <cid>`, `pin remote ls [<node ID>] [<cid>] [--check] [--json]`, `pin remote ls --served [--json]` | Remote pinning; `ls` lists the remote pins this node asked for (rnfs 0.2.0: node, CID, state, when asked and last checked; section 8, Status), `--check` checking them first, and `--served` those other identities asked of it, with each identity's use of `remote_pin_quota` |
-| `gc`, `verify` | Evict all cached fetches; re-check every stored block against its CID |
-| `providers <cid>` | Find nodes providing a CID |
-| `ping <node ID>` | Open a link and report its round-trip time (`rnprobe` can't probe `rnfs.dht`, which doesn't send delivery proofs) |
+| `gc [--dry-run]`, `verify` | Evict all cached fetches; re-check every stored block against its CID. `--dry-run` (rnfs 0.2.1: `POST /api/gc {"dry_run": true}`) changes nothing and says what `gc` would free, and the stored bytes split by what keeps them: pins, cached fetches, operations in progress, nothing; and what the state database takes (provider records and node state) |
+| `providers <cid>` | Find nodes providing a CID, each printed as it is found (rnfs: `GET /api/providers?stream=1`, JSON lines; a client closing the connection ends the lookup) |
+| `ping <node ID>` | Open a link and report its round-trip time (`rnprobe` can't probe `rnfs.dht`, which doesn't send delivery proofs), or why none: no path, no identity, the wrong identity, not a member, the link refused, closed or not established in time (rnfs: `GET /api/ping` also gives `reason`, the path's `hops`, `interface` and `path_since`, when it was learned; `stream=1` tells of each step, path, identity and link, as it begins) |
 | `name create\|rm\|export\|import <alias>`, `name list` | Manage name keys; `rm` releases the name's pin. A name can't move to another key, so losing its key loses the name for good: `create` and `import` say so and give the `export` command, the node remembers which keys were exported (by `name export`) or imported, and `status` lists the others (`unexported_names`; keys made before rnfs 0.2.0 count as never exported) |
 | `name publish <alias> <cid>[/path]`, `name resolve <name>` | Mutable names. Every `<name>` argument is 32 hex digits or a name contact's nick. `publish` says on stderr when the name's announce is held because the clock is behind its last announce (`announce_held`, section 9) |
 | `name keep\|unkeep <name>`, `name kept` | Keep a name's signed record and serve it (section 9) |
 | `name follow\|unfollow <name>`, `name following` | Keep a name's latest target pinned (section 9) |
 | `name sync <alias> <folder>`, `name unsync <alias>`, `name syncs [--json]` | Keep a name pointing at a folder's current content, published at most once an hour once it has been unchanged a minute (section 9, Syncing a folder); `syncs` lists each sync's folder, state (`new`, `settling`, `waiting`, `synced`, `paused` and why), the root last imported and the one last published and when (rnfs: `POST /api/name/sync {"alias", "path"}`, `POST /api/name/unsync {"alias"}`, `GET /api/name/syncs`) |
 | `export <cid>[/path] -o file [--background]`, `import file [--background]` | Archives; `import --background` runs as an `import` job |
-| `jobs [list]`, `jobs show\|wait\|cancel <id>`, `jobs clear [<id>]` | Background jobs (below) |
+| `jobs [list]`, `jobs show\|wait\|cancel <id>`, `jobs clear [<id>]` | Background jobs (below); from rnfs 0.2.1 the uploads the API is reading (`add -`, an app's stream or tar add, an archive import from a stream) are listed too while they run, and cancelling one stops it (the upload is answered `409` `cancelled`); they are never saved or resumed |
 | `contacts add <nick> <hex> [--kind name\|node\|lxmf]`, `contacts rm <nick>`, `contacts ls` | Contacts (below) |
 | `deny add\|rm <entry>…`, `deny ls` | The local deny list (CIDs, `sha256:<hex>` file hashes); `ls` also shows each `deny_lists` source, the version in use and its state (section 8) |
-| `peers [--json]`, `stats [--json]` | Known nodes with hops, interface, traffic, the last link round-trip time and whether each is online (Peers, below); traffic since start, refusals by cause, per interface |
-| `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
-| `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
+| `peers [--json]`, `stats [--json]` | Known nodes with hops, interface, traffic, the last link round-trip time and whether each is online (Peers, below); traffic since start, refusals by cause, per interface, and (rnfs 0.2.1) Reticulum's interfaces as they stand: up or down, mode, bitrate, bytes and speeds (the shared instance's when attached to one). rnfs only reads them: they are configured in Reticulum's config |
+| `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart (rnfs 0.2.1: `POST /api/config/set` with `dry_run` makes every check and says what it would do, writing nothing, so an app can check settings as the user types them) |
+| `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>`, `app requests [--json]`, `app approve\|deny <id>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these. `requests` lists the apps asking for a token themselves (pairing, rnfs 0.2.1), each with the code it shows its user, and `approve` gives the one whose code matches its token (which only it collects; the approver never sees it), `deny` refuses it |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), the hash of the identity `add --identify` identifies to NomadNet nodes with (`nomadnet_identity_hash`, the value a NomadNet node's operator lists; made then if there is none), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), the local servers it knows of (`local_servers`, section 6 "LoRa islands") and whether it is in partition mode and since when (`partition`, `partition_since`: Unix time, or null), the clock's estimated offset from the network's and the names whose announces are held (`clock_offset`, `announces_held`: section 9, "Announces and the clock"; `rnfs status` warns on stderr of an offset over 5 minutes and of held names), what it sees of the network (`network`, `record_store`: Network status, below), storage use, traffic, jobs, deny-list entries and sources (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
+| `restart [--wait S]` | Ask the daemon to stop as `stop` does and start again with the same command line, so settings that need a restart apply, and wait until it answers again (rnfs 0.2.1: 120 s; `POST /api/restart`). On POSIX it starts again in place, keeping its process ID, so a service manager sees no exit; on Windows only a daemon the task wrapper runs can (it exits for the wrapper to start it again). Refused where it can't (daemon.json's `can_restart`) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), the hash of the identity `add --identify` identifies to NomadNet nodes with (`nomadnet_identity_hash`, the value a NomadNet node's operator lists; made then if there is none), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), the local servers it knows of (`local_servers`, section 6 "LoRa islands") and whether it is in partition mode and since when (`partition`, `partition_since`: Unix time, or null), the clock's estimated offset from the network's and the names whose announces are held (`clock_offset`, `announces_held`: section 9, "Announces and the clock"; `rnfs status` warns on stderr of an offset over 5 minutes and of held names), what it sees of the network (`network`, `record_store`: Network status, below), the shared folder as its last scan left it (rnfs 0.2.1, `shared_folder`: its path, entries imported and their bytes, whether a scan runs, when the last ended, why the folder is refused or the last scan failed, and the entries that failed to import, the first 10 by name), storage use, traffic, jobs, deny-list entries and sources (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
 
 **Network status** (rnfs 0.2.0). `status` (`GET /api/status`, the library's `Status`) also reports what the node can
 see of the network from its own state, with nothing sent to learn it: the cheapest way to learn how big the network
@@ -2246,7 +2247,8 @@ gateway can never reach the API.
 - Both MUST reject requests whose `Host` header isn't `127.0.0.1:<port>` or `localhost:<port>`, which blocks
   DNS rebinding. The gateway also accepts its site hosts (below), matched as exactly; the API accepts nothing
   else.
-- Every API request except `GET /api/status` MUST carry `X-Rnfs-Api: <token>`, compared in constant time.
+- Every API request except `GET /api/status` (and, from rnfs 0.2.1, an app asking for a token and collecting it:
+  pairing, below) MUST carry `X-Rnfs-Api: <token>`, compared in constant time.
   The token is random (at least 128 bits), made anew at each daemon start and written to
   `<rnfs dir>/api_token` with mode 0600 (on Windows, with a protected access list allowing only the user and
   SYSTEM); clients (the CLI, and apps through `rnfs.Client`, built on `rnfs.apiclient`) read it from there and
@@ -2329,7 +2331,10 @@ gateway can never reach the API.
 - **For apps** (rnfs 0.2.0). While it runs, the daemon describes itself in `<rnfs dir>/daemon.json` (written
   atomically after its API listens, mode 0600 like the token, removed when it stops): its process ID, API and
   gateway ports, version, start time, rnfs directory, Reticulum config directory, whether it attached to a shared
-  instance, and node ID. Clients read the port there first (refusing a symlink, a file other users could have
+  instance, and node ID; from 0.2.1 also what started it (`started_by`: `systemd`, `launchd`, `windows_task`,
+  `terminal`, `unknown`, or what the program starting it set `RNFS_STARTED_BY` to, such as `app:<name>`), the
+  service unit or launchd label (`service`), `sandbox` (`flatpak`) and whether `POST /api/restart` can restart it
+  (`can_restart`), so an app needn't ask the service managers. Clients read the port there first (refusing a symlink, a file other users could have
   written, or one whose process has ended), so a client finds the daemon even when it can't read a newer
   daemon's `rnfs.toml`; nothing else in it is trusted, and the proof above still comes first. Errors are
   `{"error": message, "code": code}`, the code machine-readable and never renamed once released, so a client
@@ -2338,9 +2343,22 @@ gateway can never reach the API.
   error codes and headers, checked against the code by the tests); `GET /api/capabilities` lists the daemon's
   routes, features, event kinds, error codes and
   capabilities. `POST /api/shutdown` stops the daemon as SIGTERM does,
-  after answering (Windows has no other clean way for a program to stop a daemon running in the background). `GET /api/events` is a long poll on the
+  after answering (Windows has no other clean way for a program to stop a daemon running in the background);
+  `POST /api/restart` (0.2.1) stops it so and starts it again, for a daemon started in a terminal as much as one a
+  service runs. **Pairing** (0.2.1): an app with no token asks for one (`POST /api/apps/request`, no token, naming
+  itself in the custom header `X-Rnfs-Pairing`, so no web page can ask: its request would need a CORS preflight,
+  which fails) and is given a request id, a secret and a 6-digit code to show its user. The user sees the request
+  with the same code where the CLI's token is (`rnfs app requests`, or an app told by an `apps` event) and approves
+  or denies it; the code tells their app's request from one another local process made under the same name. Once
+  approved the app collects its token with the secret (`GET /api/apps/request`), once. A node SHOULD bound the
+  requests waiting (rnfs: 8, for 10 minutes, in memory only). As with any client before it holds a token, an app
+  pairing can't tell the daemon from another program squatting its port while it is down: one that can read the
+  rnfs directory should use `rnfs app add` instead. `GET /api/log` (0.2.1) gives its recent log lines, its own and Reticulum's as its console shows them
+  (rnfs: the last 2000, kept in memory only), so an app shows the log of a daemon it didn't start. `GET /api/events` is a long poll on the
   node's events — jobs, pins, cached fetches, names it holds, peers and remote pins (those it asked
-  for and those it serves, section 8) — numbered within a run:
+  for and those it serves, section 8); from 0.2.1 settings changed through the API (with those a restart would
+  change), name syncs started, stopped or changed, apps added or removed, and status fields changed (checked at
+  most every 30 s, so a status page needn't poll) — numbered within a run:
   answered as soon as there is an event after the sequence the client gives, or after a wait (at most 30 s),
   level-triggered like the name watch below, so a client asking again with what it was given loses nothing. A
   node keeps a bounded number of events (rnfs: 1024) and says `lost` when the client asks for some it no longer
@@ -2596,13 +2614,18 @@ in its requests and responses (rnfs: these routes):
   component, or whose names break the entry-name rules are skipped with a warning; directories a path implies
   are made; a later file replaces an earlier one of the same path, and a member conflicting with what is
   there as the other type is skipped with a warning. A file is executable if its mode has the owner's execute
-  bit. Sealing is refused (400): a sealed folder is added from a path (`POST /api/add` with `to`), where the node
-  packs the folder itself (section 5). The node MUST bound what a tar can make it hold: rnfs refuses (413) more than
+  bit. With `to`/`to_self` (rnfs 0.2.1) the tar is sealed as a folder instead (section 5), `name` (required) being
+  the folder's: its members are read under the same rules and written again as the node packs a folder from a path,
+  under `name/` after the sealed-folder marker, and only the sealed bytes are stored (`seal_name` is refused: the
+  sealed name is `<name>.tar`). The node MUST bound what a tar can make it hold: rnfs refuses (413) more than
   `max_output_entries` files and directories or nesting deeper than `MAX_DEPTH`, refuses (400) extended headers
   over 64 KiB, more than 8 in a row, global headers of more than 4 KiB in all, and sparse files, and keeps 100
   warnings (counting the rest), each naming at most 300 characters of the member. A malformed header anywhere,
   anything but zeros after the tar's end (as a zeroed header in its middle leaves), or a body ending inside the
   tar, is an error (400), never a shorter directory. The result is `/api/add`'s, the root pinned `user` (or cached with `pin=0`).
+  A stream add (with or without `format=tar`) takes `origin` (rnfs 0.2.1): what `pin ls` says the content was added
+  from (a URL, the app's own path for it), so an app's adds aren't all listed as `(stdin)` and the user's label stays
+  free.
 - `GET /api/get/stream?target=&format=tar`: the target as a tar, its DAG fetched first within
   `max_download_size` and `max_output_entries` (413) and checked against the deny list (451) like `get`, then
   sent with an exact Content-Length, so a client can tell a transfer cut short. A directory's entries are the
@@ -2623,12 +2646,21 @@ while after it (rnfs: 60 s); watching sends nothing to the network. A node SHOUL
 (rnfs: 64), the calls waiting at once (rnfs: 4, so watchers can't take the API's connections; more get `503`)
 and the names watched (rnfs: 1024). `GET /api/cat` takes `from`, a node to fetch from, as `GET /api/info` does.
 
+**Routing table** (rnfs 0.2.1). `GET /api/routing` gives the DHT routing table as the node holds it, read from
+memory: each bucket holding a node, with each node's first-seen and last-heard times, its queries unanswered since
+it was last heard and whether it is stale (the first to give up its place); how many nodes left with their seniority
+kept for a while; the nodes avoided as unreliable (in the table or not) and when each may be queried again; and the
+bans, with when each ends and why (a ban's reason is kept in memory only: one from before a restart has none), and
+how many identities Reticulum blackholes.
+
 **Peers.** `GET /api/peers` lists the nodes this one knows (in its routing table, with an open link, or met since
 it started) with what it already knows of each, gathered without network I/O. Besides the path and traffic fields,
 each has `first_heard` (when this node first heard of it, as far as it knows: rnfs keeps nothing of its peers
 across a restart, so it is since the start unless the routing table or Reticulum's own announce cache knows an
 earlier time; null if nothing does), `rtt` and `rtt_at` (the round trip measured on the last link this node
-established to it, a ping's included, in seconds, and when; null if none) and `online`, decided by the node so
+established to it, a ping's included, in seconds, and when; null if none), `last_seen` (the Unix time of that
+last sign it was up, below; null if none since the start; `last_heard`, which a path response refreshes, is no such
+sign) and `online`, decided by the node so
 every client applies the same rule: online while a link to it is open, or within a window (rnfs: 15 minutes) of
 the last sign it was up — an answer to a request (a refusal too), a request of its own served, a link established,
 or an announce of its own emitted within the window (by the emission time signed in it, allowing some clock

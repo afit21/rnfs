@@ -82,6 +82,17 @@ class Client(interface.Rnfs):
         # on the event thread isn't fetched again and again (only the poller uses it)
         self._polled: dict[bytes, int] = {}
 
+    @classmethod
+    def pair(cls, app: str, rnfs_dir: str | None = None, *, description: str | None = None, on_code=None,
+             wait: float = 600.0, port: int | None = None, timeout: float | None = None) -> tuple["Client", str]:
+        """Ask the daemon for a token for app (rnfs 0.2.1), for an app that has none: on_code(code) is told the
+        6-digit code to show the user, who approves the request where it shows the same code (rnfs app requests,
+        approve; or an app such as RNFS Desktop). Returns (a Client as app, its token: keep it, as rnfs app add's,
+        for the next start). Raises AuthFailed (refused), TimeoutError (no answer within wait seconds), ValueError
+        (an invalid name, or one taken or asked for already), NoSuchEndpoint (a daemon before 0.2.1)."""
+        token = ApiConnection(rnfs_dir, port=port, timeout=timeout).pair(app, description, wait, on_code)
+        return cls(rnfs_dir, port=port, timeout=timeout, app=app, token=token), token
+
     @property
     def api(self) -> ApiConnection:
         """The API connection underneath, whose get(path, **params) and post(path, **fields) reach every endpoint.
@@ -315,13 +326,48 @@ class _Backend:
         """GET /api/pin/remote/served."""
         return self.api.pin_remote_served()
 
-    def providers(self, cid: str) -> list[str]:
-        """GET /api/providers."""
-        return self.api.providers(cid)
+    def providers(self, cid: str, on_provider=None) -> list[str]:
+        """GET /api/providers; with on_provider, streamed (stream=1), on_provider(hex) told of each as found."""
+        if on_provider is None:
+            return self.api.providers(cid)
+        lines = self.api.providers_stream(cid)
+        try:
+            for line in lines:
+                if "provider" in line:
+                    on_provider(line["provider"])
+                if line.get("done"):
+                    return line["providers"]
+        finally:
+            lines.close()
+        raise AssertionError("json_lines ends with its last line")  # pragma: no cover
+
+    def log_lines(self, after: int | None, limit: int | None, level) -> dict:
+        """GET /api/log."""
+        return self.api.log_lines(after, limit, level)
+
+    def routing(self) -> dict:
+        """GET /api/routing."""
+        return self.api.routing()
 
     def ping(self, node_id: str) -> float | None:
         """GET /api/ping."""
         return self.api.ping(node_id)
+
+    def ping_info(self, node_id: str, on_stage=None) -> dict:
+        """GET /api/ping (a daemon before 0.2.1 answers only "rtt"); with on_stage, streamed (stream=1), on_stage
+        told of each step as it begins."""
+        if on_stage is None:
+            return self.api.ping_info(node_id)
+        lines = self.api.ping_stream(node_id)
+        try:
+            for line in lines:
+                if "stage" in line:
+                    on_stage(line["stage"])
+                if line.get("done"):
+                    return {key: value for key, value in line.items() if key != "done"}
+        finally:
+            lines.close()
+        raise AssertionError("json_lines ends with its last line")  # pragma: no cover
 
     def export(self, target: str, output: str) -> dict:
         """POST /api/export."""
@@ -331,9 +377,9 @@ class _Backend:
         """POST /api/import."""
         return self.api.import_archive(path)
 
-    def gc(self) -> dict:
+    def gc(self, dry_run: bool = False) -> dict:
         """POST /api/gc."""
-        return self.api.gc()
+        return self.api.gc(dry_run)
 
     def verify(self) -> dict:
         """POST /api/verify."""
@@ -490,6 +536,10 @@ class _Backend:
         """POST /api/shutdown, then (wait) polling the open status until it stops answering."""
         return self.api.shutdown(wait)
 
+    def restart(self, wait: float | None) -> bool:
+        """POST /api/restart, then (wait) polling until a new run answers."""
+        return self.api.restart(wait)
+
     def daemon_info(self) -> dict | None:
         """The daemon's daemon.json (read_daemon_info)."""
         return self.api.daemon_info()
@@ -498,13 +548,13 @@ class _Backend:
         """GET /api/config."""
         return self.api.config()
 
-    def config_set(self, settings: dict) -> dict:
+    def config_set(self, settings: dict, dry_run: bool = False) -> dict:
         """POST /api/config/set."""
-        return self.api.config_set(settings)
+        return self.api.config_set(settings, dry_run)
 
-    def add_tar(self, data, name: str | None, pin: bool, only_hash: bool, chunker: str | None) -> dict:
-        """POST /api/add/stream?format=tar."""
-        return self.api.add_tar(data, name=name, only_hash=only_hash, pin=pin, chunker=chunker)
+    def add_tar(self, data, name: str | None, pin: bool, only_hash: bool, chunker: str | None, **options) -> dict:
+        """POST /api/add/stream?format=tar (options: to, to_self, origin)."""
+        return self.api.add_tar(data, name=name, only_hash=only_hash, pin=pin, chunker=chunker, **options)
 
     def get_tar(self, target: str):
         """GET /api/get/stream?format=tar: the body, read as it arrives; sent once iterated, as read()'s."""

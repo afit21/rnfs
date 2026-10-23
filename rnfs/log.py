@@ -11,6 +11,7 @@ import RNS
 # Re-exported so callers only need this module for logging
 from RNS import LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING  # noqa: F401
 
+from rnfs import recentlog
 from rnfs.fsutil import printable
 from rnfs.units import human_size
 
@@ -19,7 +20,7 @@ MAX_WARNINGS = 100
 
 # sink(level, text) given every message as well, at any level: the debug log's (set_debug_sink), or None
 _debug_sink = None
-# Set while an rnfs message is inside RNS.log, so the debug log's copy of RNS's own output can skip it
+# Set while an rnfs message is inside RNS.log, so the copies of RNS's own output (the debug log's, recentlog's) skip it
 _passing = threading.local()
 
 
@@ -28,16 +29,17 @@ def log(message: str, level: int = LOG_INFO):
     # Messages carry remote-chosen names (DAG entries, request paths): escaping here, once,
     # keeps escape sequences and fake newlines out of every log line without each caller remembering
     text = printable(message)
-    sink = _debug_sink
-    if sink is None:
-        RNS.log(f"rnfs {text}", level)
-        return
+    if level <= RNS.loglevel:  # what the console shows, for GET /api/log (0.2.1)
+        recentlog.LINES.add(level, "rnfs", text)
+    # Marked while inside RNS.log, so what copies RNS's output (the debug log, rnfs.recentlog) skips it
     _passing.active = True
     try:
         RNS.log(f"rnfs {text}", level)
     finally:
         _passing.active = False
-    sink(level, text)
+    sink = _debug_sink
+    if sink is not None:
+        sink(level, text)
 
 
 def set_debug_sink(sink):

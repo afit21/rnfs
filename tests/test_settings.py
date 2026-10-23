@@ -388,6 +388,33 @@ class ApiTest(SettingsBase):
         loaded = Config.load(self.b.config.root)
         self.assertEqual((loaded.max_storage, loaded.dht_mode, loaded.members), (5_000_000, "client", []))
 
+    def test_dry_run_checks_and_changes_nothing(self):
+        """dry_run (0.2.1) answers what set would, with dry_run, writing and applying nothing; a refusal is the same
+        refusal."""
+        self.write("max_storage = 100  # mine\n")
+        before = self.read()
+        got, body = self.call("POST", "/api/config/set", {"settings": {"max_storage": 5_000_000, "dht_mode": "client"},
+                                                          "dry_run": True})
+        self.assertEqual(got, 200, body)
+        self.assertEqual(body, {"path": self.toml, "applied": ["max_storage"], "restart_required": ["dht_mode"],
+                                "overridden": [], "warnings": [], "dry_run": True})
+        self.assertEqual(self.read(), before)
+        self.assertNotEqual(self.b.config.max_storage, 5_000_000)
+        got, body = self.call("POST", "/api/config/set", {"settings": {"max_storage": "lots"}, "dry_run": True})
+        self.assertEqual(got, 400, body)
+        self.assertEqual(self.read(), before)
+
+    def test_config_events(self):
+        """A change publishes a "config" event (0.2.1) with what changed, applied and needs a restart, and every
+        setting pending a restart; a dry run publishes none."""
+        start = self.b.events.last
+        self.call("POST", "/api/config/set", {"settings": {"max_storage": 5_000_000}, "dry_run": True})
+        self.assertEqual(self.b.events.since(start, ["config"])["events"], [])
+        self.set({"max_storage": 5_000_000, "dht_mode": "client"})
+        [event] = self.b.events.since(start, ["config"])["events"]
+        self.assertEqual((event["changed"], event["applied"], event["restart_required"], event["pending"]),
+                         (["max_storage", "dht_mode"], ["max_storage"], ["dht_mode"], ["dht_mode"]))
+
     def test_null_removes(self):
         self.write("beta = 4\nban_time = 60\n")  # written after the start: the node runs with the defaults
         self.assertTrue(self.setting("ban_time")["pending"])

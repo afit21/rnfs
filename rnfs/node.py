@@ -38,7 +38,7 @@ from typing import BinaryIO, Callable, Iterator, Literal, Protocol, TypeVar, ove
 import RNS
 
 from rnfs import __version__, denylist, events, features, fsutil, remote_pins, statedb, winacl
-from rnfs.apps import AppRegistry
+from rnfs.apps import AppRegistry, PairingRequests
 from rnfs.config import LOCK_FILE, Config
 from rnfs.constants import (APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, K, MISSED_ANNOUNCES, MODE_SERVER,
                             PARTIAL_SUFFIX)
@@ -59,7 +59,7 @@ from rnfs.dht.routing_state import RoutingState
 from rnfs.dht.scores import Scores
 from rnfs.errors import Denied, InvalidDag, NotFound, RnfsError, TooLarge
 from rnfs.fetcher import Fetch, Fetcher, describe
-from rnfs.mesh import PathInfo, RnsPaths, SlowPaths, is_local_path, no_path_info
+from rnfs.mesh import NO_PATH, PathInfo, RnsPaths, SlowPaths, is_local_path, no_path_info
 from rnfs.log import (LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, SlowStep, cap_warnings, log,
                       node_name, plural, size)
 from rnfs.name_sync import NameSync
@@ -72,13 +72,16 @@ from rnfs.network.blackhole import Blackhole
 from rnfs.network.channel import ChannelLoad
 from rnfs.network.client import PeerClient
 from rnfs.network.identity import load_or_create_identity, parse_node_id
-from rnfs.network.links import LinkPool
+from rnfs.network.links import FAIL_NO_PATH, LinkPool
 from rnfs.network.server import RequestServer
 from rnfs.publisher import Publisher
 from rnfs.remote_pins import DROPPED
 
 RECORDS_INTERVAL = 30.0  # seconds between passes over the provider records (expiry), each saving their changes
 STATE_SAVE_INTERVAL = 30.0  # seconds between saves of cache records, fetched targets and invalid roots, when changed
+# Seconds between checks of the status for a "status" event (0.2.1): an app's Status page waits for the event
+# instead of polling, at most this late
+STATUS_EVENT_INTERVAL = 30.0
 ARCHIVE_BLOCK_OVERHEAD = 64  # bytes an archive spends on each block beyond the block (msgpack framing, CID)
 EVICT_INTERVAL = 60.0  # seconds between max_storage checks when nothing else triggers one
 GATEWAY_NAME_AGE = 60.0  # a gateway resolution reuses a record heard this recently
@@ -619,6 +622,7 @@ class RnfsNode(NodePins):
         self.slow = slow
         self.channel: ChannelLoad | None = None  # a slow node's radios' measured load, once Reticulum runs
         self._nomadnet_hash: str | None = None  # the NomadNet identity's hash, once status() read it
+        self._last_status: dict | None = None  # status() at the last status_event, to tell what changed
         self._is_known = is_known
         self.members = config.member_set
         # Private mode: node IDs that sent /provide as a member this run (their identity was checked then)
@@ -733,6 +737,7 @@ class RnfsNode(NodePins):
         self.pin_names.prune_labels(self.storage.pinned_cids())
         # The apps rnfs app add issued tokens to (the API's callers besides the CLI), written through
         self.apps = self._add_store(AppRegistry(config.state_dir), batched=False)
+        self.pairing = PairingRequests(self.apps)  # apps asking for a token (0.2.1), in memory
         self.fetcher = self._add_store(Fetcher(self.storage, client, config, node_id, self.routing, self._lookup,
                                                slow, config.state_dir, after_store=self._enforce_storage,
                                                make_room=self._make_room, scores=self.scores))
@@ -766,7 +771,8 @@ class RnfsNode(NodePins):
         self._add_store(_StoreParts(close=self.names.close), batched=False)
         # Folders synced to names (rnfs.name_sync): its syncs are written through, its per-file cache saved with the
         # batched stores; scanned by a thread of its own (_start_threads)
-        self.folder_syncs = self._add_store(NameSync(self.names, self.storage, config, check=self._hash_check))
+        self.folder_syncs = self._add_store(NameSync(self.names, self.storage, config, check=self._hash_check,
+                                                     on_change=self._name_sync_event))
         self.backend = NodeBackend(self)
 
         self._lock = threading.Lock()
@@ -1222,6 +1228,11 @@ class RnfsNode(NodePins):
         followed or resolved) or watches, as a "name" event."""
         self.events.publish("name", name=name.hex(), cid=str(record.cid), sequence=record.sequence)
 
+    def _name_sync_event(self, entry: dict, removed: bool):
+        """NameSync's on_change (no lock held): a sync started, changed or stopped, as a "name_sync" event (0.2.1):
+        the sync's entry (as GET /api/name/syncs lists it) and removed."""
+        events.publish(self, "name_sync", **entry, removed=removed)
+
     def _heard_server(self, node_id: bytes):
         """A server-mode announce (or path response) from node_id."""
         self._count_heard(node_id, "server")
@@ -1517,9 +1528,13 @@ class RnfsNode(NodePins):
             self._prune_fetched()
 
     def maintain(self, now: float, last: dict) -> None:
-        """One maintenance pass: shared folder, provider records, storage, RNS's blackhole. last holds when each ran."""
+        """One maintenance pass: shared folder, provider records, storage, RNS's blackhole, the status event. last
+        holds when each ran."""
         for node_id in self.blackhole.refresh_if_due():
             self.routing.remove(node_id)  # and kept out while it is listed (RoutingTable.blackholed)
+        if now - last.get("status", float("-inf")) >= STATUS_EVENT_INTERVAL:
+            last["status"] = now
+            self.status_event()
         if now - last.get("scan", float("-inf")) >= self.config.scan_interval:
             last["scan"] = now
             try:
@@ -1901,20 +1916,42 @@ class RnfsNode(NodePins):
                                          progress=progress, source=source)
 
     def add_tar(self, stream: BinaryIO, name: str | None = None, only_hash: bool = False, pin: bool = True,
-                chunker: str | None = None, source: str = USER) -> dict:
+                chunker: str | None = None, source: str = USER, to: list[str] | None = None, to_self: bool = False,
+                seal_name: bool = True, origin: str | None = None) -> dict:
         """Import the directory a tar stream holds (POST /api/add/stream?format=tar; rnfs/content/tarstream.py's
         rules and limits, max_output_entries files and directories at most), wrapped as the entry name if given,
         pinned with source (cache if not pin) unless only_hash; chunker as for add_path. {"cid", "size", "warnings"}
         (+ "warnings_total" past MAX_WARNINGS, as get caps them). Reads the stream to its end, where only zeros
-        may follow the tar's own."""
+        may follow the tar's own. origin is what pin ls says it was added from (default: the name, or "(tar
+        upload)").
+
+        With to/to_self (0.2.1) the folder is sealed for those recipients as `add --to <folder>` seals one: name (the
+        folder's, required) is its top directory and, with .tar, its sealed name (node_content.folder_sealed_name:
+        seal_name False is refused), its members re-packed as that writes them (tarstream.repack_chunks) and only
+        the sealed bytes stored; the sealed file is the CID (not wrapped), {"sealed": true} in the result."""
         from rnfs.content import tarstream
 
         _caller_source(source)
-
+        recipients = node_content.seal_recipients(self, to, to_self, only_hash)
         options = builder.BuildOptions(chunker)  # ValueError for an unknown chunker, before anything is read
         warnings = tarstream.Warnings()
         max_entries = self.config.max_output_entries
-        if only_hash:
+        if recipients:
+            if not name:
+                raise ValueError("sealing a tar needs the folder's name (name=): it is the sealed folder's top "
+                                 "directory and, with .tar, its sealed name")
+            sealed_name = node_content.folder_sealed_name(name, seal_name)
+            tar = tarstream.IteratorReader(tarstream.repack_chunks(stream, name, max_entries, warnings))
+            options = builder.BuildOptions(options.chunker, self._hash_check())
+            try:
+                with self._refusing(), self.storage.protect() as session:
+                    with session.writer() as put:
+                        built = builder.add_stream(seal.SealingReader(tar, recipients, sealed_name), put, None,
+                                                   options=options)
+                    node_content.keep_added(self, built.cid, pin, source)
+            finally:
+                tar.close()
+        elif only_hash:
             built = tarstream.build_tar(stream, builder.NO_PUT, warnings, max_entries, options, name)
         else:
             options = builder.BuildOptions(options.chunker, self._hash_check())
@@ -1922,11 +1959,13 @@ class RnfsNode(NodePins):
                 with session.writer() as put:
                     built = tarstream.build_tar(stream, put, warnings, max_entries, options, name)
                 node_content.keep_added(self, built.cid, pin, source)
+        if not only_hash:
             if pin:
                 self._app_still_there(source, [built.cid])
-                self.pin_names.record(built.cid, name or "(tar upload)")
+                self.pin_names.record(built.cid, origin or name or "(tar upload)")
             self._added(built)
-        return {"cid": str(built.cid), "size": built.size, **warnings.result()}
+        return {"cid": str(built.cid), "size": built.size, **warnings.result(), **({"sealed": True} if recipients
+                                                                                   else {})}
 
     def block(self, cid: str, for_gateway: bool = False) -> bytes:
         """A CID's own block, fetched if needed and re-verified (the gateway's ?format=raw)."""
@@ -2207,7 +2246,9 @@ class RnfsNode(NodePins):
         Raises ValueError for an invalid name or one taken. An app called lxmf holds the app:lxmf:<address> pins
         the LXMF feature of rnfs before 0.2.0 made (storage.LXMF_PREFIX), and removing it releases them."""
         check_app_name(name)
-        return self.apps.add(name)
+        added = self.apps.add(name)
+        events.publish(self, "apps", change="added", name=name)
+        return added
 
     def app_ls(self) -> list[dict]:
         """Every app: [{"name", "created"}], by name."""
@@ -2216,7 +2257,37 @@ class RnfsNode(NodePins):
     def app_rm(self, name: str) -> dict:
         """Revoke app name's token and release every pin it holds (app:<name> and app:<name>:<key>): {"released"},
         how many pins (of a CID by one source) were released. NotFound for an app there isn't."""
-        return {"released": self.apps.remove(name, lambda: self._release_app(name))}
+        released = self.apps.remove(name, lambda: self._release_app(name))
+        events.publish(self, "apps", change="removed", name=name)
+        return {"released": released}
+
+    def app_request(self, name: str, description: str | None = None) -> dict:
+        """An app asks for a token (0.2.1: POST /api/apps/request): {"id", "secret", "code", "expires"}, for the
+        user to approve (PairingRequests); an "apps" event (change "requested", with its id and code) tells apps
+        such as RNFS Desktop to ask the user."""
+        asked = self.pairing.request(name, description)
+        events.publish(self, "apps", change="requested", name=name, id=asked["id"], code=asked["code"])
+        return asked
+
+    def app_requests(self) -> list[dict]:
+        """The apps waiting for the user's answer: [{"id", "name", "description", "code", "requested", "expires"}]."""
+        return self.pairing.pending()
+
+    def app_approve(self, request_id: str) -> dict:
+        """Approve an app's request: the app is added, its token kept for it alone; {"name", "created"}."""
+        added = self.pairing.approve(request_id)
+        events.publish(self, "apps", change="added", name=added["name"])
+        return added
+
+    def app_deny(self, request_id: str) -> dict:
+        """Refuse an app's request: {"name"}."""
+        denied = self.pairing.deny(request_id)
+        events.publish(self, "apps", change="denied", name=denied["name"])
+        return denied
+
+    def app_request_state(self, request_id: str, secret: str) -> dict:
+        """What became of an app's request, for the app: {"name", "state", "token" (once), "expires"}."""
+        return self.pairing.state(request_id, secret)
 
     def _release_app(self, name: str) -> int:
         """Once app name's token no longer passes: tell the features (jobs cancels the app's), then release every
@@ -2235,8 +2306,13 @@ class RnfsNode(NodePins):
 
     # Facade: storage
 
-    def gc(self) -> dict:
-        """Evict every cached fetch and delete unreachable blocks; withdraw what is no longer complete."""
+    def gc(self, dry_run: bool = False) -> dict:
+        """Evict every cached fetch and delete unreachable blocks; withdraw what is no longer complete. dry_run
+        (0.2.1): change nothing, and say what it would free and what the stored blocks are kept for
+        (Storage.gc_preview, with "dry_run": true and "records_bytes", what the provider records stored for others
+        take: record_store's "bytes")."""
+        if dry_run:
+            return {**self.storage.gc_preview(), "records_bytes": self.records.usage().get("bytes"), "dry_run": True}
         stats = self.storage.gc()
         self.publisher.refresh()
         self._prune_fetched()
@@ -2288,24 +2364,56 @@ class RnfsNode(NodePins):
 
     # Facade: network
 
-    def providers(self, cid: str) -> list[bytes]:
-        """Nodes providing cid: records held here, then everything a complete provider lookup finds."""
+    def providers(self, cid: str, on_provider: Callable[[bytes], None] | None = None,
+                  should_stop: Callable[[], bool] | None = None) -> list[bytes]:
+        """Nodes providing cid: records held here, then everything a complete provider lookup finds (ended early
+        once should_stop() is True). on_provider(node_id) is told of each as it is found, from this thread, the
+        records held first; it mustn't block."""
         parsed = Cid.parse(cid)
-        found: list[bytes] = list(self.records.providers(parsed.key, exclude=self.excluded_provider))
+        found: list[bytes] = []
 
         def add(node_id: bytes):
             """Collect a provider the lookup reports."""
             if node_id not in found:
                 found.append(node_id)
+                if on_provider is not None:
+                    on_provider(node_id)
 
-        self._lookup(parsed.key).find_providers(add)
-        if parsed in self.publisher.provided() and self.node_id not in found:
-            found.append(self.node_id)
+        for node_id in self.records.providers(parsed.key, exclude=self.excluded_provider):
+            add(node_id)
+        if should_stop is None:
+            self._lookup(parsed.key).find_providers(add)
+        elif not should_stop():
+            self._lookup(parsed.key).find_providers(add, should_stop)
+        if parsed in self.publisher.provided():
+            add(self.node_id)
         return found
+
+    def routing_info(self) -> dict:
+        """The routing table (GET /api/routing; 0.2.1): RoutingTable.snapshot(), with "blackholed", the identities
+        RNS blackholes (whose nodes count as banned without being listed in "bans")."""
+        blackhole = getattr(self, "blackhole", None)
+        return {**self.routing.snapshot(), "blackholed": blackhole.listed_count() if blackhole is not None else 0}
 
     def ping(self, node_id: bytes) -> float | None:
         """Round-trip time of a new link to node_id, or None if unreachable."""
         return self.client.ping(node_id)
+
+    def ping_info(self, node_id: bytes, on_stage: Callable[[str], None] | None = None) -> dict:
+        """ping() with why it failed and the path it took: {"rtt" (seconds, or None), "reason" (None, or why it
+        failed: links.OPEN_FAILURES), "hops", "interface" and "path_since" (when RNS learned the path, Unix time) as
+        they stand once it ends (None without a path)}. on_stage(stage) is told of each step of opening the link as it
+        begins (links.OPEN_STAGES: path, identity, link), from this thread."""
+        ping_reason = getattr(self.client, "ping_reason", None)
+        if ping_reason is not None:
+            rtt, reason = ping_reason(node_id, on_stage)
+        else:  # a stand-in client (offline tests): no reasons
+            rtt = self.client.ping(node_id)
+            reason = None if rtt is not None else FAIL_NO_PATH
+        paths = getattr(self, "paths", None)
+        path = paths.info(node_id) if paths is not None else NO_PATH
+        return {"rtt": rtt, "reason": reason, "hops": path.hops, "interface": path.interface,
+                "path_since": paths.since(node_id) if paths is not None and path.hops is not None else None}
 
     # Facade: names
 
@@ -2453,8 +2561,21 @@ class RnfsNode(NodePins):
                 "names": len(self.names.list()), "unexported_names": self.names.unexported(),
                 **self.names.announce_status(),
                 "local_servers": len(self.local), **self.partition.state(),
+                "shared_folder": self.shared_folder.status(),
                 "network": self._network_status(), "record_store": self.records.usage(),
                 **{key: value for feature in self.features.values() for key, value in feature.status().items()}}
+
+    def status_event(self):
+        """Publish a "status" event (0.2.1) naming the top-level status() fields that changed since the last call
+        ({"changed": [names]}), if any did; the first call only records them. The maintenance pass calls it every
+        STATUS_EVENT_INTERVAL: status() reads only what is kept in memory."""
+        current = self.status()
+        previous, self._last_status = self._last_status, current
+        if previous is None:
+            return
+        changed = sorted(name for name in current.keys() | previous.keys() if current.get(name) != previous.get(name))
+        if changed:
+            events.publish(self, "status", changed=changed)
 
     def _nomadnet_identity_hash(self) -> str | None:
         """The hash (hex) of the identity `add --identify` identifies to NomadNet nodes with (node_content.

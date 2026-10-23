@@ -65,6 +65,14 @@ MIN_SWEEP_WAIT = 0.25  # the idle sweep runs at most this often, however soon a 
 # arriving early is handed over within moments; the rest are late answers to requests RNS already gave up on
 EARLY_RESPONSE_LIFE = 30.0
 MAX_EARLY_RESPONSES = 16
+# The steps of opening a link (LinkPool._open's on_stage), and why one failed (PeerLink.failure): GET /api/ping's
+# stages and reasons
+STAGE_PATH, STAGE_IDENTITY, STAGE_LINK = "path", "identity", "link"
+OPEN_STAGES = (STAGE_PATH, STAGE_IDENTITY, STAGE_LINK)
+FAIL_NO_PATH, FAIL_NO_IDENTITY, FAIL_WRONG_IDENTITY = "no_path", "no_identity", "wrong_identity"
+FAIL_NOT_MEMBER, FAIL_REFUSED, FAIL_CLOSED, FAIL_TIMEOUT = "not_member", "link_refused", "link_closed", "link_timeout"
+OPEN_FAILURES = (FAIL_NO_PATH, FAIL_NO_IDENTITY, FAIL_WRONG_IDENTITY, FAIL_NOT_MEMBER, FAIL_REFUSED, FAIL_CLOSED,
+                 FAIL_TIMEOUT)
 
 
 def close_reason(link) -> str:
@@ -266,6 +274,7 @@ class PeerLink:
         # lost on the way (LinkPool._open), rather than the node being out of reach
         self.unestablished = False
         self.refused = False  # the node closed the link before it was established at this end (closed_by_other)
+        self.failure: str | None = None  # why _open failed (OPEN_FAILURES), for ping's answer
         self.handed_out: float | None = None  # when LinkPool.get() last returned it (the pool's clock)
         self.held_until: float | None = None  # LinkPool.hold: in use until then, as if handed out then
         self.cond = threading.Condition()
@@ -483,30 +492,50 @@ class LinkPool:
 
     def open_oneshot(self, node_id: bytes, identify: bool) -> PeerLink | None:
         """A new link to node_id outside the shared pool (identifying if asked, or in private mode)."""
+        return self.try_oneshot(node_id, identify)[0]
+
+    def try_oneshot(self, node_id: bytes, identify: bool, on_stage: Callable[[str], None] | None = None
+                    ) -> tuple[PeerLink | None, str | None]:
+        """open_oneshot(): (the link, None), or (None, why it failed: OPEN_FAILURES). on_stage(stage) is told of each
+        step as it begins (OPEN_STAGES)."""
         peer = PeerLink(node_id, identified=identify or self.config.private, shared=False)
         with self.lock:
             self.oneshot.add(peer)
-        if not self._open(peer):
+        if not self._open(peer, on_stage):
             with self.lock:
                 self.oneshot.discard(peer)
-            return None
-        return peer
+            return None, peer.failure or FAIL_CLOSED
+        return peer, None
 
-    def _open(self, peer: PeerLink) -> bool:
-        """Find a path and the identity for peer's node, establish the link, and identify if peer should."""
+    def _open(self, peer: PeerLink, on_stage: Callable[[str], None] | None = None) -> bool:
+        """Find a path and the identity for peer's node, establish the link, and identify if peer should. On False,
+        peer.failure says why (OPEN_FAILURES); on_stage(stage) is told of each step as it begins (OPEN_STAGES)."""
         node_id = peer.node_id
         name = node_name(node_id)
+
+        def stage(step: str):
+            """Tell on_stage, which mustn't stop the link opening by failing."""
+            if on_stage is not None:
+                try:
+                    on_stage(step)
+                except Exception:  # noqa: BLE001 - a listener's failure isn't the link's
+                    pass
+
+        stage(STAGE_PATH)
         if not RNS.Transport.has_path(node_id):
             log(f"requesting a path to {name}", LOG_VERBOSE)
         if not self.paths.await_path(node_id, self.config.path_timeout, cancel=self.stop_event):
             log(f"no path to {name} after {self.config.path_timeout:g}s")
+            peer.failure = FAIL_NO_PATH
             return False
         if _debug_logged():  # RNS path lookups, only for a message that will be kept
             log(f"path to {name}: {path_description(node_id) or 'known'}", LOG_DEBUG)
 
+        stage(STAGE_IDENTITY)
         identity = self._recall(node_id)
         if identity is None:
             log(f"have a path to {name} but not its identity (none after {self.config.path_timeout:g}s)")
+            peer.failure = FAIL_NO_IDENTITY
             return False
 
         destination = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, DHT_ASPECT)
@@ -515,9 +544,11 @@ class LinkPool:
             # otherwise answer for many node IDs (ground near target keys) or dodge a ban on its real one
             log(f"the identity known for {name} isn't that node's (its rnfs.dht is "
                 f"{node_name(destination.hash)}); not connecting", LOG_VERBOSE)
+            peer.failure = FAIL_WRONG_IDENTITY
             return False
         if self.config.private and identity.hash.hex() not in self.members:
             log(f"{name} isn't a member; not connecting in private mode", LOG_VERBOSE)
+            peer.failure = FAIL_NOT_MEMBER
             return False
         # Set on close too, so a failed link doesn't wait out the full timeout
         settled = threading.Event()
@@ -528,6 +559,7 @@ class LinkPool:
             settled.set()
             log(f"link to {name} {close_reason(closed_link)}", LOG_VERBOSE)
 
+        stage(STAGE_LINK)
         log(f"connecting to {name}", LOG_VERBOSE)
         started = time.monotonic()
         link = RNS.Link(destination, established_callback=lambda _: settled.set(), closed_callback=on_closed)
@@ -541,12 +573,14 @@ class LinkPool:
             log(f"{name} closed the link as it was established", LOG_VERBOSE)
             peer.mark_closed()
             peer.refused = True
+            peer.failure = FAIL_REFUSED
             return False
         if link.status != RNS.Link.ACTIVE:
             route = path_description(node_id)
             why = (close_reason(link) if link.status == RNS.Link.CLOSED
                    else f"not established within {time.monotonic() - started:.0f}s")
             log(f"could not connect to {name}: {why}" + (f" ({route})" if route else ""))
+            peer.failure = FAIL_CLOSED if link.status == RNS.Link.CLOSED else FAIL_TIMEOUT
             link.teardown()
             peer.mark_closed()
             peer.unestablished = True

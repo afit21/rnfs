@@ -719,7 +719,9 @@ compress, block_size, on_progress) -> RangeResult` (0.2.0: the next range after 
 `protocol.parse_range_response`; `.block` the whole block once a range ends it, verified; `.bad` if that fails;
 `.silent` when RNS timed it out with the link up, as an older node leaves `/range`; counted in traffic only once the
 block verifies, and a silence not at all), `pin(node_id, cid, pin) -> bool`,
-`ping(node_id) -> float | None`, `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs.dht`
+`ping(node_id) -> float | None`, `ping_reason(node_id, on_stage=None) -> (rtt or None, None or why: links.OPEN_FAILURES)`
+(0.2.1: `LinkPool.try_oneshot`, `_open` setting `PeerLink.failure` where it gives up and calling `on_stage` with
+`path`, `identity` and `link` as each step begins), `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs.dht`
 destination of the identity RNS recalls, and only if its hash is the node ID asked for (in private mode, also only if
 that identity is on `members`); the idle sweep (`LinkPool.sweep`) closes a shared link with no request in progress
 once it has had no data, and hasn't been handed out by `LinkPool.get()`, for its idle limit (`links.idle_limit`:
@@ -842,9 +844,9 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | Method | Returns |
 |---|---|
 | `add_path(path, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True, chunker=None)` | `{"cid", "size", "warnings": [str]}` (+ `"sealed"`); file or directory, pinned `user` (or cached with `pin=False`); with `to`/`to_self` a directory is packed as one tar and sealed as `<name>.tar` (`node_content.add_sealed_path`, `tarstream.folder_chunks`) |
-| `add_stream(stream, size=None, name=None, only_hash=False, …)` | as above; `name` wraps it as that entry (sealed: the sealed name) |
+| `add_stream(stream, size=None, name=None, only_hash=False, …, origin=None)` | as above; `name` wraps it as that entry (sealed: the sealed name); recorded in pin_names as `origin` (`POST /api/add/stream`'s, 0.2.1: `api.parse_origin`, at most `MAX_NAME_LENGTH`), else `name`, `seal_name` or `(stdin)` |
 | `add_nomadnet(link, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True, chunker=None, name=None, identify=False, progress=None)` | as `add_stream` (+ `"name"`, the snapshot's name, and `"link"`): a snapshot of what a NomadNet node serves at `link` (`node_content.add_nomadnet`, "Adding from NomadNet" below); recorded in pin_names as the link; `progress(received, total)` is an add job's |
-| `add_tar(stream, name=None, only_hash=False, pin=True, chunker=None)` | as above (+ `"warnings_total"` past 100): the directory a tar stream holds (`POST /api/add/stream?format=tar`), built by `tarstream.build_tar` as it is read; at most `max_output_entries` files and directories; recorded in pin_names as `name` or `(tar upload)` |
+| `add_tar(stream, name=None, only_hash=False, pin=True, chunker=None, to=None, to_self=False, seal_name=True, origin=None)` | as above (+ `"warnings_total"` past 100): the directory a tar stream holds (`POST /api/add/stream?format=tar`), built by `tarstream.build_tar` as it is read; at most `max_output_entries` files and directories; recorded in pin_names as `origin`, `name` or `(tar upload)`. With `to`/`to_self` (0.2.1) sealed as a folder named `name` (required): `tarstream.repack_chunks` reads it as `build_tar` does (`_place`, the same bounds and warnings) and writes the members again as `folder_chunks` does, under `name/` after the marker, into `seal.SealingReader`, so no plaintext block is stored; the tree's DAG depth is checked once the stream ends (TooLarge then, the add failing before anything is pinned) |
 | `get(target, output, from_node=None, raw=False, no_extract=False)` | `{"cid", "warnings"}` (+ `"warnings_total"` past 100; + `"sealed", "name"`, the name only if `safe_default_name` accepts it; + `"extracted"` for a sealed folder unpacked, `name` then the directory's); fetches and writes the file or directory under `.rnfs-get-<random>.partial` beside `output`, then renames it to `output` (`rename_new`), decrypting a sealed file unless `raw` and unpacking a sealed folder unless `no_extract` (`node_content.get_sealed`); a directory output is first checked to still be the one `write_out` made (`walker.check_unchanged`) and, on Windows, made to inherit its folder's access list (`winacl.inherit_from_parent`; if that fails it stays private, with a warning logged) |
 | `info(target, for_gateway=False, from_node=None, raw=False)` | `{"cid", "type": "file"\|"directory", "size", "executable"}` (+ `"sealed", "recipient", "stored_size", "name"`, and for a recipient `"sealed_folder"`; the sealed name is None unless `safe_default_name` accepts it) |
 | `stored_head(target, length)` | a file's first `length` bytes if stored, else None; never fetches (the user's own gateway `HEAD` and ranges not at 0); `Denied` as a read: a denied CID met, or while there are file hashes a file that fails `_check_file` (one not wholly stored gives None) |
@@ -864,9 +866,11 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `pin_remote(node_id, cid, pin)` | `bool` accepted; recorded (`AskedPins.record`) |
 | `pin_remote_ls(node_id=None, cid=None, check=False)` | `[{"node", "cid", "pin", "accepted", "asked", "state", "done", "checked", "seen"}]`, most recently asked first; `check` runs `AskedPins.check_now` first (Remote pin status, below) |
 | `pin_remote_served()` | `{"pins": [{"identity", "cid", "state", "reason", "at", "detail", "retry_at"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}` |
-| `gc()` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}` |
-| `providers(cid)` | `[node_id bytes]` |
+| `gc(dry_run=False)` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}`; `dry_run` (0.2.1): `Storage.gc_preview()` (the DAG nodes warmed without the lock, then one walk under it: what pins reach, what pins and sessions reach, what `_live` reaches, so what `gc` would delete and the stored bytes by what keeps them), `records_bytes` and `"dry_run": true`, nothing changed. `ApiConnection.gc(dry_run=True)` checks the `gc_dry_run` capability first, as an older daemon ignores `dry_run` and collects |
+| `providers(cid, on_provider=None, should_stop=None)` | `[node_id bytes]`; `on_provider(node_id)` as each is found (the records held first), the lookup ended early once `should_stop()` (0.2.1) |
 | `ping(node_id)` | round-trip seconds, or None |
+| `routing_info()` (0.2.1) | `RoutingTable.snapshot()` (`GET /api/routing`: the buckets holding a node, each node's first seen, last heard, unanswered queries and whether stale; the dropped count; unreliable nodes and bans, at most `MAX_LISTED` (256) each with their totals, a ban's reason kept in memory from `ban(node_id, reason)`, none for one restored at start) and `blackholed` (`Blackhole.listed_count()`) |
+| `ping_info(node_id, on_stage=None)` (0.2.1) | `{"rtt", "reason", "hops", "interface", "path_since"}`: `client.ping_reason`, then the path as `RnsPaths.info` and `since` (the path table entry's timestamp) read it |
 | `name_create(alias)`, `name_import(alias, key_bytes)` | `{"alias", "name", "warning"}` (`warning`: how to back the key up, `names.key_backup_warning`) |
 | `name_rm(alias)`, `name_export(alias)` | `None`, key bytes |
 | `name_list()` | `[{"alias", "name", "cid" or None, "sequence", "exported"}]` (`exported`: the key was exported or imported) |
@@ -1154,6 +1158,15 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   are computed for every name, so the answer and its time are the same whether or not the app exists, and anyone
   who can reach the port can't list the apps (REV9). A node without `apps` (a stand-in) lets no app in and sends
   no proof for one.
+- **Pairing** (0.2.1). `rnfs/apps.py`'s `PairingRequests` (`RnfsNode.pairing`, in memory): `request(name,
+  description)` (`POST /api/apps/request`, an open route needing `X-Rnfs-Pairing`) holds a `_Request` with a random
+  id, secret (32 bytes) and 6-digit code for `REQUEST_LIFE` (600 s), at most `MAX_PENDING` (8) waiting and a name
+  once, refusing a name `AppRegistry` has; `approve(id)` (`POST /api/apps/approve`, CLI token) runs
+  `AppRegistry.add` and keeps the token on the request for `PICKUP_LIFE` (300 s); `state(id, secret)` (`GET
+  /api/apps/request`, open, the secret in `X-Rnfs-Pairing-Secret`, compared in constant time; a wrong one is a
+  request there isn't) gives it once and forgets the request. The node publishes `apps` events `requested` (with
+  id and code), `added`, `denied`. `ApiConnection.pair()` and `rnfs.Client.pair()` request, call `on_code`, and
+  poll every 2 s.
 - **Discovery.** `cli.run_daemon` writes `<rnfs dir>/daemon.json` (`apiclient.DAEMON_FILE`; `cli.write_daemon_info`,
   `fsutil.write_atomic`, 0600, private) once its servers listen and its token is written, and removes it when it
   stops if it still names its PID (`remove_daemon_info`). `apiclient.read_daemon_info` reads it without following a
@@ -1189,7 +1202,13 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   node's own, kept, followed or resolved — or watched), `remote_pin` (`side` "asked": `node`, `cid`, `state`, as
   a remote pin this node asked for is recorded or a check changes its state; `side` "served": `identity`, `cid`,
   `state`, `reason`, for each outcome of one another identity asked of it: Remote pin status, below), and `job`
-  and `peer` from their features. `GET /api/events` waits at most 30 s, `MAX_EVENT_WAITERS` (8) calls at once
+  and `peer` from their features. From 0.2.1: `config` (`changed`, `applied`, `restart_required`, `pending`: the
+  settings feature's `set`, not a dry run, `pending` being every setting a restart would change, so Settings
+  shows a change made elsewhere and a restart due), `name_sync` (a sync's entry and `removed`: `NameSync.on_change`,
+  the node's `_name_sync_event`, told outside the locks when a sync starts or stops and when a scan changes its
+  state, reason or published root), `apps` (`change`: added or removed, `name`: `app_add`, `app_rm`) and `status`
+  (`changed`: the top-level `status()` fields that differ from the last check, `status_event`, which the
+  maintenance pass runs every `STATUS_EVENT_INTERVAL`, 30 s; the first only records). `GET /api/events` waits at most 30 s, `MAX_EVENT_WAITERS` (8) calls at once
   (`ApiHandler.event_waiters`, a semaphore per server; 503 beyond).
 - **Reference.** `docs/openapi.json`, an OpenAPI 3.1 document (JSON, so the standard library can read it; no
   runtime use): every core and feature route with its parameters, bodies (streamed ones too), answers, error codes
@@ -1202,6 +1221,24 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   over an offline node behind an `ApiServer`, that status, capabilities, pin ls, name list, peers, stats, config, apps,
   remote pins, events and the calls making them answer exactly the documented fields (no undocumented field, every
   required one) with the documented JSON types, in list items too.
+- **Log lines** (0.2.1). `rnfs/recentlog.py`: `LINES`, a `RecentLines` ring of the last `MAX_LINES` (2000), each
+  `{"seq", "time", "level", "level_name", "source", "text"}`. `rnfs.log.log` adds rnfs's messages at RNS's loglevel
+  or more severe (what the console shows); the daemon's `recentlog.capture()`, after the debug log's hook, makes
+  RNS's log callback one that calls the one before it (the debug log's) or prints, then adds RNS's own lines,
+  their level read as the debug log reads them (`debuglog.RNS_LINE`), skipping rnfs's (`log.passing_through()`, now
+  set whether or not the debug log runs). `GET /api/log?after=&limit=&level=`: the last `limit` (200, at most 1000)
+  after `after`, of `level` or more severe, with `next` and `dropped`. In memory only. An embedded Node's are rnfs's
+  messages (its program owns RNS's output).
+- **Restart** (0.2.1). `rnfs/launch.py`: `how_started()` gives daemon.json's `started_by`, `service`, `sandbox` and
+  `can_restart` (a systemd service by `INVOCATION_ID` and a `.service` cgroup, as a terminal's shell may inherit the
+  variable; launchd as macOS's parent 1; `RNFS_STARTED_BY`, which the Windows task wrapper sets to `windows_task`
+  and an app may set, first). `ApiServer(restart=)`, passed only where `can_restart`: `POST /api/restart` answers
+  `{"restarting": true}`, then sets `restarting` and `stopping`; once the daemon has stopped as on SIGTERM,
+  `cli.restart_daemon` runs `Reticulum.exit_handler()` (what `RNS.exit()` does before `os._exit`), unlocks the rnfs
+  dir and `os.execv`s `launch.restart_argv()` (`sys.orig_argv` with the interpreter, or a frozen build's own argv), so
+  the same process starts again with the same command line and environment; the wrapper's daemon exits with
+  `EXIT_RESTART` (75), which the wrapper starts again at once. `ApiConnection.restart(wait=)` polls `GET /api/events`
+  until its epoch changes (a new run; the client reads the new token when its proof fails).
 - **Shutdown.** `ApiServer(shutdown=)`: the daemon passes its `stopping.set`, the event its signal handlers set,
   so `POST /api/shutdown` answers `{"stopping": true}`, flushes, then stops the daemon exactly as SIGTERM does
   (the servers stop, `daemon.json` and the token are removed, the node saves and stops). Without one (tests) it is
@@ -1351,14 +1388,16 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `EventBatch` | `events: tuple[Event]`, `next`, `lost`, `epoch` | — |
 | `Capabilities` | `version`, `capabilities: frozenset[str]` (`has(name)`), `routes: tuple[(method, path)]`, `features`, `event_kinds`, `error_codes`; empty from a daemon before 0.2.0 | — |
 | `Setting` | `rnfs.config.settings_schema()`'s `name`, `group`, `type`, `choices`, `nullable`, `default`, `unit`, `minimum`, `maximum`, `exclusive_minimum`, `description`, `live`, and `value`, `file`, `overridden`, `pending` (lists as tuples) | the name |
-| `Settings` / `SettingsChange` | `path`, `settings: tuple[Setting]` (`settings["max_jobs"]`, iteration), `file_error`, `warnings` / `path`, `applied`, `restart_required`, `overridden`, `warnings` | — |
+| `Settings` / `SettingsChange` | `path`, `settings: tuple[Setting]` (`settings["max_jobs"]`, iteration), `file_error`, `warnings` / `path`, `applied`, `restart_required`, `overridden`, `warnings`, `dry_run` (0.2.1) | — |
 | `Record` | `name: bytes`, `cid`, `sequence`, `age` (seconds since heard, or None) | — |
-| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `allocated_bytes`, `allocation_unit`, `names`, `unexported_names`, `announces_held`, `clock_offset`, `local_servers`, `partition`, `partition_since`, `network`, `record_store`, `nomadnet_identity_hash`, `features: dict` (every other field) | — |
-| `Collected` / `Verified` | `removed_blocks`, `freed_bytes` / `checked`, `bad: tuple[Cid]` | — |
+| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `allocated_bytes`, `allocation_unit`, `names`, `unexported_names`, `announces_held`, `clock_offset`, `local_servers`, `partition`, `partition_since`, `network`, `record_store`, `nomadnet_identity_hash`, `shared_folder` (0.2.1: `SharedFolder.status()`: `path`, `entries`, `bytes`, `scanning`, `last_scan`, `refused`, `error`, `failed`, `failures`; each a field the scan replaces whole, read without its lock, the entries' sizes read from their root blocks once per CID), `features: dict` (every other field) | — |
+| `Collected` / `Verified` | `removed_blocks`, `freed_bytes`, and for a dry run (0.2.1; None otherwise) `dry_run`, `allocated_bytes`, `held_back`, `cached_fetches`, `pinned_bytes`, `cached_bytes`, `protected_bytes`, `unreferenced_bytes`, `records_bytes` / `checked`, `bad: tuple[Cid]` | — |
 | `Exported` / `Imported` | `roots: tuple[Cid]`, `blocks` / and `incomplete` | — |
 | `DenyState` | `entries: tuple[str]`, `lists: tuple[dict]` | — |
-| `Peer` | `node_id`, `mode`, `in_table`, `seniority`, `senior`, `hops`, `interface`, `bitrate`, `link`, `rate`, `last_heard`, `last_active`, `banned`, `sent`, `received`, `requests`, `answered`, `refused`, `failed`, `bad`, and (None from a daemon before 0.2.0) `first_heard`, `rtt`, `rtt_at`, `online` | node ID hex |
-| `Stats` | `since`, `totals: dict`, `refused: dict`, `interfaces: dict`, `upload_budget`, `upload_budget_left` | — |
+| `Peer` | `node_id`, `mode`, `in_table`, `seniority`, `senior`, `hops`, `interface`, `bitrate`, `link`, `rate`, `last_heard`, `last_active`, `banned`, `sent`, `received`, `requests`, `answered`, `refused`, `failed`, `bad`, and (None from a daemon before 0.2.0) `first_heard`, `rtt`, `rtt_at`, `online`, and (None before 0.2.1) `last_seen` | node ID hex |
+| `Ping` (0.2.1) | `rtt`, `reason`, `hops`, `interface`, `path_since`; `reachable` (property) | — |
+| `Routing` (0.2.1) | `k`, `buckets`, `nodes`, `dropped`, `unreliable`, `unreliable_total`, `bans`, `bans_total`, `blackholed` | — |
+| `Stats` | `since`, `totals: dict`, `refused: dict`, `interfaces: dict`, `upload_budget`, `upload_budget_left`, `reticulum_interfaces` (0.2.1: `mesh.interface_states`, from `Reticulum.get_interface_stats()`, the shared instance's through its RPC: name, full name, type, online, mode, bitrate, bytes and speeds, clients; read-only, as rnfs never edits Reticulum's config) | — |
 | `Contact` | `nick`, `kind` ("name", "node", "lxmf"), `id: bytes` | the nick |
 | `Kept` | `name: bytes`, `reasons: tuple[str]` ("user", "follow", "own"), `sequence`, `cid`, `emitted` (the record held, or None) | name hex |
 | `Followed` | `name: bytes`, `pinned`, `latest` (CIDs or None), `sequence`, `state` | name hex |
@@ -1386,7 +1425,7 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 |---|---|---|
 | `status() -> Status` | | `status()` / `GET /api/status` |
 | `node_id -> bytes` (property) | | `node_id` / status, read once |
-| `add(source, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None) -> Added` | `ValueError` (options: `name` with a path, `wrap` without `name`, a source neither a path, bytes nor a binary file), `NotFound` (path), `Denied` (a file's hash), `StorageFull`, `OSError` | a path (str or PathLike): `add_path` / `POST /api/add`; bytes or a binary file: `add_stream(name=name)` / `POST /api/add/stream`, sealing with `name` as the sealed name unless `seal_name` is False |
+| `add(source, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, origin=None) -> Added` | `ValueError` (options: `name` or `origin` with a path, `wrap` without `name`, a source neither a path, bytes nor a binary file), `NotFound` (path), `Denied` (a file's hash), `StorageFull`, `OSError` | a path (str or PathLike): `add_path` / `POST /api/add`; bytes or a binary file: `add_stream(name=name, origin=origin)` / `POST /api/add/stream`, sealing with `name` as the sealed name unless `seal_name` is False |
 | `add_nomadnet(link, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, identify=False) -> Added` | `ValueError` (a malformed link or option), `NotFound` (unreachable, no answer, "Request Not Allowed"), `TooLarge`, `Denied`, `StorageFull` | `add_nomadnet` / `POST /api/add` with `nomadnet` |
 | `get(target, output, *, from_node=None, raw=False, no_extract=False) -> Written` | fetch errors, `ValueError` (output exists), `OSError` | `get` / `POST /api/get` (`no_extract` sent only when set) |
 | `open(target, *, from_node=None, raw=False) -> File` | fetch errors, `ValueError` (a directory) | `info`, then `read(target, offset, length)` per refill / `GET /api/info`, then `GET /api/cat?offset=&length=&from=` per refill |
@@ -1401,18 +1440,18 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 | `pins(cid=None) -> list[Pin]` | | `pin_ls` / `GET /api/pin/ls` |
 | `pin_remote(node_id, cid, pin=True) -> bool` | | `pin_remote` / `POST /api/pin/remote` |
 | `remote_pins(node_id=None, cid=None, *, check=False) -> list[RemotePin]`, `served_pins() -> ServedPins` (`pins: tuple[ServedPin]`, `usage: tuple[RemotePinUsage]`, `quota`) | `ValueError`; a Client: `NoSuchEndpoint` (an older daemon: its 405 for the GET is turned into it) | `pin_remote_ls`, `pin_remote_served` / `GET /api/pin/remote`, `GET /api/pin/remote/served` |
-| `providers(cid) -> list[bytes]`, `ping(node_id) -> float \| None` | | `providers`, `ping` / `GET /api/providers`, `/api/ping` |
+| `providers(cid, *, on_provider=None) -> list[bytes]`, `ping(node_id) -> float \| None`, `ping_info(node_id, *, on_stage=None) -> Ping` (`rtt`, `reason`, `hops`, `interface`, `path_since`, `reachable`; 0.2.1) | | `providers(on_provider=)`, `ping`, `ping_info(on_stage=)` / `GET /api/providers`, `/api/ping`; with a callback, `stream=1` (`ApiConnection.providers_stream`, `ping_stream`: `apiclient.json_lines`), the callback called on the caller's thread as each line comes, before the call returns |
 | `export(target, output) -> Exported`, `import_archive(path) -> Imported` | fetch errors, `ValueError`, `OSError` | `export`, `import_archive` / `POST /api/export`, `/api/import` |
-| `add_tar(source, *, name=None, pin=True, only_hash=False, chunker=None) -> Added` (bytes or a binary file, read up to the tar's end; `Added.warnings_total`) | `ValueError` (a malformed tar, a chunker), `Denied`, `TooLarge`, `StorageFull` | `add_tar` / `POST /api/add/stream?format=tar` |
+| `add_tar(source, *, name=None, pin=True, only_hash=False, chunker=None, to=None, to_self=False, origin=None) -> Added` (bytes or a binary file, read up to the tar's end; `Added.warnings_total`; `to`/`to_self` seal it as the folder `name`, 0.2.1) | `ValueError` (a malformed tar, a chunker, sealing without `name`), `Denied`, `TooLarge`, `StorageFull` | `add_tar` / `POST /api/add/stream?format=tar` |
 | `get_tar(target) -> Iterator[bytes]`, `export_stream(target) -> Iterator[bytes]` (sent once iterated, as `cat`; the whole DAG fetched first; `close()` stops early) | fetch errors, `ValueError`, possibly once iterated | `get_tar`, `export_chunks` (the chunks, closed when done) / `GET /api/get/stream?format=tar`, `/api/export/stream` |
 | `import_stream(source) -> Imported` (bytes or a binary file, read to its end) | `InvalidDag`, `Denied`, `StorageFull`, `ValueError` | `import_stream` / `POST /api/import/stream` |
 | `label_pin(cid, label) -> Pin` (None or "" clears it) | `NotFound` (not pinned), `ValueError` | `pin_label` / `POST /api/pin/label` |
 | `cache() -> list[Cached]`, `uncache(cid) -> Uncached` | `uncache`: `NotFound` (no cached fetch leads to it) | `cache_ls`, `cache_rm` / `GET /api/cache/ls`, `POST /api/cache/rm` |
 | `capabilities() -> Capabilities` | | `api.capabilities(node, without=embedded.NODE_LACKS)` (a Node: not "shutdown" or "daemon_json") / `GET /api/capabilities` (`{}` from an older daemon) |
-| `shutdown(wait=None) -> bool`, `daemon_info() -> dict \| None` | `shutdown`: `Unsupported` (a Node: `close()` stops it; a daemon without a way to stop it), `NoSuchEndpoint` (an older daemon) | a Node: refused / None; a Client: `ApiConnection.shutdown`, `daemon_info` (`daemon.json`, read locally) |
-| `config() -> Settings`, `config_set(settings) -> SettingsChange` | `ValueError` (unknown, refused or malformed settings), `Busy` (rnfs.toml changed meanwhile), `NotFound` (no settings feature) | `SettingsFeature.describe`, `set` (a Node: through JSON, as the API carries them) / `GET /api/config`, `POST /api/config/set` |
+| `shutdown(wait=None) -> bool`, `restart(wait=None) -> bool` (0.2.1), `daemon_info() -> dict \| None` | `shutdown`: `Unsupported` (a Node: `close()` stops it; a daemon without a way to stop it), `NoSuchEndpoint` (an older daemon) | a Node: refused / None; a Client: `ApiConnection.shutdown`, `daemon_info` (`daemon.json`, read locally) |
+| `config() -> Settings`, `config_set(settings, *, dry_run=False) -> SettingsChange` (`dry_run`, 0.2.1: only checked; a Client checks the `config_dry_run` capability first, as an older daemon would write) | `ValueError` (unknown, refused or malformed settings), `Busy` (rnfs.toml changed meanwhile), `NotFound` (no settings feature) | `SettingsFeature.describe`, `set` (a Node: through JSON, as the API carries them) / `GET /api/config`, `POST /api/config/set` |
 | `events.watch(callback, kinds=None) -> Watch`, `events.since(after=None, kinds=None, wait=0, epoch=None) -> EventBatch` (epoch "" is None; a Client's wait fits its timeout, pausing up to a second on an empty answer when that leaves none) | `ValueError` (an unknown kind, after or wait not a whole number ≥ 0); a Client: `NoSuchEndpoint` (an older daemon), `since`: `Busy` (8 polls waiting) | `EventLog.add_listener`, `since` / `GET /api/events` (below) |
-| `gc() -> Collected`, `verify() -> Verified` | | `gc`, `verify` / `POST /api/gc`, `/api/verify` |
+| `gc(*, dry_run=False) -> Collected`, `verify() -> Verified` | `gc(dry_run=True)`: a Client `Unsupported` from a daemon before 0.2.1 | `gc`, `verify` / `POST /api/gc` (`{"dry_run": true}`), `/api/verify` |
 | `names.create(alias) -> Name`, `names.import_key(alias, key) -> Name` | `ValueError` (alias invalid or taken, key malformed) | `name_create`, `name_import` / `POST /api/name/create`, `/api/name/import` |
 | `names.get(alias) -> Name`, `names.list() -> list[Name]` | `NotFound` | `name_list` / `GET /api/name/list` |
 | `names.remove(alias)` | `NotFound` | `name_rm` / `POST /api/name/rm` |
@@ -1421,10 +1460,12 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 | `names.sync(alias, path) -> FolderSync` (a relative path made absolute where the program runs), `names.unsync(alias)`, `names.syncs() -> list[FolderSync]` | `sync`: `NotFound` (no such name or folder), `ValueError` (not a folder, one in the rnfs dir); a `RuntimeWarning` in private mode; `unsync`: `NotFound` (not synced) | `name_sync`, `name_unsync`, `name_syncs` / `POST /api/name/sync`, `/api/name/unsync`, `GET /api/name/syncs` |
 | `Name`: `alias`, `name: bytes`, `cid`, `sequence`, `str()` hex; `publish(target) -> Record`, `export_key() -> bytes`, `remove()`, `refresh() -> Name` | `publish`: `NotFound` (path not stored), `ValueError`, `RnfsError` (highest sequence) | `name_publish`, `name_export`, `name_rm` / `POST /api/name/publish`, `/api/name/export`, `/api/name/rm` |
 | `jobs.get(target, output, *, from_node=None, sealed_name=False, fallback_dht=False, on_progress=None, no_extract=False, retry=False) -> Job`, `jobs.pin(target, *, on_progress=None, retry=False) -> Job`, `jobs.export(target, output, *, on_progress=None, retry=False) -> Job`, `jobs.add(path, *, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, on_progress=None) -> Job`, `jobs.add_nomadnet(link, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, identify=False, on_progress=None) -> Job`, `jobs.import_archive(path, *, on_progress=None) -> Job` | `ValueError` (output exists or in use, an option), `NotFound` (add, import: no such path), `Busy` (1000 active) | `JobsFeature.submit` / `POST /api/jobs` |
-| `jobs.job(job_id) -> Job`, `jobs.list() -> list[Job]`, `jobs.clear(job_id=None) -> int` | `NotFound`, `ValueError` (not finished) | `JobsFeature.get`, `list`, `clear` / `GET /api/jobs/get`, `GET /api/jobs`, `POST /api/jobs/clear` |
+| `jobs.job(job_id) -> Job`, `jobs.list() -> list[Job]` (from 0.2.1 a Client's lists the daemon's uploads too, `Job.stream` and `stream_name`: `JobsFeature.uploading`, the API's `upload_job` around `POST /api/add/stream` and `/api/import/stream`, reading through `api._Counted`; a cancelled one is answered 409 `cancelled`, which `ApiConnection._early_answer` reads after its send fails on the closed connection), `jobs.clear(job_id=None) -> int` | `NotFound`, `ValueError` (not finished) | `JobsFeature.get`, `list`, `clear` / `GET /api/jobs/get`, `GET /api/jobs`, `POST /api/jobs/clear` |
 | `Job`: `id`, `kind`, `target` (None for add and import), `output`, `from_node`, `sealed_name`, `fallback_dht`, `no_extract`, `path`, `options` (add and import), `source` (pin, add and import), `nomadnet` (an add of a NomadNet link), `state`, `error`, `result: dict`, `total_bytes`, `done_bytes`, `downloaded_bytes`, `blocks`, `blocks_total`, `rate`, `eta`, `created`, `started`, `finished`, `runs`, `retry_at`, `retry_since` (queued again as its content wasn't found), `retry` (True: submitted to be), `providers` and `searching` (while running: its fetch's providers in use and whether it is searching), `done` (finished); `refresh() -> Job`, `wait(timeout=None) -> Job`, `cancel() -> Job`, `watch(callback) -> Watch` | `wait`: `TimeoutError`; `NotFound` once cleared | `JobsFeature.get(wait=)`, `cancel` / `GET /api/jobs/get?wait=`, `POST /api/jobs/cancel` |
 | `deny.list() -> DenyState`, `deny.add(entries) -> list[str]`, `deny.remove(entries) -> list[str]` | `ValueError` (malformed entry, too many), `NotFound` (remove: not on it) | `node.deny.entries`/`add`/`remove`, `DenyFeature.lists` / `GET /api/deny`, `POST /api/deny/add`, `/api/deny/rm` |
 | `timeout(seconds) -> context manager` | `ValueError` (not None or a positive number) | a Client: `ApiConnection.using_timeout`; a Node: nothing (above) |
+| `routing() -> Routing` (0.2.1) | a Client: `NoSuchEndpoint` (an older daemon) | `routing_info` / `GET /api/routing` |
+| `log(*, after=None, limit=None, level=None) -> dict` (0.2.1) | `ValueError`; a Client: `NoSuchEndpoint` | `recentlog.LINES.since` / `GET /api/log` |
 | `peers() -> list[Peer]`, `stats() -> Stats` | `NotFound` (no peers feature) | `PeersFeature.peers`, `stats` / `GET /api/peers`, `/api/stats` |
 | `contacts.list() -> list[Contact]`, `contacts.get(nick) -> Contact`, `contacts.add(nick, id, kind=None) -> Contact` (id: bytes, hex or a `Name`; kind None: the node tells), `contacts.remove(nick)` | `ValueError` (nick, id or kind invalid, a kind it can't tell, full), `NotFound` (no such contact; no contacts feature) | `ContactsFeature.list`, `get`, `add`, `remove` / `GET /api/contacts`, `/api/contacts/get`, `POST /api/contacts/add`, `/api/contacts/rm` |
 | `names.keep(name) -> Kept`, `names.unkeep(name)`, `names.kept() -> list[Kept]` (name: bytes, hex, `Name` or a name contact's nick) | `ValueError` (malformed, unknown nick, `keep_max_names`), `NotFound` (unkeep: not kept by the user; no keepers feature) | `KeepersFeature.keep`, `unkeep`, `kept` / `POST /api/name/keep`, `/api/name/unkeep`, `GET /api/name/kept` |
@@ -1760,7 +1801,9 @@ interface (at most 64) and in total, never persisted.
   shared link, or `last_seen` within `ONLINE_WINDOW` (900 s: three `link_idle_timeout`s, far below
   `announce_interval`) on the monotonic clock, a negative age being offline.
 - The peers feature (`features/peers.py`) lists them (`first_heard` is the earliest of `Traffic`'s, the routing
-  table's entry (now − seniority) and RNS's `known_destinations` time, `_earliest`) and publishes `peer` events
+  table's entry (now − seniority) and RNS's `known_destinations` time, `_earliest`; `last_seen`, from 0.2.1, is
+  `Traffic`'s turned into wall time against the monotonic clock read at the same moment, `_wall`, never later than
+  now) and publishes `peer` events
   (`{"node_id", "change": "new" | "online" | "offline", "online"}`) from its `rnfs-peers` thread: `check()` every
   `CHECK_INTERVAL` (30 s) computes `mesh.online` for every peer `Traffic` counts or with an open link (both
   bounded; not the listing, which a routing table beyond `MAX_PEERS` cuts, and whose routing-only peers are never
@@ -2675,9 +2718,9 @@ Everything in the specification is implemented, with these simplifications and a
   (a fresh block store's shard directories, up to 4 MiB once) falls within the disk reserve. Where the output's name must be chosen before the get (a
   daemon without the job manager, or a path target ending in `.tar`, whose job keeps its visible name), the CLI
   asks `GET /api/info` first and drops `.tar` only when it says `sealed_folder`; an older daemon doesn't say
-  it, and doesn't unpack. `POST /api/add/stream?format=tar`
-  can't seal (a tar uploaded by an app would have to be repacked under one top directory): sealed folders are
-  added from a path.
+  it, and doesn't unpack. `POST /api/add/stream?format=tar` with `to` (0.2.1) repacks the uploaded tar under one
+  top directory as it streams (`tarstream.repack_chunks`), so an app whose files the daemon can't open seals a
+  folder too.
 - **Sealed files.** `get` of a *directory* containing sealed files writes them as stored (get each with
   `get <cid>/<path>`). Sealing hides content and name but not size, recipients or wrapper names, and gives no
   sender authentication. A recipient opens it with its node identity's private key, which the node holds

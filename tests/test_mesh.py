@@ -1003,11 +1003,25 @@ class PeersFeatureTest(unittest.TestCase):
         self.assertEqual((p3["first_heard"], p3["online"]), (None, True))  # an open link, nothing counted
         self.assertEqual((p4["first_heard"], p4["rtt"], p4["rtt_at"], p4["online"]),
                          (50000.0, 0.4, 50000.0, False))  # its link closed longer than ONLINE_WINDOW ago
+        # last_seen, in wall time: what online is decided from (P2's path response or announce don't move it on)
+        self.assertEqual((p1["last_seen"], p2["last_seen"], p3["last_seen"], p4["last_seen"]),
+                         (None, wall.now, None, wall.now - mesh.ONLINE_WINDOW - 1))
         # Every field before 0.2.0 is still there
         self.assertEqual(set(p1), {"node_id", "mode", "in_table", "seniority", "senior", "hops", "interface",
                                    "bitrate", "link", "rate", "last_heard", "last_active", "banned", "sent",
                                    "received", "requests", "answered", "refused", "failed", "bad",
-                                   "first_heard", "rtt", "rtt_at", "online"})
+                                   "first_heard", "rtt", "rtt_at", "online", "last_seen"})
+
+    def test_last_seen_isnt_refreshed_by_a_path_response(self):
+        """A path response (any node with a path may send one) moves last_heard on, never last_seen."""
+        wall, mono = self.clocks()
+        traffic = self.feature.traffic
+        traffic.request(P2, mesh.ANSWERED)
+        seen = wall.now
+        self.advance(wall, mono, 600)
+        traffic.heard(P2, "server")  # a path response, long after
+        peer = {peer["node_id"]: peer for peer in self.feature.peers()}[P2.hex()]
+        self.assertEqual((peer["last_heard"], peer["last_seen"]), (wall.now, seen))
 
     def test_first_heard_from_rns_cache(self):
         # RNS's announce cache heard it by then, before this run counted it: the earlier time
@@ -1094,7 +1108,31 @@ class PeersFeatureTest(unittest.TestCase):
         stats = self.feature.stats()
         self.assertEqual(stats["upload_budget"], 1000)
         self.assertIn("interfaces", stats)
+        self.assertEqual(stats["reticulum_interfaces"], [])  # an offline node has no Reticulum
         self.assertTrue(peers_feature.format_stats(stats))
+
+    def test_reticulum_interfaces(self):
+        """stats' reticulum_interfaces (0.2.1): get_interface_stats' entries, read-only, malformed values left out;
+        rnfs stats shows each; one that can't be read gives none."""
+        entries = {"interfaces": [
+            {"name": "TCPInterface[Hub/1.2.3.4:4242]", "short_name": "Hub", "type": "TCPClientInterface",
+             "status": True, "mode": 0x01, "bitrate": 10_000_000, "rxb": 2048, "txb": 1024, "rxs": 80.0, "txs": 0,
+             "clients": None},
+            {"name": "RNodeInterface[LoRa]", "short_name": "LoRa", "type": "RNodeInterface", "status": False,
+             "mode": 0x04, "bitrate": 1200, "rxb": "lots", "txb": 0, "rxs": float("nan"), "txs": 0, "clients": True},
+            "not an entry"]}
+        self.node.reticulum = mock.Mock(get_interface_stats=mock.Mock(return_value=entries))
+        hub, lora = self.feature.stats()["reticulum_interfaces"]
+        self.assertEqual(hub, {"name": "Hub", "full_name": "TCPInterface[Hub/1.2.3.4:4242]", "type": "TCPClientInterface",
+                               "online": True, "mode": "full", "bitrate": 10_000_000, "rx_bytes": 2048,
+                               "tx_bytes": 1024, "rx_speed": 80.0, "tx_speed": 0, "clients": None})
+        self.assertEqual((lora["online"], lora["mode"], lora["rx_bytes"], lora["rx_speed"], lora["clients"]),
+                         (False, "roaming", None, None, None))
+        lines = peers_feature.format_stats(self.feature.stats())
+        self.assertIn("reticulum Hub (TCPClientInterface): up; full, 10000 kbit/s, rx 2.05 KB, tx 1.02 KB", lines)
+        self.assertIn("reticulum LoRa (RNodeInterface): down; roaming, 1.2 kbit/s, rx -, tx 0 B", lines)
+        self.node.reticulum = mock.Mock(get_interface_stats=mock.Mock(side_effect=OSError("RPC failed")))
+        self.assertEqual(self.feature.stats()["reticulum_interfaces"], [])
 
     def test_routes_and_commands(self):
         self.assertEqual(set(peers_feature.FEATURE.api_routes()), {("GET", "/api/peers"), ("GET", "/api/stats")})

@@ -29,6 +29,7 @@ from rnfs.constants import BUCKET_COUNT, ID_LENGTH, K, MISSED_ANNOUNCES
 AVOID_AFTER = 300.0  # seconds an unreliable node isn't retried after max_failures failed queries in a row ...
 AVOID_MAX = 3600.0  # ... doubling with each further failure up to this
 MAX_UNRELIABLE = 4096  # nodes whose failed queries are remembered; the least recently failed is forgotten first
+MAX_LISTED = 256  # unreliable nodes and bans snapshot() lists at most (it counts them all)
 
 # What a saved row (row(), restore()) holds for a node
 IN_TABLE = 0  # in the table: first seen, last heard, failed queries since last heard
@@ -93,6 +94,9 @@ class RoutingTable:
         # _prune only looks at the front of each
         self._dropped: dict[bytes, tuple[float, float]] = {}  # node ID -> (first seen, when dropped)
         self._bans: dict[bytes, float] = {}  # node ID -> ban end
+        # Node ID -> why it was banned (0.2.1, for snapshot()), while banned; not saved, so a ban restored at start
+        # has none
+        self._ban_reasons: dict[bytes, str] = {}
         # Node ID -> [failed queries in a row, when it may be retried], for any node; only an answer clears it
         self._unanswered: OrderedDict[bytes, list] = OrderedDict()
         self._lock = threading.RLock()
@@ -134,6 +138,7 @@ class RoutingTable:
             expired.append(node_id)
         for node_id in expired:
             del self._bans[node_id]
+            self._ban_reasons.pop(node_id, None)
             self._changed(node_id)
         expired = []
         for node_id, (_, dropped) in self._dropped.items():
@@ -285,8 +290,9 @@ class RoutingTable:
             self._dropped.pop(node_id, None)
             self._changed(node_id)
 
-    def ban(self, node_id: bytes):
-        """Ban node_id for ban_time: dropped with its seniority, and ignored by heard() until the ban ends."""
+    def ban(self, node_id: bytes, reason: str | None = None):
+        """Ban node_id for ban_time: dropped with its seniority, and ignored by heard() until the ban ends. reason
+        is what snapshot() says it was banned for."""
         check_id(node_id)
         if node_id == self.own_id:
             return
@@ -294,6 +300,10 @@ class RoutingTable:
             self.remove(node_id)
             self._bans.pop(node_id, None)  # re-inserted last, keeping _bans in expiry order
             self._bans[node_id] = self.clock() + self.config.ban_time
+            if reason is not None:
+                self._ban_reasons[node_id] = reason
+            else:
+                self._ban_reasons.pop(node_id, None)
             self._changed(node_id)
 
     def is_banned(self, node_id: bytes) -> bool:
@@ -307,9 +317,42 @@ class RoutingTable:
                 return False
             if until <= self.clock():
                 del self._bans[node_id]
+                self._ban_reasons.pop(node_id, None)
                 self._changed(node_id)
                 return False
             return True
+
+    def snapshot(self, max_listed: int = MAX_LISTED) -> dict:
+        """The table as GET /api/routing gives it (0.2.1), times as wall clock: {"k" (a bucket's size), "buckets":
+        [{"index" (i: distance in [2^i, 2^(i+1)) from this node), "nodes": [{"node_id", "first_seen", "last_heard",
+        "failures" (unanswered queries since last heard), "stale" (failed one since, or silent past two announce
+        intervals: the first to give up its place)}], by first seen}] (the buckets holding a node, by index),
+        "nodes", "dropped" (nodes that left, whose seniority a return within two announce intervals regains),
+        "unreliable" (nodes, in the table or not, whose last max_failures queries all failed: [{"node_id",
+        "failures", "retry_at"}], the most recently failed first) and "unreliable_total", "bans" ([{"node_id",
+        "until", "reason" (None: not known, as for a ban from before a restart)}], soonest to end first) and
+        "bans_total"}. At most max_listed unreliable nodes and bans are listed."""
+        with self._lock:
+            now = self.clock()
+            self._prune(now)
+            offset = self.wall_clock() - now
+            buckets = [{"index": index, "nodes": [
+                {"node_id": entry.node_id.hex(), "first_seen": entry.first_seen + offset,
+                 "last_heard": entry.last_heard + offset, "failures": entry.failures,
+                 "stale": self._stale(entry, now)}
+                for entry in sorted(bucket.values(), key=lambda e: e.first_seen)]}
+                for index, bucket in enumerate(self._buckets) if bucket]
+            unreliable = [(node_id, entry) for node_id, entry in reversed(self._unanswered.items())
+                          if entry[0] >= self.config.max_failures]
+            bans = [(node_id, until) for node_id, until in self._bans.items() if until > now]
+            return {"k": K, "buckets": buckets, "nodes": sum(len(bucket["nodes"]) for bucket in buckets),
+                    "dropped": len(self._dropped),
+                    "unreliable": [{"node_id": node_id.hex(), "failures": entry[0], "retry_at": entry[1] + offset}
+                                   for node_id, entry in unreliable[:max_listed]],
+                    "unreliable_total": len(unreliable),
+                    "bans": [{"node_id": node_id.hex(), "until": until + offset,
+                              "reason": self._ban_reasons.get(node_id)} for node_id, until in bans[:max_listed]],
+                    "bans_total": len(bans)}
 
     def closest(self, key: bytes, count: int = K, for_reply: bool = False) -> list[bytes]:
         """The count servers in the table closest to key, closest first.

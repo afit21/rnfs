@@ -42,7 +42,7 @@ from rnfs.content import builder, chunker, dag
 from rnfs.content.builder import Built, FileState, display_path
 from rnfs.content.cid import Cid
 from rnfs.content.storage import FOLDER, Session, Storage
-from rnfs.errors import RnfsError, StorageFull
+from rnfs.errors import InvalidDag, RnfsError, StorageFull
 from rnfs.log import LOG_INFO, LOG_WARNING, log
 
 
@@ -111,6 +111,7 @@ def open_signature(handle: builder.Handle, st: os.stat_result, path: str) -> str
 
 
 RETRY_AFTER = 600.0  # seconds before an entry whose import failed for a reason that may pass is tried again
+MAX_STATUS_FAILURES = 10  # entries that failed to import status() names (it counts them all)
 # The rnfs dir's subdirectories holding its keys (storage/identity, names/) and state: never scanned as the folder.
 # lxmf/ too: the LXMF router state rnfs before 0.2.0 kept there may still be on disk, for an LXMF app to adopt
 PRIVATE_SUBDIRS = ("storage", "names", "state", "blocks", "lxmf")
@@ -520,6 +521,14 @@ class SharedFolder:
         self._lock = threading.Lock()
         self._known: dict[str, tuple[str, Cid]] = {}  # entry name -> (signature, CID) of its last import
         self._saved: dict[str, tuple[str, Cid]] = {}  # what the shared_folder table holds
+        # What status() reports (0.2.1), each replaced whole, so status() reads them without the lock: the content
+        # bytes of each entry's CID (as its root block states them, None if unreadable), whether a scan runs, when
+        # the last one ended (Unix time), why the folder is refused (None: it isn't) and why the last scan failed
+        self._sizes: dict[Cid, int | None] = {}
+        self._scanning = False
+        self._last_scan: float | None = None
+        self._refused: str | None = None
+        self._error: str | None = None
         try:
             # What the files inside entries were built as (D1): a store of its own, which the node saves
             self.files = FolderFiles(state_dir)
@@ -581,36 +590,83 @@ class SharedFolder:
 
         options: the chunker and the deny list's file-hash check every import is built with (builder.BuildOptions;
         by default those of this context, builder.current_options)."""
+        with self._lock:
+            self._scanning = True
+            try:
+                pins = self._scan(options)
+            except Exception as e:
+                self._error = str(e) or type(e).__name__
+                raise
+            else:
+                self._error = None
+                return pins
+            finally:
+                self._scanning = False
+                self._last_scan = time.time()
+
+    def _scan(self, options: builder.BuildOptions | None) -> set[Cid]:
+        """scan(), the lock held."""
         options = options if options is not None else builder.current_options()
         options = dataclasses.replace(options, skip_dirs=options.skip_dirs | private_dirs(self.rnfs_dir))
-        with self._lock:
-            os.makedirs(self.directory, exist_ok=True)
-            current: dict[str, tuple[str, Cid]] = {}
-            # The folder itself is the owner's setting, so a symlink to it is followed; nothing inside it is
-            folder, st = builder.open_path(self.directory)
-            try:
-                if not stat.S_ISDIR(st.st_mode):
-                    raise NotADirectoryError(f"{display_path(self.directory)} is not a directory")
-                # A refused folder counts as empty: every folder pin is released, so a node whose folder already
-                # led into the rnfs dir (as 0.1.5 allowed) stops providing what it imported from there
-                checked = self._check_target(folder, st, options.skip_dirs)
-                items = builder.list_directory(folder) if checked else []
-                for item in items:
-                    result = self._scan_item(folder, item, options)
-                    if result is not None:
-                        current[item.name] = result
-            finally:
-                builder.close(folder)
-            names = {item.name for item in items}
-            self.files.retain(names)
-            pins = {cid for _, cid in current.values()}
-            for cid in self.storage.pinned_by(FOLDER) - pins:
-                self.storage.unpin(cid, FOLDER)
-            self._known = current
-            if current != self._saved:  # also after a save that failed: _save writes what the table lacks
-                self._save()
-            self._importer.retain(names)
-            return pins
+        os.makedirs(self.directory, exist_ok=True)
+        current: dict[str, tuple[str, Cid]] = {}
+        # The folder itself is the owner's setting, so a symlink to it is followed; nothing inside it is
+        folder, st = builder.open_path(self.directory)
+        try:
+            if not stat.S_ISDIR(st.st_mode):
+                raise NotADirectoryError(f"{display_path(self.directory)} is not a directory")
+            # A refused folder counts as empty: every folder pin is released, so a node whose folder already
+            # led into the rnfs dir (as 0.1.5 allowed) stops providing what it imported from there
+            checked = self._check_target(folder, st, options.skip_dirs)
+            items = builder.list_directory(folder) if checked else []
+            for item in items:
+                result = self._scan_item(folder, item, options)
+                if result is not None:
+                    current[item.name] = result
+        finally:
+            builder.close(folder)
+        names = {item.name for item in items}
+        self.files.retain(names)
+        pins = {cid for _, cid in current.values()}
+        for cid in self.storage.pinned_by(FOLDER) - pins:
+            self.storage.unpin(cid, FOLDER)
+        self._known = current
+        self._sizes = {cid: self._sizes[cid] if cid in self._sizes else self._size(cid) for cid in pins}
+        if current != self._saved:  # also after a save that failed: _save writes what the table lacks
+            self._save()
+        self._importer.retain(names)
+        return pins
+
+    def _size(self, cid: Cid) -> int | None:
+        """The content bytes of an entry's CID, as its root block states them (a raw block: its own size); None if
+        it isn't stored or isn't a valid DAG node. Read once per CID, at the scan that first finds it."""
+        if cid.is_raw:
+            return self.storage.block_size(cid)
+        block = self.storage.get(cid)
+        if block is None:
+            return None
+        try:
+            return dag.decode(block).size
+        except InvalidDag:
+            return None
+
+    def status(self) -> dict:
+        """The folder as the last scan left it, for GET /api/status (0.2.1), without waiting for a scan:
+        {"path", "entries" (imported and pinned), "bytes" (their content, as their root blocks state it; None before
+        the first scan ends),
+        "scanning", "last_scan" (when the last ended, Unix time; None before the first), "refused" (why the folder
+        isn't scanned, or None), "error" (why the last scan failed, or None), "failed" (entries that couldn't be
+        imported or read whole) and "failures" (the first MAX_STATUS_FAILURES of those by name: {"name", "reason"})}."""
+        known, sizes, importer = self._known, self._sizes, self._importer
+        failures = {name: reason for name, (_, _, reason) in dict(importer.failed).items()}
+        failures.update(dict(importer.unread))
+        return {"path": self.directory, "entries": len(known),
+                "bytes": None if self._last_scan is None else sum(size for size in sizes.values() if size is not None),
+                "scanning": self._scanning,
+                "last_scan": self._last_scan, "refused": self._refused, "error": self._error,
+                "failed": len(failures),
+                "failures": [{"name": name, "reason": failures[name]}
+                             for name in sorted(failures)[:MAX_STATUS_FAILURES]]}
 
     def _check_target(self, folder: builder.Handle, st: os.stat_result, skip_dirs: frozenset[builder.DirId]) -> bool:
         """False, with a warning while it stays so, if the folder open as folder (whose stat is st) may not be
@@ -620,6 +676,7 @@ class SharedFolder:
         reason = refused_reason(real, self.rnfs_dir)
         if reason is None and builder.is_skipped_dir(st, skip_dirs):
             reason = builder.PRIVATE_DIR
+        self._refused = reason
         if reason is not None:
             self._warn_once("target", f"not scanning {display_path(self.directory)}: {reason}. Its pins with "
                                       f"source folder were released; point it at another directory")

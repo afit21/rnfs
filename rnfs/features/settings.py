@@ -8,7 +8,8 @@ schema, read and changed through the daemon, some applied without a restart.
   settings) wins over rnfs.toml, as at start: such a setting is "overridden", and a restart with the same command
   line keeps the command line's value.
 - `POST /api/config/set` checks the whole resulting configuration as Config.load would (unknown names, types,
-  ranges, the rules between settings) before writing anything, then rewrites rnfs.toml atomically (owner-only;
+  ranges, the rules between settings) before writing anything (with dry_run, 0.2.1, only that: the answer says what
+  would apply now and what at the next start, and nothing is written), then rewrites rnfs.toml atomically (owner-only;
   read through config.open_checked, so a symlink, a file of another user's or one over the size limit is refused,
   and a symlink at its path is replaced, never written through), keeping comments and other lines
   (config.edit_settings). Then it applies the settings in LIVE to the running node. rnfs_dir is refused: rnfs.toml
@@ -73,12 +74,14 @@ class SettingsFeature(Feature):
 
     # Changing
 
-    def set(self, changes) -> dict:
+    def set(self, changes, dry_run: bool = False) -> dict:
         """Set the settings in changes (name -> value, None: removed from rnfs.toml, so back to the default) in
         rnfs.toml, then apply those in LIVE that the command line doesn't override. Nothing is written unless the
         whole result is valid. Returns {"path", "applied": [applied now], "restart_required": [whose new value
         applies at the next start], "overridden": [set on the daemon's command line, which keeps winning],
         "warnings"}, names in the order given; a setting set to the value running is in none of the first two.
+        dry_run (0.2.1): every check made, nothing written or applied, the answer what it would be, with
+        "dry_run": true (for checking settings as the user types them).
         A name that isn't a setting (or rnfs_dir) may only be removed, and only if rnfs.toml has it: so a file a
         start refuses for it can be mended. Raises ValueError (refused), Busy (rnfs.toml changed meanwhile),
         OSError (it can't be written)."""
@@ -129,22 +132,34 @@ class SettingsFeature(Feature):
             for name in live:
                 setattr(mixed, name, getattr(candidate, name))
             mixed.validate()
+            restart = [name for name in changes if name not in live and name not in running.overrides
+                       and not same_value(getattr(candidate, name), getattr(running, name))]
+            # Said applied only if the value changed (each is applied all the same), before _apply changes running
+            applied = [name for name in live if not same_value(getattr(candidate, name), getattr(running, name))]
+            overridden = [name for name in changes if name in running.overrides]
+            if dry_run:
+                return {"path": path, "applied": applied, "restart_required": restart, "overridden": overridden,
+                        "warnings": warnings, "dry_run": True}
             # A hand edit since the read would be lost: refused, for the caller to try again on the new file
             if settings.read_settings_file(path)[0] != data:
                 raise Busy("rnfs.toml changed while it was being edited; try again")
             from rnfs import fsutil
             fsutil.write_atomic(path, new_data, mode=0o600, private=True)
-            restart = [name for name in changes if name not in live and name not in running.overrides
-                       and not same_value(getattr(candidate, name), getattr(running, name))]
-            # Said applied only if the value changed (each is applied all the same), before _apply changes running
-            applied = [name for name in live if not same_value(getattr(candidate, name), getattr(running, name))]
             for name in live:
                 self._apply(name, getattr(candidate, name))
-        overridden = [name for name in changes if name in running.overrides]
         _common.log(f"settings: rnfs.toml changed ({', '.join(changes)}); applied now: {', '.join(applied) or 'none'}"
                     f"; at the next start: {', '.join(restart) or 'none'}", _common.LOG_NOTICE)
+        # 0.2.1: so Settings shows a change made elsewhere (the CLI, another app), and that a restart is due
+        from rnfs import events
+        events.publish(self.node, "config", changed=list(changes), applied=applied, restart_required=restart,
+                       pending=self.pending())
         return {"path": path, "applied": applied, "restart_required": restart, "overridden": overridden,
                 "warnings": warnings}
+
+    def pending(self) -> list[str]:
+        """The settings a restart would change (GET /api/config's "pending"), by name; none if rnfs.toml can't be
+        read."""
+        return [entry["name"] for entry in self.describe()["settings"] if entry.get("pending")]
 
     def _apply(self, name: str, value):
         """Run the node with setting name at value (already checked): node.config changed, then the hook that
@@ -321,9 +336,12 @@ def _api_config(handler):
 
 
 def _api_config_set(handler):
-    """POST /api/config/set {"settings": {name: value or null}}: rnfs.toml changed, live ones applied."""
+    """POST /api/config/set {"settings": {name: value or null}, "dry_run"}: rnfs.toml changed, live ones applied;
+    dry_run (0.2.1): only checked."""
+    from rnfs.api import parse_bool
     body = handler.json_body()
-    handler.send_json(200, _common.feature(handler, NAME).set(body.get("settings")))
+    handler.send_json(200, _common.feature(handler, NAME).set(body.get("settings"),
+                                                              dry_run=parse_bool(body.get("dry_run"))))
 
 
 # CLI

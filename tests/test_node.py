@@ -526,6 +526,21 @@ class NetworkStatusTest(NodeTest):
         self.assertIsNotNone(status["network"]["size_estimate"])
 
 
+class StatusEventTest(NodeTest):
+    """The "status" event (0.2.1): status_event names the top-level fields changed since its last call."""
+
+    def test_names_what_changed(self):
+        start = self.a.events.last
+        self.a.status_event()  # the first call only records
+        self.a.status_event()
+        self.assertEqual(self.a.events.since(start, ["status"])["events"], [])
+        self.a.add_stream(io.BytesIO(b"status"), name=None)
+        self.a.status_event()
+        [event] = self.a.events.since(start, ["status"])["events"]
+        self.assertTrue({"pins", "blocks", "used_bytes"} <= set(event["changed"]), event["changed"])
+        self.assertNotIn("node_id", event["changed"])
+
+
 class SealedCheckTest(NodeTest):
     """Whether a file is sealed is read from its first bytes once: plain files are remembered (_not_sealed), and
     read_file passes what its info opened on to its read."""

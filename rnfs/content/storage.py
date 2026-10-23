@@ -1540,6 +1540,36 @@ class Storage:
         return {"removed_blocks": stats["removed_blocks"], "freed_bytes": stats["freed_bytes"],
                 "incomplete": incomplete, "uncached": stats["uncached"]}
 
+    def gc_preview(self) -> dict:
+        """What gc() would delete now, deleting nothing, and what the stored blocks are kept for (0.2.1: POST /api/gc
+        with dry_run): {"removed_blocks", "freed_bytes" (block bytes, as gc() counts them), "allocated_bytes" (what
+        those take on disk), "held_back" (a damaged DAG node something reaches: gc would delete nothing),
+        "cached_fetches" (the records gc would evict), "pinned_bytes" (blocks a pin reaches), "cached_bytes" (blocks
+        only a cached fetch reaches), "protected_bytes" (blocks only an operation in progress holds: a fetch, an
+        add, a job) and "unreferenced_bytes" (blocks nothing reaches)}. Walks every pin's DAG, as gc does: the nodes
+        are read without the lock first (_warm)."""
+        with self._lock:
+            roots = self._roots() | set(self._cache.values())
+        self._warm(roots, [])
+        with self._lock:
+            damaged: set[Cid] = set()
+            pinned = self._reach(self._pins, damaged=damaged)
+            held = pinned | self._reach(self._roots(), known=pinned, damaged=damaged)
+            live = self._live(damaged)
+            dead = self._sizes.keys() - held
+            held_back = bool(damaged)
+            removed = set() if held_back else dead
+
+            def total(cids) -> int:
+                """The block bytes of cids."""
+                return sum(self._sizes[cid] for cid in cids if cid in self._sizes)
+
+            return {"removed_blocks": len(removed), "freed_bytes": total(removed),
+                    "allocated_bytes": sum(self._allocation(self._sizes[cid]) for cid in removed),
+                    "held_back": held_back, "cached_fetches": len(self._cache),
+                    "pinned_bytes": total(pinned), "cached_bytes": total(live - held),
+                    "protected_bytes": total(held - pinned), "unreferenced_bytes": total(self._sizes.keys() - live)}
+
     def verify(self) -> dict:
         """Re-check every stored block against its CID, deleting bad ones.
 

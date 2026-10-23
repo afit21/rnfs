@@ -40,7 +40,7 @@ from rnfs.objects import Record
 # often short-lived, and short-lived nodes should be DHT clients (section 6)
 EMBEDDED_DEFAULTS = {"dht_mode": "client"}
 # The capabilities (api.CAPABILITIES) a Node lacks: it serves no API to be stopped through, and writes no daemon.json
-NODE_LACKS = ("shutdown", "daemon_json")
+NODE_LACKS = ("shutdown", "daemon_json", "restart")
 
 _process_lock = threading.Lock()
 _running: "Node | None" = None  # the Node running in this process: one at a time, as RNS.Reticulum is one
@@ -258,13 +258,33 @@ class _Backend:
         """RnfsNode.pin_remote_served."""
         return self.node.pin_remote_served()
 
-    def providers(self, cid: str) -> list[str]:
-        """RnfsNode.providers, in hex."""
-        return [node_id.hex() for node_id in self.node.providers(cid)]
+    def providers(self, cid: str, on_provider=None) -> list[str]:
+        """RnfsNode.providers, in hex; on_provider(hex) told of each as found."""
+        report = None if on_provider is None else lambda node_id: on_provider(node_id.hex())
+        return [node_id.hex() for node_id in self.node.providers(cid, on_provider=report)]
+
+    def log_lines(self, after: int | None, limit: int | None, level) -> dict:
+        """rnfs.recentlog's lines (rnfs's messages; Reticulum's own are the program's), as GET /api/log gives them."""
+        from rnfs import api, recentlog
+        from rnfs.debuglog import LEVEL_NUMBERS
+        if isinstance(level, str):
+            level = {name.lower(): number for name, number in LEVEL_NUMBERS.items()}.get(level.lower())
+            if level is None:
+                raise ValueError("unknown level")
+        return recentlog.LINES.since(after, api.DEFAULT_LOG_LINES if limit is None else min(limit, recentlog.MAX_LIMIT),
+                                     level)
+
+    def routing(self) -> dict:
+        """RnfsNode.routing_info."""
+        return self.node.routing_info()
 
     def ping(self, node_id: str) -> float | None:
         """RnfsNode.ping."""
         return self.node.ping(_bytes(node_id))
+
+    def ping_info(self, node_id: str, on_stage=None) -> dict:
+        """RnfsNode.ping_info."""
+        return self.node.ping_info(_bytes(node_id), on_stage=on_stage)
 
     def export(self, target: str, output: str) -> dict:
         """RnfsNode.export."""
@@ -274,9 +294,9 @@ class _Backend:
         """RnfsNode.import_archive."""
         return self.node.import_archive(path)
 
-    def gc(self) -> dict:
+    def gc(self, dry_run: bool = False) -> dict:
         """RnfsNode.gc."""
-        return self.node.gc()
+        return self.node.gc(dry_run=dry_run)
 
     def verify(self) -> dict:
         """RnfsNode.verify."""
@@ -427,10 +447,10 @@ class _Backend:
 
     # Streams (rnfs 0.2.0)
 
-    def add_tar(self, data, name: str | None, pin: bool, only_hash: bool, chunker: str | None) -> dict:
-        """RnfsNode.add_tar of bytes or a binary file."""
+    def add_tar(self, data, name: str | None, pin: bool, only_hash: bool, chunker: str | None, **options) -> dict:
+        """RnfsNode.add_tar of bytes or a binary file (options: to, to_self, origin)."""
         stream = io.BytesIO(data) if isinstance(data, bytes) else data
-        return self.node.add_tar(stream, name=name, only_hash=only_hash, pin=pin, chunker=chunker)
+        return self.node.add_tar(stream, name=name, only_hash=only_hash, pin=pin, chunker=chunker, **options)
 
     def get_tar(self, target: str):
         """RnfsNode.get_tar's chunks: a generator, fetching (and raising) once iterated, as a Client's."""
@@ -482,6 +502,10 @@ class _Backend:
         """Refused: a Node is the program's; close() stops it."""
         raise Unsupported("an rnfs.Node runs inside this program: close() it to stop it")
 
+    def restart(self, wait: float | None) -> bool:
+        """Refused: a Node is the program's; close() it and make a new one."""
+        raise Unsupported("an rnfs.Node runs inside this program: close() it and make a new one to restart it")
+
     def daemon_info(self) -> dict | None:
         """None: a Node is no daemon, and its rnfs dir has no daemon.json."""
         return None
@@ -492,12 +516,12 @@ class _Backend:
         from rnfs.features import _common, settings
         return json.loads(json.dumps(_common.feature(self, settings.NAME).describe()))
 
-    def config_set(self, changes: dict) -> dict:
+    def config_set(self, changes: dict, dry_run: bool = False) -> dict:
         """SettingsFeature.set of changes as POST /api/config/set's JSON body carries them (tuples as lists: the
         feature checks rnfs.toml reads back as exactly what it was given)."""
         from rnfs.features import _common, settings
         feature = _common.feature(self, settings.NAME)
-        return feature.set(json.loads(json.dumps(changes)))
+        return feature.set(json.loads(json.dumps(changes)), dry_run=dry_run)
 
     def events_since(self, after: int | None, kinds: list[str] | None, wait: int, epoch: str | None) -> dict:
         """EventLog.since, as GET /api/events calls it: wait capped as it caps it, and none without after."""

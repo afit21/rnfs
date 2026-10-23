@@ -78,9 +78,14 @@ PIN_KEY_HEADER = "X-Rnfs-Pin-Key"
 # Before sending the token, a client makes whatever listens on the API port prove it knows it (api_proof)
 CHALLENGE_HEADER = "X-Rnfs-Challenge"
 PROOF_HEADER = "X-Rnfs-Proof"
+# Pairing (0.2.1): the app's name, on its request for a token (a custom header: no web page can send it without a
+# CORS preflight, which fails), and the secret its answer gave, to collect the token
+PAIRING_HEADER = "X-Rnfs-Pairing"
+PAIRING_SECRET_HEADER = "X-Rnfs-Pairing-Secret"
 PROOF_TIMEOUT = 15  # seconds to connect and prove (at most the client's timeout): a listener mustn't hang a client
 PROOF_READ_LIMIT = 64 * 1024  # the most read of a proof's response (the daemon's is a few dozen bytes)
 COPY_SIZE = 64 * 1024  # what a Stream reads at a time when iterated
+MAX_JSON_LINE = 1024 * 1024  # bytes of one line of a streamed answer (json_lines): its last line lists every provider
 # The oldest daemon a client talks to: one before 0.1.5 closes the connection it proved itself on, so the request
 # could only go on a new connection, which another listener could take (clients before 0.2.0 sent it there)
 OLDEST_DAEMON = (0, 1, 5)
@@ -392,6 +397,14 @@ def read_token(path: str, app: str | None = None) -> str:
     return token
 
 
+def _json_of(response: http.client.HTTPResponse):
+    """A response's JSON body. Raises ConnectionFailed for one that isn't."""
+    try:
+        return json.loads(read_all(response))
+    except ValueError:
+        raise ConnectionFailed("the daemon sent an invalid response") from None
+
+
 def read_all(response: http.client.HTTPResponse) -> bytes:
     """A response's whole body. Raises ConnectionFailed if it is shorter than its Content-Length (the daemon hit
     an error)."""
@@ -403,6 +416,55 @@ def read_all(response: http.client.HTTPResponse) -> bytes:
         raise ConnectionFailed("the daemon didn't finish its answer within the timeout") from None
     except OSError as e:  # a reset
         raise ConnectionFailed(f"the response failed ({e!r}); see the daemon's log") from None
+
+
+def json_lines(response: http.client.HTTPResponse):
+    """The JSON lines of a streamed answer (the API's send_lines: application/x-ndjson) as they arrive, the last
+    (with "done": true) included; an error line raises its ApiError, and an answer ending without a last line
+    ConnectionFailed. Closing the generator closes the connection, which ends the daemon's work early."""
+    try:
+        while True:
+            try:
+                line = response.readline(MAX_JSON_LINE)
+            except TimeoutError:
+                raise ConnectionFailed("the daemon stopped sending within the timeout") from None
+            except OSError as e:  # a reset
+                raise ConnectionFailed(f"the answer failed ({e!r}); see the daemon's log") from None
+            if not line:
+                raise ConnectionFailed("the answer was cut short; see the daemon's log")
+            try:
+                item = json.loads(line)
+            except ValueError:
+                raise ConnectionFailed("the daemon sent an invalid line") from None
+            if not isinstance(item, dict):
+                raise ConnectionFailed("the daemon sent an invalid line")
+            if item.get("done") and "error" in item:
+                status = item.get("status")
+                raise error_for(status if isinstance(status, int) else 500, str(item["error"]), item.get("code"))
+            yield item
+            if item.get("done"):
+                return
+    finally:
+        response.close()
+
+
+def _lines_or_json(response: http.client.HTTPResponse):
+    """json_lines(response), or for a daemon that ignored stream= (an answer in plain JSON) that answer alone, with
+    "done": true."""
+    if (response.getheader("Content-Type") or "").startswith("application/x-ndjson"):
+        return json_lines(response)
+
+    def single():
+        """The one answer."""
+        try:
+            answer = json.loads(read_all(response))
+        except ValueError:
+            raise ConnectionFailed("the daemon sent an invalid response") from None
+        finally:
+            response.close()
+        yield {**answer, "done": True}
+
+    return single()
 
 
 class Stream:
@@ -617,6 +679,22 @@ class ApiConnection:
         shorter (a listener mustn't hold a request longer than the caller allows it in all)."""
         return PROOF_TIMEOUT if timeout is None else min(timeout, PROOF_TIMEOUT)
 
+    @staticmethod
+    def _early_answer(connection: http.client.HTTPConnection, method: str,
+                      error: Exception) -> http.client.HTTPResponse | None:
+        """The answer the daemon sent before it stopped reading an upload (a refusal, or the upload's job cancelled:
+        409 cancelled) and closed the connection, which sending the rest of the body then failed on; None if none
+        can be read (not a dropped connection, or nothing came)."""
+        sock = connection.sock
+        if sock is None or not isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            return None
+        try:
+            response = http.client.HTTPResponse(sock, method=method)
+            response.begin()
+        except (http.client.HTTPException, OSError):
+            return None
+        return response
+
     def _exchange(self, connection: http.client.HTTPConnection, method: str, url: str, body,
                   headers: dict) -> http.client.HTTPResponse:
         """Send one request on connection and return its response, whatever its status; a connection that fails
@@ -626,6 +704,9 @@ class ApiConnection:
             connection.request(method, url, body=body, headers=headers)
             return connection.getresponse()
         except (http.client.HTTPException, OSError) as e:
+            early = self._early_answer(connection, method, e) if body is not None else None
+            if early is not None:
+                return early
             connection.close()
             if isinstance(e, ConnectionRefusedError):
                 holder = dir_holder(self.rnfs_dir)
@@ -813,13 +894,13 @@ class ApiConnection:
             return {}
 
     def events(self, after: int | None = None, kinds: list[str] | None = None, wait: int = 0,
-               epoch: str | None = None) -> dict:
+               epoch: str | None = None, timeout=DEFAULT) -> dict:
         """The daemon's events after sequence after (of kinds, if given), as soon as there is one or after wait
         seconds (the API caps it): {"events", "next", "lost", "epoch"}. after None answers at once with the
         "next" to start from; pass the epoch given, so a restarted daemon answers "lost". NoSuchEndpoint from a
         daemon before 0.2.0."""
         return self.get("/api/events", after=after, kinds=",".join(kinds) if kinds else None, wait=wait or None,
-                        epoch=epoch)
+                        epoch=epoch, timeout=timeout)
 
     def shutdown(self, wait: float | None = None) -> bool:
         """Ask the daemon to stop (as SIGTERM does). With wait, poll up to that many seconds (at least once) until
@@ -855,6 +936,28 @@ class ApiConnection:
             return False  # something answered
         return pid is None or not _process_alive(pid)
 
+    def restart(self, wait: float | None = None) -> bool:
+        """Ask the daemon to restart (0.2.1): it stops as SIGTERM stops it and starts again with the same command
+        line, so settings that need a restart apply. With wait, poll up to that many seconds until it answers as a
+        new run (its events' epoch changed): True once it does, False if not within wait. Without wait, True once
+        it agreed. Unsupported from a daemon that can't restart itself (daemon.json's can_restart),
+        NoSuchEndpoint from one before 0.2.1."""
+        before = self.events()["epoch"] if wait is not None else None
+        self.post("/api/restart")
+        if wait is None:
+            return True
+        deadline = time.monotonic() + wait
+        while True:
+            remaining = deadline - time.monotonic()
+            try:
+                if self.events(timeout=max(0.1, min(remaining, PROOF_TIMEOUT)))["epoch"] != before:
+                    return True
+            except (DaemonNotRunning, ConnectionFailed, TokenError, AuthFailed):
+                pass  # stopping, starting again (its new token written once its API listens)
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.5, max(remaining, 0)))
+
     def daemon_info(self) -> dict | None:
         """What the daemon wrote about itself (read_daemon_info) in this client's rnfs dir, or None."""
         return read_daemon_info(self.rnfs_dir)
@@ -873,6 +976,58 @@ class ApiConnection:
     def app_rm(self, name: str) -> dict:
         """Revoke app name's token and release every pin it made: {"released"}. NotFound for an app there isn't."""
         return self.post("/api/apps/rm", name=name)
+
+    def app_requests(self) -> list[dict]:
+        """The apps waiting for the user's answer: [{"id", "name", "description", "code", "requested",
+        "expires"}] (0.2.1)."""
+        return self.get("/api/apps/requests")["requests"]
+
+    def app_approve(self, request_id: str) -> dict:
+        """Approve an app's request (0.2.1): {"name", "created"}; its token goes to the app alone."""
+        return self.post("/api/apps/approve", id=request_id)
+
+    def app_deny(self, request_id: str) -> dict:
+        """Refuse an app's request (0.2.1): {"name"}."""
+        return self.post("/api/apps/deny", id=request_id)
+
+    # Pairing, for an app that has no token yet (0.2.1): no token is sent
+
+    def app_request(self, name: str, description: str | None = None) -> dict:
+        """Ask the daemon for a token for app name: {"id", "secret", "code", "expires"}. Show the code to the user,
+        who approves the request where it shows the same code (rnfs app requests, approve), then collect the token
+        with app_request_state, or wait for it with pair()."""
+        response = self.request("POST", "/api/apps/request", json_body={"description": description},
+                                extra_headers={PAIRING_HEADER: name}, authenticated=False)
+        return _json_of(response)
+
+    def app_request_state(self, request_id: str, secret: str) -> dict:
+        """What became of a pairing request: {"name", "state": "pending" | "approved" | "denied", "token" (once
+        approved, given once), "expires"}; NotFound once collected or expired."""
+        response = self.request("GET", "/api/apps/request", params={"id": request_id},
+                                extra_headers={PAIRING_SECRET_HEADER: secret}, authenticated=False)
+        return _json_of(response)
+
+    def pair(self, name: str, description: str | None = None, wait: float = 600.0, on_code=None,
+             poll: float = 2.0) -> str:
+        """Ask for a token for app name (app_request), tell on_code(code) the code to show the user, and wait up to
+        wait seconds for the user's answer: the token once approved. Raises AuthFailed when denied, TimeoutError
+        without an answer in time (or once the request expired)."""
+        asked = self.app_request(name, description)
+        if on_code is not None:
+            on_code(asked["code"])
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                answer = self.app_request_state(asked["id"], asked["secret"])
+            except NotFound:
+                raise TimeoutError("the pairing request expired without an answer") from None
+            if answer["state"] == "approved":
+                return answer["token"]
+            if answer["state"] == "denied":
+                raise AuthFailed(f"the user refused app {name}'s request for a token", 403)
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"no answer to app {name}'s request for a token within {wait:g} seconds")
+            time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
 
     # Content
 
@@ -899,25 +1054,30 @@ class ApiConnection:
 
     def add_stream(self, data, name: str | None = None, length: int | None = None, only_hash: bool = False,
                    pin: bool = True, to: list[str] | None = None, to_self: bool = False,
-                   seal_name: str | None = None, chunker: str | None = None) -> dict:
+                   seal_name: str | None = None, chunker: str | None = None, origin: str | None = None) -> dict:
         """Add bytes, or a binary file read to its end (sent chunked unless length is given): as add_path. name
-        wraps it in a directory as that entry; when sealing, seal_name is the name sealed inside."""
+        wraps it in a directory as that entry; when sealing, seal_name is the name sealed inside. origin is what pin
+        ls says it was added from (a daemon before 0.2.1 ignores it)."""
         if isinstance(data, (bytes, bytearray, memoryview)) and length is None:
             length = len(data)
         params = {"name": name, "only_hash": _flag(only_hash), "pin": None if pin else 0,
                   "to": ",".join(to) if to else None, "to_self": _flag(to_self), "seal_name": seal_name,
-                  "chunker": chunker}
+                  "chunker": chunker, "origin": origin}
         return self.call("POST", "/api/add/stream", params=params, body=data, length=length)
 
     def add_tar(self, data, name: str | None = None, length: int | None = None, only_hash: bool = False,
-                pin: bool = True, chunker: str | None = None) -> dict:
+                pin: bool = True, chunker: str | None = None, to: list[str] | None = None, to_self: bool = False,
+                origin: str | None = None) -> dict:
         """Add the directory a tar holds (bytes, or a binary file read to its end, sent chunked unless length is
         given): regular files and directories, the rest skipped with a warning; name wraps it in a directory as that
-        entry. {"cid", "size", "warnings"} (+ "warnings_total"). For a program whose files the daemon can't open."""
+        entry. {"cid", "size", "warnings"} (+ "warnings_total"). For a program whose files the daemon can't open.
+        to/to_self (0.2.1) seal it as a folder named name instead (its top directory; sealed as <name>.tar); origin
+        is what pin ls says it was added from."""
         if isinstance(data, (bytes, bytearray, memoryview)) and length is None:
             length = len(data)
         params = {"format": "tar", "name": name, "only_hash": _flag(only_hash), "pin": None if pin else 0,
-                  "chunker": chunker}
+                  "chunker": chunker, "to": ",".join(to) if to else None, "to_self": _flag(to_self),
+                  "origin": origin}
         return self.call("POST", "/api/add/stream", params=params, body=data, length=length)
 
     def get_tar(self, target: str) -> Stream:
@@ -983,9 +1143,17 @@ class ApiConnection:
         """Import an archive on this machine: {"roots", "incomplete", ...}."""
         return self.post("/api/import", path=os.path.abspath(os.path.expanduser(path)))
 
-    def gc(self) -> dict:
-        """Remove blocks no pin needs: {"removed_blocks", "freed_bytes"}."""
-        return self.post("/api/gc")
+    def gc(self, dry_run: bool = False) -> dict:
+        """Remove blocks no pin needs: {"removed_blocks", "freed_bytes"}. dry_run: remove nothing, and say what it
+        would free and what the stored bytes are kept for (+ "allocated_bytes", "held_back", "cached_fetches",
+        "pinned_bytes", "cached_bytes", "protected_bytes", "unreferenced_bytes", "records_bytes", "dry_run"). A daemon
+        before 0.2.1, which would ignore dry_run and collect, isn't asked: its capabilities lack "gc_dry_run", and
+        this raises Unsupported."""
+        if not dry_run:
+            return self.post("/api/gc")
+        if "gc_dry_run" not in self.capabilities().get("capabilities", ()):
+            raise Unsupported("the daemon has no gc dry run (rnfs 0.2.1 or later)", 404, "unsupported")
+        return self.post("/api/gc", dry_run=True)
 
     def verify(self) -> dict:
         """Check every stored block against its CID: {"checked", "bad", ...}."""
@@ -1052,6 +1220,34 @@ class ApiConnection:
     def ping(self, node: str) -> float | None:
         """The round-trip time in seconds of a new link to node (hex), or None if it is unreachable."""
         return self.get("/api/ping", node=node)["rtt"]
+
+    def log_lines(self, after: int | None = None, limit: int | None = None, level: str | int | None = None) -> dict:
+        """The daemon's recent log lines: {"lines": [{"seq", "time", "level", "level_name", "source", "text"}],
+        "next", "dropped"}, those after sequence after, the last limit (default 200), of level or more severe
+        (NoSuchEndpoint from a daemon before 0.2.1)."""
+        return self.get("/api/log", after=after, limit=limit, level=level)
+
+    def routing(self) -> dict:
+        """The routing table: {"k", "buckets", "nodes", "dropped", "unreliable", "unreliable_total", "bans",
+        "bans_total", "blackholed"} (NoSuchEndpoint from a daemon before 0.2.1)."""
+        return self.get("/api/routing")
+
+    def ping_info(self, node: str) -> dict:
+        """ping() with why it failed and the path: {"rtt", "reason", "hops", "interface", "path_since"} (a daemon
+        before 0.2.1 answers only "rtt")."""
+        return self.get("/api/ping", node=node)
+
+    def ping_stream(self, node: str):
+        """ping_info() as it goes: {"stage"} as each step of opening the link begins, then ping_info()'s answer with
+        "done": true (json_lines). A daemon before 0.2.1 answers that last line alone, without "done"."""
+        response = self.request("GET", "/api/ping", params={"node": node, "stream": "1"})
+        return _lines_or_json(response)
+
+    def providers_stream(self, cid: str):
+        """providers() as they are found: {"provider"} each, then {"providers", "done": true} (json_lines); closing
+        the generator ends the lookup. A daemon before 0.2.1 answers that last line alone, once its lookup ends."""
+        response = self.request("GET", "/api/providers", params={"cid": cid, "stream": "1"})
+        return _lines_or_json(response)
 
     # Names
 
@@ -1132,11 +1328,17 @@ class ApiConnection:
         or None), "warnings"}. NoSuchEndpoint from a daemon before 0.2.0."""
         return self.get("/api/config")
 
-    def config_set(self, settings: dict) -> dict:
+    def config_set(self, settings: dict, dry_run: bool = False) -> dict:
         """Set settings ({name: value, or None to remove it from rnfs.toml}) in the daemon's rnfs.toml, applying at
         once those that can be: {"path", "applied", "restart_required", "overridden", "warnings"}. BadRequest,
-        writing nothing, unless the whole result is valid."""
-        return self.post("/api/config/set", settings=dict(settings))
+        writing nothing, unless the whole result is valid. dry_run: only check them, writing nothing (the answer
+        what it would be, with "dry_run"); a daemon before 0.2.1, which would ignore it and write, isn't asked: its
+        capabilities lack "config_dry_run", and this raises Unsupported."""
+        if not dry_run:
+            return self.post("/api/config/set", settings=dict(settings))
+        if "config_dry_run" not in self.capabilities().get("capabilities", ()):
+            raise Unsupported("the daemon has no settings dry run (rnfs 0.2.1 or later)", 404, "unsupported")
+        return self.post("/api/config/set", settings=dict(settings), dry_run=True)
 
     # Jobs (background transfers, with progress)
 

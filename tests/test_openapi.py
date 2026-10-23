@@ -337,8 +337,22 @@ class LiveTest(unittest.TestCase):
         self.check("GET", "/api/stats", self.call("GET", "/api/stats"))
 
     def test_config(self):
-        """GET /api/config, every setting's entry."""
+        """GET /api/config, every setting's entry; POST /api/config/set's dry run (0.2.1)."""
         self.check("GET", "/api/config", self.call("GET", "/api/config"))
+        self.check("POST", "/api/config/set", self.call("POST", "/api/config/set",
+                                                        {"settings": {"max_jobs": 3}, "dry_run": True}))
+
+    def test_routing_ping_and_gc_preview(self):
+        """GET /api/routing with a node and a ban in it, GET /api/ping, and POST /api/gc's dry run (0.2.1)."""
+        self.node.routing.heard(PEER_ID)
+        self.node.routing.ban(bytes([0xC] * 16), "a test")
+        self.check("GET", "/api/routing", routing := self.call("GET", "/api/routing"))
+        self.assertEqual((routing["nodes"], routing["bans"][0]["reason"]), (1, "a test"))
+        self.check("GET", "/api/ping", self.call("GET", f"/api/ping?node={PEER_ID.hex()}"),
+                   {"$ref": "#/components/schemas/PingResult"})
+        self.call("POST", "/api/add", {"path": os.path.abspath(__file__)})
+        self.check("POST", "/api/gc", self.call("POST", "/api/gc", {"dry_run": True}),
+                   {"$ref": "#/components/schemas/GcPreview"})
 
     def test_apps(self):
         """POST /api/apps/add, GET /api/apps with the app in it, POST /api/apps/rm."""

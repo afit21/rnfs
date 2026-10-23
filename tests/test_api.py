@@ -355,21 +355,33 @@ class FakeNode:
         self.cached.discard(cid)
         return {"removed_records": 1, "removed_blocks": 1, "freed_bytes": 1}
 
-    def gc(self):
-        self.record("gc")
-        return {"removed_blocks": 3, "freed_bytes": 300}
+    def gc(self, dry_run=False):
+        self.record("gc", **({"dry_run": True} if dry_run else {}))
+        return {"removed_blocks": 3, "freed_bytes": 300, **({"dry_run": True} if dry_run else {})}
 
     def verify(self):
         self.record("verify")
         return {"checked": len(self.objects), "bad": []}
 
-    def providers(self, cid):
+    def providers(self, cid, on_provider=None, should_stop=None):
         self.record("providers", cid)
-        return self.provider_map.get(cid, [])
+        found = self.provider_map.get(cid, [])
+        for node_id in found:
+            if on_provider is not None:
+                on_provider(node_id)
+        return found
 
     def ping(self, node_id):
         self.record("ping", node_id)
         return None if node_id == b"\xff" * 16 else 0.25
+
+    def ping_info(self, node_id, on_stage=None):
+        for stage in ("path", "identity", "link") if node_id != b"\xff" * 16 else ("path",):
+            if on_stage is not None:
+                on_stage(stage)
+        rtt = self.ping(node_id)
+        return {"rtt": rtt, "reason": None if rtt is not None else "no_path", "hops": 1 if rtt else None,
+                "interface": "TCP" if rtt else None, "path_since": 1000.0 if rtt else None}
 
     def _name_of(self, key: bytes) -> str:
         return hashlib.sha256(key).digest()[:16].hex()
@@ -556,7 +568,8 @@ class SecurityTest(ApiTestCase):
         self.assertEqual(self.node.called("gc"), [])
 
     def test_token_required(self):
-        # Every route but status, with valid parameters, so only the token can be what refuses them
+        # Every route but the open ones (status, and pairing's: AppSupportTest), with valid parameters, so only the
+        # token can be what refuses them
         file_cid = self.node.put_file(b"x")
         with tempfile.TemporaryDirectory() as tmp:
             secret = os.path.join(tmp, "secret")
@@ -567,8 +580,10 @@ class SecurityTest(ApiTestCase):
                           "path": secret, "output": os.path.join(tmp, "out"), "alias": "k", "pin": True}
             query = "&".join(f"{name}={value}" for name, value in parameters.items() if name != "pin")
             wrong = ["1", "0", "", self.server.token[:-1], self.server.token + "x", "é" + self.server.token[1:]]
+            self.assertEqual(ApiHandler.OPEN_ROUTES, {("GET", "/api/status"), ("POST", "/api/apps/request"),
+                                                      ("GET", "/api/apps/request")})
             for (method, path) in ApiHandler.ROUTES:
-                if path == "/api/status":
+                if (method, path) in ApiHandler.OPEN_ROUTES:
                     continue
                 body = parameters if method == "POST" else None
                 status, _, data = self.call(method, f"{path}?{query}", body, api=False)
@@ -814,10 +829,48 @@ class EndpointTest(ApiTestCase):
         self.assertEqual(self.ok("GET", f"/api/stat?target={directory}/%3Cb%3E")["size"], 3)
         self.node.provider_map[file_cid] = [bytes.fromhex("ab" * 16)]
         self.assertEqual(self.ok("GET", f"/api/providers?cid={file_cid}"), {"providers": ["ab" * 16]})
-        self.assertEqual(self.ok("GET", f"/api/ping?node={'cd' * 16}"), {"rtt": 0.25})
+        self.assertEqual(self.ok("GET", f"/api/ping?node={'cd' * 16}"),
+                         {"rtt": 0.25, "reason": None, "hops": 1, "interface": "TCP", "path_since": 1000.0})
         self.assertEqual(self.node.called("ping")[0][0], (bytes.fromhex("cd" * 16),))
-        self.assertEqual(self.ok("GET", f"/api/ping?node={'ff' * 16}"), {"rtt": None})
+        self.assertEqual(self.ok("GET", f"/api/ping?node={'ff' * 16}"),
+                         {"rtt": None, "reason": "no_path", "hops": None, "interface": None, "path_since": None})
         self.assertEqual(self.ok("GET", "/api/status")["node_id"], bytes(range(16)).hex())
+
+    def lines(self, path) -> list:
+        """The JSON lines of a streamed answer (send_lines), checked to be one."""
+        status, headers, data = self.call("GET", path)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(headers["Content-Type"], "application/x-ndjson")
+        self.assertIsNone(headers["Content-Length"])
+        self.assertTrue(data.endswith(b"\n"))
+        return [json.loads(line) for line in data.splitlines()]
+
+    def test_streamed_ping_and_providers(self):
+        """stream=1: each step or provider as it comes, then the answer the plain request gives, with done."""
+        self.assertEqual(self.lines(f"/api/ping?node={'cd' * 16}&stream=1"),
+                         [{"stage": "path"}, {"stage": "identity"}, {"stage": "link"},
+                          {"rtt": 0.25, "reason": None, "hops": 1, "interface": "TCP", "path_since": 1000.0,
+                           "done": True}])
+        self.assertEqual(self.lines(f"/api/ping?node={'ff' * 16}&stream=1")[-1]["reason"], "no_path")
+        file_cid = self.node.put_file(b"abc")
+        self.node.provider_map[file_cid] = [bytes.fromhex("ab" * 16), bytes.fromhex("cd" * 16)]
+        self.assertEqual(self.lines(f"/api/providers?cid={file_cid}&stream=1"),
+                         [{"provider": "ab" * 16}, {"provider": "cd" * 16},
+                          {"providers": ["ab" * 16, "cd" * 16], "done": True}])
+        # Errors before the first line are answered as without stream=
+        self.assertEqual(self.call("GET", "/api/providers?cid=nope&stream=1")[0], 400)
+
+    def test_streamed_error_after_the_first_line(self):
+        """An error once lines were sent ends the answer with an error line carrying its status and code."""
+        from rnfs.errors import NotFound
+
+        def ping_info(node_id, on_stage=None):
+            on_stage("path")
+            raise NotFound("gone")
+
+        self.node.ping_info = ping_info
+        self.assertEqual(self.lines(f"/api/ping?node={'cd' * 16}&stream=1"),
+                         [{"stage": "path"}, {"error": "gone", "code": "not_found", "status": 404, "done": True}])
 
     def test_validation(self):
         file_cid = self.node.put_file(b"abc")
@@ -1318,6 +1371,19 @@ class AppSupportTest(ApiTestCase):
         self.server, self.port = server, server.port
         self.assertEqual(self.ok("POST", "/api/shutdown"), {"stopping": True})
         self.assertTrue(stopped.wait(5))
+
+    def test_restart(self):
+        """POST /api/restart (0.2.1) answers, then calls the server's restart; a server without one (a daemon that
+        can't restart itself) answers 404 unsupported."""
+        status, body = self.error("POST", "/api/restart")
+        self.assertEqual((status, body["code"]), (404, "unsupported"))
+        restarting = threading.Event()
+        server = ApiServer(self.node, 0, restart=restarting.set)
+        server.start()
+        self.addCleanup(server.stop)
+        self.server, self.port = server, server.port
+        self.assertEqual(self.ok("POST", "/api/restart"), {"restarting": True})
+        self.assertTrue(restarting.wait(5))
 
     def test_pin_label_and_cache_routes(self):
         """POST /api/pin/label, GET /api/cache/ls and POST /api/cache/rm reach the facade, CIDs checked first."""

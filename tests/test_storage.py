@@ -710,6 +710,37 @@ class EvictionTest(StorageTest):
         self.storage.gc()
         self.assertFalse(self.storage.has(protected.cid))
 
+    def test_gc_preview_changes_nothing_and_tells_what_gc_does(self):
+        """gc_preview (0.2.1) deletes nothing, gives what gc then removes, and splits the stored bytes by what keeps
+        them: pins, cached fetches only, sessions only, nothing."""
+        pinned = self.add(b"P" * 100000)
+        cached = self.add(b"C" * 100000)
+        protected = self.add(b"S" * 100000)
+        orphan = self.add(b"O" * 10)
+        self.storage.pin(pinned.cid, USER)
+        self.storage.record_fetch(cached.cid, [], cached.cid)
+
+        def total(cid: Cid) -> int:
+            """The block bytes of a stored DAG."""
+            return sum(self.storage.block_size(block) for block in self.blocks_of(cid))
+
+        with self.storage.protect() as session:
+            session.add(protected.cid)
+            used, blocks = self.storage.used_bytes(), self.storage.block_count()
+            preview = self.storage.gc_preview()
+            self.assertEqual((self.storage.used_bytes(), self.storage.block_count()), (used, blocks))
+            self.assertEqual(len(self.storage.cached_fetches()), 1)
+            self.assertEqual(
+                {key: preview[key] for key in ("pinned_bytes", "cached_bytes", "protected_bytes",
+                                               "unreferenced_bytes", "cached_fetches", "held_back")},
+                {"pinned_bytes": total(pinned.cid), "cached_bytes": total(cached.cid),
+                 "protected_bytes": total(protected.cid), "unreferenced_bytes": total(orphan.cid),
+                 "cached_fetches": 1, "held_back": False})
+            self.assertGreaterEqual(preview["allocated_bytes"], preview["freed_bytes"])
+            stats = self.storage.gc()
+        self.assertEqual((preview["removed_blocks"], preview["freed_bytes"]),
+                         (stats["removed_blocks"], stats["freed_bytes"]))
+
     def test_cached_fetch_keeps_path_nodes_and_target(self):
         root, a, b = self.tree()
         self.storage.record_fetch(root.cid, ["a"], a.cid)

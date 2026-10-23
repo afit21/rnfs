@@ -294,6 +294,43 @@ class SharedFolderTest(unittest.TestCase):
         self.assertEqual(pins, {self.cid_of("dir"), self.cid_of("other"), self.cid_of("moved.txt")})
         self.assertEqual(self.storage.pinned_by(FOLDER), pins)
 
+    def test_status(self):
+        """status() (0.2.1): entries and their bytes as the last scan left them, when it ended, the entries that
+        failed to import by name, why the last scan failed, and why the folder is refused."""
+        status = self.folder.status()
+        self.assertEqual((status["path"], status["entries"], status["bytes"], status["scanning"], status["last_scan"],
+                          status["failed"], status["failures"]), (self.files, 0, None, False, None, 0, []))
+        self.write("a.txt", b"a" * 10)
+        self.write("dir/b.txt", b"b" * 5)
+        self.write("bad.txt", b"denied")
+        denied = hashlib.sha256(b"denied").digest()
+
+        def deny(digest: bytes):
+            """The deny list's check, denying bad.txt's content."""
+            if digest == denied:
+                raise Denied("its content is denied")
+
+        before = time.time()
+        with mock.patch("rnfs.content.shared_folder.log"):
+            self.folder.scan(builder.BuildOptions(check=deny))
+        status = self.folder.status()
+        self.assertEqual((status["entries"], status["bytes"], status["error"], status["refused"]), (2, 15, None, None))
+        self.assertGreaterEqual(status["last_scan"], before)
+        self.assertEqual((status["failed"], status["failures"]),
+                         (1, [{"name": "bad.txt", "reason": "its content is denied"}]))
+        os.remove(os.path.join(self.files, "bad.txt"))
+        with mock.patch("rnfs.content.shared_folder.builder.list_directory", side_effect=OSError("disk failing")):
+            with self.assertRaises(OSError):
+                self.folder.scan()
+        status = self.folder.status()
+        self.assertEqual((status["error"], status["scanning"], status["entries"]), ("disk failing", False, 2))
+        with mock.patch("rnfs.content.shared_folder.refused_reason", return_value="it leads into the rnfs dir"), \
+                mock.patch("rnfs.content.shared_folder.log"):
+            self.folder.scan()
+        status = self.folder.status()
+        self.assertEqual((status["refused"], status["error"], status["entries"], status["bytes"]),
+                         ("it leads into the rnfs dir", None, 0, 0))
+
     def test_a_newly_denied_hash_is_still_refused(self):
         """A remembered file's content hash goes through the deny check as if it were read."""
         paths = self.tree(3)

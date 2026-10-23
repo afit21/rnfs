@@ -22,7 +22,7 @@ from rnfs.features import jobs
 from tests import test_jobs, test_seal
 from tests.support import POSIX_MODES, real, state_rows, wait_for
 from tests.test_seal import ALICE, BOB, open_all
-from tests.test_tar_stream import END, Blocks, files_of, member
+from tests.test_tar_stream import END, Blocks, files_of, member, tar_of
 
 MARK = tarstream.folder_marker()  # what makes a sealed .tar a sealed folder that get unpacks
 
@@ -150,6 +150,66 @@ class AddSealedFolderTest(SealedFolderBase):
         self.assertEqual((job["total_bytes"], job["done_bytes"]), (size, size))
         self.advertise(job["result"]["cid"])
         self.assertEqual(self.b.info(job["result"]["cid"])["name"], "photos.tar")
+
+
+class SealedTarUploadTest(SealedFolderBase):
+    """add_tar with to (0.2.1): a folder a program sends as a tar, sealed as add --to seals one from a path."""
+
+    def upload(self, data: bytes, name: str = "photos", **options) -> dict:
+        """Seal the tar data for Bob on A as the folder name, provided; add_tar's result."""
+        result = self.a.add_tar(io.BytesIO(data), name=name, to=[BOB.get_public_key().hex()], **options)
+        self.advertise(result["cid"])
+        return result
+
+    def test_round_trip(self):
+        """A recipient's get unpacks it as the folder sealed from its path would be, executable bits included; the
+        plaintext was never stored on the adding node, and its origin is the folder's name unless given."""
+        top = make_folder(os.path.join(self.tmp.name, "photos"))
+        result = self.upload(tar_of(top))
+        self.assertEqual((result["sealed"], result["warnings"]), (True, []))
+        info = self.b.info(result["cid"])
+        self.assertEqual((info["sealed"], info["name"]), (True, "photos.tar"))
+        plain = self.plaintext(result["cid"])
+        self.assertTrue(tarstream.is_marked(plain))
+        with tarfile.open(fileobj=io.BytesIO(plain)) as archive:
+            self.assertTrue(all(name == "photos" or name.startswith("photos/") for name in archive.getnames()))
+        out = os.path.join(self.tmp.name, "out")
+        got = self.b.get(result["cid"], out)
+        self.assertEqual((got["extracted"], got["name"]), (True, "photos"))
+        self.assertEqual(files_of(out), files_of(top))
+        store = Blocks()
+        tarstream.build_tar(io.BytesIO(plain), store.put, tarstream.Warnings(), 10_000)
+        self.assertFalse([block for block in store.blocks if self.a.storage.has(block)])
+        self.assertEqual({pin["cid"]: pin["origin"] for pin in self.a.pin_ls()}[result["cid"]], "photos")
+
+    def test_skipped_members_and_origin(self):
+        """Members add skips (a symlink, a path out of the folder) are warnings; origin names it."""
+        data = (member("a.txt", b"hello") + member("link", type=tarfile.SYMTYPE, linkname="a.txt")
+                + member("../out", b"x") + END)
+        result = self.upload(data, origin="https://example.org/photos.tar")
+        self.assertEqual(len(result["warnings"]), 2)
+        out = os.path.join(self.tmp.name, "out")
+        self.b.get(result["cid"], out)
+        self.assertEqual(files_of(out), {"a.txt": (b"hello", False)})
+        self.assertEqual({pin["cid"]: pin["origin"] for pin in self.a.pin_ls()}[result["cid"]],
+                         "https://example.org/photos.tar")
+
+    def test_refusals(self):
+        """No name, --no-sealed-name, only_hash, a stream that isn't a tar, and the folder's limits refuse it."""
+        data = tar_of(make_folder(os.path.join(self.tmp.name, "photos")))
+        bob = [BOB.get_public_key().hex()]
+        with self.assertRaisesRegex(ValueError, "folder's name"):
+            self.a.add_tar(io.BytesIO(data), to=bob)
+        with self.assertRaisesRegex(ValueError, "no-sealed-name"):
+            self.a.add_tar(io.BytesIO(data), name="photos", to=bob, seal_name=False)
+        with self.assertRaisesRegex(ValueError, "only-hash"):
+            self.a.add_tar(io.BytesIO(data), name="photos", to=bob, only_hash=True)
+        with self.assertRaisesRegex(ValueError, "not a valid tar"):
+            self.a.add_tar(io.BytesIO(b"not a tar" * 100), name="photos", to=bob)
+        self.a.config.max_output_entries = 3
+        with self.assertRaises(TooLarge):
+            self.a.add_tar(io.BytesIO(data), name="photos", to=bob)
+        self.assertEqual(self.a.storage.pinned_cids(), frozenset())
 
 
 class GetSealedFolderTest(SealedFolderBase):

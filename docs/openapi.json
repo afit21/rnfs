@@ -205,7 +205,7 @@
         "tags": [
           "content"
         ],
-        "description": "Pinned with the caller's source. Reads may pause up to `body_timeout` (60 s) each, with no overall limit. A tar's directory holds at most `max_output_entries` entries.",
+        "description": "Pinned with the caller's source. Reads may pause up to `body_timeout` (60 s) each, with no overall limit. A tar's directory holds at most `max_output_entries` entries. Runs as a job while it reads the body (since 0.2.1): `GET /api/jobs` lists it with the bytes read, and `POST /api/jobs/cancel` stops it, answered 409 `cancelled`.",
         "parameters": [
           {
             "name": "name",
@@ -213,7 +213,7 @@
             "schema": {
               "type": "string"
             },
-            "description": "Wrap it as this entry (a sealed file: the sealed name)."
+            "description": "Wrap it as this entry (a sealed file: the sealed name). With format=tar and to or to_self: the folder's name, required, its top directory and with .tar its sealed name."
           },
           {
             "name": "only_hash",
@@ -253,7 +253,7 @@
             "schema": {
               "type": "string"
             },
-            "description": "The name to seal inside."
+            "description": "The name to seal inside (not with format=tar)."
           },
           {
             "name": "chunker",
@@ -276,7 +276,16 @@
                 "tar"
               ]
             },
-            "description": "`tar`: the body is a tar stream; its directory is built (no `to`, `to_self` or `seal_name`)."
+            "description": "`tar`: the body is a tar stream; its directory is built, or with `to`/`to_self` (since 0.2.1) sealed as a folder (as POST /api/add seals one: its members re-packed under `name`/, sealed as `<name>.tar`, nothing but the sealed bytes stored); no `seal_name`."
+          },
+          {
+            "name": "origin",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "description": "What `pin ls` says it was added from (a URL, the app's own path for it). Default: `name`, else `(stdin)` or `(tar upload)`. Since 0.2.1 (an older daemon ignores it)."
           },
           {
             "$ref": "#/components/parameters/PinKey"
@@ -325,6 +334,16 @@
           },
           "default": {
             "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "description": "Its job was cancelled while it ran (code `cancelled`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       }
@@ -770,6 +789,10 @@
                     "minProperties": 1,
                     "additionalProperties": true,
                     "description": "{name: value (TOML-compatible JSON), or null to remove it from rnfs.toml}."
+                  },
+                  "dry_run": {
+                    "type": "boolean",
+                    "description": "Only check the settings (as the user types them): nothing written or applied; the answer is what it would be, with dry_run. Since 0.2.1; an older daemon ignores it and writes, so check the `config_dry_run` capability first."
                   }
                 },
                 "required": [
@@ -1566,7 +1589,14 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Collected"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Collected"
+                    },
+                    {
+                      "$ref": "#/components/schemas/GcPreview"
+                    }
+                  ]
                 }
               }
             }
@@ -1576,6 +1606,24 @@
           },
           "default": {
             "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "Evicts every cached fetch and deletes every block no pin or operation in progress reaches. With dry_run (since 0.2.1) nothing changes: the answer says what it would free. An older daemon ignores dry_run and collects, so check the `gc_dry_run` capability first.",
+        "requestBody": {
+          "required": false,
+          "description": "A JSON object (may be empty).",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "dry_run": {
+                    "type": "boolean",
+                    "description": "Change nothing; answer GcPreview. Since 0.2.1."
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -1809,7 +1857,7 @@
         "tags": [
           "content"
         ],
-        "description": "Its roots are pinned with the caller's source.",
+        "description": "Its roots are pinned with the caller's source. Runs as a job while it reads the body (since 0.2.1): `GET /api/jobs` lists it with the bytes read, and `POST /api/jobs/cancel` stops it, answered 409 `cancelled`.",
         "parameters": [
           {
             "$ref": "#/components/parameters/PinKey"
@@ -1858,6 +1906,16 @@
           },
           "default": {
             "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "description": "Its job was cancelled while it ran (code `cancelled`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       }
@@ -3710,7 +3768,7 @@
     "/api/ping": {
       "get": {
         "operationId": "api_ping",
-        "summary": "Round trip to a node",
+        "summary": "Round trip to a node, or why it failed",
         "tags": [
           "content"
         ],
@@ -3723,6 +3781,14 @@
             },
             "description": "A node ID (32 hex characters; the CLI resolves contacts' nicks itself).",
             "required": true
+          },
+          {
+            "name": "stream",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "`1`: answer in JSON lines (application/x-ndjson) {\"stage\": \"path\" | \"identity\" | \"link\"} as each step of opening the link begins, then the plain answer with \"done\": true; the connection closes after it. An error after the first line ends the answer with an `ErrorLine`. Since 0.2.1 (an older daemon ignores it and answers in plain JSON)."
           }
         ],
         "responses": {
@@ -3731,20 +3797,52 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "rtt": {
-                      "type": [
-                        "number",
-                        "null"
-                      ],
-                      "description": "Seconds; null if unreachable."
-                    }
-                  },
-                  "required": [
-                    "rtt"
-                  ]
+                  "$ref": "#/components/schemas/PingResult"
                 }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "stage": {
+                          "type": "string",
+                          "enum": [
+                            "path",
+                            "identity",
+                            "link"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "stage"
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/PingResult"
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "done": {
+                              "const": true
+                            }
+                          },
+                          "required": [
+                            "done"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorLine"
+                    }
+                  ]
+                },
+                "description": "One JSON object per line (stream=1)."
               }
             }
           },
@@ -3757,7 +3855,8 @@
           "default": {
             "$ref": "#/components/responses/Error"
           }
-        }
+        },
+        "description": "Opens a new link to the node: finding a path, then its identity, then establishing the link, each step bounded by path_timeout (about a minute in all at most). stream=1 tells of each step as it begins."
       }
     },
     "/api/providers": {
@@ -3776,6 +3875,14 @@
             },
             "description": "A CID.",
             "required": true
+          },
+          {
+            "name": "stream",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "`1`: answer in JSON lines (application/x-ndjson) {\"provider\": node ID} as each is found, then the plain answer with \"done\": true; the connection closes after it. An error after the first line ends the answer with an `ErrorLine`. Since 0.2.1 (an older daemon ignores it and answers in plain JSON)."
           }
         ],
         "responses": {
@@ -3800,6 +3907,60 @@
                     "providers"
                   ]
                 }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "provider": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        }
+                      },
+                      "required": [
+                        "provider"
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "providers": {
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]{32}$",
+                                "description": "32 lowercase hex characters."
+                              },
+                              "description": "Node IDs (this node's own too, when it provides it)."
+                            }
+                          },
+                          "required": [
+                            "providers"
+                          ]
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "done": {
+                              "const": true
+                            }
+                          },
+                          "required": [
+                            "done"
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorLine"
+                    }
+                  ]
+                },
+                "description": "One JSON object per line (stream=1)."
               }
             }
           },
@@ -3812,7 +3973,8 @@
           "default": {
             "$ref": "#/components/responses/Error"
           }
-        }
+        },
+        "description": "The provider records held here, then what a complete provider lookup finds (which may take a minute on a slow network). stream=1 sends each as it is found, and a client closing the connection ends the lookup."
       }
     },
     "/api/shutdown": {
@@ -4023,6 +4185,519 @@
                 }
               }
             }
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/restart": {
+      "post": {
+        "operationId": "api_restart",
+        "summary": "Restart the daemon",
+        "tags": [
+          "daemon"
+        ],
+        "description": "Answers, then stops the daemon as SIGTERM does and starts it again with the same command line, so settings that need a restart apply (on POSIX in place, keeping its process ID, so a service manager sees no exit; on Windows only under the task wrapper, which restarts it). The new run writes a new API token and has a new events epoch. 404 `unsupported` where it can't (daemon.json's `can_restart`). Since 0.2.1.",
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "restarting": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "restarting"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/routing": {
+      "get": {
+        "operationId": "api_routing",
+        "summary": "The routing table",
+        "tags": [
+          "content"
+        ],
+        "description": "Its buckets with each node's times and failed queries, the nodes avoided as unreliable, and the bans with when they end and why. Read from memory; sends nothing. Since 0.2.1.",
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Routing"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/log": {
+      "get": {
+        "operationId": "api_log",
+        "summary": "The daemon's recent log lines",
+        "tags": [
+          "daemon"
+        ],
+        "description": "rnfs's and Reticulum's lines as the daemon's console shows them, the last 2000 kept in memory (nothing written; a restart starts afresh), so an app shows the log of a daemon it didn't start. Since 0.2.1.",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Only lines after this sequence (`next` of the last answer)."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000,
+              "default": 200
+            },
+            "description": "The last this many of them."
+          },
+          {
+            "name": "level",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only this level or more severe: a name (critical, error, warning, notice, info, verbose, debug, pathing, extra) or 0-8."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogLines"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/apps/request": {
+      "post": {
+        "operationId": "api_app_request",
+        "summary": "Ask for an app token (pairing; since 0.2.1)",
+        "tags": [
+          "apps"
+        ],
+        "description": "No token: an app that has none asks for one. Show its code to the user, who approves the request where the CLI's token is (rnfs app requests, approve; an app such as RNFS Desktop, told by an `apps` event of change `requested`) after checking it shows the same code; then collect the token with GET /api/apps/request. At most 8 requests wait at once (503), each for 10 minutes; a name an app has, or one asked for already, is refused (400). The custom header keeps web pages from asking: their request would need a CORS preflight, which fails.",
+        "security": [
+          {}
+        ],
+        "parameters": [
+          {
+            "name": "X-Rnfs-Pairing",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The app's name (a-z, 0-9, '.', '_', '-')."
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "description": "A JSON object (may be empty).",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "description": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 200,
+                    "description": "What the app says of itself, shown to the user."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "secret": {
+                      "type": "string",
+                      "description": "Only the requester has it: it collects the token with it."
+                    },
+                    "code": {
+                      "type": "string",
+                      "pattern": "^[0-9]{6}$",
+                      "description": "Shown by the app and where the user approves, to tell this request from another under the same name."
+                    },
+                    "expires": {
+                      "type": "number",
+                      "description": "Unix time the request ends unanswered."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "secret",
+                    "code",
+                    "expires"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "get": {
+        "operationId": "api_app_request_state",
+        "summary": "What became of a pairing request (since 0.2.1)",
+        "tags": [
+          "apps"
+        ],
+        "description": "No token: the requester's, with its secret. Once approved the token is given, a single time, and the request forgotten (404 after); a denied one is told once too.",
+        "security": [
+          {}
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Rnfs-Pairing-Secret",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The secret POST /api/apps/request gave."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "pending",
+                        "approved",
+                        "denied"
+                      ]
+                    },
+                    "token": {
+                      "type": "string",
+                      "description": "Present once approved: the app's token (X-Rnfs-Api, with X-Rnfs-App naming the app)."
+                    },
+                    "expires": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "state",
+                    "expires"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/apps/requests": {
+      "get": {
+        "operationId": "api_app_requests",
+        "summary": "The apps asking for a token (since 0.2.1)",
+        "tags": [
+          "apps"
+        ],
+        "description": "The CLI's token only.",
+        "security": [
+          {
+            "token": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "requests": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "description": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "code": {
+                            "type": "string"
+                          },
+                          "requested": {
+                            "type": "number"
+                          },
+                          "expires": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "name",
+                          "description",
+                          "code",
+                          "requested",
+                          "expires"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "requests"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/apps/approve": {
+      "post": {
+        "operationId": "api_app_approve",
+        "summary": "Approve an app's request for a token (since 0.2.1)",
+        "tags": [
+          "apps"
+        ],
+        "description": "The CLI's token only. Adds the app; its token is kept for the requester, who collects it (GET /api/apps/request): the approver never sees it.",
+        "security": [
+          {
+            "token": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "A JSON object.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "The request's id (GET /api/apps/requests)."
+                  }
+                },
+                "required": [
+                  "id"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "created": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "created"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/apps/deny": {
+      "post": {
+        "operationId": "api_app_deny",
+        "summary": "Refuse an app's request for a token (since 0.2.1)",
+        "tags": [
+          "apps"
+        ],
+        "description": "The CLI's token only.",
+        "security": [
+          {
+            "token": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "A JSON object.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "The request's id (GET /api/apps/requests)."
+                  }
+                },
+                "required": [
+                  "id"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
@@ -4389,7 +5064,14 @@
                 "apps",
                 "remote_pin_status",
                 "add_nomadnet",
-                "name_sync"
+                "name_sync",
+                "gc_dry_run",
+                "config_dry_run",
+                "add_origin",
+                "sealed_tar",
+                "ping_details",
+                "streamed_answers",
+                "restart"
               ]
             },
             "description": "What this daemon offers beyond the routes themselves, each a promise kept once released."
@@ -4540,6 +5222,10 @@
             "items": {
               "type": "string"
             }
+          },
+          "dry_run": {
+            "const": true,
+            "description": "Present when only checked (dry_run)."
           }
         },
         "required": [
@@ -4751,6 +5437,10 @@
           {
             "const": "forbidden",
             "description": "403: an app's token on a route only the CLI's token may use (/api/apps)."
+          },
+          {
+            "const": "cancelled",
+            "description": "An upload's job was cancelled while it ran (409). Since 0.2.1."
           }
         ]
       },
@@ -4774,6 +5464,18 @@
           },
           {
             "$ref": "#/components/schemas/RemotePinEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ConfigEvent"
+          },
+          {
+            "$ref": "#/components/schemas/NameSyncEvent"
+          },
+          {
+            "$ref": "#/components/schemas/AppsEvent"
+          },
+          {
+            "$ref": "#/components/schemas/StatusEvent"
           }
         ],
         "discriminator": {
@@ -4784,7 +5486,11 @@
             "cache": "#/components/schemas/CacheEvent",
             "name": "#/components/schemas/NameEvent",
             "peer": "#/components/schemas/PeerEvent",
-            "remote_pin": "#/components/schemas/RemotePinEvent"
+            "remote_pin": "#/components/schemas/RemotePinEvent",
+            "config": "#/components/schemas/ConfigEvent",
+            "name_sync": "#/components/schemas/NameSyncEvent",
+            "apps": "#/components/schemas/AppsEvent",
+            "status": "#/components/schemas/StatusEvent"
           }
         }
       },
@@ -4826,7 +5532,11 @@
           "cache",
           "name",
           "peer",
-          "remote_pin"
+          "remote_pin",
+          "config",
+          "name_sync",
+          "apps",
+          "status"
         ],
         "description": "An event kind (GET /api/events?kinds=)."
       },
@@ -5222,6 +5932,17 @@
           "searching": {
             "type": "boolean",
             "description": "While it runs (rnfs 0.2.0): true while its fetch searches the DHT for providers, which takes minutes on a radio before any byte arrives. False otherwise."
+          },
+          "stream": {
+            "const": true,
+            "description": "An upload the API reads (POST /api/add/stream, /api/import/stream): listed and cancellable while it runs (the upload is answered 409 cancelled), never saved or resumed. Present only for those. Since 0.2.1."
+          },
+          "stream_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An upload's origin or name, if given. Present only for uploads."
           }
         },
         "required": [
@@ -5573,7 +6294,7 @@
               "number",
               "null"
             ],
-            "description": "Unix time."
+            "description": "Unix time of its last announce or path response. A path response may come from any node with a path to it, so this is no sign the node is up: see last_seen."
           },
           "last_active": {
             "type": [
@@ -5629,6 +6350,13 @@
           },
           "online": {
             "type": "boolean"
+          },
+          "last_seen": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Unix time of its last sign of life this run (an answer to a request, a request of its own served, a link established, or an announce of its own emitted recently); null if none. What online is decided from. Since 0.2.1."
           }
         },
         "required": [
@@ -5655,7 +6383,8 @@
           "first_heard",
           "rtt",
           "rtt_at",
-          "online"
+          "online",
+          "last_seen"
         ]
       },
       "PeerEvent": {
@@ -6409,6 +7138,106 @@
               "integer",
               "null"
             ]
+          },
+          "reticulum_interfaces": {
+            "type": "array",
+            "description": "Reticulum's interfaces, read-only (attached to a shared instance, the instance's): what carries this node's traffic. rnfs doesn't change them: edit Reticulum's config, or rnsd's. Since 0.2.1.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "description": "As configured."
+                },
+                "full_name": {
+                  "type": "string",
+                  "description": "As Reticulum writes it, e.g. TCPInterface[Hub/1.2.3.4:4242]."
+                },
+                "type": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "online": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "mode": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    null,
+                    "full",
+                    "point_to_point",
+                    "access_point",
+                    "roaming",
+                    "boundary",
+                    "gateway",
+                    "internal"
+                  ]
+                },
+                "bitrate": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "description": "bits/s."
+                },
+                "rx_bytes": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "description": "Bytes received since Reticulum started."
+                },
+                "tx_bytes": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "description": "Bytes sent since Reticulum started."
+                },
+                "rx_speed": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "description": "bits/s now."
+                },
+                "tx_speed": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "description": "bits/s now."
+                },
+                "clients": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "description": "Connected clients, for a server interface."
+                }
+              },
+              "required": [
+                "name",
+                "full_name",
+                "type",
+                "online",
+                "mode",
+                "bitrate",
+                "rx_bytes",
+                "tx_bytes",
+                "rx_speed",
+                "tx_speed",
+                "clients"
+              ]
+            }
           }
         },
         "required": [
@@ -6417,7 +7246,8 @@
           "refused",
           "interfaces",
           "upload_budget",
-          "upload_budget_left"
+          "upload_budget_left",
+          "reticulum_interfaces"
         ]
       },
       "Status": {
@@ -6595,6 +7425,9 @@
           },
           "record_store": {
             "$ref": "#/components/schemas/StatusRecordStore"
+          },
+          "shared_folder": {
+            "$ref": "#/components/schemas/StatusSharedFolder"
           }
         },
         "required": [
@@ -6625,7 +7458,8 @@
           "partition",
           "partition_since",
           "network",
-          "record_store"
+          "record_store",
+          "shared_folder"
         ],
         "description": "The node's own fields (RnfsNode.status)."
       },
@@ -6955,6 +7789,655 @@
         "required": [
           "cid",
           "warnings"
+        ]
+      },
+      "ErrorLine": {
+        "type": "object",
+        "description": "The last line of a streamed answer (application/x-ndjson) that failed after its first line: the error, its code and the status it would have had.",
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode"
+          },
+          "status": {
+            "type": "integer"
+          },
+          "done": {
+            "const": true
+          }
+        },
+        "required": [
+          "error",
+          "code",
+          "status",
+          "done"
+        ]
+      },
+      "PingResult": {
+        "type": "object",
+        "properties": {
+          "rtt": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Seconds; null if the link couldn't be established."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              null,
+              "no_path",
+              "no_identity",
+              "wrong_identity",
+              "not_member",
+              "link_refused",
+              "link_closed",
+              "link_timeout"
+            ],
+            "description": "Why not, when rtt is null: no path within path_timeout; a path but not the node's identity; the identity known isn't the node's; not a member (private mode); the node closed the link as it was established (it is up, but refused); the link closed or wasn't established in time. Since 0.2.1."
+          },
+          "hops": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Hops of the path to the node once the ping ended; null without one. Since 0.2.1."
+          },
+          "interface": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The path's next-hop interface. Since 0.2.1."
+          },
+          "path_since": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "When Reticulum learned or last refreshed the path, Unix time. Since 0.2.1."
+          }
+        },
+        "required": [
+          "rtt",
+          "reason",
+          "hops",
+          "interface",
+          "path_since"
+        ]
+      },
+      "StatusSharedFolder": {
+        "type": "object",
+        "description": "The shared folder (<rnfs dir>/files, or shared_folder) as its last scan left it, so an app needn't read the folder itself (it may not be able to: a Flatpak daemon, another user's). Since 0.2.1.",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The folder, on the daemon's machine."
+          },
+          "entries": {
+            "type": "integer",
+            "description": "Top-level entries imported and pinned (source folder)."
+          },
+          "bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Their content bytes, as their root blocks state them; null before the first scan ends."
+          },
+          "scanning": {
+            "type": "boolean"
+          },
+          "last_scan": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "When the last scan ended, Unix time; null before the first."
+          },
+          "refused": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the folder isn't scanned (it leads into the rnfs dir); null if it is."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the last scan failed (the folder isn't a directory, a disk error); null if it didn't."
+          },
+          "failed": {
+            "type": "integer",
+            "description": "Entries that couldn't be imported (their content refused, a full disk) or read whole."
+          },
+          "failures": {
+            "type": "array",
+            "description": "The first 10 of those, by name.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "reason"
+              ]
+            }
+          }
+        },
+        "required": [
+          "path",
+          "entries",
+          "bytes",
+          "scanning",
+          "last_scan",
+          "refused",
+          "error",
+          "failed",
+          "failures"
+        ]
+      },
+      "GcPreview": {
+        "type": "object",
+        "description": "What gc would do now, nothing changed (dry_run; since 0.2.1), and what the stored blocks are kept for.",
+        "properties": {
+          "removed_blocks": {
+            "type": "integer",
+            "description": "Blocks gc would delete."
+          },
+          "freed_bytes": {
+            "type": "integer",
+            "description": "Their bytes, as gc counts them."
+          },
+          "allocated_bytes": {
+            "type": "integer",
+            "description": "What they take on disk (what max_storage counts)."
+          },
+          "held_back": {
+            "type": "boolean",
+            "description": "A damaged DAG node something reaches: gc would delete nothing until `rnfs verify` removes it."
+          },
+          "cached_fetches": {
+            "type": "integer",
+            "description": "The cached fetches gc would evict."
+          },
+          "pinned_bytes": {
+            "type": "integer",
+            "description": "Stored block bytes a pin reaches."
+          },
+          "cached_bytes": {
+            "type": "integer",
+            "description": "Those only a cached fetch reaches."
+          },
+          "protected_bytes": {
+            "type": "integer",
+            "description": "Those only an operation in progress holds (a fetch, an add, a job)."
+          },
+          "unreferenced_bytes": {
+            "type": "integer",
+            "description": "Those nothing reaches."
+          },
+          "records_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "What counts against record_budget: the state database, provider records stored for others and the rest of rnfs's state (record_store's bytes)."
+          },
+          "dry_run": {
+            "const": true
+          }
+        },
+        "required": [
+          "removed_blocks",
+          "freed_bytes",
+          "allocated_bytes",
+          "held_back",
+          "cached_fetches",
+          "pinned_bytes",
+          "cached_bytes",
+          "protected_bytes",
+          "unreferenced_bytes",
+          "records_bytes",
+          "dry_run"
+        ]
+      },
+      "ConfigEvent": {
+        "type": "object",
+        "description": "rnfs.toml was changed through the API (POST /api/config/set; not a dry run), from any client: what changed, what applied at once, what needs a restart, and every setting a restart would change now (GET /api/config's pending). Since 0.2.1.",
+        "properties": {
+          "seq": {
+            "type": "integer",
+            "description": "1, 2, ... within the daemon's run."
+          },
+          "time": {
+            "type": "number",
+            "description": "Unix time."
+          },
+          "kind": {
+            "const": "config"
+          },
+          "changed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The settings set or removed."
+          },
+          "applied": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Applied to the running node now."
+          },
+          "restart_required": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Of those changed, whose new value applies at the next start."
+          },
+          "pending": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Every setting a restart would change, these changes or earlier ones (POST /api/restart applies them)."
+          }
+        },
+        "required": [
+          "seq",
+          "kind",
+          "time",
+          "changed",
+          "applied",
+          "restart_required",
+          "pending"
+        ]
+      },
+      "NameSyncEvent": {
+        "type": "object",
+        "properties": {
+          "seq": {
+            "type": "integer",
+            "description": "1, 2, ... within the daemon's run."
+          },
+          "time": {
+            "type": "number",
+            "description": "Unix time."
+          },
+          "kind": {
+            "const": "name_sync"
+          },
+          "alias": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string",
+            "description": "The folder, absolute."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "new",
+              "settling",
+              "waiting",
+              "synced",
+              "paused"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it is paused; null otherwise."
+          },
+          "root": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The folder's root as last imported."
+          },
+          "published": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The root this sync last published."
+          },
+          "published_at": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "When it last published (Unix time)."
+          },
+          "next_publish": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "The earliest the next publish may be (Unix time), while within the hour since the last; null otherwise."
+          },
+          "removed": {
+            "type": "boolean",
+            "description": "The sync was stopped (POST /api/name/unsync, or its name removed)."
+          }
+        },
+        "required": [
+          "seq",
+          "kind",
+          "time",
+          "alias",
+          "path",
+          "state",
+          "reason",
+          "root",
+          "published",
+          "published_at",
+          "next_publish",
+          "removed"
+        ],
+        "description": "A name sync started, stopped, or changed state, reason or published root: its entry as GET /api/name/syncs lists it. Since 0.2.1."
+      },
+      "AppsEvent": {
+        "type": "object",
+        "description": "An app was given a token (rnfs app add, or a request approved) or removed, asked for one (pairing: show the user its id's request with its code), or was refused. Since 0.2.1.",
+        "properties": {
+          "seq": {
+            "type": "integer",
+            "description": "1, 2, ... within the daemon's run."
+          },
+          "time": {
+            "type": "number",
+            "description": "Unix time."
+          },
+          "kind": {
+            "const": "apps"
+          },
+          "change": {
+            "type": "string",
+            "enum": [
+              "added",
+              "removed",
+              "requested",
+              "denied"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "description": "change requested: the request's id."
+          },
+          "code": {
+            "type": "string",
+            "description": "change requested: the code the app shows."
+          }
+        },
+        "required": [
+          "seq",
+          "kind",
+          "time",
+          "change",
+          "name"
+        ]
+      },
+      "StatusEvent": {
+        "type": "object",
+        "description": "Top-level GET /api/status fields changed since the last check (every 30 s at most): fetch the status again. Since 0.2.1.",
+        "properties": {
+          "seq": {
+            "type": "integer",
+            "description": "1, 2, ... within the daemon's run."
+          },
+          "time": {
+            "type": "number",
+            "description": "Unix time."
+          },
+          "kind": {
+            "const": "status"
+          },
+          "changed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The fields that changed."
+          }
+        },
+        "required": [
+          "seq",
+          "kind",
+          "time",
+          "changed"
+        ]
+      },
+      "Routing": {
+        "type": "object",
+        "description": "The DHT routing table (RoutingTable.snapshot). Since 0.2.1.",
+        "properties": {
+          "k": {
+            "type": "integer",
+            "description": "A bucket's size."
+          },
+          "buckets": {
+            "type": "array",
+            "description": "The buckets holding a node, by index.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer",
+                  "description": "i: its nodes are at distance [2^i, 2^(i+1)) from this node."
+                },
+                "nodes": {
+                  "type": "array",
+                  "description": "By first seen.",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "node_id": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{32}$",
+                        "description": "32 lowercase hex characters."
+                      },
+                      "first_seen": {
+                        "type": "number",
+                        "description": "Unix time (kept across a short absence)."
+                      },
+                      "last_heard": {
+                        "type": "number",
+                        "description": "Unix time of its last announce or answer."
+                      },
+                      "failures": {
+                        "type": "integer",
+                        "description": "Queries unanswered since last heard."
+                      },
+                      "stale": {
+                        "type": "boolean",
+                        "description": "Failed a query since last heard, or silent past two announce intervals: the first to give up its place."
+                      }
+                    },
+                    "required": [
+                      "node_id",
+                      "first_seen",
+                      "last_heard",
+                      "failures",
+                      "stale"
+                    ]
+                  }
+                }
+              },
+              "required": [
+                "index",
+                "nodes"
+              ]
+            }
+          },
+          "nodes": {
+            "type": "integer"
+          },
+          "dropped": {
+            "type": "integer",
+            "description": "Nodes that left whose seniority a return within two announce intervals regains."
+          },
+          "unreliable": {
+            "type": "array",
+            "description": "Nodes (in the table or not) whose last max_failures queries all failed, most recently failed first; at most 256.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "node_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{32}$",
+                  "description": "32 lowercase hex characters."
+                },
+                "failures": {
+                  "type": "integer"
+                },
+                "retry_at": {
+                  "type": "number",
+                  "description": "Unix time it may be queried again."
+                }
+              },
+              "required": [
+                "node_id",
+                "failures",
+                "retry_at"
+              ]
+            }
+          },
+          "unreliable_total": {
+            "type": "integer"
+          },
+          "bans": {
+            "type": "array",
+            "description": "Banned nodes, soonest to end first; at most 256.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "node_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{32}$",
+                  "description": "32 lowercase hex characters."
+                },
+                "until": {
+                  "type": "number",
+                  "description": "Unix time the ban ends."
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Why; null when not known (a ban from before a restart)."
+                }
+              },
+              "required": [
+                "node_id",
+                "until",
+                "reason"
+              ]
+            }
+          },
+          "bans_total": {
+            "type": "integer"
+          },
+          "blackholed": {
+            "type": "integer",
+            "description": "Identities Reticulum blackholes: their nodes count as banned, without being listed in bans."
+          }
+        },
+        "required": [
+          "k",
+          "buckets",
+          "nodes",
+          "dropped",
+          "unreliable",
+          "unreliable_total",
+          "bans",
+          "bans_total",
+          "blackholed"
+        ]
+      },
+      "LogLines": {
+        "type": "object",
+        "description": "The daemon's recent log lines (rnfs.recentlog). Since 0.2.1.",
+        "properties": {
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "seq": {
+                  "type": "integer",
+                  "description": "1, 2, ... within the daemon's run."
+                },
+                "time": {
+                  "type": "number",
+                  "description": "Unix time."
+                },
+                "level": {
+                  "type": "integer",
+                  "description": "Reticulum's loglevel: 0 critical ... 8 extra."
+                },
+                "level_name": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string",
+                  "enum": [
+                    "rnfs",
+                    "RNS"
+                  ]
+                },
+                "text": {
+                  "type": "string",
+                  "description": "As the console shows it, non-printable characters escaped; at most 4096 characters."
+                }
+              },
+              "required": [
+                "seq",
+                "time",
+                "level",
+                "level_name",
+                "source",
+                "text"
+              ]
+            }
+          },
+          "next": {
+            "type": "integer",
+            "description": "Pass as after to get only newer lines."
+          },
+          "dropped": {
+            "type": "boolean",
+            "description": "Lines after after are no longer kept (it keeps the last 2000)."
+          }
+        },
+        "required": [
+          "lines",
+          "next",
+          "dropped"
         ]
       }
     }

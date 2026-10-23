@@ -783,6 +783,90 @@ def _pack_file(handle: int, st: os.stat_result, path: str, member: str, packing:
     return fixed_height(size)
 
 
+def repack_chunks(stream: BinaryIO, top: str, max_entries: int, warn: Callable[[str], None],
+                  mtime: int | None = None) -> Iterator[bytes]:
+    """The tar folder_chunks would write of the folder an uploaded tar stream holds, under top/: the sealed-folder
+    marker, then the stream's members re-written as that writer writes them (_header_of), for sealing a folder a
+    program sends as a tar (POST /api/add/stream?format=tar with to). Read as build_tar reads one (the module
+    docstring's rules: _place, its warnings and bounds, refusing what isn't a valid plain tar), never held whole, and
+    nothing of it stored: only the sealed bytes are.
+
+    A file a later member of the same path replaces is written twice, as tar's own rule has the later one win where
+    it is unpacked (build_tar). A member whose name holds a character some extractors read as a path separator
+    (safe_name) is skipped with a warning, as folder_chunks skips one. As folder_chunks, refused (TooLarge) past
+    max_entries files and directories (top included) or a tree deeper than MAX_DEPTH DAG nodes one level above top,
+    which is known only once the stream has been read. Raises ValueError for a stream that isn't a valid tar, and
+    for a top name that isn't a valid entry name or is unsafe in a tar."""
+    if not dag.is_valid_name(top):
+        raise ValueError(f"{builder.display_path(top)!r} isn't valid as an entry name")
+    if not safe_name(top):
+        raise ValueError(f"{builder.display_path(top)!r} holds a character some extractors read as a path separator")
+    mtime = int(time.time()) if mtime is None else mtime
+    tree = _Tree(max_entries)
+    tree.entries = 1  # top
+    written = 0
+
+    def emit(data: bytes) -> bytes:
+        """data, counted as written."""
+        nonlocal written
+        written += len(data)
+        return data
+
+    yield emit(folder_marker())
+    yield emit(_header_of(top, dag.KIND_DIRECTORY, 0, mtime))
+    try:
+        archive = tarfile.open(fileobj=_Ending(stream), mode="r|", tarinfo=_header_class(), encoding="utf-8",
+                               errors="surrogateescape")
+        with archive:
+            while (member := archive.next()) is not None:
+                archive.members.clear()  # as build_tar
+                parts = _parts(member.name)
+                if not isinstance(parts, str) and not all(safe_name(part) for part in parts):
+                    warn(f"skipped {_shown(builder.display_path(member.name))}: a character in its name could be "
+                         f"read as a path separator")
+                    continue
+                if member.isdir() and not isinstance(parts, str) and parts:
+                    if len(parts) > constants.MAX_DEPTH:
+                        raise TooLarge(f"{_shown(builder.display_path(member.name))} is nested deeper than MAX_DEPTH "
+                                       f"({constants.MAX_DEPTH})")
+                    if tree.directory(parts) is None:
+                        warn(f"skipped {_shown(builder.display_path(member.name))}: a file holds its name or the name "
+                             f"of one of its directories")
+                    else:
+                        yield emit(_header_of("/".join([top, *parts]), dag.KIND_DIRECTORY, 0, mtime))
+                    continue
+                placed = _place(member, tree, warn)
+                if placed is None:
+                    continue
+                parent, name = placed
+                parent[name] = fixed_height(member.size)  # a file: its height, for the depth check at the end
+                kind = dag.KIND_EXECUTABLE if member.mode & 0o100 else dag.KIND_FILE
+                yield emit(_header_of("/".join([top, *parts]), kind, member.size, mtime))
+                data, remaining = archive.extractfile(member), member.size
+                while remaining:
+                    chunk = data.read(min(COPY_SIZE, remaining))
+                    if not chunk:
+                        raise ValueError("not a valid tar stream: it ended inside a member")
+                    remaining -= len(chunk)
+                    yield emit(chunk)
+                if _padding(member.size, BLOCK):
+                    yield emit(bytes(_padding(member.size, BLOCK)))
+            while data := archive.fileobj.read(COPY_SIZE):  # as build_tar: only the end blocks and padding
+                if data.count(0) != len(data):
+                    raise ValueError("not a valid tar stream: data after its end (a damaged header?)")
+    except (tarfile.TarError, OverflowError) as e:
+        raise ValueError(f"not a valid tar stream: {e}") from None
+
+    def height(directory: dict) -> int:
+        """A directory's height as builder builds it (recursion bounded by MAX_DEPTH, checked as members came)."""
+        return directory_height(len(directory), max((height(child) if isinstance(child, dict) else child
+                                                     for child in directory.values()), default=0))
+
+    if 1 + height(tree.root) > constants.MAX_DEPTH:  # top's DAG, one level above it
+        raise TooLarge(f"the tar makes a tree deeper than MAX_DEPTH ({constants.MAX_DEPTH}) DAG nodes")
+    yield bytes(2 * BLOCK + _padding(written + 2 * BLOCK, RECORD))
+
+
 class IteratorReader:
     """A binary reader over an iterator of bytes, for code that reads a stream (SealingReader, tarfile): a folder's
     tar being written into the sealer, a sealed file decrypted into build_tar. Holds at most what one read asks for

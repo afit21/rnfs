@@ -13,14 +13,16 @@ code}` (below).
 | GET  | /api/ls | `target` | `{"entries": ls(target)}` |
 | GET  | /api/stat | `target` | `stat(target)` |
 | GET  | /api/pin/ls | `cid` (optional) | `{"pins": pin_ls(cid)}`: `cid`, `sources`, `complete`, `type`, `sealed`, `name`, and since 0.2.0 `label`, `origin`, `size`, `entries`, `added` |
-| GET  | /api/providers | `cid` | `{"providers": [node ID]}` |
-| GET  | /api/ping | `node` | `{"rtt": seconds or null}` |
+| GET  | /api/providers | `cid`, `stream` | `{"providers": [node ID]}`; `stream=1` (0.2.1): JSON lines, `{"provider"}` as each is found, then that answer with `"done": true` (below) |
+| GET  | /api/ping | `node`, `stream` | `ping_info(node)`: `{"rtt": seconds or null, "reason", "hops", "interface", "path_since"}` (all but `rtt` since 0.2.1); `stream=1`: JSON lines, `{"stage"}` as each step begins (path, identity, link), then that answer with `"done": true` |
+| GET  | /api/routing | | `routing_info()` (0.2.1): `{"k", "buckets": [{"index", "nodes": [{"node_id", "first_seen", "last_heard", "failures", "stale"}]}], "nodes", "dropped", "unreliable": [{"node_id", "failures", "retry_at"}], "unreliable_total", "bans": [{"node_id", "until", "reason"}], "bans_total", "blackholed"}` (RoutingTable.snapshot) |
+| GET  | /api/log | `after` (a sequence), `limit` (default 200, ≤ 1000), `level` (a name or 0-8: that or more severe) | `{"lines": [{"seq", "time", "level", "level_name", "source", "text"}], "next", "dropped"}` (0.2.1): the daemon's recent log lines, rnfs's and Reticulum's, as its console shows them (rnfs.recentlog: the last 2000, in memory), the last `limit` after `after` |
 | GET  | /api/name/list | | `{"names": name_list()}` |
 | GET  | /api/name/resolve | `name` | `name_resolve(name)` |
 | GET  | /api/name/watch | `names` (comma-separated), `after` (a sequence or `-` per name), `wait` (≤ 30 s) | `{"records": [{"name", "cid", "sequence", "age"}]}`: the records held whose sequence is above `after`, as soon as there is one or after `wait` (below) |
 | GET  | /api/name/syncs | | `{"syncs": name_syncs()}`: `[{"alias", "path", "state", "reason", "root", "published", "published_at", "next_publish"}]` (rnfs.name_sync), by alias |
 | POST | /api/add | JSON `path`, `wrap`, `only_hash`, `pin`, `to` (list), `to_self`, `seal_name` (bool), `chunker`; or `nomadnet` (a NomadNet link) instead of `path`, with `name` and `identify` too | `add_path(...)`; with `nomadnet`, `add_nomadnet(...)`: its result has the snapshot's `name` and the `link` too |
-| POST | /api/add/stream | query `name`, `only_hash`, `pin`, `to` (comma-separated), `to_self`, `seal_name` (the name), `chunker`, `format`; body is the data | `add_stream(...)`; `format=tar`: the body is a tar stream, `add_tar(stream, name, ...)` builds the directory it holds (no `to`, `to_self` or `seal_name`) |
+| POST | /api/add/stream | query `name`, `only_hash`, `pin`, `to` (comma-separated), `to_self`, `seal_name` (the name), `chunker`, `format`, `origin`; body is the data | `add_stream(...)`; `format=tar`: the body is a tar stream, `add_tar(stream, name, ...)` builds the directory it holds, or with `to`/`to_self` (0.2.1) seals it as a folder named `name` (required; no `seal_name`); `origin` (0.2.1): what `pin ls` says it was added from (default `name`, else `(stdin)` or `(tar upload)`) |
 | GET  | /api/get/stream | `target`, `format` (`tar`) | the target as a tar stream (`get_tar`), fetched first, Content-Length set |
 | GET  | /api/export/stream | `target` | the target's archive (`export_chunks`), byte-identical to `export`, Content-Length set |
 | POST | /api/import/stream | body is an archive | `import_stream(body)`, as `/api/import` answers |
@@ -35,7 +37,7 @@ code}` (below).
 | POST | /api/pin/label | JSON `cid`, `label` (null or "" clears it) | `pin_label(cid, label)`: the pin's `pin_ls` entry |
 | GET  | /api/cache/ls | | `{"cache": cache_ls()}`: the cached fetches, most recently used first |
 | POST | /api/cache/rm | JSON `cid` | `cache_rm(cid)`: `{"removed_records", "removed_blocks", "freed_bytes", "unreferenced_blocks", "unreferenced_bytes"}` |
-| POST | /api/gc, /api/verify | | `gc()`, `verify()` |
+| POST | /api/gc, /api/verify | gc: JSON `dry_run` (0.2.1) | `gc()`, `verify()`; `dry_run`: `gc(dry_run=True)`, nothing changed: what it would free (`removed_blocks`, `freed_bytes`, `allocated_bytes`, `held_back`, `cached_fetches`) and the stored bytes split by what keeps them (`pinned_bytes`, `cached_bytes`, `protected_bytes`, `unreferenced_bytes`; `records_bytes`), with `"dry_run": true` |
 | POST | /api/name/create | JSON `alias` | `name_create(alias)` |
 | POST | /api/name/rm | JSON `alias` | `{}` after `name_rm(alias)` |
 | POST | /api/name/export | JSON `alias` | the key bytes |
@@ -48,9 +50,14 @@ code}` (below).
 | GET  | /api/capabilities | | `{"version", "capabilities": [...], "routes": [[method, path]...], "features": [...], "event_kinds": [...], "error_codes": [...]}` (below) |
 | GET  | /api/events | `after` (a sequence; absent: none, only `next`), `kinds` (comma-separated), `epoch`, `wait` (≤ 30 s) | `{"events": [event], "next", "lost", "epoch"}` (rnfs.events): the events after `after`, as soon as there is one or after `wait` |
 | POST | /api/shutdown | | `{"stopping": true}`, then the daemon stops as on SIGTERM (`unsupported` 404 where nothing can stop it) |
+| POST | /api/restart | | `{"restarting": true}`, then the daemon stops as on SIGTERM and starts again with the same command line (0.2.1; `unsupported` 404 where it can't: daemon.json's `can_restart`, rnfs.launch) |
 | GET  | /api/apps | | `{"apps": app_ls()}`: `[{"name", "created"}]` (the CLI's token only, below) |
 | POST | /api/apps/add | JSON `name` | `app_add(name)`: `{"name", "created", "token"}`, the only time the token is given |
 | POST | /api/apps/rm | JSON `name` | `app_rm(name)`: `{"released"}`, the app's token revoked and its pins released |
+| POST | /api/apps/request | header `X-Rnfs-Pairing: <name>`, JSON `description`; no token | `app_request(name, description)` (0.2.1): `{"id", "secret", "code", "expires"}`, the app's request for a token, for the user to approve (below) |
+| GET  | /api/apps/request | `id`, header `X-Rnfs-Pairing-Secret: <secret>`; no token | `{"name", "state": "pending" \| "approved" \| "denied", "token" (approved: given once), "expires"}` (404 once collected, expired, or for a wrong secret) |
+| GET  | /api/apps/requests | | `{"requests": [{"id", "name", "description", "code", "requested", "expires"}]}`, the apps waiting for an answer (the CLI's token only) |
+| POST | /api/apps/approve, /api/apps/deny | JSON `id` | approve: `{"name", "created"}`, the app added, its token kept for its requester; deny: `{"name"}` (the CLI's token only) |
 
 The features (rnfs.features, each's `api_routes()`) add these; `name` is a name or a name contact's nick:
 
@@ -62,7 +69,7 @@ The features (rnfs.features, each's `api_routes()`) add these; `name` is a name 
 | POST | /api/jobs/cancel | JSON `id` | the job |
 | POST | /api/jobs/clear | JSON `id` (optional) | `{"removed": count}` of the finished jobs forgotten |
 | GET  | /api/peers | | `{"peers": [...]}` |
-| GET  | /api/stats | | traffic totals, refusals and per-interface bytes |
+| GET  | /api/stats | | traffic totals, refusals and per-interface bytes; from 0.2.1 `reticulum_interfaces`, Reticulum's interfaces read-only (mesh.interface_states) |
 | POST | /api/name/keep | JSON `name` | the kept name |
 | POST | /api/name/unkeep | JSON `name` | `{}` |
 | GET  | /api/name/kept | | `{"kept": [{"name", "reasons", "sequence", "cid", "emitted"}]}` |
@@ -77,7 +84,7 @@ The features (rnfs.features, each's `api_routes()`) add these; `name` is a name 
 | POST | /api/deny/add | JSON `entries` | `{"added": [entries new to the local list]}` |
 | POST | /api/deny/rm | JSON `entries` | `{"removed": [...]}` (404 if one isn't on the local list) |
 | GET  | /api/config | | `{"path", "settings": [schema entry + "value", "file", "overridden", "pending"], "file_error", "warnings"}` (rnfs.features.settings) |
-| POST | /api/config/set | JSON `settings` ({name: value, or null to remove it from rnfs.toml}) | `{"path", "applied", "restart_required", "overridden", "warnings"}`; nothing written unless the whole result is valid (400) |
+| POST | /api/config/set | JSON `settings` ({name: value, or null to remove it from rnfs.toml}), `dry_run` (0.2.1) | `{"path", "applied", "restart_required", "overridden", "warnings"}`; nothing written unless the whole result is valid (400); `dry_run`: only checked, nothing written or applied, the answer what it would be with `"dry_run": true` |
 
 Both tables are checked against ApiHandler.ROUTES and the features' routes (tests/test_api.py). docs/openapi.json
 describes every route in full (parameters, bodies, answers, errors, headers), checked by tests/test_openapi.py.
@@ -89,6 +96,11 @@ codes"), so a client tells "no such endpoint" (`no_such_endpoint`, an older daem
 
 Events (rnfs.events, `GET /api/events`): a long poll like the name watch below, at most MAX_EVENT_WAITERS waiting
 at once (503 beyond); `after` absent answers at once with the `next` to start from.
+
+Streamed answers (`stream=1`, send_lines; 0.2.1): `application/x-ndjson`, one JSON object per line as the work goes,
+the last with `"done": true` (the plain answer's fields, or `{"error", "code", "status"}` for an error after the first
+line; one before it is answered as without `stream=`), then the connection closes. A client closing it ends the work
+early where it can (a provider lookup). An older daemon ignores `stream=` and answers in plain JSON.
 
 GET parameters are in the query string. Request bodies may use Content-Length or chunked encoding.
 
@@ -125,6 +137,15 @@ Security:
   dir/set, dir/rm, pin/add, pin/rm, import, import/stream, and the pin, add and import jobs) use source "user" for the
   CLI and "app:<name>" for an app, "app:<name>:<key>" with `X-Rnfs-Pin-Key: <key>` (pin_source; with the CLI's token a
   pin key is refused, 400): an app's pin rm releases only its own.
+- Pairing (0.2.1; rnfs.apps.PairingRequests): an app without a token asks for one (POST /api/apps/request, naming
+  itself in X-Rnfs-Pairing, a custom header, so no web page can ask: its request would need a CORS preflight, which
+  fails) and gets a request id, a secret and a 6-digit code it shows its user. The user sees the request, with the
+  same code, where the CLI's token is (rnfs app requests; an app such as RNFS Desktop, told by an "apps" event) and
+  approves or denies it: the code tells their app's request from one another process made under its name. Approving
+  adds the app; the app collects its token with the secret (GET /api/apps/request), once, and the approver never
+  sees it. Requests live in memory, at most 8 waiting, for 10 minutes (an approved token for 5 more). A process
+  squatting the API port while the daemon is down can answer a pairing app as any listener can: an app that can
+  read the rnfs dir should prefer rnfs app add, and every app should show the code for the user to compare.
 - Errors map to statuses as design.md says (rnfs.errors.STATUSES): ValueError 400, NotFound 404, TooLarge 413,
   Denied 451 (the deny list), InvalidDag 422, Busy 503, StorageFull 507, other errors 500. A 500 is logged as an
   error, and a BlockMismatch (a 400, but a bug: the node handed the store a block that doesn't match) as a
@@ -142,19 +163,22 @@ import hmac
 import io
 import json
 import os
+import queue
 import re
 import secrets
 import socket
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from rnfs import __version__, events, fsutil, ids, nomadnet_links
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
-from rnfs.apiclient import API_HEADER, APP_HEADER, CHALLENGE_HEADER, PIN_KEY_HEADER, PROOF_HEADER, api_proof
+from rnfs.apiclient import (API_HEADER, APP_HEADER, CHALLENGE_HEADER, PAIRING_HEADER, PAIRING_SECRET_HEADER,
+                            PIN_KEY_HEADER, PROOF_HEADER, api_proof)
 from rnfs.content.cid import Cid
-from rnfs.content.storage import APP_PREFIX, app_source, check_app_name
+from rnfs.content.storage import APP_PREFIX, USER, app_source, check_app_name
 from rnfs.errors import CODES, STATUSES, BlockMismatch, Busy, Unsupported, error_code
 from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_WARNING, log
 
@@ -171,10 +195,16 @@ MAX_WATCH_WAIT = 30  # seconds one may wait, as GET /api/jobs/get's wait=
 WATCH_GRACE = 60.0  # seconds a name stays watched after the last call naming it ends
 MAX_WATCHED = 1024  # names watched for API clients at most; the soonest to end go first
 MAX_EVENT_WAITERS = 8  # GET /api/events calls waiting at once
+LINE_POLL = 0.5  # seconds between checks that the client of a streamed answer (send_lines) is still there
+DEFAULT_LOG_LINES = 200  # lines GET /api/log answers without limit=
 # What this daemon offers beyond the routes themselves (GET /api/capabilities), each a promise kept once released
 CAPABILITIES = ("error_codes", "capabilities", "events", "shutdown", "daemon_json", "pin_details", "pin_label",
                 "cache", "peer_details", "config", "jobs_add", "jobs_import", "add_tar", "get_tar", "export_stream",
-                "import_stream", "sealed_folders", "apps", "remote_pin_status", "add_nomadnet", "name_sync")
+                "import_stream", "sealed_folders", "apps", "remote_pin_status", "add_nomadnet", "name_sync",
+                # 0.2.1: POST /api/gc's dry_run (an older daemon ignores it and collects: check this first), a stream
+                # add's origin, a sealed tar upload, ping's reason and path, stream=1 on ping and providers
+                "gc_dry_run", "config_dry_run", "add_origin", "sealed_tar", "ping_details", "streamed_answers",
+                "restart")
 
 # Exception class → HTTP status, checked in order (design.md); anything else is 500. The one table, rnfs.errors'
 ERROR_STATUSES = STATUSES
@@ -292,6 +322,53 @@ def parse_entry_name(value) -> str | None:
     if not nomadnet_links.is_valid_name(value):
         raise ValueError(f"invalid entry name {value!r}")
     return value
+
+
+class _Counted:
+    """An upload's body as its job counts it (JobsFeature.uploading): each read told to job.read, which raises
+    Cancelled once the job is cancelled."""
+
+    def __init__(self, reader, job):
+        """Read through reader for job."""
+        self.reader, self.job = reader, job
+
+    def read(self, size: int = -1) -> bytes:
+        """reader.read, counted."""
+        self.job.check_cancelled()
+        data = self.reader.read(size)
+        self.job.read(len(data))
+        return data
+
+    def readinto(self, buffer) -> int:
+        """reader.readinto, counted."""
+        self.job.check_cancelled()
+        count = self.reader.readinto(buffer)
+        self.job.read(count or 0)
+        return count
+
+    def readable(self) -> bool:
+        """True."""
+        return True
+
+    def __getattr__(self, name):
+        """Everything else is the reader's (its chunked, remaining)."""
+        return getattr(self.reader, name)
+
+
+def _counted(reader, job):
+    """reader counted for job, or reader itself without one (no jobs feature)."""
+    return reader if job is None else _Counted(reader, job)
+
+
+def parse_origin(value) -> str | None:
+    """An add's origin (what pin ls says it was added from: a URL, the app's own path for it): None if absent or
+    blank, else the text without surrounding whitespace. ValueError past pin_names.MAX_NAME_LENGTH characters."""
+    from rnfs.pin_names import MAX_NAME_LENGTH
+    if value is None or not value.strip():
+        return None
+    if len(value.strip()) > MAX_NAME_LENGTH:
+        raise ValueError(f"origin may have at most {MAX_NAME_LENGTH} characters")
+    return value.strip()
 
 
 def parse_bool(value) -> bool:
@@ -735,17 +812,19 @@ class ApiServer(LocalServer):
 
     max_connections = 32  # the CLI makes one connection per command; this is plenty for scripts too
 
-    def __init__(self, node, port: int, token: str | None = None, shutdown=None):
+    def __init__(self, node, port: int, token: str | None = None, shutdown=None, restart=None):
         """Bind to 127.0.0.1:port, requiring token (a new random one if None); serves once start() is called.
         shutdown, if given, is called (with no arguments) once POST /api/shutdown has been answered: the daemon
-        passes what its signal handlers do. Without it that route answers 404 unsupported."""
+        passes what its signal handlers do. Without it that route answers 404 unsupported. restart (0.2.1) is
+        POST /api/restart's, likewise: the daemon passes it where it can restart itself (rnfs.launch)."""
         self.token = token if token is not None else secrets.token_urlsafe(32)
         if not self.token:
             raise ValueError("the API token must not be empty")
         self.watches = NameWatches(node)
         super().__init__(ApiHandler, port, node=node, token=self.token, watches=self.watches,
                          event_waiters=threading.BoundedSemaphore(MAX_EVENT_WAITERS),
-                         shutdown_callback=None if shutdown is None else staticmethod(shutdown))
+                         shutdown_callback=None if shutdown is None else staticmethod(shutdown),
+                         restart_callback=None if restart is None else staticmethod(restart))
 
     def stop(self):
         """Stop serving, then end the name watches held for API clients (and their timer)."""
@@ -771,6 +850,7 @@ class ApiHandler(TimedHandler):
     watches: NameWatches | None = None
     event_waiters: threading.BoundedSemaphore | None = None
     shutdown_callback = None  # what POST /api/shutdown calls once answered (ApiServer's shutdown)
+    restart_callback = None  # what POST /api/restart calls once answered (ApiServer's restart)
     server_version = "rnfs"
     sys_version = ""
 
@@ -785,6 +865,8 @@ class ApiHandler(TimedHandler):
         ("GET", "/api/pin/ls"): "api_pin_ls",
         ("GET", "/api/providers"): "api_providers",
         ("GET", "/api/ping"): "api_ping",
+        ("GET", "/api/routing"): "api_routing",
+        ("GET", "/api/log"): "api_log",
         ("GET", "/api/name/list"): "api_name_list",
         ("GET", "/api/name/resolve"): "api_name_resolve",
         ("GET", "/api/name/watch"): "api_name_watch",
@@ -819,13 +901,21 @@ class ApiHandler(TimedHandler):
         ("GET", "/api/capabilities"): "api_capabilities",
         ("GET", "/api/events"): "api_events",
         ("POST", "/api/shutdown"): "api_shutdown",
+        ("POST", "/api/restart"): "api_restart",
         ("GET", "/api/apps"): "api_apps",
         ("POST", "/api/apps/add"): "api_app_add",
         ("POST", "/api/apps/rm"): "api_app_rm",
+        ("POST", "/api/apps/request"): "api_app_request",
+        ("GET", "/api/apps/request"): "api_app_request_state",
+        ("GET", "/api/apps/requests"): "api_app_requests",
+        ("POST", "/api/apps/approve"): "api_app_approve",
+        ("POST", "/api/apps/deny"): "api_app_deny",
     }
-    OPEN_ROUTES = {("GET", "/api/status")}  # allowed without the token
+    # Allowed without the token: status, and an app asking for one and collecting it (pairing, 0.2.1)
+    OPEN_ROUTES = {("GET", "/api/status"), ("POST", "/api/apps/request"), ("GET", "/api/apps/request")}
     # Only the CLI's token (api_token) may use these: an app can't issue itself or another app a token, nor revoke one
-    CLI_ROUTES = {("GET", "/api/apps"), ("POST", "/api/apps/add"), ("POST", "/api/apps/rm")}
+    CLI_ROUTES = {("GET", "/api/apps"), ("POST", "/api/apps/add"), ("POST", "/api/apps/rm"),
+                  ("GET", "/api/apps/requests"), ("POST", "/api/apps/approve"), ("POST", "/api/apps/deny")}
     PROOF_ROUTE = ("GET", "/api/status")
     proved = False  # this connection had its proof request kept open: it is closed after the next request
     principal: str | None = None  # caller() of the request being answered, set by dispatch
@@ -1208,13 +1298,105 @@ class ApiHandler(TimedHandler):
         self.send_json(200, {"pins": self.node.pin_ls(parse_cid(cid) if cid else None)})
 
     def api_providers(self):
-        """GET /api/providers?cid=: node IDs providing a CID."""
-        providers = self.node.providers(parse_cid(self.param("cid")))
-        self.send_json(200, {"providers": [provider.hex() for provider in providers]})
+        """GET /api/providers?cid=&stream=: node IDs providing a CID; stream=1: each as found (send_lines)."""
+        cid = parse_cid(self.param("cid"))
+        if not parse_bool(self.param("stream", False) or ""):
+            self.send_json(200, {"providers": [provider.hex() for provider in self.node.providers(cid)]})
+            return
+
+        def run(emit, stopped):
+            """The lookup, each provider emitted as found, stopped once the client goes."""
+            found = self.node.providers(cid, on_provider=lambda node_id: emit({"provider": node_id.hex()}),
+                                        should_stop=stopped)
+            return {"providers": [provider.hex() for provider in found]}
+
+        self.send_lines("providers", run)
 
     def api_ping(self):
-        """GET /api/ping?node=: round-trip time to a node, or null."""
-        self.send_json(200, {"rtt": self.node.ping(parse_hex_id(self.param("node")))})
+        """GET /api/ping?node=&stream=: round-trip time to a node, or null and why, with its path; stream=1: each step
+        of opening the link as it begins (send_lines)."""
+        node_id = parse_hex_id(self.param("node"))
+        if not parse_bool(self.param("stream", False) or ""):
+            self.send_json(200, self.node.ping_info(node_id))
+            return
+        self.send_lines("ping", lambda emit, stopped: self.node.ping_info(
+            node_id, on_stage=lambda stage: emit({"stage": stage})))
+
+    def api_routing(self):
+        """GET /api/routing (0.2.1): the routing table's buckets, unreliable nodes and bans."""
+        self.send_json(200, self.node.routing_info())
+
+    def api_log(self):
+        """GET /api/log?after=&limit=&level= (0.2.1): the daemon's recent log lines (rnfs.recentlog)."""
+        from rnfs import recentlog
+        from rnfs.debuglog import LEVEL_NAMES, LEVEL_NUMBERS
+        after = parse_int(self.param("after", False), "after", None)
+        limit = parse_int(self.param("limit", False), "limit", DEFAULT_LOG_LINES)
+        if limit > recentlog.MAX_LIMIT:
+            raise ValueError(f"limit may be at most {recentlog.MAX_LIMIT}")
+        level_text = self.param("level", False)
+        level = None
+        if level_text:
+            named = {name.lower(): number for name, number in LEVEL_NUMBERS.items()}
+            level = named.get(level_text.lower())
+            if level is None:
+                level = parse_int(level_text, "level", None)
+                if level not in LEVEL_NAMES:
+                    raise ValueError(f"level is one of {', '.join(LEVEL_NAMES[n].lower() for n in sorted(LEVEL_NAMES))}"
+                                     f" or 0 to {max(LEVEL_NAMES)}")
+        self.send_json(200, recentlog.LINES.since(after, limit, level))
+
+    def send_lines(self, what: str, run):
+        """Answer with JSON lines (application/x-ndjson) as run(emit, stopped) emits them, from a thread of its own
+        ("rnfs-api-<what>"), then a last line: what run returns, with "done": true. stopped() is True once the client
+        has gone (which ends the answer; run then ends on its own, bounded as the request without stream= is). An
+        error before the first line gets its status as any request's; after it, a last line {"error", "code",
+        "status", "done": true}. No Content-Length: the connection closes after the last line."""
+        from rnfs.gateway_formats import client_gone
+        lines: queue.Queue = queue.Queue()
+        gone = threading.Event()
+
+        def work():
+            """run, its lines and its end queued for this thread."""
+            try:
+                lines.put(("done", run(lambda item: lines.put(("line", item)), gone.is_set)))
+            except Exception as e:  # noqa: BLE001 - handed to the request's thread, which answers it
+                lines.put(("error", e))
+
+        threading.Thread(target=work, name=f"rnfs-api-{what}", daemon=True).start()
+        self.close_connection = True
+        started = False
+        try:
+            while True:
+                try:
+                    kind, value = lines.get(timeout=LINE_POLL)
+                except queue.Empty:
+                    if client_gone(self.connection):
+                        return
+                    continue
+                if kind == "error":
+                    if not started:
+                        raise value  # answered with its status, as any request's error
+                    status = error_status(value)
+                    log(f"API {what} failed mid-stream: {value!r}", LOG_ERROR if status >= 500 else LOG_NOTICE)
+                    value = {"error": str(value) or type(value).__name__, "code": error_code(value, status),
+                             "status": status}
+                if not started:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-ndjson")
+                    self.send_common_headers()
+                    self.end_headers()
+                    started = True
+                last = kind != "line"
+                try:
+                    self.wfile.write(json.dumps({**value, "done": True} if last else value).encode() + b"\n")
+                    self.wfile.flush()
+                except OSError:  # the client went away
+                    return
+                if last:
+                    return
+        finally:
+            gone.set()
 
     def api_name_list(self):
         """GET /api/name/list: this node's names."""
@@ -1276,16 +1458,24 @@ class ApiHandler(TimedHandler):
         only_hash = parse_bool(self.param("only_hash", False) or "")
         options = node_content.add_options(lambda key: self.param(key, False), stream=True)  # pin, to, seal_name…
         options.update(source)
+        origin = parse_origin(self.param("origin", False))
+        if origin is not None:
+            options["origin"] = origin
         stream_format = self.param("format", False)
-        if stream_format is None:
-            self.send_json(200, self.node.add_stream(reader, size=size, name=name, only_hash=only_hash, **options))
-            return
-        if stream_format != "tar":
+        if stream_format not in (None, "tar"):
             raise ValueError("format must be tar")
-        if {"to", "to_self", "seal_name"} & options.keys():
-            raise ValueError("a tar stream can't be sealed: seal a folder by its path (POST /api/add with to)")
-        # add_tar reads the body to its end, checking that only zeros follow the tar's (its padding)
-        self.send_json(200, self.node.add_tar(reader, name=name, only_hash=only_hash, **options))
+        if stream_format == "tar" and "seal_name" in options:  # a sealed folder's sealed name is <name>.tar
+            raise ValueError("seal_name isn't taken with format=tar: a sealed folder is sealed as <name>.tar")
+        with self.upload_job("add", origin or name, size, source) as job:
+            reader = _counted(reader, job)
+            if stream_format is None:
+                result = self.node.add_stream(reader, size=size, name=name, only_hash=only_hash, **options)
+            else:
+                # add_tar reads the body to its end, checking that only zeros follow the tar's (its padding)
+                result = self.node.add_tar(reader, name=name, only_hash=only_hash, **options)
+            if job is not None:
+                job.result = result
+        self.send_json(200, result)
 
     def api_get(self):
         """POST /api/get: fetch and write out to a path on this machine (parameters: the module docstring's table)."""
@@ -1360,8 +1550,10 @@ class ApiHandler(TimedHandler):
         self.send_json(200, self.node.pin_remote_served())
 
     def api_gc(self):
-        """POST /api/gc: evict every cached fetch."""
-        self.json_body()
+        """POST /api/gc {"dry_run"}: evict every cached fetch; dry_run (0.2.1): only say what that would free."""
+        if parse_bool(self.json_body().get("dry_run")):
+            self.send_json(200, self.node.gc(dry_run=True))
+            return
         self.send_json(200, self.node.gc())
 
     def api_verify(self):
@@ -1426,7 +1618,29 @@ class ApiHandler(TimedHandler):
         """POST /api/import/stream: import the archive the request body holds, read to its end, its roots pinned
         with the caller's source."""
         source = self.pin_source()  # refused before the body is read
-        self.send_json(200, self.node.import_stream(self.stream_reader(), **source))
+        reader = self.stream_reader()
+        with self.upload_job("import", None, None if reader.chunked else reader.remaining, source) as job:
+            result = self.node.import_stream(_counted(reader, job), **source)
+            if job is not None:
+                job.result = result
+        self.send_json(200, result)
+
+    @contextmanager
+    def upload_job(self, kind: str, name: str | None, size: int | None, source: dict):
+        """The job an upload runs as (JobsFeature.uploading; 0.2.1), or None without the jobs feature. One the user
+        cancelled is answered 409 cancelled."""
+        jobs = (getattr(self.node, "features", None) or {}).get("jobs")
+        if jobs is None:
+            yield None
+            return
+        from rnfs.errors import Cancelled
+        try:
+            with jobs.uploading(kind, name, size, source.get("source", USER)) as job:
+                yield job
+        except Cancelled as e:
+            if job.cancel_requested:
+                raise ApiRequestError(409, f"the upload was cancelled (job {job.id})", "cancelled") from None
+            raise ApiRequestError(503, str(e) or "the daemon is stopping", "busy") from None
 
     # Capabilities, events, shutdown
 
@@ -1474,6 +1688,36 @@ class ApiHandler(TimedHandler):
         """POST /api/apps/rm {"name"}: revoke an app's token and release its pins; {"released"}."""
         self.send_json(200, self.node.app_rm(check_app_name(self.json_body().get("name"))))
 
+    # Pairing (0.2.1): an app asks for a token, the user approves it (rnfs.apps.PairingRequests)
+
+    def api_app_request(self):
+        """POST /api/apps/request {"description"} with X-Rnfs-Pairing: <name>, no token: {"id", "secret", "code",
+        "expires"}. The custom header keeps web pages from asking (their request would need a CORS preflight)."""
+        name = (self.headers.get(PAIRING_HEADER) or "").strip()
+        if not name:
+            raise ValueError(f"name the app in the header {PAIRING_HEADER}")
+        self.send_json(200, self.node.app_request(check_app_name(name), self.json_body().get("description")))
+
+    def api_app_request_state(self):
+        """GET /api/apps/request?id= with X-Rnfs-Pairing-Secret: <its secret>, no token: {"name", "state", "token"
+        (once approved, given once), "expires"}."""
+        secret = (self.headers.get(PAIRING_SECRET_HEADER) or "").strip()
+        if not secret:
+            raise ValueError(f"give the request's secret in the header {PAIRING_SECRET_HEADER}")
+        self.send_json(200, self.node.app_request_state(self.param("id"), secret))
+
+    def api_app_requests(self):
+        """GET /api/apps/requests: the apps waiting for an answer (the CLI's token only)."""
+        self.send_json(200, {"requests": self.node.app_requests()})
+
+    def api_app_approve(self):
+        """POST /api/apps/approve {"id"}: add the app, its token kept for it alone (the CLI's token only)."""
+        self.send_json(200, self.node.app_approve(self.json_body().get("id")))
+
+    def api_app_deny(self):
+        """POST /api/apps/deny {"id"}: refuse the app's request (the CLI's token only)."""
+        self.send_json(200, self.node.app_deny(self.json_body().get("id")))
+
     def api_shutdown(self):
         """POST /api/shutdown: answer, then stop the daemon as SIGTERM does (ApiServer's shutdown)."""
         self.json_body()
@@ -1483,3 +1727,15 @@ class ApiHandler(TimedHandler):
         self.send_json(200, {"stopping": True})
         self.wfile.flush()
         self.shutdown_callback()
+
+    def api_restart(self):
+        """POST /api/restart (0.2.1): answer, then stop the daemon as SIGTERM does and start it again with the same
+        command line (rnfs.launch), so settings that need a restart apply; unsupported where it can't."""
+        self.json_body()
+        if self.restart_callback is None:
+            raise Unsupported("this daemon can't restart itself (daemon.json's can_restart): stop it and start it "
+                              "again")
+        log("restarting: asked through the API", LOG_NOTICE)
+        self.send_json(200, {"restarting": True})
+        self.wfile.flush()
+        self.restart_callback()

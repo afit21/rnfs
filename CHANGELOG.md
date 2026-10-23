@@ -4,7 +4,60 @@
 
 ## 0.2.1 (unreleased)
 
-Fixes. No wire-format or CID changes: these nodes, 0.2.0, 0.1.6, 0.1.5, 0.1.4 and 0.1.3 nodes work together.
+Fixes, and additions to the local API for apps. No wire-format or CID changes: these nodes, 0.2.0, 0.1.6, 0.1.5,
+0.1.4 and 0.1.3 nodes work together. Every API addition is additive: older clients see the answers they knew, with
+new fields beside them, and `GET /api/capabilities` lists `gc_dry_run`, `config_dry_run`, `add_origin`,
+`sealed_tar`, `ping_details`, `streamed_answers` and `restart`.
+
+Added (the local API, `rnfs.Client`/`rnfs.Node`, and the CLI where it helps):
+- **A peer's real last sign of life:** `GET /api/peers` (`Peer.last_seen`) gives when each peer last showed it was
+  up (an answer, a request of its own, a link, a fresh announce), as wall time; it is what `online` is decided
+  from. `last_heard` is no such sign: any node's path response refreshes it.
+- **Why a ping failed:** `GET /api/ping` (`ping_info()`, `Ping`) adds `reason` (`no_path`, `no_identity`,
+  `wrong_identity`, `not_member`, `link_refused`, `link_closed`, `link_timeout`) and the path's `hops`,
+  `interface` and `path_since`; `stream=1` answers in JSON lines, telling of each step (path, identity, link) as it
+  begins. `rnfs ping` says why.
+- **Providers as they are found:** `GET /api/providers?stream=1` sends each provider as the lookup finds it
+  (`providers(on_provider=)`); closing the connection ends the lookup. `rnfs providers` prints them as they come.
+- **A stream add's origin:** `POST /api/add/stream` takes `origin` (`add(..., origin=)`, `add_tar(..., origin=)`),
+  what `pin ls` says it was added from, so an app's adds aren't all `(stdin)` and the user's label stays free.
+- **Sealed folders from a tar upload:** `POST /api/add/stream?format=tar` with `to`/`to_self` seals the folder the
+  tar holds as `add --to <folder>` seals one (`name` is the folder's), re-packing its members as it streams: nothing
+  but the sealed bytes is stored.
+- **The shared folder's figures:** `GET /api/status` (`Status.shared_folder`) gives its path, entries and their
+  bytes, whether a scan runs, when the last ended, why the folder is refused or the last scan failed, and the
+  entries that failed to import; `rnfs status` sums it up.
+- **What `gc` would free:** `POST /api/gc` with `dry_run` (`gc(dry_run=True)`, `rnfs gc --dry-run`) changes nothing
+  and says what it would remove, and the stored bytes split by what keeps them: pins, cached fetches, operations in
+  progress, nothing, with what the state database takes. A client checks the `gc_dry_run` capability first: an
+  older daemon would ignore `dry_run` and collect.
+- **Settings checked without writing them:** `POST /api/config/set` with `dry_run` (`config_set(...,
+  dry_run=True)`) makes every check and says what would apply now and what at the next start (capability
+  `config_dry_run`, for the same reason).
+- **How the daemon runs:** `daemon.json` gains `started_by` (`systemd`, `launchd`, `windows_task`, `terminal`,
+  `unknown`, or what the program starting it set `RNFS_STARTED_BY` to), `service`, `sandbox` (`flatpak`) and
+  `can_restart`.
+- **Restart through the API:** `POST /api/restart` (`restart(wait=)`, `rnfs restart`) stops the daemon as SIGTERM
+  does and starts it again with the same command line, so settings that need a restart apply to a daemon started
+  in a terminal as much as one a service runs. On POSIX it starts again in place, keeping its process ID; on
+  Windows the task wrapper (`contrib/install-windows-task.ps1`, which now sets `RNFS_STARTED_BY`) restarts it.
+- **The routing table:** `GET /api/routing` (`routing()`, `Routing`) gives the buckets and each node's times and
+  failed queries, the nodes avoided as unreliable, and the bans with when they end and why.
+- **The daemon's log:** `GET /api/log` (`log()`) gives its recent lines, rnfs's and Reticulum's as its console shows
+  them (the last 2000, in memory), so an app shows the log of a daemon it didn't start.
+- **Uploads are jobs:** a stream add or import (`POST /api/add/stream`, `/api/import/stream`) is listed in
+  `GET /api/jobs` while it runs (`stream`, `stream_name`), with the bytes read, and cancelling it stops it (`409`,
+  code `cancelled`). Uploads are never saved or resumed, and take no job slot.
+- **More events:** `config` (a setting changed through the API, with what applied, what needs a restart and every
+  setting pending one), `name_sync` (a sync started, stopped or changed), `apps` (added, removed, requested,
+  denied) and `status` (the status fields that changed, checked every 30 s), so a status page needn't poll.
+- **Pairing:** an app with no token asks for one (`POST /api/apps/request`; `rnfs.Client.pair()`), shows its user
+  a 6-digit code, and the user approves it where that code shows too (`rnfs app requests`, `rnfs app approve`,
+  `deny`; an app told by the `requested` event). The app collects its token itself, once; the approver never sees
+  it.
+- **Reticulum's interfaces, read-only:** `GET /api/stats` (`Stats.reticulum_interfaces`, `rnfs stats`) gives each
+  interface's state, mode, bitrate, bytes and speeds (the shared instance's when attached to one). rnfs still never
+  edits Reticulum's config.
 
 Changed:
 - **Sizes are written in decimal units everywhere** (KB, MB, as `rnfs jobs`, `rnfs peers` and the log already

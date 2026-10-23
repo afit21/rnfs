@@ -17,6 +17,8 @@ Per peer the listing also gives:
   allowing mesh.EMISSION_SKEW of clock difference, and later than the last counted: Traffic.announced). A path
   response, or an announce held in a queue or passed on late by a shared instance, says nothing of now. No network
   I/O.
+- last_seen (0.2.1): that last sign it was up, as wall time (Unix seconds), or null if none was seen this run.
+  last_heard is no such sign: a path response for the node (which any node with a path may send) refreshes it.
 
 "peer" events (rnfs.events): {"node_id", "change": "new" | "online" | "offline", "online"}. A thread checks every
 CHECK_INTERVAL (offline comes with time passing, so it can't be a hook) and diffs the online states of the peers
@@ -196,15 +198,22 @@ class PeersFeature(Feature):
                                          None if seniority is None else now - seniority, recalled),
                 "rtt": counts.get("rtt"), "rtt_at": counts.get("rtt_at"),
                 "online": mesh.online(node_id in linked, counts.get("last_seen"), monotonic),
+                "last_seen": _wall(counts.get("last_seen"), now, monotonic),
             })
         peers.sort(key=lambda p: (p["hops"] if p["hops"] is not None else math.inf, p["node_id"]))
         return peers
 
     def stats(self) -> dict:
-        """Traffic since start: totals, airtime refusals, per-interface bytes and the budget left."""
+        """Traffic since start: totals, airtime refusals, per-interface bytes and the budget left; and (0.2.1)
+        Reticulum's interfaces, read-only (mesh.interface_states; [] if they can't be read, logged)."""
         snapshot = self.traffic.snapshot()
         snapshot["upload_budget"] = self.node.config.upload_budget
         snapshot["upload_budget_left"] = self._budget_remaining()
+        try:
+            snapshot["reticulum_interfaces"] = mesh.interface_states(getattr(self.node, "reticulum", None))
+        except Exception as e:  # noqa: BLE001 - RNS internals or the instance's RPC: a listing shows what it can
+            self._failed(f"couldn't read Reticulum's interfaces: {e!r}")
+            snapshot["reticulum_interfaces"] = []
         return snapshot
 
     def _recalled_mode(self, node_id: bytes) -> str | None:
@@ -265,6 +274,12 @@ def _earliest(*times: float | None) -> float | None:
     table, RNS's announce cache) knows of a time the peer had been heard by, so the earliest is the best answer."""
     known = [value for value in times if value is not None]
     return min(known) if known else None
+
+
+def _wall(seen: float | None, now: float, monotonic: float) -> float | None:
+    """A Traffic.monotonic time as wall time (now and monotonic read together), or None. Never later than now: a
+    sign of life dated ahead by an announce's allowed skew is shown as now."""
+    return None if seen is None else now - max(0.0, monotonic - seen)
 
 
 def _api_peers(handler):
@@ -349,6 +364,12 @@ def format_stats(stats: dict) -> list[str]:
     for name, counters in sorted(stats["interfaces"].items()):
         lines.append(f"interface {name}: sent {human_size(counters['sent'])}, "
                      f"received {human_size(counters['received'])}")
+    for interface in stats.get("reticulum_interfaces") or []:  # 0.2.1
+        state = {True: "up", False: "down"}.get(interface.get("online"), "?")
+        details = ", ".join(part for part in (
+            interface.get("mode"), f"{interface['bitrate'] / 1000:g} kbit/s" if interface.get("bitrate") else None,
+            f"rx {human_size(interface.get('rx_bytes'))}, tx {human_size(interface.get('tx_bytes'))}") if part)
+        lines.append(f"reticulum {interface.get('name')} ({interface.get('type') or '?'}): {state}; {details}")
     return [printable(line) for line in lines]
 
 

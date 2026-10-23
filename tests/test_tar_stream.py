@@ -7,6 +7,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import threading
 import unicodedata
 import unittest
 
@@ -18,6 +19,7 @@ from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.dag import Entry
 from rnfs.content.storage import USER
 from rnfs.errors import TooLarge as NodeTooLarge
+from tests.support import state_rows, wait_for
 from tests.test_jobs import ApiBase
 
 
@@ -652,7 +654,9 @@ class TarApiTest(ApiBase):
 
     def test_tar_refusals(self):
         data = tar_of(tree(self.out("top")))
-        for params in ({"format": "zip"}, {"format": "tar", "to_self": 1}, {"format": "tar", "seal_name": "x"}):
+        # Sealing a tar (0.2.1) needs the folder's name, and takes no seal_name (its sealed name is <name>.tar)
+        for params in ({"format": "zip"}, {"format": "tar", "to_self": 1}, {"format": "tar", "seal_name": "x"},
+                       {"format": "tar", "to_self": 1, "name": "top", "seal_name": "x"}):
             with self.subTest(params), self.assertRaises(BadRequest):
                 self.api.call("POST", "/api/add/stream", params=params, body=data, length=len(data))
         with self.assertRaises(BadRequest):
@@ -667,6 +671,63 @@ class TarApiTest(ApiBase):
             self.api.get_tar(cid)
         with self.assertRaises(TooLarge):
             self.api.add_tar(data)
+
+    def test_origin(self):
+        """origin (0.2.1) is what pin ls says a stream or tar was added from; without it, the name or the default."""
+        data = tar_of(tree(self.out("top")))
+        tar_cid = self.api.add_tar(data, origin="https://example.org/top.tar")["cid"]
+        file_cid = self.api.add_stream(b"from the web", origin=" https://example.org/a.txt ")["cid"]
+        named = self.api.add_stream(b"named", name="n.txt")["cid"]
+        origins = {pin["cid"]: pin["origin"] for pin in self.b.pin_ls()}
+        self.assertEqual((origins[tar_cid], origins[file_cid], origins[named]),
+                         ("https://example.org/top.tar", "https://example.org/a.txt", "n.txt"))
+        with self.assertRaises(BadRequest):
+            self.api.add_stream(b"x", origin="x" * 4097)
+
+    def test_uploads_are_jobs(self):
+        """A stream add is a job while it runs (0.2.1): listed with its bytes read, and cancelling it fails the
+        upload with 409 cancelled; one that ends is done, with its result, and never saved."""
+        from rnfs.apiclient import ApiError
+        started, release = threading.Event(), threading.Event()
+
+        class Slow(io.RawIOBase):
+            """A body that sends a chunk, then waits to be released before sending the next, forever."""
+            def readable(self):
+                return True
+
+            def readinto(self, buffer):
+                if started.is_set():
+                    release.wait(10)
+                started.set()
+                count = min(len(buffer), 1000)
+                buffer[:count] = b"x" * count
+                return count
+
+        outcome = {}
+
+        def upload():
+            """Send the slow body, chunked; note how it ended."""
+            try:
+                outcome["result"] = self.api.add_stream(io.BufferedReader(Slow()), origin="https://example.org/big")
+            except ApiError as e:
+                outcome["error"] = e
+
+        thread = threading.Thread(target=upload, daemon=True)
+        thread.start()
+        self.assertTrue(started.wait(10))
+        job = wait_for(lambda: next((job for job in self.api.jobs() if job.get("stream")), None))
+        self.assertEqual((job["kind"], job["state"], job["stream_name"]), ("add", "running", "https://example.org/big"))
+        self.api.cancel_job(job["id"])
+        release.set()
+        thread.join(10)
+        self.assertEqual((outcome["error"].status, outcome["error"].code), (409, "cancelled"), repr(outcome["error"]))
+        self.assertEqual(self.api.job(job["id"])["state"], "cancelled")
+        done = self.api.add_stream(b"small", name="s.txt")
+        finished = [job for job in self.api.jobs() if job.get("stream") and job["state"] == "done"]
+        self.assertEqual([(job["stream_name"], job["result"]["cid"], job["done_bytes"]) for job in finished],
+                         [("s.txt", done["cid"], 5)])
+        self.b.features["jobs"].save()
+        self.assertEqual(state_rows(self.b.config.state_dir, "SELECT id FROM jobs"), [])
 
     def test_export_and_import_streams(self):
         cid = self.b.add_path(tree(self.out("top")))["cid"]

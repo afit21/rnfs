@@ -227,11 +227,17 @@ class PeerClient:
     def ping(self, node_id: bytes) -> float | None:
         """Open a new link to node_id and return its round-trip time in seconds, or None if unreachable. The pool
         records it in traffic as it does for every link (LinkPool.on_rtt)."""
-        peer = self.links.open_oneshot(node_id, identify=False)
+        return self.ping_reason(node_id)[0]
+
+    def ping_reason(self, node_id: bytes, on_stage: Callable[[str], None] | None = None) -> tuple[float | None,
+                                                                                                    str | None]:
+        """ping(): (round-trip seconds, None), or (None, why it failed: links.OPEN_FAILURES). on_stage(stage) is told
+        of each step of opening the link as it begins (links.OPEN_STAGES)."""
+        peer, failure = self.links.try_oneshot(node_id, identify=False, on_stage=on_stage)
         if peer is None:
-            return None
+            return None, failure
         try:
-            return getattr(peer.link, "rtt", None)
+            return getattr(peer.link, "rtt", None), None
         finally:
             self.links.close_link(peer)
 
