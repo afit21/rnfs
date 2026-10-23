@@ -1104,6 +1104,80 @@ class EvictionTest(StorageTest):
         self.assertFalse(self.storage.has(busy.cid))
         self.assertEqual(self.storage.used_bytes(), 0)
 
+    def test_an_unreadable_block_is_damaged_not_an_error(self):
+        # A read that raises (a disk error, or a file a run as root left that this user can't open) makes the block
+        # damaged, said why, rather than breaking every walk, collection and verify that meets it. It is kept, as a
+        # damaged node is, until verify removes it: a file left by root is whole, and may be the only copy
+        built = self.add(os.urandom(200_000))  # chunks under one file node
+        self.storage.pin(built.cid, USER)
+        real_get = self.storage.blocks.get
+
+        def get(cid):
+            """BlockStore.get, failing for the file node as an unreadable file does."""
+            if cid == built.cid:
+                raise PermissionError(13, "Permission denied", self.storage.blocks.path(cid))
+            return real_get(cid)
+
+        with mock.patch.object(self.storage.blocks, "get", side_effect=get), \
+                mock.patch("rnfs.content.storage.log") as logged:
+            self.assertFalse(self.storage.is_complete(built.cid))
+            self.assertIsNone(self.storage.get(built.cid))
+            self.assertTrue(self.storage.has(built.cid))  # kept
+            self.storage.evict()
+            self.storage.gc()
+            self.assertTrue(self.storage.has(built.cid))
+            self.storage.verify()
+            self.assertFalse(self.storage.has(built.cid))
+        self.assertTrue(any("can't be read ([Errno 13] Permission denied" in call.args[0]
+                            for call in logged.call_args_list))
+
+    def test_verify_removes_an_unreadable_block_and_says_why(self):
+        built = self.add(b"abc")
+        real_get = self.storage.blocks.get
+
+        def get(cid):
+            """BlockStore.get, failing for built as a bad sector does."""
+            if cid == built.cid:
+                raise OSError(5, "Input/output error")
+            return real_get(cid)
+
+        with mock.patch.object(self.storage.blocks, "get", side_effect=get), \
+                mock.patch("rnfs.content.storage.log") as logged:
+            stats = self.storage.verify()
+        self.assertEqual(stats["bad"], [built.cid])
+        self.assertFalse(self.storage.has(built.cid))
+        self.assertTrue(any("can't be read ([Errno 5] Input/output error)" in call.args[0]
+                            for call in logged.call_args_list))
+
+    def test_a_delete_that_fails_keeps_the_index_and_memos_right(self):
+        # One delete raising (a disk error, a filesystem remounted read-only) mustn't leave the blocks deleted before
+        # it counted as stored, nor their DAG memoised as complete
+        built = self.add(os.urandom(200_000))
+        self.storage.record_fetch(built.cid, [], built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))  # memoised
+        real_delete = self.storage.blocks.delete
+        calls = []
+
+        def delete(cid):
+            """BlockStore.delete, the second one failing."""
+            calls.append(cid)
+            if len(calls) == 2:
+                raise OSError(30, "Read-only file system")
+            return real_delete(cid)
+
+        with mock.patch.object(self.storage.blocks, "delete", side_effect=delete), \
+                mock.patch("rnfs.content.storage.log") as logged:
+            stats = self.storage.gc()
+        self.assertEqual(stats["removed_blocks"], len(calls) - 1)
+        self.assertTrue(self.storage.has(calls[1]))  # still on disk, so still stored and counted
+        self.assertFalse(self.storage.is_complete(built.cid))
+        self.assertEqual(self.storage.used_bytes(), sum(size for _, size in self.storage.blocks.scan()))
+        self.assertEqual(self.storage.block_count(), 1)
+        self.assertTrue(any("Read-only file system" in call.args[0] for call in logged.call_args_list))
+        self.assertTrue(self.storage._maybe_garbage)  # tried again by the next collection
+        self.storage.gc()
+        self.assertEqual(self.storage.block_count(), 0)
+
 
 class AllocationTest(StorageTest):
     """max_storage counts what the blocks take on disk: each block's size rounded up to the allocation unit."""

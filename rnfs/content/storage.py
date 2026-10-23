@@ -80,6 +80,7 @@ WRITE_QUEUE = 32  # blocks a writer holds waiting to be written, at most (2 MiB 
 
 DAMAGED = object()  # Storage._node's answer for a stored DAG node that is unreadable or no longer matches its CID
 MISSING = object()  # Storage._read_node's answer for a block that isn't stored (or was deleted meanwhile)
+UNREADABLE = "can't be read"  # how _block_problem starts its answer for a block whose read raised an OSError
 _NO_MEMO = object()  # a memo's answer for a key it has no entry for (None is a memoised answer)
 _NO_ENTRIES: frozenset = frozenset()  # dag_entries of a file, shared by every one memoised
 
@@ -618,14 +619,32 @@ class Storage:
         with self._lock:
             if cid not in self._sizes:
                 return None
-        block = self.blocks.get(cid)
+        try:
+            block = self.blocks.get(cid)
+        except OSError as e:
+            # Unreadable (a disk error, a file this user can't open): damaged, as _read_node takes it, but kept until
+            # verify() removes it, as a damaged node is: a file a run as root left is whole, and may be the only copy
+            log(f"storage: block {cid} {UNREADABLE} ({e}); `rnfs verify` removes it", LOG_ERROR)
+            return None
         if block is None or (verify and not blockstore.matches(cid, block)):
             with self._lock:
-                if cid in self._sizes and not self.blocks.verify(cid):
-                    log(f"storage: block {cid} is damaged or missing; removing it", LOG_ERROR)
+                problem = self._block_problem(cid) if cid in self._sizes else None
+                if problem is not None:
+                    log(f"storage: block {cid} {problem}; removing it", LOG_ERROR)
                     self._delete({cid})  # if Windows defers it, verify() or the next read tries again
             return None
         return block
+
+    def _block_problem(self, cid: Cid) -> str | None:
+        """Why the stored block cid is bad, for the log, or None if it can be read and matches its CID. An unreadable
+        one says why (the OSError: a disk error, or a file this user can't open, such as one a run as root left)."""
+        try:
+            block = self.blocks.get(cid)
+        except OSError as e:
+            return f"{UNREADABLE} ({e})"
+        if block is None:
+            return "is missing"
+        return None if blockstore.matches(cid, block) else "is damaged (it doesn't match its CID)"
 
     def block_size(self, cid: Cid) -> int | None:
         """Length of a stored block, or None."""
@@ -1121,16 +1140,26 @@ class Storage:
         """Delete stored blocks; returns (deleted, bytes freed) (lock held). Invalidates completeness memos.
 
         A block Windows keeps in use (a reader has it open) stays stored and indexed, so the index always
-        matches the disk; it is left out of deleted, and the next collection tries again.
+        matches the disk; it is left out of deleted, and the next collection tries again. So does one whose delete
+        fails (an OSError: a disk error, a filesystem remounted read-only), which is logged; the blocks deleted
+        around it are accounted for all the same, and their DAGs' completeness memos forgotten.
         """
         deleted: set[Cid] = set()
         freed = released = 0  # bytes, and what they took on disk
         deferred = False
+        failed, error = 0, None  # deletes that raised, and the first error
         if self._closed:
             return deleted, freed  # the sizes are saved: the blocks stay, and are collected after the next start
         for cid in cids:
             if cid in self._sizes:
-                if self.blocks.delete(cid) is None:
+                try:
+                    removed = self.blocks.delete(cid)
+                except OSError as e:
+                    failed += 1
+                    error = error or e  # one line for them all: a read-only filesystem fails every one
+                    deferred = True
+                    continue
+                if removed is None:
                     log(f"storage: block {cid} is in use; deleting it later", LOG_VERBOSE)
                     deferred = True
                     continue
@@ -1150,6 +1179,8 @@ class Storage:
             self._complete_entries = {root: entries for root, entries in self._complete_entries.items()
                                       if root in self._complete}
             self._complete_bytes = {root: n for root, n in self._complete_bytes.items() if root in self._complete}
+        if failed:
+            log(f"storage: couldn't delete {plural(failed, 'block')} ({error}); trying again later", LOG_ERROR)
         if deleted or deferred:
             # A deleted DAG node no longer reaches its children; a deferred block is still garbage
             self._maybe_garbage = True
@@ -1526,7 +1557,10 @@ class Storage:
                     continue
                 with self._lock:
                     # Checked again under the lock: it may have been deleted (or rewritten) meanwhile
-                    if cid in self._sizes and not self.blocks.verify(cid):
+                    problem = self._block_problem(cid) if cid in self._sizes else None
+                    if problem is not None:
+                        if problem.startswith(UNREADABLE):  # why, so a disk error or a file's owner can be told
+                            log(f"storage: block {cid} {problem}", LOG_ERROR)
                         self._delete({cid})  # reported either way; one Windows defers stays until a later try
                         bad.append(cid)
             return set(bad)

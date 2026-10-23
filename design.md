@@ -114,6 +114,8 @@ rnfs/
   constants.py config.py ids.py errors.py log.py   shared foundation
   debuglog.py         the debug log file, <rnfs dir>/debug.log (debug_log)
   fsutil.py           cross-platform file operations: replace/remove retried on Windows, O_BINARY, IS_WINDOWS
+  winacl.py           owner-only access on Windows: a protected DACL for the rnfs dir and its secret files
+  units.py            sizes as people read them (human_size), in decimal units as RNS writes them; no RNS
   retry.py            when content not found yet is tried again (remote pins, jobs): next_retry, no imports
   statedb.py          the state database, <rnfs dir>/state/rnfs.db: schema, transactions, JSON state migration
   content/            no networking; uses RNS's bundled msgpack and RNS logging, so importing it loads RNS
@@ -144,11 +146,16 @@ rnfs/
     lookups.py        Lookups: which lookups searching and publishing run; Search: the fallback to disjoint paths (6)
     sweep.py          sweep providing: regions of due keys, the far half's extra /find, Sweep (section 6)
     recent.py         RecentCounts: events per minute over the last day, for the network status (section 11)
+    local.py          LocalServers: the DHT servers on this node's own island, for two-level records and the
+                      local-first search; judged from the path to each (section 6, LoRa islands)
   network/            everything that talks to RNS
     protocol.py       message encoding/validation, batch sizes (sections 3, 6, 7, 8)
     rates.py          rate estimates, slow links, slow node detection (section 2); the /blocks size rules both
                       ends share: response_capacity, default_upload_cap (sections 3, 7)
     links.py          LinkPool: shared unidentified links, identified one-shot links, idle close (section 3)
+    paths.py          PathRequests: one budget for every path request the node makes (section 3)
+    channel.py        pacing by the radio's measured load (section 3, Measured airtime)
+    blackhole.py      honouring RNS's identity blackhole (section 10)
     guards.py         guards rejecting oversized, compressed or request Resource advertisements (on every
                       link in the daemon, on rnfs.dht links only in an embedded node) and, on rnfs.dht links,
                       responses that fail a msgpack header check before RNS decodes them (3, 10); the
@@ -167,23 +174,32 @@ rnfs/
                       RNS (section 9)
   name_sync.py        NameSync: names kept pointing at a folder's content, settle time, hourly limit (section 9)
   denylist.py         DenyList: denied CIDs and file hashes, local entries, accepted lists (section 8)
+  pin_names.py        PinNames: where each pin came from on this machine and the label its user gave it
+                      (rnfs pin ls)
+  remote_pins.py      AskedPins, ServedPins: the status of remote pins this node asked for and was asked
+                      for; local only, /pin is unchanged (section 8)
   fetcher.py          fetching a target from providers; observing() for job progress (sections 6, 7)
   ranges.py           /range on the requesting side: which nodes answer it (persisted), partial blocks, one range
                       fetched into one (section 7)
   publisher.py        provide strategy, batched /provide, republish, withdrawal, extra key sources (section 6)
   node.py             RnfsNode: wires everything; the facade below
   node_content.py     node side of --no-pin, sealing/unsealing, raw blocks and archive streams
+  node_pins.py        NodePins, which RnfsNode inherits: the pin facade (pin add/rm/ls/label, the details pin ls
+                      shows) and remote pins, asked and served, with their workers and saved state (section 8)
   apps.py             AppRegistry: the apps rnfs app add issued tokens to, their verifiers (section 11)
   uris.py             rnfs: URIs and the LXMF link map (Link, parse_uri, format_uri, encode_field,
                       decode_field): the interop contract LXMF apps use, exported as rnfs.Link and so on; no RNS
                       (section 13)
   entry_names.py      the entry name rule (check_name, is_valid_name), which rnfs.content.dag re-exports; no RNS,
-                      so uris.py and nomadnet.py check names without loading it (section 5)
+                      so uris.py and nomadnet_links.py check names without loading it (section 5)
+  nomadnet_links.py   NomadNet links' syntax (parse, snapshot_name, is_not_allowed); no RNS, so the CLI checks
+                      them; the fetch is network/nomadnet.py (section 11)
   lxmf_messages.py    the lxmf_messages table rnfs's LXMF left (before 0.2.0) for an LXMF app: only the import of
                       0.1.4's lxmf_inbox.json and lxmf_outbox.json into it (section 13)
   api.py              local API, 127.0.0.1:8788 (section 11)
   apiclient.py        the local API's protocol layer (ApiConnection) under rnfs.Client and the CLI: token, proof
                       check, typed errors (section 11)
+  events.py           EventLog: what changed on the node, for GET /api/events' long poll (section 11); no RNS
   objects.py          the public API's typed objects (Added, Entry, Info, Record, ...); no RNS
   interface.py        the public API both classes share (Rnfs, Names, Jobs, Deny, File, Watch); no RNS
   embedded.py         rnfs.Node: a node inside a program (imports RNS)
@@ -193,12 +209,15 @@ rnfs/
   cli.py              command line (section 11)
   features/           optional features, one module each (below)
     __init__.py       Feature base class, FEATURE_MODULES, feature API routes
+    _common.py        helpers the feature modules share (the feature an API route reaches, logging)
     peers.py          rnfs peers, rnfs stats
     jobs.py           background jobs (section 11)
     keepers.py        /name, kept names (section 9)
     follow.py         followed names (section 9)
     contacts.py       address book (section 11)
     deny.py           deny_lists sources: fetched, checked, followed; rnfs deny (section 8)
+    settings.py       rnfs config, GET /api/config, POST /api/config/set: settings read and changed through the
+                      daemon, live ones applied at once (section 12)
 examples/             rnfs_share.py: the public API with either class
 install.sh            Linux installer of the latest release (or --main): venv, command, optional systemd user
                       unit; --update, --uninstall
@@ -1639,7 +1658,7 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   can come once part of the folder has been sealed, and what was stored is then unreferenced, for the next
   collection. A file's size is its open `fstat`'s; a file growing meanwhile is cut there, one shrinking fails
   the add.
-- **Adding from NomadNet** (`rnfs add <destination>:/page/<path>`, specification section 11). `rnfs/nomadnet.py`
+- **Adding from NomadNet** (`rnfs add <destination>:/page/<path>`, specification section 11). `rnfs/nomadnet_links.py`
   (no RNS: the CLI uses it) parses links (`parse`, `looks_like` for the CLI's `./` escape), names a snapshot
   (`snapshot_name`) and recognises NomadNet's "Request Not Allowed" page (`is_not_allowed`, NomadNet's
   `DEFAULT_NOTALLOWED` text). `node_content.add_nomadnet` checks the options (recipients, chunker) before any
@@ -1765,7 +1784,11 @@ interface (at most 64) and in total, never persisted.
   zero-progress response past half its grace from an interface holding two or more, at most once per grace
   per interface (`fairness_at`); else, for a newcomer whose link and identity hold no slot, the slowest
   response older than `deadline_slack` and past its grace, marked idle if `Response.far_behind` (below a
-  quarter of `needed_rate`, measured against `Response.due`). Never one on the newcomer's own link.
+  quarter of `needed_rate`, measured against `Response.due`). Never one on the newcomer's own link. A request
+  takes no slot (`_serve`) if nothing it asks for is served, if it is a `/range` past the block's stored end, or if
+  its handler's `fits_packet` (the stored sizes of what it serves) says the answer fits one packet: that one gets a
+  `Response` outside the pools, paced and charged as any, and reserves a slot after all if the answer built is
+  larger than foreseen.
   `check_responses` cancels and refunds a response that has sent nothing once its grace plus `deadline_slack`
   has passed, or that makes no progress for `stall_timeout`. `Cooldowns` then refuses `/blocks` from a link
   (and its identity, if identified) whose response was displaced or cancelled idle, for `blocks_cooldown`,
@@ -1799,7 +1822,8 @@ interface (at most 64) and in total, never persisted.
   `check_responses` charges progress as it reads it (`_charge_progress`), and `_settle` (from `_finish`)
   makes the charge final: the cost if completed or progress is unreadable, else progress × size, refunding
   an unused reservation. One requester's responses in flight may cost at most half the bucket's capacity
-  (`_budget_share_left` cuts the budget, or refuses).
+  (`_budget_share_left` cuts the budget, or refuses: once before a slot is reserved, so a requester at its share
+  displaces nothing, and again after any pacing wait).
   `RequestServer.traffic` and `PeerClient.traffic` share one `Traffic`.
 - `network/guards.py` also rejects, on `rnfs.dht` links only (recognised by the link's destination or owner
   name `rnfs.dht.<hex>`; an incoming link's destination is set by `Link.validate_request` before it is

@@ -150,7 +150,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from rnfs import __version__, events, fsutil, ids, nomadnet
+from rnfs import __version__, events, fsutil, ids, nomadnet_links
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
 from rnfs.apiclient import API_HEADER, APP_HEADER, CHALLENGE_HEADER, PIN_KEY_HEADER, PROOF_HEADER, api_proof
 from rnfs.content.cid import Cid
@@ -281,15 +281,15 @@ def parse_int(text, name: str, default: int | None) -> int | None:
 
 
 def parse_nomadnet(text) -> str:
-    """A NomadNet link (<32 hex>:/page/<path> or :/file/<path>, rnfs.nomadnet.parse) as written, or ValueError."""
-    return str(nomadnet.parse(text))
+    """A NomadNet link (<32 hex>:/page/<path> or :/file/<path>, rnfs.nomadnet_links.parse) as written, or ValueError."""
+    return str(nomadnet_links.parse(text))
 
 
 def parse_entry_name(value) -> str | None:
-    """An entry name (rnfs.nomadnet.is_valid_name), or None if absent or empty; ValueError otherwise."""
+    """An entry name (rnfs.nomadnet_links.is_valid_name), or None if absent or empty; ValueError otherwise."""
     if value is None or value == "":
         return None
-    if not nomadnet.is_valid_name(value):
+    if not nomadnet_links.is_valid_name(value):
         raise ValueError(f"invalid entry name {value!r}")
     return value
 
@@ -498,6 +498,8 @@ class BoundedHTTPServer(ThreadingHTTPServer):
         """Serve the connection, free its slot, then close it (gently, if a closer slot is free)."""
         try:
             self.finish_request(request, client_address)
+        except ConnectionError:
+            pass  # the client reset or closed the connection: nothing to answer, and no fault of the server's
         except Exception:  # noqa: BLE001 - as socketserver does: report, then close the connection
             self.handle_error(request, client_address)
         finally:
@@ -603,7 +605,9 @@ class NameWatches:
     """GET /api/name/watch's state, one per ApiServer: the names watched for API clients, each until WATCH_GRACE
     after the last call naming it ends, and the calls waiting. Each name in until holds exactly one
     NameManager.watch, so its lock is held while watching and unwatching there (taken before the names lock,
-    never under it: the record listener, called with the names lock held, only sets the waiting calls' events)."""
+    never under it: the record listener, called with the names lock held, only sets the waiting calls' events).
+    A watch ends on time without a later call: one daemon timer (rnfs-api-name-watch) is armed for the soonest end,
+    and re-armed when it fires while names are still watched; close() cancels it and ends every watch."""
 
     def __init__(self, node, clock=time.monotonic):
         """Watches on node's names (read only once a call comes)."""
@@ -613,6 +617,9 @@ class NameWatches:
         self.until: dict[bytes, float] = {}  # name -> when its watch ends (each one NameManager.watch)
         self.waiters: tuple = ()  # (names, event) of each call waiting; swapped whole, read without the lock
         self.listening = False
+        self.timer: threading.Timer | None = None  # ends the watches due at timer_due (_arm)
+        self.timer_due = 0.0
+        self.closed = False
 
     def wait(self, names: list[bytes], after: list[int | None], wait: float) -> list[dict]:
         """The records held for names above the matching after (None: any), once there is one or after wait
@@ -643,10 +650,52 @@ class NameWatches:
             with self.lock:
                 self.waiters = tuple(item for item in self.waiters if item is not waiter)
                 self._extend(names, self.clock() + WATCH_GRACE)
+                self._arm()
+
+    def _arm(self):
+        """Have the timer fire when the soonest watch ends (none while nothing is watched). Lock held."""
+        if self.closed or not self.until:
+            return
+        due = min(self.until.values())
+        if self.timer is not None:
+            if self.timer_due <= due:
+                return  # it fires first, and re-arms for what is left
+            self.timer.cancel()
+        # At least a moment: a watch found not quite ended when the timer fires doesn't make it spin
+        self.timer = threading.Timer(max(due - self.clock(), 0.01), self._expire)
+        self.timer.name = "rnfs-api-name-watch"
+        self.timer.daemon = True
+        self.timer_due = due
+        self.timer.start()
+
+    def _expire(self):
+        """The timer: end the watches whose grace has passed, then arm it for the next."""
+        with self.lock:
+            if self.timer is not None and self.timer is not threading.current_thread():
+                return  # replaced by a timer due sooner; that one arms what follows
+            self.timer = None
+            if self.closed:
+                return
+            self._extend([], self.clock())
+            self._arm()
+
+    def close(self):
+        """Cancel the timer and end every watch (ApiServer.stop): nothing is watched for a server that stopped."""
+        with self.lock:
+            self.closed = True
+            if self.timer is not None:
+                self.timer.cancel()
+                self.timer = None
+            for name in self.until:
+                self.node.names.unwatch(name)
+            self.until.clear()
 
     def _extend(self, names: list[bytes], until: float):
         """Keep names (distinct) watched until at least until, unwatching those whose watch has ended, and the
-        soonest to end past MAX_WATCHED, in NameManager too. Lock held."""
+        soonest to end past MAX_WATCHED, in NameManager too; nothing once closed (a call still answered then
+        watches nothing, which no timer would end). Lock held."""
+        if self.closed:
+            return
         manager = self.node.names
         now = self.clock()
         for name in [name for name, end in self.until.items() if end <= now and name not in names]:
@@ -693,9 +742,15 @@ class ApiServer(LocalServer):
         self.token = token if token is not None else secrets.token_urlsafe(32)
         if not self.token:
             raise ValueError("the API token must not be empty")
-        super().__init__(ApiHandler, port, node=node, token=self.token, watches=NameWatches(node),
+        self.watches = NameWatches(node)
+        super().__init__(ApiHandler, port, node=node, token=self.token, watches=self.watches,
                          event_waiters=threading.BoundedSemaphore(MAX_EVENT_WAITERS),
                          shutdown_callback=None if shutdown is None else staticmethod(shutdown))
+
+    def stop(self):
+        """Stop serving, then end the name watches held for API clients (and their timer)."""
+        super().stop()
+        self.watches.close()
 
 
 class ApiRequestError(Exception):

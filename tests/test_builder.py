@@ -265,6 +265,20 @@ class DirectoryTest(unittest.TestCase):
             self.assertEqual(built.height, 3)
             self.assertEqual(built.size, 50)
 
+    def test_sizes_past_2_64_are_too_large_in_any_group(self):
+        """Entries whose sizes add up past 2^64 - 1 (files of repeated subtrees can claim 2^63 bytes from a few
+        blocks, and `dir set` puts them together) are TooLarge, also when they share a group below an index node,
+        whose size couldn't even be encoded; nothing past the limit is stored."""
+        huge = 2**63
+        for count in (2, 4):  # one directory node; a group of three and one, under an index
+            with self.subTest(count=count), small_tree():
+                entries = [Entry("a", EMPTY_FILE, huge, 0), Entry("b", EMPTY_FILE, huge, 0)]
+                entries += [Entry(f"c{i}", EMPTY_FILE, 0, 0) for i in range(count - 2)]
+                blocks = Blocks()
+                with self.assertRaises(TooLarge):
+                    builder.build_directory(entries, blocks.put)
+                self.assertEqual(blocks, {})
+
     def test_wrap(self):
         blocks = Blocks()
         inner = builder.build_bytes(b"data", blocks.put)

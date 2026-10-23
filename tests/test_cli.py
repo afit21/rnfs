@@ -356,7 +356,7 @@ class OtherCommandTest(CliTestCase):
             "network_size: about 1240 DHT servers (estimated from 16 lookups); 57 servers in the routing table",
             "density_check: fired on 2 of 48 checks in the last hour, 9 of 1104 in the last day",
             "partition_for: 2 h 5 min",
-            "record_store: 3.0 MiB of 1.0 GiB (room for 7000000 records), full; 7105 records (5 this node's) from 141 "
+            "record_store: 3.15 MB of 1.07 GB (room for 7000000 records), full; 7105 records (5 this node's) from 141 "
             "publishers",
             "record_tiers: known 100 (0.0%, floor 30%), earned 6000 (0.1%, floor 60%), newcomer 1000 (14.3%, floor "
             "10%)",

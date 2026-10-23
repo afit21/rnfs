@@ -808,6 +808,11 @@ class TrafficTest(unittest.TestCase):
         # A sender's clock ahead of ours: seen now, never later
         self.assertTrue(traffic.announced(P4, wall.now + 3600))
         self.assertEqual(traffic.peer(P4)["last_seen"], mono.now)
+        # ... its clock then put right: its next announce, emitted later than the skew allowed, counts
+        wall.now += mesh.EMISSION_SKEW + 1
+        mono.now += mesh.EMISSION_SKEW + 1
+        self.assertTrue(traffic.announced(P4, wall.now))
+        self.assertEqual(traffic.peer(P4)["last_seen"], mono.now)
         for emitted in (None, float("nan"), float("inf"), True, "50000"):  # unknown: doesn't count
             self.assertFalse(traffic.announced(bytes([9]) * 16, emitted))
 
@@ -1114,7 +1119,7 @@ class PeersFeatureTest(unittest.TestCase):
     def test_human_formats(self):
         self.assertEqual(peers_feature.human_size(None), "-")
         self.assertEqual(peers_feature.human_size(999), "999 B")
-        self.assertEqual(peers_feature.human_size(1500), "1.5 KB")
+        self.assertEqual(peers_feature.human_size(1500), "1.50 KB")
         self.assertEqual(peers_feature.human_rate(1200), "1.2 kbps")
         self.assertEqual(peers_feature.human_age(59), "59s")
         self.assertEqual(peers_feature.human_age(3 * 3600 + 5), "3h")

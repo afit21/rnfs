@@ -219,7 +219,11 @@ class DenyFeature(Feature):
 
     def _loop(self):
         """The background thread: checks and fetches, one at a time, once the node has joined."""
-        self.node.joined.wait()
+        # In steps, so a stop during the join (minutes on a radio) ends this at once rather than at the node's stop
+        # deadline, which would leave the other features' threads and the node's no time
+        while not self.node.joined.wait(0.5):
+            if self._stop.is_set():
+                return
         while not self._stop.is_set():
             try:
                 delay = self.run_due()

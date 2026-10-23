@@ -460,6 +460,36 @@ class PatienceTest(LookupTestCase):
         self.assertEqual(ended, "complete")
         self.assertLess(took, 0.6)  # within HOLD_PATIENCE x patience: it didn't wait for them
 
+    def test_a_slow_node_asks_the_next_server_while_it_knows_few(self):
+        """Alpha 1 (slow nodes) and no more nodes known than the window: the server that doesn't answer gives up the
+        only place after patience, and the next is asked (before, it took the place back at once, and the search waited
+        out its whole time with the record one query away)."""
+        provider = ident(0x7777)
+        self.net.nodes[self.alive[0]].store.store(self.key, provider)
+        found = []
+        lookup = self.lookup(self.net, self.key, [self.dead[0], self.alive[0]], timeout=3, alpha=1, beta=3,
+                             patience=0.2)
+        started = time.monotonic()
+        self.assertEqual(lookup.find_providers(found.append, should_stop=lambda: bool(found)), [provider])
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(self.net.queried[:2], [self.dead[0], self.alive[0]])
+
+    def test_a_server_slow_to_answer_is_still_waited_for_when_it_is_the_last(self):
+        """Its place given up, a lagging query alone near the key still keeps the search from ending before it
+        answers: a search that found nobody holds for it, and once that hold is over it waits as for any query."""
+        self.net.hang.clear()
+        slow, gate = self.dead[0], threading.Event()
+        self.net.nodes[slow].store.store(self.key, ident(0x7777))
+        query = self.net.query
+
+        def slowly(node_id, key):
+            if node_id == slow:
+                gate.wait(5)
+            return query(node_id, key)
+        lookup = Lookup(self.key, [slow], slowly, ident(0), alpha=1, timeout=10, poll_interval=0.05, patience=0.1)
+        threading.Timer(1.0, gate.set).start()  # past patience and its hold (3 x 0.1 s)
+        self.assertEqual(lookup.find_providers(lambda provider: None), [ident(0x7777)])
+
     def test_without_patience_it_waits_for_them(self):
         ended, took = self.run_search(None)
         self.assertEqual(ended, "out of time")

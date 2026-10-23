@@ -535,10 +535,9 @@ class _PublishState(statedb.RowStore):
         tx.executemany("INSERT OR REPLACE INTO publish_items (key, item, due, at, retry, nodes, earlier, heal)"
                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", sorted(rows))
         # A new item's row says it was never published; one already there (a restart) is kept. Items no longer
-        # provided (removed since) get none
-        gone = {key for (key,) in deleted}
-        new = sorted((item.key, _item_id(item)) for batch in added for item in batch
-                     if item in provided and item.key not in gone)
+        # provided (removed since) get none. One removed and provided again since the last save is in both: its row,
+        # deleted above, is written again as never published (left out, it had none, and was never published again)
+        new = sorted((item.key, _item_id(item)) for batch in added for item in batch if item in provided)
         tx.executemany("INSERT OR IGNORE INTO publish_items (key, item, due, at, retry, nodes, earlier, heal)"
                        " VALUES (?, ?, 0, NULL, NULL, x'', x'', 0)", new)
         if snapshot["round_end"]:
@@ -1298,7 +1297,9 @@ class Publisher:
             self._clamp(now)
             self._check_interval()
             waits = []
-            if any(self._withdrawals.values()):
+            # In partition mode only those for local servers can go (_publish): the rest, left queued, aren't due
+            islands = self._islands
+            if any(keys for node, keys in self._withdrawals.items() if islands is None or islands.allows(node)):
                 if not self.slow_node:
                     return 0.0
                 waits.append(0.0)

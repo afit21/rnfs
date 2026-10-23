@@ -606,8 +606,8 @@ class SharedFolder:
             pins = {cid for _, cid in current.values()}
             for cid in self.storage.pinned_by(FOLDER) - pins:
                 self.storage.unpin(cid, FOLDER)
-            if current != self._known:
-                self._known = current
+            self._known = current
+            if current != self._saved:  # also after a save that failed: _save writes what the table lacks
                 self._save()
             self._importer.retain(names)
             return pins

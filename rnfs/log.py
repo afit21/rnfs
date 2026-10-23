@@ -12,6 +12,7 @@ import RNS
 from RNS import LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING  # noqa: F401
 
 from rnfs.fsutil import printable
+from rnfs.units import human_size
 
 # Warnings a result keeps (a write-out skipping 50,000 entries mustn't make a 16 MB response or saved job)
 MAX_WARNINGS = 100
@@ -138,8 +139,8 @@ def plural(count: int, noun: str) -> str:
 
 
 def size(num_bytes: float) -> str:
-    """Human-readable size, e.g. "3.00 MB"."""
-    return RNS.prettysize(num_bytes)
+    """Human-readable size, e.g. "3.20 MB" (units.human_size)."""
+    return human_size(num_bytes)
 
 
 def cap_warnings(warnings: list) -> dict:

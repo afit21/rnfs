@@ -9,8 +9,9 @@
 # Per user (the default):   venv ~/.local/share/rnfs/venv, command ~/.local/bin/rnfs
 # --system (or as root):    venv /opt/rnfs/venv,           command /usr/local/bin/rnfs
 #
-#   --service     also install the systemd user unit and start it (system mode: install it for all users,
-#                 each then runs `systemctl --user enable --now rnfs`)
+#   --service     also install the systemd user unit and start it, or restart it on the new version if it was
+#                 running (system mode: install it for all users, each then runs
+#                 `systemctl --user enable --now rnfs`)
 #   --main        install the main branch, which may be newer than the latest release, instead of the release
 #                 (the branch archive has no checksum or provenance to check)
 #   --update      re-install from the latest release, or the main branch with --main (running the installer
@@ -548,6 +549,19 @@ python3-dev libffi-dev), run this again with RNFS_ALLOW_SOURCE_BUILDS=1 set:
 
 have_user_systemd() { command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; }
 
+start_user_service() {  # after the user unit is written: with --service, run the version just installed; else restart a running one
+    systemctl --user daemon-reload
+    if [ "$SERVICE" = yes ]; then
+        # Not enable --now, which leaves a daemon already running as it is: the version before this update
+        systemctl --user enable rnfs.service
+        systemctl --user restart rnfs.service
+        say "Started the rnfs service (systemctl --user status rnfs; logs: journalctl --user -u rnfs -f)"
+    else
+        systemctl --user try-restart rnfs.service || true
+        say "Updated the systemd user unit (restarted rnfs if it was running)"
+    fi
+}
+
 # Actions
 
 do_install() {
@@ -610,14 +624,7 @@ $check"
                 say "  systemctl --user daemon-reload && systemctl --user restart rnfs)"
             fi
         elif have_user_systemd; then
-            systemctl --user daemon-reload
-            if [ "$SERVICE" = yes ]; then
-                systemctl --user enable --now rnfs.service
-                say "Started the rnfs service (systemctl --user status rnfs; logs: journalctl --user -u rnfs -f)"
-            else
-                systemctl --user try-restart rnfs.service || true
-                say "Updated the systemd user unit (restarted rnfs if it was running)"
-            fi
+            start_user_service
         else
             say "Installed $UNIT, but there's no systemd user session here; start it later with:"
             say "  systemctl --user daemon-reload && systemctl --user enable --now rnfs"

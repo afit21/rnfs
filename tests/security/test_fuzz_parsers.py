@@ -27,7 +27,7 @@ from unittest import mock
 import RNS
 from RNS.vendor import umsgpack
 
-from rnfs import nomadnet, ranges, statedb
+from rnfs import nomadnet_links, ranges, statedb
 from rnfs.config import Config
 from rnfs.constants import ID_LENGTH, K, KIB, MAX_BLOCK_SIZE, RANGE_BZ2, RANGE_PATH
 from rnfs.content import archive, builder, dag, seal, walker
@@ -553,7 +553,7 @@ class PrecheckFuzzTest(unittest.TestCase):
         # What a fetch makes of it: a valid, printable entry name whatever the node sent
         sent = nomadnet_fetch._sent_name(value)
         self.assertTrue(sent is None or type(sent) in (bytes, str))
-        name = nomadnet.snapshot_name(nomadnet.parse("00" * 16 + ":/file/fallback"), sent)
+        name = nomadnet_links.snapshot_name(nomadnet_links.parse("00" * 16 + ":/file/fallback"), sent)
         self.assertTrue(dag.is_valid_name(name) and name.isprintable())
 
     @fuzz()
@@ -1203,7 +1203,7 @@ class RangeExchangeFuzzTest(unittest.TestCase):
                 break
 
 
-# NomadNet answers (rnfs/network/nomadnet.py) and links (rnfs/nomadnet.py)
+# NomadNet answers (rnfs/network/nomadnet.py) and links (rnfs/nomadnet_links.py)
 
 SEGMENT = nomadnet_fetch.SEGMENT_SIZE
 segment_fields = st.integers(-1, 6) | st.integers(0, 4 * SEGMENT) | msgpack_leaves
@@ -1247,11 +1247,11 @@ def accepted_segments(test: unittest.TestCase, segments: list) -> list:
     return accepted
 
 
-nomadnet_links = (st.text(max_size=60)
-                  | st.tuples(st.sampled_from(["00" * 16, "aB" * 16, "0" * 31, "g" * 32]),
-                              st.sampled_from([":/page/", ":/file/", ":/", ":/page", ":/other/"]),
-                              st.lists(uri_segments | valid_names | st.sampled_from([".", "..", "", "a`b", "\n"]),
-                                       max_size=3).map("/".join)).map("".join))
+nomadnet_link_texts = (st.text(max_size=60)
+                       | st.tuples(st.sampled_from(["00" * 16, "aB" * 16, "0" * 31, "g" * 32]),
+                                   st.sampled_from([":/page/", ":/file/", ":/", ":/page", ":/other/"]),
+                                   st.lists(uri_segments | valid_names | st.sampled_from([".", "..", "", "a`b", "\n"]),
+                                            max_size=3).map("/".join)).map("".join))
 
 
 @needs_hypothesis
@@ -1303,45 +1303,45 @@ class NomadnetFuzzTest(unittest.TestCase):
     @fuzz()
     @given(metadata_values | metadata_maps, st.sampled_from(["/file/", "/page/"]), valid_names)
     def test_snapshot_name(self, metadata, kind, last):
-        link = nomadnet.NomadnetLink(bytes(16), kind + "dir/" + last)
+        link = nomadnet_links.NomadnetLink(bytes(16), kind + "dir/" + last)
         for sent in (nomadnet_fetch._sent_name(metadata), metadata):
-            name = nomadnet.snapshot_name(link, sent)
+            name = nomadnet_links.snapshot_name(link, sent)
             self.assertTrue(dag.is_valid_name(name) and name.isprintable() or name == last)
             if kind == "/page/":
                 self.assertEqual(name, last)
 
     @fuzz()
-    @given(nomadnet_links)
+    @given(nomadnet_link_texts)
     def test_link(self, text):
-        looks = nomadnet.looks_like(text)
+        looks = nomadnet_links.looks_like(text)
         try:
-            link = nomadnet.parse(text)
+            link = nomadnet_links.parse(text)
         except ValueError:
             return
         self.assertTrue(looks)
         self.assertEqual(len(link.destination), 16)
-        self.assertEqual(nomadnet.parse(str(link)), link)
-        self.assertTrue(nomadnet.is_valid_name(link.last_name) and link.last_name.isprintable())
+        self.assertEqual(nomadnet_links.parse(str(link)), link)
+        self.assertTrue(nomadnet_links.is_valid_name(link.last_name) and link.last_name.isprintable())
 
     @fuzz()
     @given(st.text(max_size=12) | valid_names | st.text(min_size=60, max_size=260)
            | st.text(alphabet="aé😀/.\0", min_size=60, max_size=260)
            | st.sampled_from([".", "..", "", "a" * 255, "a" * 256, "é" * 127, "é" * 128]))
     def test_names_agree_with_dag(self, name):
-        # The CLI checks names without loading RNS (rnfs/nomadnet.py), so its copy of the rule must be dag's
-        self.assertEqual(nomadnet.is_valid_name(name), dag.is_valid_name(name))
+        # The CLI checks names without loading RNS (rnfs/nomadnet_links.py), so its copy of the rule must be dag's
+        self.assertEqual(nomadnet_links.is_valid_name(name), dag.is_valid_name(name))
 
     @fuzz()
     @given(st.binary(max_size=300) | msgpack_values
            | st.tuples(st.sampled_from(["", " ", "\n", "\r\n"]), st.booleans(), st.sampled_from(["", "\n", " \r\n"]))
-           .map(lambda t: (t[0].encode() + (nomadnet.NOT_ALLOWED.replace(b"\n", b"\r\n") if t[1]
-                                            else nomadnet.NOT_ALLOWED) + t[2].encode())))
+           .map(lambda t: (t[0].encode() + (nomadnet_links.NOT_ALLOWED.replace(b"\n", b"\r\n") if t[1]
+                                            else nomadnet_links.NOT_ALLOWED) + t[2].encode())))
     def test_not_allowed(self, data):
-        allowed = nomadnet.is_not_allowed(data)
+        allowed = nomadnet_links.is_not_allowed(data)
         self.assertIs(type(allowed), bool)
         if allowed:
-            self.assertEqual(bytes(data).replace(b"\r\n", b"\n").strip(), nomadnet.NOT_ALLOWED.strip())
-        elif type(data) is bytes and data.replace(b"\r\n", b"\n").strip() == nomadnet.NOT_ALLOWED.strip():
+            self.assertEqual(bytes(data).replace(b"\r\n", b"\n").strip(), nomadnet_links.NOT_ALLOWED.strip())
+        elif type(data) is bytes and data.replace(b"\r\n", b"\n").strip() == nomadnet_links.NOT_ALLOWED.strip():
             self.fail("NomadNet's page not recognised")
 
 

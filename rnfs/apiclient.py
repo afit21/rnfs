@@ -499,8 +499,9 @@ class ApiConnection:
     def __init__(self, rnfs_dir: str | None = None, port: int | None = None, token_file: str | None = None,
                  timeout: float | None = None, *, app: str | None = None, token: str | None = None):
         """A client; nothing is sent until the first request. Raises SettingsError if port isn't given and
-        rnfs.toml can't be read, ValueError for an app without token or token_file, or a token that is empty or
-        given with a token_file."""
+        rnfs.toml can't be read, ValueError for an app without token or token_file, a token that is empty or
+        given with a token_file, or a timeout that isn't None or a positive number of seconds (check_timeout)."""
+        timeout = check_timeout(timeout)
         if token is not None and (not isinstance(token, str) or not token.strip() or token_file is not None):
             raise ValueError("token is a non-empty string, given instead of token_file")
         if app is not None and token is None and token_file is None:

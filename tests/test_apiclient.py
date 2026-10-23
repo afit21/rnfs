@@ -885,6 +885,18 @@ class TimeoutTest(ClientTestCase):
                 with self.assertRaises(ValueError), self.api.using_timeout(bad):
                     pass
 
+    def test_the_connections_timeout_is_checked(self):
+        """The timeout a connection (and so an rnfs.Client) is made with is checked as a call's: ValueError at
+        construction, not a non-blocking socket's misleading "can't reach the daemon" on every request."""
+        from rnfs.remote import Client
+        for bad in (0, -1, True, "5", float("inf"), float("nan")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    ApiConnection(self.tmp, port=self.server.port, timeout=bad)
+                with self.assertRaises(ValueError):
+                    Client(self.tmp, port=self.server.port, timeout=bad)
+        self.assertEqual(ApiConnection(self.tmp, port=self.server.port, timeout=2.5).effective_timeout(), 2.5)
+
 
 class ErrorTest(ClientTestCase):
     """Every failure is a typed ApiError with the message the CLI prints."""

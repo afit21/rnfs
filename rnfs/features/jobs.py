@@ -73,12 +73,15 @@ from collections import deque
 from contextlib import ExitStack
 from typing import Callable
 
-from rnfs import ids
+from rnfs import fsutil, ids
 from rnfs.constants import PARTIAL_SUFFIX
 from rnfs.retry import counted_since, next_retry
 from rnfs.features import Feature, _common
 from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_WARNING
 from rnfs.fsutil import printable
+from rnfs.objects import ACTIVE, CANCELLED, DONE, FAILED, FINISHED, QUEUED, RUNNING
+from rnfs.objects import MAX_JOB_WAIT as MAX_WAIT
+from rnfs.units import human_size
 
 NAME = "jobs"
 KINDS = ("get", "pin", "export", "add", "import")
@@ -90,14 +93,10 @@ ADD_OPTIONS = {"wrap": bool, "only_hash": bool, "pin": bool, "to": list, "to_sel
                "chunker": str}
 NOMADNET_OPTIONS = {"name": str, "identify": bool}  # what an add job of a NomadNet link takes besides ADD_OPTIONS
 MAX_RECIPIENT_TEXT = 256  # characters of one of an add job's to= recipients (a key is 128 hex digits)
-QUEUED, RUNNING, DONE, FAILED, CANCELLED = "queued", "running", "done", "failed", "cancelled"
 STATES = (QUEUED, RUNNING, DONE, FAILED, CANCELLED)
-ACTIVE = frozenset({QUEUED, RUNNING})
-FINISHED = frozenset({DONE, FAILED, CANCELLED})
 MAX_ACTIVE = 1000  # queued and running jobs at most, so a script can't queue without bound
 RATE_WINDOW = 300.0  # seconds the rate is averaged over: LoRa responses can arrive minutes apart
 SAMPLE_INTERVAL = 1.0  # seconds between rate samples
-MAX_WAIT = 30  # longest wait= a GET /api/jobs/get may ask for, in seconds
 POLL_TTY = 1  # seconds between progress updates the CLI shows
 POLL_QUIET = 10  # seconds a CLI without a progress line waits per request (it returns early when the job ends)
 FINISHED_GRACE = 60.0  # seconds a finished job is kept whatever max_finished_jobs says
@@ -338,7 +337,10 @@ class Job:
         if self.retry:
             record["retry"] = True
         if self.retry_since is not None:
-            record.update(retry_at=self.retry_at, retry_since=self.retry_since)
+            # A retry run in progress is saved as due when it was (begin_run moved retry_at to retry_due), so a run
+            # resuming it after a restart still knows how late it came (rnfs.retry.counted_since: REL-11)
+            record.update(retry_at=self.retry_at if self.retry_at is not None else self.retry_due,
+                          retry_since=self.retry_since)
         record.update({"state": self.state, "created": self.created, "started": self.started,
                        "finished": self.finished, "error": self.error, "result": self.result, "runs": self.runs,
                        "total_bytes": self.total_bytes, "done_bytes": self.done_bytes, "blocks": self.blocks,
@@ -414,7 +416,7 @@ def check_job_params(kind: str, target, output, from_node, sealed_name=False, fa
     (check_add_options) only for add; source "user", or for pin, add and import an app's (app:<name>[:<key>]); an add
     may have a NomadNet link (nomadnet, as written) instead of a path; retry is a boolean (any kind: it only
     changes a get's, pin's or export's)."""
-    from rnfs import nomadnet as nomadnet_links
+    from rnfs import nomadnet_links
     from rnfs.content import walker  # validates the root CID and every path name
     from rnfs.content.storage import app_of
     if kind not in KINDS:
@@ -463,7 +465,7 @@ def check_add_options(options, nomadnet: bool = False):
     of a NomadNet link), each of its type, to a list of at most MAX_RECIPIENTS recipient strings, chunker a known
     chunker's name, name a valid entry name. What the node checks only when the add runs (recipients it knows,
     only_hash with to) fails the job then, with the add's own message."""
-    from rnfs import nomadnet as nomadnet_links
+    from rnfs import nomadnet_links
     from rnfs.content import chunker, seal
     if not isinstance(options, dict):
         raise ValueError("an add job's options must be an object")
@@ -692,7 +694,8 @@ class JobsFeature(Feature):
         Feature.stop), save."""
         with self._lock:
             self._started = False
-            threads = list(self._threads.values())
+            # Not one _schedule has registered but not started yet (it can't be joined): it sees the stop at once
+            threads = [thread for thread in self._threads.values() if thread.ident is not None]
         self._stop_event.set()
         self._join(deadline, threads)
         try:
@@ -833,10 +836,9 @@ class JobsFeature(Feature):
 
     def _get(self, job: Job) -> dict:
         """A get job: write to its partial path, then rename that to the output (or the sealed name)."""
-        from rnfs import fsutil
         partial = partial_path(job)
-        remove_partial(partial)  # what an interrupted earlier run (or a crash) left
-        remove_partial(write_path(job))  # and what its write-out had under way (REL-10)
+        fsutil.remove_tree(partial)  # what an interrupted earlier run (or a crash) left
+        fsutil.remove_tree(write_path(job))  # and what its write-out had under way (REL-10)
         try:
             result = self._fetch_to(job, partial)
             output = job.output
@@ -846,10 +848,17 @@ class JobsFeature(Feature):
                 name = fsutil.safe_default_name(result.get("name"), None)
                 if name is not None:
                     output = os.path.join(os.path.dirname(job.output), name)
-            fsutil.rename_new(partial, output)
+            try:
+                fsutil.rename_new(partial, output)
+            except FileExistsError:
+                # A run before a crash may have renamed its output into place without its outcome being saved: the
+                # same content there is that run's
+                if job.runs <= 1 or not fsutil.same_content(partial, output):
+                    raise
+                fsutil.remove_tree(partial)
         except BaseException:
             try:
-                remove_partial(partial)  # stored blocks stay, so a retry or resume writes it out again quickly
+                fsutil.remove_tree(partial)  # stored blocks stay, so a retry or resume writes it out again quickly
             except OSError as e:  # the job's own error matters more; the next run tries again
                 _log(f"job {job.id}: removing {partial} failed: {e!r}", LOG_WARNING)
             raise
@@ -874,7 +883,7 @@ class JobsFeature(Feature):
                 raise
             _log(f"job {job.id}: getting {job.target} from {job.from_node} failed ({e}); trying the DHT",
                  LOG_NOTICE)
-        remove_partial(path)
+        fsutil.remove_tree(path)
         return self.node.get(job.target, path, **options)
 
     def _dag_block_count(self, result: dict) -> int | None:
@@ -1098,15 +1107,6 @@ def write_path(job: Job) -> str:
     return os.path.join(os.path.dirname(job.output), f".rnfs-job-{job.id}.write{PARTIAL_SUFFIX}")
 
 
-def remove_partial(path: str):
-    """Delete a get job's partial output, file or directory tree; a symlink there is removed, not followed."""
-    from rnfs import fsutil
-    if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path)
-    else:
-        fsutil.remove(path)
-
-
 # API handlers: handler is the ApiHandler; every route requires the API token
 
 
@@ -1180,20 +1180,6 @@ def api_clear(handler):
 
 
 # Formatting (pure, for the CLI and its tests)
-
-
-def human_size(num_bytes: float | None) -> str:
-    """A size in decimal units: "512 B", "1.5 KB", "3.20 MB"."""
-    if num_bytes is None:
-        return "?"
-    value = float(num_bytes)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if value < 1000 or unit == "TB":
-            if unit == "B":
-                return f"{int(value)} B"
-            return f"{value:.2f} {unit}" if value < 10 else f"{value:.1f} {unit}" if value < 100 else f"{value:.0f} {unit}"
-        value /= 1000
-    return f"{value:.0f} TB"  # not reached
 
 
 def human_duration(seconds: float | None) -> str:

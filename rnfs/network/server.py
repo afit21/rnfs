@@ -256,11 +256,13 @@ class Response:
     - grace, floor, interface and identity: set by ResponsePools.reserve under ResponsePools.lock, before the
       response is visible to any other thread. grace is set again, with no lock, by the handler thread at
       handover, dropping the pacing wait it covered until then: a reader sees one value or the other.
-    - size, deadline, due, find_until and untracked: written once each, with no lock, by the handler thread at
-      handover, size first and the others after it, before it returns the body (so before RNS can build the
-      Resource) and before it wakes the monitor. Readers take size None to mean not yet handed over and skip
-      the response (check_responses), so a reader that sees size set but an older deadline (inf) or
-      find_until (inf) only waits one more pass. requester is likewise set once by the handler, before _admit.
+    - size, deadline, due, find_until and untracked: written once each by the handler thread at handover, size
+      first (under RequestServer.lock, and only if the response isn't finished, so _cancel tells a response
+      handed to RNS from one it need only finish) and the others after it with no lock, before it returns the
+      body (so before RNS can build the Resource) and before it wakes the monitor. Readers take size None to mean
+      not yet handed over and skip the response (check_responses), so a reader that sees size set but an older
+      deadline (inf) or find_until (inf) only waits one more pass. requester is likewise set once by the
+      handler, before _admit.
     - sent and first_progress: written by the monitor thread only (note_progress), with no lock. Other threads
       read them as a snapshot: a stale value only makes a response look slower than it is.
     - grace_start and progress_at: moved forward only (max), with no lock, by the handler at handover, by
@@ -1031,7 +1033,23 @@ class RequestServer:
             if any(self.backend.serves(cid) for cid in cids):
                 return None
             return protocol.encode_blocks_response([None] * len(cids))
-        return self._serve(BLOCKS_PATH, link_id, request_id, remote_identity, max_bytes, build, unserved)
+
+        def fits_packet(mdu: int) -> bool:
+            """Whether the answer surely fits one packet: every served block's size known, and an answer holding all
+            of them (build's is that or a part of it) no larger than mdu."""
+            entries, total = [], 0
+            for cid in cids:
+                if not self.backend.serves(cid):
+                    entries.append(None)
+                    continue
+                known = self.backend.served_block_size(cid)
+                if known is None or total + known >= mdu:
+                    return False
+                total += known
+                entries.append(bytes(known))
+            return protocol.packed_response_size(request_id, protocol.encode_blocks_response(entries)) <= mdu
+        return self._serve(BLOCKS_PATH, link_id, request_id, remote_identity, max_bytes, build, unserved,
+                           fits_packet)
 
     def _handle_range(self, path, data, request_id, link_id, remote_identity):
         """Answer /range (rnfs 0.2.0) as /blocks is answered (_serve): a byte range of one served block, sent whole as
@@ -1058,18 +1076,39 @@ class RequestServer:
             what = f"{size(len(data))} of {cid} from byte {offset}" + (
                 f" (bz2: {size(len(payload))})" if encoding == RANGE_BZ2 else "")
             return protocol.encode_range_response(len(block), encoding, payload), True, what
-        return self._serve(RANGE_PATH, link_id, request_id, remote_identity, max_bytes, build,
-                           lambda: None if self.backend.serves(cid) else [])
+
+        def unserved():
+            """[] if the block isn't served, False (as build answers) if offset is past its end by its stored size,
+            else None."""
+            if not self.backend.serves(cid):
+                return []
+            known = self.backend.served_block_size(cid)
+            return False if known is not None and offset > known else None
+
+        def fits_packet(mdu: int) -> bool:
+            """Whether the answer surely fits one packet: the block's size known, and the range as it is (compressed,
+            it is only sent if smaller) no larger than mdu."""
+            known = self.backend.served_block_size(cid)
+            if known is None:
+                return False
+            length = protocol.range_length(known, offset, max_bytes)
+            return length < mdu and protocol.packed_response_size(
+                request_id, protocol.encode_range_response(known, protocol.RANGE_RAW, bytes(length))) <= mdu
+        return self._serve(RANGE_PATH, link_id, request_id, remote_identity, max_bytes, build, unserved, fits_packet)
 
     def _serve(self, path: str, link_id: bytes, request_id: bytes, remote_identity, max_bytes: int,
-               build: Callable[[int], tuple], unserved: Callable[[], object]):
+               build: Callable[[int], tuple], unserved: Callable[[], object],
+               fits_packet: Callable[[int], bool] = lambda mdu: False):
         """Answer a /blocks or /range request within the per-link limit, the response pools, upload pacing and the
         budget: one path for both, so /range counts against everything /blocks does (section 7).
 
         build(limit) makes the response once every check has passed, given the budget for blocks after the first
         served one: (body, whether it carries blocks, what it is, for the log). A body of False refuses the request.
-        unserved() is the answer when nothing asked for is served (None if something is): sent at once, as one
+        unserved() is the answer when nothing asked for can be served (None if something can): sent at once, as one
         packet, without a response slot, so a request for nothing can't displace a response in progress (REL-2).
+        fits_packet(mdu) is True if the answer surely fits one packet on a link of that MDU: it then takes no
+        response slot either (it is sent as RNS gets it, so it holds none for long, and would displace one for
+        nothing), though everything else (pacing, the budget) applies as to any response.
         """
         link = self._find_link(link_id)
         if link is None:
@@ -1092,30 +1131,55 @@ class RequestServer:
         handed_over = False
         try:
             nothing = unserved()
+            if nothing is False:
+                log(f"refused {path}: what was asked for is past the end of the block", LOG_VERBOSE)
+                return False
             if nothing is not None:
                 log(f"{path}: sending nothing: none of what was asked for is served", LOG_VERBOSE)
                 return nothing
-            # Refusals come first and at once: pacing, then the pools; only an accepted request waits
+            # Refusals come first and at once: pacing, the requester's share of upload_budget, then the pools; only
+            # an accepted request waits
             wait = self.pacer.wait_time(link_id)
             if wait > MAX_PACING_WAIT:
                 log(f"refused {path}: the link's upload cap allows the next response in {wait:.0f}s", LOG_VERBOSE)
+                return False
+            requester = identity if identity is not None else link_id
+            share = self._budget_share_left(requester)
+            if share is not None and share <= 0:
+                self.traffic.refused(mesh.REFUSED_BUDGET)
+                log(f"refused {path}: that requester's responses in flight hold half of upload_budget", LOG_VERBOSE)
                 return False
             rate = self.rates.get(link_id)
             slow = rates.link_is_slow(link, rate, self.config)
             interface, bitrate, hops = link_path(link)
             fast = fast_path(link)
             grace = response_grace(bitrate, hops, self.config, fast, self._queued_bits(interface, bitrate))
-            # Until it is handed to RNS, the grace also covers the pacing wait
-            response, displaced = self.pools.reserve(SLOW_POOL if slow else FAST_POOL, link_id, request_id,
-                                                     grace=min(self.config.deadline_slack, grace + wait),
-                                                     floor=progress_floor(bitrate, hops, self.config),
-                                                     interface=interface, identity=identity)
-            if displaced is not None:
-                self._cancel(displaced, "made no progress; displaced by a new request" if displaced.idle
-                             else "displaced by a new request")
-            if response is None:
-                log(f"refused {path}: every {'slow' if slow else 'fast'}-link response slot is busy", LOG_VERBOSE)
-                return False
+            pool = SLOW_POOL if slow else FAST_POOL
+            mdu = link.get_mdu() or protocol.DEFAULT_MDU
+
+            def reserve() -> Response | None:
+                """A slot in the link's pool for the response (None, logged, if every one is busy), cancelling the
+                response it displaces. Until it is handed to RNS, its grace also covers the pacing wait."""
+                reserved, displaced = self.pools.reserve(pool, link_id, request_id,
+                                                         grace=min(self.config.deadline_slack, grace + wait),
+                                                         floor=progress_floor(bitrate, hops, self.config),
+                                                         interface=interface, identity=identity)
+                if displaced is not None:
+                    self._cancel(displaced, "made no progress; displaced by a new request" if displaced.idle
+                                 else "displaced by a new request")
+                if reserved is None:
+                    log(f"refused {path}: every {'slow' if slow else 'fast'}-link response slot is busy", LOG_VERBOSE)
+                return reserved
+
+            # An answer that surely fits one packet holds no slot (fits_packet): a response outside the pools
+            slotted = not fits_packet(mdu)
+            if slotted:
+                response = reserve()
+                if response is None:
+                    return False
+            else:
+                response = Response(link_id, request_id, pool, self.clock())
+                response.interface, response.identity = interface, identity
             if wait > 0:
                 self._pace(response, wait)
                 if response.finished:
@@ -1126,8 +1190,9 @@ class RequestServer:
             cap = self.config.effective_max_upload_rate(slow, rate)
             limit = self.airtime.limit(blocks_budget(max_bytes, rate, cap, self.config.response_target),
                                        self._committed(response))
-            response.requester = identity if identity is not None else link_id
-            share = self._budget_share_left(response)
+            response.requester = requester
+            # Again, after the wait: the requester's other responses may have been admitted meanwhile
+            share = self._budget_share_left(requester, response)
             if share is not None:
                 if share <= 0:
                     self.traffic.refused(mesh.REFUSED_BUDGET)
@@ -1140,8 +1205,14 @@ class RequestServer:
                 log(f"refused {path}: {what}", LOG_VERBOSE)
                 return False
             packed = protocol.packed_response_size(request_id, body)
-            mdu = link.get_mdu() or protocol.DEFAULT_MDU
             single = packed <= mdu
+            if not single and not slotted:
+                # Larger than fits_packet foresaw (a stored size out of date): it needs a slot after all
+                unslotted, response = response, reserve()
+                if response is None:
+                    return False
+                response.requester = unslotted.requester
+                slotted = True
             untracked = link_id not in self.watched
             # The upload budget is charged for responses carrying blocks (answers of only None are tiny), as
             # they are sent: up front only a reservation of about one packet (its advertisement), or all of it
@@ -1150,8 +1221,13 @@ class RequestServer:
                 self.traffic.refused(mesh.REFUSED_BUDGET)
                 log(f"refused {path}: {size(packed)} is over what is left of upload_budget", LOG_VERBOSE)
                 return False
-            if response.finished:
-                return False  # displaced while it was being built (_admit charged nothing, or _finish settled)
+            with self.lock:
+                # The handover, checked and made under the lock _finish takes, so a _cancel either sees it (and
+                # cancels what RNS sends) or makes the handler refuse: nothing goes to RNS that nobody follows
+                if response.finished:
+                    return False  # displaced while it was being built (_admit charged nothing, or _finish settled)
+                if not single:
+                    response.size = packed
             with self.lock:
                 if link_id in self.links:  # a closed link's entry would never be forgotten
                     self.pacer.started(link_id, packed, cap)
@@ -1162,7 +1238,6 @@ class RequestServer:
                 with self.lock:
                     response.settled = True  # sent as a single packet once we return: the charge stands
                 return body  # nothing to track
-            response.size = packed
             response.deadline = response.started + rates.response_deadline(packed, rate, self.config)
             response.due = response.started + rates.response_deadline(
                 packed, rate or (self.config.slow_bitrate if fast else None), self.config)
@@ -1378,8 +1453,9 @@ class RequestServer:
         elif final < charged:
             self.airtime.refund(charged - final)
 
-    def _budget_share_left(self, response: Response) -> int | None:
-        """Budget bytes response's requester may still have in flight (None without upload_budget).
+    def _budget_share_left(self, requester: bytes, response: Response | None = None) -> int | None:
+        """Budget bytes requester (an identity hash, else a link ID) may still have in flight, besides response if
+        given (None without upload_budget).
 
         One requester's responses in flight may cost at most half the bucket's capacity in all, so one requester
         can't size its responses to take the whole budget at once and leave others none. Unidentified links
@@ -1392,7 +1468,7 @@ class RequestServer:
         responses = self.pools.responses()
         with self.lock:
             in_flight = sum(other.cost for other in responses
-                            if other is not response and other.requester == response.requester and not other.finished)
+                            if other is not response and other.requester == requester and not other.finished)
         return int(bucket.capacity // 2) - in_flight
 
     def _concluded(self, response: Response, link, resource):
@@ -1437,7 +1513,8 @@ class RequestServer:
         return sent >= NO_PROGRESS_FRACTION * response.size
 
     def _cancel(self, response: Response, reason: str):
-        """Stop sending a response: cancel its Resource, or close its link if we can't reach the Resource."""
+        """Stop sending a response: cancel its Resource, or close its link if we can't reach the Resource. One not yet
+        handed to RNS (waiting for upload pacing, or being built) is only finished: its handler then refuses it."""
         with self.lock:
             link = self.links.get(response.link_id)
         resource = response.resource
@@ -1448,6 +1525,11 @@ class RequestServer:
             # Its requester made no progress with the slot: it can't take one again for a while (section 3)
             self.cooldowns.add(response.link_id, response.identity)
         self._finish(response)
+        with self.lock:
+            # The handler hands a response over (sets its size) under this lock, and only while it isn't finished
+            handed_over = response.size is not None
+        if not handed_over:
+            return  # nothing of it went to RNS, and the handler, seeing it finished, sends nothing
         if resource is not None and callable(getattr(resource, "cancel", None)):
             resource.cancel()
         elif link is not None:

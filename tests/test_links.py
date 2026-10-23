@@ -263,6 +263,69 @@ class LinkPoolTest(unittest.TestCase):
         self.assertEqual(len(FakeLink.created), 1)
         self.assertEqual(len({id(peer) for peer in results}), 1)
 
+    def joined_pool(self, await_path):
+        """A pool whose path requests are await_path(node_id, timeout, cancel=..., measure=...), with a thread opening
+        NODE's shared link through it (its result in .opened). Returns (pool, thread) once the open has begun."""
+        pool = links.LinkPool(self.identity, Config(path_timeout=1),
+                              paths=types.SimpleNamespace(await_path=await_path, charge=lambda node_id: None))
+        pool._start_sweeper = lambda: None
+        self.addCleanup(pool.close_all)
+        pool.opened = []
+
+        def open_link():
+            """The opener's get(), its exception kept (in .opened) rather than printed."""
+            try:
+                pool.opened.append(pool.get(NODE))
+            except RuntimeError as e:
+                pool.opened.append(e)
+        opener = threading.Thread(target=open_link, daemon=True)
+        opener.start()
+        wait_for(lambda: NODE in pool.connecting, what="the open to begin")
+        return pool, opener
+
+    def test_a_caller_waits_for_a_slow_opener_whatever_its_wait(self):
+        """A second caller gave up after path_timeout + 120 s and failed the node as unreachable, while the opener was
+        still waiting for its path request's turn in the node's budget (which no timeout counts) and then connected.
+        Time is compressed 100 times for the event the second caller waits on: the opener's 1.5 s stand for 150 s."""
+
+        class Compressed(threading.Event):
+            """An Event whose waits last a hundredth of their timeout."""
+
+            def wait(self, timeout=None):
+                """Wait timeout / 100."""
+                return super().wait(None if timeout is None else timeout / 100)
+
+        with mock.patch.object(links.threading, "Event", Compressed):
+            pool, opener = self.joined_pool(lambda node_id, timeout, cancel=None, measure=True: time.sleep(1.5) or True)
+        self.assertIsInstance(pool.connecting[NODE], Compressed)
+        joined = run(self, lambda: pool.get(NODE), timeout=10)
+        opener.join(5)
+        self.assertIsNotNone(joined)
+        self.assertIs(joined, pool.opened[0])
+
+    def test_a_caller_waiting_for_an_opener_that_raises_is_freed(self):
+        def broken(node_id, timeout, cancel=None, measure=True):
+            """A path request that fails unexpectedly."""
+            time.sleep(0.2)
+            raise RuntimeError("bug")
+        pool, opener = self.joined_pool(broken)
+        self.assertIsNone(run(self, lambda: pool.get(NODE), timeout=5))
+        opener.join(5)
+        self.assertEqual(pool.connecting, {})
+
+    def test_a_caller_waiting_for_an_opener_stops_with_the_pool(self):
+        release = threading.Event()
+        pool, opener = self.joined_pool(lambda node_id, timeout, cancel=None, measure=True: release.wait(10))
+        waiter = threading.Thread(target=lambda: pool.opened.append(("joined", pool.get(NODE))), daemon=True)
+        waiter.start()
+        time.sleep(0.1)
+        pool.close_all()
+        waiter.join(2)
+        self.assertFalse(waiter.is_alive())
+        self.assertIn(("joined", None), pool.opened)
+        release.set()
+        opener.join(5)
+
     def test_identified_link_is_separate(self):
         shared = run(self, lambda: self.pool.get(NODE))
         identified = run(self, lambda: self.pool.open_identified(NODE))

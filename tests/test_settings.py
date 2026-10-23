@@ -333,6 +333,24 @@ class ApiTest(SettingsBase):
         body = self.set({"announce_interval": 10}, status=400)
         self.assertEqual(body["error"], "announce_interval must be at least 60 seconds")
 
+    def test_an_interval_raised_to_its_minimum_is_not_pending(self):
+        """An interval rnfs.toml sets below its least (taken before 0.2.0) is raised to it at every start, so a node
+        running that least has nothing pending: it was listed as changed, applying at the next start."""
+        self.write("announce_interval = 30\n")
+        self.b.config.announce_interval = 60.0  # what the start that read this file runs
+        entry = self.setting("announce_interval")
+        self.assertEqual((entry["value"], entry["file"], entry["pending"]), (60.0, 30, False))
+        self.assertNotIn("!", "".join(line[0] for line in feature_module.format_settings(
+            self.call("GET", "/api/config")[1]) if line))
+
+    def test_a_live_setting_set_to_its_value_is_not_said_applied(self):
+        """A live setting set to the value the node runs is saved but in neither "applied" nor "restart_required",
+        as a setting applying at the next start is: it was said applied."""
+        result = self.set({"max_finished_jobs": self.b.config.max_finished_jobs, "max_output_entries": 5000})
+        self.assertEqual((result["applied"], result["restart_required"]), (["max_output_entries"], []))
+        self.assertIn(f"max_finished_jobs = {self.b.config.max_finished_jobs}", self.read())
+        self.assertEqual(self.b.config.max_output_entries, 5000)
+
     def test_set_on_a_file_with_a_byte_order_mark(self):
         self.write("\ufeffmax_storage = 100\n")
         self.set({"max_storage": 5_000_000})

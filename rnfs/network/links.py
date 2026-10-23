@@ -387,7 +387,9 @@ class LinkPool:
     def get(self, node_id: bytes) -> PeerLink | None:
         """The shared link to node_id, opened if needed; None if the node can't be reached.
 
-        Blocks for up to path_timeout plus RNS's link establishment timeout.
+        Blocks for up to path_timeout for the path and as long again for the identity, each after its path request's
+        turn in the node's budget, plus RNS's link establishment timeout. A caller finding another thread opening the
+        link waits for that thread's result, however long it takes, or until close_all.
         """
         with self.lock:
             peer = self.shared.get(node_id)
@@ -403,8 +405,16 @@ class LinkPool:
                 event = self.connecting[node_id] = threading.Event()
 
         if not opener:
-            # Another thread is opening this link: use its result rather than opening a second link
-            event.wait(self.config.path_timeout + 120)
+            # Another thread is opening this link: use its result rather than opening a second link. Not within a
+            # fixed time: its path requests wait for their turns in the node's budget, which no timeout counts (a slow
+            # node's busy channel spaces them up to 4 s apart), and giving up first failed a node that was reachable.
+            # The opener clears its entry whatever happens to it (below)
+            while not event.wait(POLL_INTERVAL):
+                if self.stop_event.is_set():
+                    return None
+                with self.lock:
+                    if self.connecting.get(node_id) is not event:
+                        break
             with self.lock:
                 peer = self.shared.get(node_id)
                 if peer is None or not peer.is_active():
@@ -412,22 +422,25 @@ class LinkPool:
                 peer.handed_out = self.clock()
                 return peer
 
-        peer = PeerLink(node_id, identified=self.config.private, shared=True)
+        peer = None
         opened = False
         try:
+            peer = PeerLink(node_id, identified=self.config.private, shared=True)
             opened = self._open(peer)
         finally:
             with self.lock:
                 if opened and peer.is_active():
                     peer.handed_out = self.clock()
                     self.shared[node_id] = peer
-                for marked, flag in ((self.not_established, peer.unestablished), (self.closed_by, peer.refused)):
-                    if flag:
-                        if len(marked) >= MAX_NOT_ESTABLISHED:
-                            marked.clear()  # only the latest attempts matter; keeps it bounded
-                        marked.add(node_id)
-                    else:
-                        marked.discard(node_id)
+                if peer is not None:
+                    for marked, flag in ((self.not_established, peer.unestablished), (self.closed_by, peer.refused)):
+                        if flag:
+                            if len(marked) >= MAX_NOT_ESTABLISHED:
+                                marked.clear()  # only the latest attempts matter; keeps it bounded
+                            marked.add(node_id)
+                        else:
+                            marked.discard(node_id)
+                # Here whatever _open did, returned or raised: a thread waiting for this one's result then has it
                 self.connecting.pop(node_id, None)
             event.set()
         if not (opened and peer.is_active()):

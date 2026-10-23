@@ -1022,7 +1022,9 @@ class NameManager:
             self._absorb_recalled(name)
             previous = self._published[alias]
             known = self._record(name, touch=False)
-            sequence = 1 + max(previous.sequence, known.sequence if known is not None else 0)
+            # The floor too, as known_sequence: a record resolved before may have left the table since
+            floor = self._floor[name][0] if name not in self._held and name in self._floor else 0
+            sequence = 1 + max(previous.sequence, known.sequence if known is not None else 0, floor)
             if sequence > MAX_SEQUENCE:
                 raise RnfsError(f"name {alias} has reached the highest sequence")
 

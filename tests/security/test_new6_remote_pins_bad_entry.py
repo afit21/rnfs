@@ -21,7 +21,7 @@ from unittest import mock
 
 import RNS
 
-from rnfs import node as node_module
+from rnfs import node as node_module, node_pins
 from rnfs.config import Config
 from rnfs.content.cid import Cid
 from rnfs.content.storage import remote_source
@@ -106,7 +106,7 @@ class RemotePinsBadEntryTest(unittest.TestCase):
         """Rows whose source isn't text or whose CID isn't a binary CID are skipped and logged; the good one is
         still fetched."""
         logged = []
-        with mock.patch.object(node_module, "log", side_effect=lambda message, *args: logged.append(message)):
+        with mock.patch.object(node_pins, "log", side_effect=lambda message, *args: logged.append(message)):
             node = self.start_with(rows=[(SOURCE, str(self.cid)), (SOURCE, self.cid.binary[:-1]),
                                          (SOURCE.encode(), self.cid.binary), (SOURCE, self.cid.binary)])
         self.assertTrue(wait_for(lambda: SOURCE in node.storage.pins().get(self.cid, set()), 15),

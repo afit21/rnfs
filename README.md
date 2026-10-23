@@ -21,7 +21,7 @@ Access any file on RNFS by it's **'CID'**.
 
 No centralized servers
 
-<img width="700" alt="rnfs demo" src="https://raw.githubusercontent.com/afit21/rnfs/refs/heads/main/rnfsgifcompressed.gif" />
+<img width="700" alt="rnfs demo" src="https://raw.githubusercontent.com/afit21/rnfs/refs/heads/main/docs/rnfs-demo.gif" />
 
 <hr>
 

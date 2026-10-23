@@ -58,15 +58,17 @@ class SettingsFeature(Feature):
         warnings: list[str] = []
         file_values: dict = {}
         file_error = None
+        restart = None
         try:
             data, warnings = settings.read_settings_file(path)
             file_values = settings.parse_settings(data, path)
             # What a restart would make of it, so a file it would refuse says so before the restart does (and one
             # holding a retired setting is told so)
-            warnings = [*warnings, *restart_config(config, file_values, path).warnings]
+            restart = restart_config(config, file_values, path)
+            warnings = [*warnings, *restart.warnings]
         except (ValueError, TypeError, AttributeError, OSError) as e:  # OSError: PermissionError too (untrusted)
             file_error = str(e)
-        entries = [settings_entry(entry, config, file_values) for entry in settings.settings_schema()]
+        entries = [settings_entry(entry, config, file_values, restart) for entry in settings.settings_schema()]
         return {"path": path, "settings": entries, "file_error": file_error, "warnings": warnings}
 
     # Changing
@@ -134,12 +136,14 @@ class SettingsFeature(Feature):
             fsutil.write_atomic(path, new_data, mode=0o600, private=True)
             restart = [name for name in changes if name not in live and name not in running.overrides
                        and not same_value(getattr(candidate, name), getattr(running, name))]
+            # Said applied only if the value changed (each is applied all the same), before _apply changes running
+            applied = [name for name in live if not same_value(getattr(candidate, name), getattr(running, name))]
             for name in live:
                 self._apply(name, getattr(candidate, name))
         overridden = [name for name in changes if name in running.overrides]
-        _common.log(f"settings: rnfs.toml changed ({', '.join(changes)}); applied now: {', '.join(live) or 'none'}"
+        _common.log(f"settings: rnfs.toml changed ({', '.join(changes)}); applied now: {', '.join(applied) or 'none'}"
                     f"; at the next start: {', '.join(restart) or 'none'}", _common.LOG_NOTICE)
-        return {"path": path, "applied": live, "restart_required": restart, "overridden": overridden,
+        return {"path": path, "applied": applied, "restart_required": restart, "overridden": overridden,
                 "warnings": warnings}
 
     def _apply(self, name: str, value):
@@ -287,16 +291,21 @@ def jsonable(value):
     return value
 
 
-def settings_entry(entry: dict, config: settings.Config, file_values: dict) -> dict:
+def settings_entry(entry: dict, config: settings.Config, file_values: dict,
+                   restarted: settings.Config | None = None) -> dict:
     """A setting's schema entry with: "value" (the running node's), "file" (rnfs.toml's, or None where it doesn't
     set it: TOML has no null), "overridden" (the daemon's command line, or an embedded node's settings, set it,
-    and wins over rnfs.toml) and "pending" (a restart with the same command line would run another value). An
-    embedded node's own defaults (given_defaults, e.g. dht_mode "client") replace the schema's "default"."""
+    and wins over rnfs.toml) and "pending" (a restart with the same command line would run another value: that of
+    restarted, the Config it would load (restart_config), when given, which raises a duration rnfs.toml sets below its
+    least as a start does). An embedded node's own defaults (given_defaults, e.g. dht_mode "client") replace the
+    schema's "default"."""
     name = entry["name"]
     value = getattr(config, name)
     default = config.given_defaults.get(name, entry["default"])
     overridden = name in config.overrides
-    if overridden:
+    if restarted is not None:
+        restart = getattr(restarted, name)
+    elif overridden:
         restart = config.overrides[name]
     elif name in file_values:
         restart = file_values[name]

@@ -113,7 +113,7 @@ class RangeSupport:
 class Partial:
     """The start of one block received from one provider (Partials.acquire)."""
 
-    __slots__ = ("key", "cid", "node_id", "size", "length", "compress", "path", "data", "busy")
+    __slots__ = ("key", "cid", "node_id", "size", "length", "compress", "path", "data", "busy", "stored")
 
     def __init__(self, key: bytes, cid: Cid, node_id: bytes, path: str | None):
         """Nothing received yet."""
@@ -126,6 +126,7 @@ class Partial:
         self.path = path  # its file, or None in memory
         self.data = bytearray() if path is None else None
         self.busy = False  # a request holds it
+        self.stored = False  # its block was stored while a request held it: forgotten once released (Partials.drop)
 
 
 class Partials:
@@ -236,15 +237,26 @@ class Partials:
             partial.data = bytearray()
 
     def release(self, partial: Partial):
-        """The request holding partial is done with it."""
+        """The request holding partial is done with it (forgotten if its block was stored meanwhile)."""
         with self.lock:
             partial.busy = False
+            if not partial.stored or self.partials.get(partial.key) is not partial:
+                return  # still wanted, or forgotten already (its block completed): its path may be another's now
+            del self.partials[partial.key]
+        self._delete(partial)
 
     def drop(self, cid: Cid):
-        """Forget every provider's partial of cid's block (it is stored), except one a request holds (it drops its
-        own once the block it completes is verified)."""
+        """Forget every provider's partial of cid's block (it is stored); one a request holds is forgotten once it is
+        released (a range still arriving from a provider whose block another brought: kept, it stayed on disk)."""
         with self.lock:
-            gone = [key for key, partial in self.partials.items() if partial.cid == cid and not partial.busy]
+            gone = []
+            for key, partial in self.partials.items():
+                if partial.cid != cid:
+                    continue
+                if partial.busy:
+                    partial.stored = True
+                else:
+                    gone.append(key)
             partials = [self.partials.pop(key) for key in gone]
         for partial in partials:
             self._delete(partial)

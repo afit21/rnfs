@@ -22,10 +22,11 @@ import stat
 import sys
 import time
 
-from rnfs import __version__, apiclient, fsutil, nomadnet
+from rnfs import __version__, apiclient, fsutil, nomadnet_links
 from rnfs.apiclient import CHALLENGE_HEADER, PROOF_HEADER, TOKEN_FILE, api_proof, token_path  # noqa: F401
 from rnfs.apiclient import daemon_info_path
 from rnfs.config import DEFAULT_API_PORT, LOCK_FILE, Config
+from rnfs.units import human_size
 
 DEFAULT_DIR = apiclient.DEFAULT_DIR
 COPY_SIZE = apiclient.COPY_SIZE
@@ -468,7 +469,7 @@ def run_add(args):
     In the foreground an add stays one request, not a job: a job would wait behind max_jobs transfers (one on slow
     nodes), and a local add mustn't queue behind an hour-long LoRa download. A NomadNet link is a transfer, so it
     runs as a job like get (run_add_nomadnet)."""
-    if nomadnet.looks_like(args.path):
+    if nomadnet_links.looks_like(args.path):
         run_add_nomadnet(args)
         return
     if getattr(args, "identify", False):
@@ -516,10 +517,10 @@ def run_add_nomadnet(args):
     there, as a job followed with a progress line (the transfer can take long on LoRa), or one request on a daemon
     without jobs; --background prints the job's ID. A local file named like that is added as ./<name>."""
     try:
-        link = str(nomadnet.parse(args.path))
+        link = str(nomadnet_links.parse(args.path))
     except ValueError as e:
         fail(f"{e}; a local file of that name is added as ./{args.path}")
-    if args.name is not None and not nomadnet.is_valid_name(args.name):
+    if args.name is not None and not nomadnet_links.is_valid_name(args.name):
         fail(f"invalid entry name {args.name!r}")
     api = client(args)
     if not daemon_has(args, api, "add_nomadnet"):
@@ -1025,14 +1026,6 @@ def run_app_rm(args):
     result = client(args).app_rm(args.name)
     print(printable(f"removed app {args.name}, releasing {result['released']} pin"
                     f"{'' if result['released'] == 1 else 's'}"))
-
-
-def human_size(size: float) -> str:
-    """A size in bytes, KiB, MiB or GiB."""
-    for unit in ("B", "KiB", "MiB", "GiB"):
-        if size < 1024 or unit == "GiB":
-            return f"{size:.0f} B" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024
 
 
 def human_duration(seconds: float) -> str:

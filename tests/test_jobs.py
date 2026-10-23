@@ -239,6 +239,27 @@ class JobsTest(JobsBase):
             self.assertTrue(feature._retries(job, error))
         self.assertGreater(job.retry_since, stale + 3 * 86400)
 
+    def test_a_retry_run_cut_off_by_a_restart_keeps_its_due_time(self):
+        """A retry run in progress when the node went off is saved as due when it was, so the run resuming it four
+        days later counts the time off as not waited (REL-11), as a job saved between its runs does: saved without
+        it, the job gave up after that one run."""
+        from rnfs.errors import NotFound
+        feature = self.b.feature("jobs")
+        job = jobs.Job("0123abcd", "get", str(Cid.for_block(RAW, b"x")), self.out("cut off"), retry=True)
+        off = 1_790_000_000.0
+        error = NotFound("no provider found")
+        with mock.patch.object(jobs.time, "time", lambda: off - 3600):
+            job.begin_run()
+            self.assertTrue(feature._retries(job, error))
+        with mock.patch.object(jobs.time, "time", lambda: off):
+            job.begin_run()  # its retry, under way when the node goes off
+        loaded = jobs.Job.from_record(job.to_record())
+        self.assertEqual(loaded.retry_at, job.retry_due)
+        with mock.patch.object(jobs.time, "time", lambda: off + 4 * 86400):
+            loaded.begin_run()  # resumed at the next start
+            self.assertTrue(feature._retries(loaded, error))
+        self.assertEqual(job.to_dict()["retry_at"], None)  # the API still shows none while it runs
+
     def test_without_retry_fails_as_in_0_1_6(self):
         """A get, pin or export job submitted without retry (or with retry false) fails at once when its content
         isn't found, as in 0.1.6: failed, with the error the equivalent call reports, and a record with no retry
@@ -444,6 +465,42 @@ class JobsTest(JobsBase):
         self.assertEqual(sorted(os.listdir(self.tmp.name)), sorted(set(os.listdir(self.tmp.name)) - {
             name for name in os.listdir(self.tmp.name) if name.startswith(".rnfs-")}))  # nothing else left
 
+    def test_resume_finds_its_output_already_in_place(self):
+        """A get job whose run renamed its output into place but whose outcome a crash kept from being saved is done
+        when the resumed run finds the same content there (a file, or a directory compared entry by entry); a
+        different file there still fails it, and is left as it is."""
+        data = os.urandom(CHUNK_SIZE + 10)
+        file_cid = self.share(data)
+        a_dir = os.path.join(self.tmp.name, "src")
+        os.makedirs(os.path.join(a_dir, "sub"))
+        with open(os.path.join(a_dir, "sub", "f.txt"), "wb") as f:
+            f.write(b"whole")
+        dir_cid = self.a.add_path(a_dir)["cid"]
+        self.a.records.store(Cid.parse(dir_cid).key, A_ID)
+        submitted = [self.jobs.submit("get", file_cid, self.out("same"))["id"],
+                     self.jobs.submit("get", dir_cid, self.out("same dir"))["id"],
+                     self.jobs.submit("get", file_cid, self.out("other"))["id"]]
+        for job_id in submitted:
+            self.assertEqual(self.finished(job_id)["state"], "done")
+        with open(self.out("other"), "wb") as f:
+            f.write(b"someone else's")
+        self.b.stop()
+        for record in self.saved():  # as a crash between the rename and the save leaves them
+            state_execute(self.b.config.state_dir, "UPDATE jobs SET record = ? WHERE id = ?",
+                          (statedb.dump({**record, "state": "running"}), record["id"]))
+        b2 = self.make_node("b", B_ID)
+        b2.routing.heard(A_ID)
+        manager = b2.feature("jobs")
+        manager.start()
+        self.assertTrue(wait_for(lambda: all(manager.get(i)["state"] in jobs.FINISHED for i in submitted)))
+        self.assertEqual([manager.get(i)["state"] for i in submitted], ["done", "done", "failed"])
+        self.assertIn("already exists", manager.get(submitted[2])["error"])
+        with open(self.out("same"), "rb") as f:
+            self.assertEqual(f.read(), data)
+        with open(self.out("other"), "rb") as f:
+            self.assertEqual(f.read(), b"someone else's")
+        self.assertEqual([name for name in os.listdir(self.tmp.name) if name.startswith(".rnfs-")], [])
+
     def sealed_get(self, name):
         """A stand-in for node.get writing a sealed file this node opened, whose sealed name is name."""
         def get(target, output, **kwargs):
@@ -642,6 +699,29 @@ class JobsTest(JobsBase):
         self.b.stop()
         # Its fetch notices the stop at its next step, well within the node's stop budget
         self.assertLess(time.monotonic() - started, STOP_TIMEOUT - 1)
+
+    def test_stop_while_a_job_is_starting(self):
+        """A stop between a job's thread being registered and started (while its running event is published) skips
+        that thread, which can't be joined yet, and still saves; it raised RuntimeError before saving."""
+        cid = self.b.add_stream(io.BytesIO(b"starting"))["cid"]
+        publish, starting, release = self.jobs._publish, threading.Event(), threading.Event()
+
+        def held(job):
+            """Hold the running event's publication, as a slow subscriber would."""
+            if job.state == jobs.RUNNING and not release.is_set():
+                starting.set()
+                release.wait(10)
+            publish(job)
+
+        with mock.patch.object(self.jobs, "_publish", held):
+            submitter = threading.Thread(target=self.jobs.submit, args=("pin", cid))
+            submitter.start()
+            self.addCleanup(submitter.join, 10)
+            self.addCleanup(release.set)
+            self.assertTrue(starting.wait(10))
+            self.jobs.stop(time.monotonic() + 1)
+            self.assertEqual([record["kind"] for record in self.saved()], ["pin"])
+            release.set()
 
 
 class ApiBase(JobsBase):

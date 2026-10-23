@@ -543,7 +543,7 @@ class Lookup:
                 now = self.clock()
                 for node_id in [n for n, at in asked_at.items() if now - at >= patience]:
                     # Unanswered past patience: on top of alpha now, as a retry is, and ranked with the unreliable, so
-                    # it is waited for again (just below) only while the lookup knows no better nodes to ask
+                    # it is waited for again (waiting, below) only while the lookup knows no better nodes to ask
                     lagging[node_id] = asked_at.pop(node_id)
                     retrying.add(node_id)
                     doubtful.add(node_id)
@@ -552,7 +552,10 @@ class Lookup:
                 if lagged:
                     ranked = sorted(known, key=rank)
             for node_id in ranked[:window]:
-                if node_id in retrying:  # a retry the lookup now needs: waited for like any query
+                # A retry the lookup now needs: waited for like any query. Not one that lagged: counted in flight again,
+                # it took back its place among the alpha whenever the lookup knew no more than the window's nodes, and
+                # with alpha 1 (slow nodes) the next node wasn't asked until its link timed out
+                if node_id in retrying and node_id not in lagging:
                     retrying.discard(node_id)
                     in_flight += 1
 
@@ -605,7 +608,10 @@ class Lookup:
                     self._send(node_id, results)
                 else:
                     passed.add(node_id)
-            if in_flight == 0 and not holding:
+            # A query that lagged holds no place among the alpha, but while it ranks within the window the run still
+            # waits for it rather than end: it may be the only node left
+            waiting = bool(lagging) and any(node_id in lagging for node_id in sorted(known, key=rank)[:window])
+            if in_flight == 0 and not holding and not waiting:
                 if sent >= self.max_queries:
                     why = "query cap"
                     break  # sent all it may, and every answer waited for is in

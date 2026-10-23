@@ -122,6 +122,18 @@ class SharedFolderTest(unittest.TestCase):
         self.folder.scan()
         self.assertEqual(set(self.rows()), {"a.txt", "b.txt"})
 
+    def test_failed_save_is_written_by_the_next_scan_even_with_nothing_new(self):
+        """A scan after a failed commit saves what the table lacks though the folder hasn't changed since, so a
+        restart doesn't load the entries as they were before the failure."""
+        self.write("a.txt", b"a")
+        with mock.patch.object(self.folder._db, "transaction", side_effect=statedb.StateDbError("disk I/O error")):
+            with self.assertRaises(OSError):
+                self.folder.scan()
+        self.assertEqual(self.rows(), {})
+        self.folder.scan()
+        self.assertEqual(self.rows(), self.folder._known)
+        self.assertEqual(set(self.rows()), {"a.txt"})
+
     def test_import_failing_for_a_reason_that_may_pass_is_tried_again(self):
         """A pin that couldn't be saved (a full or failing disk) fails the import for RETRY_AFTER, not until the
         file changes; the entry is imported once it is tried again."""

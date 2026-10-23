@@ -38,10 +38,10 @@ from rnfs.content.cid import Cid
 from rnfs.errors import Closed, NotFound, RnfsError
 from rnfs.events import EVENT_KINDS
 # A job's final states, and the longest wait one request for a job asks for (the API's cap)
-from rnfs.features.jobs import FINISHED, MAX_WAIT as MAX_JOB_WAIT
-from rnfs.objects import (Added, Cached, Capabilities, Collected, Contact, DenyState, Entry, Event, EventBatch,
-                          Exported, Followed, FolderSync, Imported, Info, Kept, Peer, Pin, Record, RemotePin,
-                          ServedPins, Settings, SettingsChange, Stat, Stats, Status, Uncached, Verified, Written)
+from rnfs.objects import (FINISHED, MAX_JOB_WAIT, Added, Cached, Capabilities, Collected, Contact, DenyState, Entry,
+                          Event, EventBatch, Exported, Followed, FolderSync, Imported, Info, Kept, Peer, Pin, Record,
+                          RemotePin, ServedPins, Settings, SettingsChange, Stat, Stats, Status, Uncached, Verified,
+                          Written)
 
 FILE_BUFFER = 64 * 1024  # what a File reads at least per refill: one read() of the node, one GET /api/cat
 # The most one refill of a File read sequentially fetches: each sequential refill doubles from FILE_BUFFER up

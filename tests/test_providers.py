@@ -280,6 +280,23 @@ class RecordTest(StoreTestCase):
             self.store.expire()
             self.assertEqual(clamp.call_count, 1)
 
+    def test_a_store_while_expiry_starts_isnt_a_clock_gone_back(self):
+        """A store on another thread between expire()'s clock reading and its pass notes a later time: no clamp, and
+        the record keeps its time (before, every such store made the pass scan every record and rewrite these)."""
+        expire = self.store._expire
+
+        def store_meanwhile(now):
+            """Another thread's store, just after expire() read the clock, then the pass."""
+            self.clock.now += 1
+            self.store.store(KEY, ident(1))
+            return expire(now)
+
+        with mock.patch.object(self.store, "_expire", store_meanwhile), \
+                mock.patch.object(self.store, "_clamp", wraps=self.store._clamp) as clamp:
+            self.store.expire()
+        self.assertEqual(clamp.call_count, 0)
+        self.assertEqual(self.store.record(KEY, ident(1)), (self.clock.now, self.clock.now))
+
     def test_retain_drops_records_and_standing(self):
         """retain() removes the records of publishers keep rejects, with their standing; this node's stay."""
         store = self.new_store(own_id=OWN)
@@ -1031,6 +1048,35 @@ class PersistenceTest(StoreTestCase):
             store.store(ident(100), ident(1))
             store.save()
         self.assertEqual(rows_written(transactions), 1)
+
+    def test_withdrawals_undone_rewrite_no_record(self):
+        """Withdrawn and stored again before the save, a record the database holds as it was isn't written again
+        (before, a loop of withdrawals and restores over a publisher's records rewrote every one each save, spending no
+        budget); one new since the save, or whose last-stored time moves, still is."""
+        store = self.open()
+        stored = keys(100, 54)
+        for start in range(0, 54, 27):
+            store.provide(ident(1), stored[start:start + 27])
+        store.save()
+        with recorded_writes(store._db) as transactions:
+            for _ in range(3):
+                for start in range(0, 54, 27):
+                    self.assertEqual(store.provide(ident(1), stored[start:start + 27], stored[start:start + 27]), 27)
+                store.save()
+            self.assertEqual(sum(len(rows) for statements in transactions for sql, rows in statements
+                                 if "provider_records" in sql), 0)
+            store.store(ident(500), ident(1))  # new since the save: withdrawn and stored again, still written
+            store.withdraw(ident(500), ident(1))
+            store.store(ident(500), ident(1))
+            self.clock.now += 7 * HOUR  # past REFRESH_WRITE: stored again with its last-stored time moved
+            store.withdraw(stored[0], ident(1))
+            store.store(stored[0], ident(1))
+            del transactions[:]
+            store.save()
+        self.assertEqual(sorted(row[:2] for statements in transactions for sql, rows in statements
+                                if "INTO provider_records" in sql for row in rows),
+                         [(ident(100), ident(1)), (ident(500), ident(1))])
+        self.assertEqual(saved(self.state), held(store))
 
     def test_a_new_refresh_day_writes_the_standing(self):
         store = self.open()

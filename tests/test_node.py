@@ -24,7 +24,7 @@ from rnfs.errors import Denied, InvalidDag, NotFound, RnfsError, StorageFull, To
 from rnfs.features.keepers import name_key
 from rnfs.network.client import OK, BlocksResult, RangeResult
 from rnfs.network.identity import parse_node_id
-from rnfs import fsutil, node as node_module, statedb
+from rnfs import fsutil, node as node_module, node_pins, statedb
 from rnfs.dht.density import MIN_SIZE_SAMPLES, SPACE
 from rnfs.dht.lookup import FIRST
 from rnfs.dht.routing import distance
@@ -630,7 +630,7 @@ class PinLsMemoTest(NodeTest):
 
     def fresh(self) -> list[dict]:
         """pin_ls as it is without the memo."""
-        with mock.patch.object(node_module, "PIN_MEMO", 0):
+        with mock.patch.object(node_pins, "PIN_MEMO", 0):
             saved, self.a._pin_memo = self.a._pin_memo, {}
             try:
                 return self.a.pin_ls()
@@ -696,7 +696,7 @@ class PinLsMemoTest(NodeTest):
         same."""
         for i in range(3):
             self.a.add_stream(io.BytesIO(b"%d" % i))
-        with mock.patch.object(node_module, "PIN_MEMO", 2):
+        with mock.patch.object(node_pins, "PIN_MEMO", 2):
             first = self.a.pin_ls()
             self.assertEqual(len(self.a._pin_memo), 2)
             self.assertEqual(self.a.pin_ls(), first)
@@ -1014,7 +1014,7 @@ class SecurityTest(NodeTest):
             go.wait(10)
             return real_fetch(cid, source)
 
-        with mock.patch.object(node_module, "REMOTE_PIN_QUEUE", 3), \
+        with mock.patch.object(node_pins, "REMOTE_PIN_QUEUE", 3), \
                 mock.patch.object(self.a, "_remote_pin_fetch", held_fetch):
             accepted = [self.a.backend.remote_pin(IDENTITY, Cid.for_block(RAW, b"%d" % i), True) for i in range(5)]
             go.set()

@@ -19,7 +19,8 @@ publishers, unused budget carried over for WRITE_CARRY windows. Past it, others'
 full store); withdrawals spend what is left but are never refused, and refreshes cost nothing. Every record inserted
 is deleted at most once, so the rows written stay within twice the budget, whatever a publisher sends. A withdrawal
 followed by a store of the same key and publisher before the next save is a refresh: the record comes back with its
-first-stored time (_withdrawn), and the row the withdrawal spent is given back (REL-13): neither is written.
+first-stored time (_withdrawn), and the row the withdrawal spent is given back (REL-13): neither is written (a record
+the database holds as it was comes back unchanged, not rewritten: _withdrawn_clean).
 
 Room is local policy (spec section 6). Records may take record_budget bytes of the state database, measured as its
 pages in use over the records held (so it counts their indexes, B-tree overhead and the database's other state), and
@@ -369,6 +370,10 @@ class ProviderStore:
         self._withdrawn: dict[tuple[bytes, bytes], tuple[float, float]] = {}
         # The write-budget pool each of those withdrawals spent from: given back if it is undone (REL-13)
         self._withdraw_spent: dict[tuple[bytes, bytes], int] = {}
+        # Those withdrawals of a record unchanged since the last save (the database holds it as it was): stored again
+        # unchanged, its row is left as it is rather than rewritten, or a loop of withdrawals and restores over a
+        # publisher's records rewrote every one of them each save, spending nothing
+        self._withdrawn_clean: set[tuple[bytes, bytes]] = set()
         self._writes = None if write_budget is None else _WriteBudget(write_budget, monotonic)
         # Records of the keys used most recently, as the database has them with _dirty's changes: key -> publisher ->
         # (first stored, last stored), least recently used first, at most CACHE_ROWS rows of CACHE_KEYS keys
@@ -463,9 +468,12 @@ class ProviderStore:
         if record is None:
             return False
         tier = self._tier_of(publisher, self._get_standing(publisher))
+        clean = publisher not in self._dirty.get(key, ())  # the database holds the record as it is
         self._remove(key, publisher)
         if publisher != self.own_id:
             self._withdrawn[(key, publisher)] = record
+            if clean:
+                self._withdrawn_clean.add((key, publisher))
             if self._writes is not None:
                 pool = self._writes.spend(tier)
                 if pool is not None:
@@ -517,6 +525,8 @@ class ProviderStore:
         # Withdrawn since the last save: a refresh of that record rather than a new one
         restored = self._withdrawn.pop((key, publisher), None) if record is None else None
         spent = self._withdraw_spent.pop((key, publisher), None) if restored is not None else None
+        clean = restored is not None and (key, publisher) in self._withdrawn_clean
+        self._withdrawn_clean.discard((key, publisher))
         if restored is not None and now - restored[1] >= self.ttl:
             restored = None  # expired meanwhile: stored as a new record, its withdrawal written too
         victim = None
@@ -545,7 +555,10 @@ class ProviderStore:
                 self._writes.spend(tier)
         else:
             first, last = restored
-            self._add(key, publisher, now, (first, last if abs(now - last) <= REFRESH_WRITE else now))
+            back = first, last if abs(now - last) <= REFRESH_WRITE else now
+            self._add(key, publisher, now, back)
+            if clean and back == restored:
+                self._unmark(key, publisher)  # the database holds it so already: nothing to write
             self._refreshed_on(publisher, now)
             if spent is not None and self._writes is not None:
                 # The withdrawal won't be written now: its row is given back, so a loop of withdrawals and restores
@@ -759,6 +772,18 @@ class ProviderStore:
             self._dirty_count += 1
             self._dirty_by_publisher.setdefault(publisher, set()).add(key)
         changed[publisher] = record
+
+    def _unmark(self, key: bytes, publisher: bytes):
+        """Forget that publisher's row for key changed: the database holds it as it is now. Lock held."""
+        changed = self._dirty[key]
+        del changed[publisher]
+        self._dirty_count -= 1
+        if not changed:
+            del self._dirty[key]
+        keys = self._dirty_by_publisher[publisher]
+        keys.discard(key)
+        if not keys:
+            del self._dirty_by_publisher[publisher]
 
     def _add(self, key: bytes, publisher: bytes, now: float, record: tuple[float, float] | None = None):
         """Add a record of publisher for key, first and last stored now unless record gives them, and count it. Lock
@@ -1046,9 +1071,14 @@ class ProviderStore:
         """expire(), the lock taken for each batch (or held by the caller). Clamps times in the future first if the
         clock went backwards."""
         with self._lock:
-            self._last_sweep = now
             if now < self._latest:
-                self._clamp(now)
+                # expire() and maintain() read now before taking the lock again, and a store since may have noted a
+                # later time: only a fresh reading earlier than that says the clock went backwards. Taken for
+                # one, every store meanwhile made this scan every record and rewrite those just stored
+                now = self.clock()
+                if now < self._latest:
+                    self._clamp(now)
+            self._last_sweep = now
             removed = self._sweep_changed(now)
         removed += self._sweep(_EXPIRED, now - self.ttl, newcomers_only=False)
         with self._lock:
@@ -1360,6 +1390,7 @@ class ProviderStore:
         self._dirty_by_publisher.clear()
         self._withdrawn.clear()
         self._withdraw_spent.clear()
+        self._withdrawn_clean.clear()
         self._dirty_standing.clear()
         self._dirty_seen.clear()
         # The changed standings are what the database has now: cached as any other, the most recently used
@@ -1449,6 +1480,7 @@ class ProviderStore:
             check(self._dirty_by_publisher == _by_publisher(self._dirty), "_dirty_by_publisher")
             check(all(self._dirty.get(key, {}).get(publisher, ()) is None for key, publisher in self._withdrawn),
                   "a record in _withdrawn isn't a deleted row in _dirty")
+            check(self._withdrawn_clean <= self._withdrawn.keys(), "_withdrawn_clean holds a record not withdrawn")
             check(self._dirty_standing | self._dirty_seen == set(self._pinned_standings),
                   "the standings kept until saved aren't those changed")
             for publisher, standing in self._standings.items():

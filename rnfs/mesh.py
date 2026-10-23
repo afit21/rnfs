@@ -684,8 +684,11 @@ class Traffic:
             peer = self._peer(node_id)
             if peer.last_emitted is not None and emitted <= peer.last_emitted:
                 return False
-            peer.last_emitted = float(emitted)
-            age = max(0.0, self.clock() - emitted - EMISSION_SKEW)
+            now = self.clock()
+            # Kept no later than the skew allowed: one from a clock far ahead, kept as it is, would leave its sender's
+            # later announces (its clock put right) uncounted for the rest of the run
+            peer.last_emitted = min(float(emitted), now + EMISSION_SKEW)
+            age = max(0.0, now - emitted - EMISSION_SKEW)
             if age > ONLINE_WINDOW:
                 return False
             seen = self.monotonic() - age

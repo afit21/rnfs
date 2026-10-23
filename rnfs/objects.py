@@ -9,6 +9,13 @@ from dataclasses import MISSING, dataclass, field, fields
 
 from rnfs.content.cid import Cid
 
+# A job's states (Job.state; rnfs.features.jobs runs them), and the longest wait= GET /api/jobs/get may ask for, in
+# seconds: the API's, which the jobs feature and rnfs.Client both follow
+QUEUED, RUNNING, DONE, FAILED, CANCELLED = "queued", "running", "done", "failed", "cancelled"
+ACTIVE = frozenset({QUEUED, RUNNING})
+FINISHED = frozenset({DONE, FAILED, CANCELLED})
+MAX_JOB_WAIT = 30
+
 __all__ = ["Cid", "Added", "Written", "Entry", "Info", "Stat", "Pin", "Record", "Status", "Collected", "Verified",
            "Exported", "Imported", "DenyState", "Peer", "Stats", "Contact", "Kept", "Followed", "Cached",
            "Uncached", "Event", "EventBatch", "Capabilities", "Setting", "Settings", "SettingsChange", "RemotePin",

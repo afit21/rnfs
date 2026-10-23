@@ -2,6 +2,73 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## 0.2.1 (unreleased)
+
+Fixes. No wire-format or CID changes: these nodes, 0.2.0, 0.1.6, 0.1.5, 0.1.4 and 0.1.3 nodes work together.
+
+Changed:
+- **Sizes are written in decimal units everywhere** (KB, MB, as `rnfs jobs`, `rnfs peers` and the log already
+  wrote them): `rnfs status`'s record store line was in KiB and MiB. One function writes them all
+  (`rnfs.units.human_size`).
+
+Fixed:
+- **`install.sh --update --service` runs the version it installed:** with the service already running, the
+  installer's `systemctl --user enable --now` left the old daemon running, so an updated node kept the previous
+  version until someone restarted it. `--service` now restarts the unit (starting it if it was stopped).
+  Without `--service`, a running daemon is restarted as before.
+- **No traceback when a local client drops its connection:** a client that reset or closed its API or gateway
+  connection mid-request (an `rnfs status` while the daemon was starting, for one) left a `ConnectionResetError`
+  traceback on the daemon's output. The connection is now closed quietly; other failures are still reported.
+- **A name's first publish from an imported key goes past what this node resolved:** the publish counted the
+  sequence of the record it held, but not the floor of one it had resolved before, whose record had since left the
+  table. A key imported on a node that had resolved its name at sequence 10 published sequence 1, which every node
+  that had seen 10 refused, and lowered this node's own floor.
+- **Deny lists end lines only at `\n`, `\r` and `\r\n`:** a comment holding U+2028, NEL or another character Python
+  takes for a line end was cut there, its rest read as an entry: a list refused, or a commented-out CID denied.
+- **An unreadable block no longer stops eviction, collection and verify:** a block file that couldn't be read (a
+  disk error, or a file a run as root left) raised out of every walk that met it, so eviction and `gc` stopped
+  for good, providing failed and `rnfs verify`, the remedy, crashed. It is now treated as damaged, the error
+  logged, and kept until `rnfs verify` removes it. A delete that fails (a filesystem remounted read-only) no
+  longer leaves the index and its memos out of step with the disk: the block stays, and the next collection
+  tries again.
+- **A directory whose sizes sum past 2^64 − 1 is refused as too large** (413) in any of its groups, not a 500.
+- **A shared-folder scan saves again after a failed save,** even when nothing in the folder changed since.
+- **Items provided again before a save are published:** an item withdrawn and provided again before the
+  publisher's next save (an unpin then re-pin, or a save that failed) lost its row and wasn't published again
+  until a restart.
+- **Partition mode doesn't wake the publisher twice a second:** withdrawals queued for servers off the island,
+  which wait for the partition to end, counted as due, so a round ran every 0.5 s for as long as it lasted.
+- **A partial block whose block another provider brought is deleted** once the `/range` request holding it is
+  done, not left on disk until the next start.
+- **Withdrawing and storing the same provider records again costs a write:** a withdrawal undone before the next
+  save had its row rewritten all the same, for nothing from the publisher's write budget (REL-13), so a loop of
+  them rewrote every record of a publisher each save.
+- **Patience works on slow nodes searching few servers:** with alpha 1, a server that lagged past patience took
+  its place back at once while the search knew three servers or fewer, so the next wasn't asked until the link
+  timed out (up to 217 s). Now it is waited for only once there is nobody else to ask.
+- **Provider expiry no longer takes a store for a clock gone back:** a store during an expiry pass made it clamp
+  every record's times, scanning the whole table under the store's lock, on about a third of passes under load.
+- **Requests answered in one packet, refused for the requester's budget share, or for a `/range` past the block's
+  end take no response slot,** so they no longer displace and cancel another requester's download
+  (specification section 3). A response displaced while it waits for upload pacing no longer closes its
+  requester's link. A second request for a node whose link is being opened waits for it rather than give up after
+  a fixed time, which counted a slow but reachable node as unreachable.
+- **A peer whose clock was once far ahead is seen online again:** one announce from a clock ahead (say by a day)
+  kept every later, correctly dated announce from counting, so the peer showed offline for the rest of the run.
+- **An embedded node whose start fails early can start again:** a failure just after its `rnfs.dht` destination
+  was registered left it registered, so every later `rnfs.Node` in the process failed with RNS's `KeyError`.
+- **Name watches end 60 s after the last watch call** as documented, rather than at the next watch call (or never).
+- **`rnfs.Client(timeout=...)` checks its timeout:** 0, a negative number or a bool raised `ValueError` only on
+  the first call, or failed every call with a misleading "can't reach the daemon".
+- **A stop during the first join is prompt:** the deny feature waited for the join without looking for a stop, so
+  a stop before the node had joined took the whole stop budget, leaving the other features and the node's threads
+  none.
+- **Jobs:** a retry run cut off by a restart keeps its due time, rather than being given up after one more try; a
+  resumed get whose output a run before the crash had already put in place (the same content) finishes done,
+  not "already exists"; and a stop just as a job starts no longer raises and skips the save.
+- **Settings:** a duration rnfs.toml sets below its minimum (raised at start) is no longer listed as needing a
+  restart, and a live setting set to its current value isn't reported as applied.
+
 ## 0.2.0
 
 The feature-complete release: the local API and the library for companion apps; providing at scale (sweep

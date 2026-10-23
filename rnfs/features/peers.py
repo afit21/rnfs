@@ -35,7 +35,7 @@ import math
 import threading
 import time
 
-from rnfs import events, mesh
+from rnfs import events, mesh, units
 from rnfs.features import Feature, _common
 from rnfs.fsutil import printable
 
@@ -280,14 +280,8 @@ def _api_stats(handler):
 # Output (no RNS here: the CLI must not load it)
 
 def human_size(num_bytes: float | None) -> str:
-    """A short size like "1.5 MB", or "-" for None."""
-    if num_bytes is None:
-        return "-"
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(num_bytes) < 1000 or unit == "TB":
-            return f"{num_bytes:.0f} {unit}" if unit == "B" else f"{num_bytes:.1f} {unit}"
-        num_bytes /= 1000
-    return f"{num_bytes:.1f} TB"
+    """A size like "1.50 MB" (units.human_size), or "-" for None."""
+    return units.human_size(num_bytes, unknown="-")
 
 
 def human_rate(bits: float | None) -> str:

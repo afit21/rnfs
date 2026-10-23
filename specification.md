@@ -4,7 +4,7 @@ rnfs is content-addressed file sharing over [Reticulum](https://reticulum.networ
 features of IPFS: content IDs, chunked files, directories, a provider DHT, verified multi-source transfer,
 pinning, mutable names and a gateway — built on what RNS already provides.
 
-**Version.** This document describes rnfs 0.2.0. The wire format (request paths and messages, CIDs and DAG
+**Version.** This document describes rnfs 0.2.1. The wire format (request paths and messages, CIDs and DAG
 bytes, chunk boundaries, provider and name records, announce app_data and the LXMF field) is byte-identical
 since rnfs 0.1.3, so nodes of 0.1.3 and later work together. 0.2.0 adds one optional request, `/range` (section 7),
 which older nodes don't answer and newer ones send only to nodes that do; every other message, and every CID, is
@@ -291,8 +291,11 @@ registered (rnfs: `links.EarlyResponses`), or the request waits out RNS's timeou
     connected requester.
   - A request for which nothing asked for is served is answered at once (each entry `None`; `[]` for `/range`)
     without taking a slot, so it displaces nothing (rnfs 0.2.0, REL-2: one ~100-byte request for a made-up CID
-    cancelled an honest LoRa download).
-  - When a pool is full, a new `/blocks` request displaces one of the pool's responses, never one on its own
+    cancelled an honest LoRa download). So is a `/range` whose `offset` is past the block's end (`False`), and
+    neither takes a slot an answer the node knows will fit one packet (from the stored sizes of what it serves):
+    sent as RNS gets it, it would hold the slot for nothing (rnfs 0.2.1; pacing and `upload_budget` apply to it
+    as to any response).
+  - When a pool is full, a new `/blocks` request that takes a slot displaces one of the pool's responses, never one on its own
     link: the response making least progress among those that are unprotected (past their grace and below the
     floor); else, if the newcomer's receiving interface holds no slot in the pool, the oldest response with
     nothing sent from an interface that holds two or more, once it is past half its grace and at most one
@@ -1388,7 +1391,8 @@ link in about a third of the airtime.
   nothing for a handler's `None`); `False` if it refuses under its limits, or `offset` is past `size`.
 - **Responder.** A `/range` response is a `/blocks` response for every rule of section 3 and this section: it serves
   only what `/blocks` would serve, re-checked against its CID; it takes the link's one `/blocks` slot (at most one
-  `/blocks` or `/range` in progress per link) and a slot in the same response pools, with the same deadline,
+  `/blocks` or `/range` in progress per link) and, as a `/blocks` response does, a slot in the same response pools
+  unless it fits one packet, with the same deadline,
   displacement, cooldowns and upload pacing; the same airtime controls refuse it and `upload_budget` charges it, by
   its packed size; a completed one gives the link a rate estimate. Its range is sent whole, as a `/blocks`
   response's first block is, so a `/range` response is never larger than the `/blocks` response for the same block

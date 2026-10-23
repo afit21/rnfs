@@ -112,7 +112,10 @@ def _check_depth(height: int):
 
 
 def _put_node(node: dag.Node, put: Put) -> Cid:
-    """Encode node, hand it to put and return its CID."""
+    """Encode node, hand it to put and return its CID. Raises TooLarge if its sizes add up past 2^64 - 1 (the DAG would
+    be invalid, and an index node above it couldn't even be encoded)."""
+    if node.size > dag.MAX_SIZE:
+        raise TooLarge("content exceeds 2^64 - 1 bytes")
     block = dag.encode(node)
     if len(block) > constants.MAX_BLOCK_SIZE:
         # Can't happen with the protocol constants (256 maximal entries are ~80 KiB), but never write one

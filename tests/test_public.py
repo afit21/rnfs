@@ -1315,6 +1315,7 @@ class NameWatchEndpointTest(unittest.TestCase):
     def test_waiters_are_capped(self):
         """Past MAX_WATCH_WAITERS calls waiting, a call that would wait gets Busy."""
         watches = NameWatches(self.node)
+        self.addCleanup(watches.close)
         watches.waiters = tuple((frozenset(), threading.Event()) for _ in range(api.MAX_WATCH_WAITERS))
         with self.assertRaises(rnfs.Busy):
             watches.wait([OTHER], [None], 1)
@@ -1323,6 +1324,7 @@ class NameWatchEndpointTest(unittest.TestCase):
         """With MAX_WATCH_WAITERS calls waiting, a wait=0 call (a Client's watch() baseline) still answers and
         marks its name watched: it holds no connection."""
         watches = NameWatches(self.node)
+        self.addCleanup(watches.close)
         waiters = tuple((frozenset(), threading.Event()) for _ in range(api.MAX_WATCH_WAITERS))
         watches.waiters = waiters
         self.assertEqual(watches.wait([OTHER], [None], 0), [])
@@ -1334,6 +1336,7 @@ class NameWatchEndpointTest(unittest.TestCase):
         """A name whose watch ends while another call waits is unwatched in NameManager when that call ends."""
         now = [0.0]
         watches = NameWatches(self.node, clock=lambda: now[0])
+        self.addCleanup(watches.close)
         watches.wait([OTHER], [None], 0)  # watched until WATCH_GRACE
         now[0] = api.WATCH_GRACE - 10
         records = watches._records
@@ -1356,6 +1359,7 @@ class NameWatchEndpointTest(unittest.TestCase):
         """A name stays watched until WATCH_GRACE after its last call."""
         now = [0.0]
         watches = NameWatches(self.node, clock=lambda: now[0])
+        self.addCleanup(watches.close)
         watches.wait([OTHER], [None], 0)
         self.assertIn(OTHER, self.node.names._watched)
         now[0] = api.WATCH_GRACE + 1

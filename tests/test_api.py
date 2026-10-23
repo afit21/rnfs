@@ -1044,6 +1044,23 @@ class ConnectionTest(ConnectionTestCase):
         self.assertTrue(wait_for(lambda: free_slots(self.server) == self.LIMITS["max_connections"]))
         self.assertEqual(self.call("GET", "/api/status")[0], 200)
 
+    def test_a_client_reset_is_not_reported(self):
+        """A client that resets its connection mid-request is closed quietly, its slot freed: no traceback on the
+        daemon's output, which a status check during startup used to leave. Any other failure is still reported."""
+        server = self.server.server
+        for error, reported in ((ConnectionResetError, False), (BrokenPipeError, False),
+                                (ConnectionAbortedError, False), (RuntimeError, True)):
+            with self.subTest(error=error.__name__):
+                ours, theirs = socket.socketpair()
+                theirs.close()  # so the lingering close finds the client gone at once
+                server.slots.acquire()
+                with mock.patch.object(server, "finish_request", side_effect=error()), \
+                        mock.patch.object(server, "handle_error") as handle_error:
+                    server.process_request_thread(ours, ("127.0.0.1", 1))
+                self.assertEqual(handle_error.called, reported)
+                self.assertEqual(ours.fileno(), -1)  # closed
+        self.assertEqual(free_slots(self.server), self.LIMITS["max_connections"])
+
     def test_log_escapes_the_target(self):
         def failing(*args, **kwargs):
             yield b"x"
@@ -1427,6 +1444,70 @@ class BindTest(unittest.TestCase):
             self.assertTrue(server.server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE))
         with self.assertRaises(OSError):
             ApiServer(FakeNode(), server.port)  # a second daemon can't share the port
+
+
+class WatchedNames:
+    """NameManager's watch counts, as NameWatches uses them."""
+
+    def __init__(self):
+        self.watched: dict[bytes, int] = {}
+
+    def watch(self, name):
+        self.watched[name] = self.watched.get(name, 0) + 1
+
+    def unwatch(self, name):
+        self.watched[name] -= 1
+        if not self.watched[name]:
+            del self.watched[name]
+
+    def record(self, name):
+        return None
+
+    def add_record_listener(self, listener):
+        pass
+
+
+class NameWatchExpiryTest(unittest.TestCase):
+    """A name watched for an API client stops being watched WATCH_GRACE after its last call, with no later call to
+    notice, and when the server stops."""
+
+    def setUp(self):
+        self.node = FakeNode()
+        self.node.names = WatchedNames()
+        patcher = mock.patch.object(api, "WATCH_GRACE", 0.2)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def timing(watches) -> bool:
+        """Whether watches' timer is running (only its own: other tests' may still be)."""
+        timer = watches.timer
+        return timer is not None and timer.is_alive()
+
+    def test_a_watch_ends_after_its_grace_without_another_call(self):
+        watches = api.NameWatches(self.node)
+        self.addCleanup(watches.close)
+        name, other = bytes(16), bytes([1] * 16)
+        watches.wait([name], [None], 0)
+        time.sleep(0.1)
+        watches.wait([other], [None], 0)  # ends later: the timer, armed for name, re-arms for it
+        self.assertEqual(set(self.node.names.watched), {name, other})
+        self.assertTrue(wait_for(lambda: name not in self.node.names.watched, 2))
+        self.assertIn(other, self.node.names.watched)
+        self.assertTrue(wait_for(lambda: not self.node.names.watched, 2))
+        self.assertEqual(watches.until, {})
+        self.assertTrue(wait_for(lambda: not self.timing(watches), 2), "the timer ends once nothing is watched")
+
+    def test_stopping_the_server_ends_the_watches_and_the_timer(self):
+        server = ApiServer(self.node, 0)
+        server.start()
+        server.watches.wait([bytes(16)], [None], 0)
+        self.assertTrue(self.timing(server.watches))
+        server.stop()
+        self.assertEqual(self.node.names.watched, {})
+        self.assertTrue(wait_for(lambda: not self.timing(server.watches), 2))
+        server.watches.wait([bytes(16)], [None], 0)  # a call answered after the stop watches nothing
+        self.assertEqual(self.node.names.watched, {})
 
 
 class BodyReaderTest(unittest.TestCase):

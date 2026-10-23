@@ -1,4 +1,4 @@
-"""`rnfs add <destination>:/page/<path>` and `:/file/<path>` (rnfs/nomadnet.py, rnfs/node_content.py add_nomadnet, the
+"""`rnfs add <destination>:/page/<path>` and `:/file/<path>` (rnfs/nomadnet_links.py, rnfs/node_content.py add_nomadnet, the
 API, add jobs and the CLI), with the fetch from the NomadNet node faked (FakeNomadnet); the fetch's own bounds are in
 tests/security/test_nomadnet_link_bounds.py, a real one over RNS in tests/test_nomadnet_e2e.py."""
 import contextlib
@@ -15,7 +15,7 @@ from unittest import mock
 
 import RNS
 
-from rnfs import api, cli, nomadnet
+from rnfs import api, cli, nomadnet_links
 from rnfs.api import ApiServer
 from rnfs.apiclient import ApiConnection
 from rnfs.config import Config
@@ -94,11 +94,11 @@ class ParseTest(unittest.TestCase):
     """The links' syntax, the snapshot's name and NomadNet's "Request Not Allowed" page."""
 
     def test_links(self):
-        link = nomadnet.parse(PAGE)
+        link = nomadnet_links.parse(PAGE)
         self.assertEqual((link.destination.hex(), link.path, link.kind, link.last_name),
-                         (DEST, "/page/index.mu", nomadnet.PAGE, "index.mu"))
-        self.assertEqual(str(nomadnet.parse(DEST.upper() + ":/file/a b/c.txt")), DEST + ":/file/a b/c.txt")
-        self.assertEqual(nomadnet.parse(FILE).kind, nomadnet.FILE)
+                         (DEST, "/page/index.mu", nomadnet_links.PAGE, "index.mu"))
+        self.assertEqual(str(nomadnet_links.parse(DEST.upper() + ":/file/a b/c.txt")), DEST + ":/file/a b/c.txt")
+        self.assertEqual(nomadnet_links.parse(FILE).kind, nomadnet_links.FILE)
 
     def test_malformed_links(self):
         for text in (DEST[:-1] + ":/page/x", DEST + ":/pages/x", DEST + ":/page/", DEST + ":/page//x",
@@ -106,30 +106,30 @@ class ParseTest(unittest.TestCase):
                      DEST + ":/page/index.mu`var_x=1", DEST + ":/page/a\x1bb", DEST + ":/page/" + "a" * 1100,
                      DEST + ":/page/a\x00", "", None, 5):
             with self.subTest(text=repr(text)[:60]), self.assertRaises(ValueError):
-                nomadnet.parse(text)
+                nomadnet_links.parse(text)
 
     def test_local_files_named_like_links(self):
-        self.assertTrue(nomadnet.looks_like(PAGE))
-        self.assertTrue(nomadnet.looks_like(DEST + ":/page/"))  # malformed, but a link: refused, not read as a file
+        self.assertTrue(nomadnet_links.looks_like(PAGE))
+        self.assertTrue(nomadnet_links.looks_like(DEST + ":/page/"))  # malformed, but a link: refused, not read as a file
         for text in ("./" + PAGE, "/abs/" + PAGE, "-", "notes.txt", DEST, DEST + ":/other/x"):
-            self.assertFalse(nomadnet.looks_like(text), text)
+            self.assertFalse(nomadnet_links.looks_like(text), text)
 
     def test_snapshot_names(self):
-        page, file = nomadnet.parse(PAGE), nomadnet.parse(FILE)
-        self.assertEqual(nomadnet.snapshot_name(page, b"other.txt"), "index.mu")  # a page's metadata never counts
+        page, file = nomadnet_links.parse(PAGE), nomadnet_links.parse(FILE)
+        self.assertEqual(nomadnet_links.snapshot_name(page, b"other.txt"), "index.mu")  # a page's metadata never counts
         for sent, expected in ((b"song.mp3", "song.mp3"), ("Song é.mp3", "Song é.mp3"), (None, "song.mp3"),
                                (b"../etc/passwd", "song.mp3"), (b"a/b", "song.mp3"), (b"..", "song.mp3"),
                                (b"\xff\xfe", "song.mp3"), (b"x\x1b[2J", "song.mp3"), (b"x" * 300, "song.mp3"),
                                (b"", "song.mp3"), (5, "song.mp3")):
             with self.subTest(sent=sent):
-                self.assertEqual(nomadnet.snapshot_name(file, sent), expected)
+                self.assertEqual(nomadnet_links.snapshot_name(file, sent), expected)
 
     def test_request_not_allowed_page(self):
-        self.assertTrue(nomadnet.is_not_allowed(nomadnet.NOT_ALLOWED))
-        self.assertTrue(nomadnet.is_not_allowed(nomadnet.NOT_ALLOWED.replace(b"\n", b"\r\n") + b"\n\n"))
-        for page in (PAGE_BYTES, b"", nomadnet.NOT_ALLOWED + b"\nbut a real page goes on " * 20,
+        self.assertTrue(nomadnet_links.is_not_allowed(nomadnet_links.NOT_ALLOWED))
+        self.assertTrue(nomadnet_links.is_not_allowed(nomadnet_links.NOT_ALLOWED.replace(b"\n", b"\r\n") + b"\n\n"))
+        for page in (PAGE_BYTES, b"", nomadnet_links.NOT_ALLOWED + b"\nbut a real page goes on " * 20,
                      b">Request Not Allowed\n"):
-            self.assertFalse(nomadnet.is_not_allowed(page), page[:40])
+            self.assertFalse(nomadnet_links.is_not_allowed(page), page[:40])
 
 
 class FetchFlowTest(unittest.TestCase):
@@ -152,10 +152,10 @@ class FetchFlowTest(unittest.TestCase):
 
     def fetch(self, identity=None):
         """fetching.fetch of PAGE into the temporary directory."""
-        return fetching.fetch(nomadnet.parse(PAGE), self.config, self.tmp, identity=identity)
+        return fetching.fetch(nomadnet_links.parse(PAGE), self.config, self.tmp, identity=identity)
 
     def test_anonymous_refusal_fails_and_says_how(self):
-        self.answers = [nomadnet.NOT_ALLOWED]
+        self.answers = [nomadnet_links.NOT_ALLOWED]
         with self.assertRaises(NotFound) as caught:
             self.fetch()
         self.assertIn("Request Not Allowed", str(caught.exception))
@@ -166,19 +166,19 @@ class FetchFlowTest(unittest.TestCase):
 
     def test_identified_refusal_is_retried_once(self):
         identity = mock.Mock(hash=bytes(range(16)))
-        self.answers = [nomadnet.NOT_ALLOWED, PAGE_BYTES]
+        self.answers = [nomadnet_links.NOT_ALLOWED, PAGE_BYTES]
         snapshot = self.fetch(identity)
         with open(snapshot.path, "rb") as f:
             self.assertEqual(f.read(), PAGE_BYTES)
         self.assertEqual(self.link.identify.call_args_list, [mock.call(identity)] * 2)
-        self.answers = [nomadnet.NOT_ALLOWED, nomadnet.NOT_ALLOWED]
+        self.answers = [nomadnet_links.NOT_ALLOWED, nomadnet_links.NOT_ALLOWED]
         with self.assertRaises(NotFound) as caught:
             self.fetch(identity)
         self.assertIn("nomadnet_identity", str(caught.exception))
         self.assertIn(bytes(range(16)).hex(), str(caught.exception))  # the hash to ask the node's operator to list
 
     def test_pages_pass(self):
-        for page in (PAGE_BYTES, b"", nomadnet.NOT_ALLOWED * 5):
+        for page in (PAGE_BYTES, b"", nomadnet_links.NOT_ALLOWED * 5):
             self.answers = [page]
             self.assertEqual(self.fetch().size, len(page))
 
@@ -210,7 +210,7 @@ class EarlyAnswerTest(unittest.TestCase):
 
     def fetch(self, identity=None) -> bytes:
         """What fetching.fetch of PAGE copied, read back."""
-        snapshot = fetching.fetch(nomadnet.parse(PAGE), Config(), self.tmp, identity=identity)
+        snapshot = fetching.fetch(nomadnet_links.parse(PAGE), Config(), self.tmp, identity=identity)
         with open(snapshot.path, "rb") as f:
             return f.read()
 
@@ -222,7 +222,7 @@ class EarlyAnswerTest(unittest.TestCase):
 
     def test_an_identified_retry_too(self):
         # "Request Not Allowed", then the page after identifying again: two requests on the link, both early
-        self.answers = [nomadnet.NOT_ALLOWED, PAGE_BYTES]
+        self.answers = [nomadnet_links.NOT_ALLOWED, PAGE_BYTES]
         identity = object()
         self.assertEqual(self.fetch(identity), PAGE_BYTES)
         self.assertEqual(self.link.identities, [identity, identity])
