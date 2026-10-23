@@ -21,7 +21,7 @@ interface.py, objects.py, embedded.py, remote.py: the public API (rnfs.Node, rnf
 uris.py      rnfs: links (rnfs.Link, parse_uri, format_uri) and the LXMF link map (encode_field, decode_field)
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 API_STATUS = "provisional"  # the public API (rnfs.Node, rnfs.Client) and the local API may change until 1.0.0
 
 # Public name -> the module defining it, imported on first use (PEP 562)

@@ -2,7 +2,7 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
-## 0.2.1 (unreleased)
+## 0.2.1
 
 Fixes, and additions to the local API for apps. No wire-format or CID changes: these nodes, 0.2.0, 0.1.6, 0.1.5,
 0.1.4 and 0.1.3 nodes work together. Every API addition is additive: older clients see the answers they knew, with

@@ -78,7 +78,7 @@ Different package options available at [latest release](https://github.com/afit2
 
 **Windows:**
 
-[`rnfs-0.2.0-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-windows-x64.exe), saved as `rnfs.exe`
+[`rnfs-0.2.1-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-windows-x64.exe), saved as `rnfs.exe`
   somewhere on your PATH ([how](#windows)).
 
 **Linux:**
@@ -95,7 +95,7 @@ Or installers for ([Debian & Ubuntu](#debian-and-ubuntu)).  [Flatpak](#other-lin
 
 **macOS:**
 
-`pipx install https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-py3-none-any.whl` ([details](#macos)).
+`pipx install https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-py3-none-any.whl` ([details](#macos)).
 
 ## 2 - Start rnfs and leave it running in its own terminal:
 
@@ -129,14 +129,14 @@ command. Your data in `~/.rnfs` is never touched by an update or uninstall.
 
 | System | Download |
 |---|---|
-| Windows (64-bit) | [`rnfs-0.2.0-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-windows-x64.exe) ([how](#windows)) |
-| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.2.0_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs_0.2.0_amd64.deb) or [`rnfs_0.2.0_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs_0.2.0_arm64.deb) ([how](#debian-and-ubuntu)) |
-| Other Linux (x86_64) | [`rnfs-0.2.0-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-x86_64.flatpak) ([how](#other-linux-flatpak)), or the [install script](#install-script) |
-| macOS, or any system with Python 3.11+ | [`rnfs-0.2.0-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-py3-none-any.whl) ([how](#macos)) |
+| Windows (64-bit) | [`rnfs-0.2.1-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-windows-x64.exe) ([how](#windows)) |
+| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.2.1_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs_0.2.1_amd64.deb) or [`rnfs_0.2.1_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs_0.2.1_arm64.deb) ([how](#debian-and-ubuntu)) |
+| Other Linux (x86_64) | [`rnfs-0.2.1-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-x86_64.flatpak) ([how](#other-linux-flatpak)), or the [install script](#install-script) |
+| macOS, or any system with Python 3.11+ | [`rnfs-0.2.1-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-py3-none-any.whl) ([how](#macos)) |
 
-These links are for 0.2.0; for a newer version, take the same files from the
+These links are for 0.2.1; for a newer version, take the same files from the
 [latest release](https://github.com/afit21/rnfs/releases/latest), which also has the source archive
-(`rnfs-0.2.0.tar.gz`) and `SHA256SUMS` ([checking a download](#checking-a-download)).
+(`rnfs-0.2.1.tar.gz`) and `SHA256SUMS` ([checking a download](#checking-a-download)).
 
 ## Windows
 
@@ -145,7 +145,7 @@ The exe is a single file with Python and Reticulum inside. In PowerShell, from y
 ```powershell
 $bin = "$env:USERPROFILE\.local\bin"
 New-Item -ItemType Directory -Force $bin | Out-Null
-Move-Item .\rnfs-0.2.0-windows-x64.exe "$bin\rnfs.exe" -Force
+Move-Item .\rnfs-0.2.1-windows-x64.exe "$bin\rnfs.exe" -Force
 Unblock-File "$bin\rnfs.exe"
 [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$bin", "User")
 # open a new terminal, then:
@@ -167,8 +167,8 @@ there, run `sudo apt install python3.11 python3.11-venv` and then the [install s
 `python3.11`.
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs_0.2.0_amd64.deb
-sudo apt install ./rnfs_0.2.0_amd64.deb
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs_0.2.1_amd64.deb
+sudo apt install ./rnfs_0.2.1_amd64.deb
 systemctl --user enable --now rnfs      # run it as a service; logs: journalctl --user -u rnfs -f
 loginctl enable-linger $USER            # keep it running while you're logged out
 ```
@@ -179,9 +179,9 @@ loginctl enable-linger $USER            # keep it running while you're logged ou
 ## Other Linux (Flatpak)
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-x86_64.flatpak
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-x86_64.flatpak
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak install --user rnfs-0.2.0-x86_64.flatpak
+flatpak install --user rnfs-0.2.1-x86_64.flatpak
 alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc
 rnfs daemon
 ```
@@ -200,7 +200,7 @@ with `flatpak uninstall --user io.github.afit21.rnfs`.
 
 ```sh
 brew install pipx && pipx ensurepath          # then open a new terminal
-pipx install https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-py3-none-any.whl
+pipx install https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-py3-none-any.whl
 rnfs daemon
 ```
 
@@ -252,12 +252,12 @@ Each release's `SHA256SUMS` lists every file's checksum. With it next to your do
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing                  # Linux; macOS: shasum -a 256 <file>
-gh attestation verify rnfs_0.2.0_amd64.deb --repo afit21/rnfs
+gh attestation verify rnfs_0.2.1_amd64.deb --repo afit21/rnfs
 ```
 
 A matching checksum shows the file is whole, not who made it. The signed build provenance, checked with the
 [GitHub CLI](https://cli.github.com/) (2.49 or newer, logged in), shows it was built by this repository's
-release workflow. On Windows, `Get-FileHash .\rnfs-0.2.0-windows-x64.exe` gives the checksum.
+release workflow. On Windows, `Get-FileHash .\rnfs-0.2.1-windows-x64.exe` gives the checksum.
 
 ## From source
 
