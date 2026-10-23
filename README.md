@@ -25,7 +25,7 @@ No centralized servers
 
 ### Embed content on Nomadnet sites by linking to a CID
 
-(Browser has to support rnfs to see this)
+No support rnfs required by the Nomadnet node. This means you can post embedded content on Nomadnet forums, group chats, etc, and other users on browsers that support rnfs can view the content.
 
 <img width="705" height="572" alt="image" src="https://github.com/user-attachments/assets/684f74bc-e11a-47ce-9b87-628a4b03168e" />
 
