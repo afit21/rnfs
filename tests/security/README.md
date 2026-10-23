@@ -219,31 +219,31 @@ the roadmap's "Security fixes from the 0.2.0 review".
 
 | ID | Test modules | Code guarded | Fix commits |
 |---|---|---|---|
-| AUD-H1 | `test_audh1_paced_answer_slot.py` | `rnfs/network/server.py` (`RequestServer._serve`: `slotted`, `unslotted`, `_untrack`, `_link_closed`) | (uncommitted) |
-| AUD-H2 | `test_audh2_ipv6_loopback_squat.py` | `rnfs/api.py` (`LocalServer._bind`, `BoundedHTTPServer` sibling slots, `server_bind`, `NO_IPV6`, `PORT_TAKEN`), `rnfs/gateway.py` (`GatewayServer`) | (uncommitted) |
-| AUD-H3 | `test_audh3_add_swapped_leaf.py` | `rnfs/node.py` (`RnfsNode.add_path`), `rnfs/content/builder.py` (`check_root`, `BuildOptions.root_check`), `rnfs/content/shared_folder.py` (`opened_refused_reason`, `opened_path`), `rnfs/node_content.py` (`add_sealed_path`) | (uncommitted) |
-| AUD-H4 | `test_audh4_dripping_probe.py` | `rnfs/fetcher.py` (`Fetch._assign`, `_probes_overdue`, `_discover`, `_duplicate`, `_settle_duplicate`, `_handle`, `_expected_time`), `rnfs/network/client.py` (`PeerClient.blocks`, `block_range`: `slot_wait`, `NO_SLOT`), `rnfs/network/links.py` (`LinkPool.request`, `Exchange.no_slot`), `rnfs/ranges.py` (`Ranges.fetch`) | (uncommitted) |
-| AUD-M1 | `test_audm1_size_estimate_poisoning.py`; also `tests/test_search.py` (`test_size_samples_only_from_keys_the_node_chose`) | `rnfs/dht/lookups.py` (`Lookups.search`, `publish`, `flags`, `widen`, `sample_due`), `rnfs/dht/density.py` (`SizeEstimate.forget`), `rnfs/node.py` (`_sample_sizes`, `_join`) | (uncommitted) |
-| AUD-M2 | `test_audm2_rerun_query_cap.py` | `rnfs/dht/lookup.py` (`Lookup._iterate`: runs share `max_queries`), `rnfs/fetcher.py` (`Fetch._lookup_found`, `_add_provider`, `_rerun_lookup`) | (uncommitted) |
-| AUD-M3 | `test_audm3_probe_introducer.py` | `rnfs/dht/local.py` (`PartitionMode.failed`, `_targets`, `probe_target`, `probed`), `rnfs/dht/lookup.py` (`Lookup.introducers`), `rnfs/node.py` (`_new_lookup`, `_query_failed`, `_is_senior`) | (uncommitted) |
-| AUD-M4 | `test_audm4_slow_pool_runs.py` | `rnfs/network/server.py` (`ResponsePools._displaceable`, `_run_start`, `_ended`, `runs`; `Response.run_start`, `fast_interface`; `RequestServer._serve`) | (uncommitted) |
-| AUD-M5 | `test_audm5_pairing_preempt.py`; also `tests/test_apps.py` (`test_deny_expiry_and_refusals`) | `rnfs/apps.py` (`PairingRequests.request`, `approve`, `MAX_PENDING`), `rnfs/api.py` (`api_app_approve`), `rnfs/apiclient.py` (`app_approve`), `rnfs/cli.py` (`run_app_approve`) | (uncommitted) |
-| AUD-M6 | `test_audm6_entry_cap.py`, `test_audm6_follow_deny_entry_cap.py`, `test_n1_entry_credit.py` | `rnfs/node_pins.py` (`pin_add`, `_remote_pin_fetch`), `rnfs/node.py` (`dir_set`, `dir_rm`), `rnfs/features/follow.py` (`FollowFeature.check`), `rnfs/features/deny.py` (`DenyFeature.check`), `rnfs/fetcher.py` (`_Walk.met`: `.entries`) | (uncommitted) |
-| AUD-M10 | `test_audm10_install_venv.py` | `install.sh` (`venv_ok`, `do_install`, `install_cleanup`, `recover_venv`), the Flatpak manifest's comments | (uncommitted) |
-| AUD-M11 | `test_audm11_get_allocation.py` | `rnfs/node.py` (`RnfsNode.get`, `_check_write_space`), `rnfs/content/tarstream.py` (`dag_extent`, `Extent.written`) | (uncommitted) |
-| AUD-L1 | `test_audl1_pairing_name_oracle.py` | `rnfs/apps.py` (`PairingRequests.request`, `approve`) | (uncommitted) |
-| AUD-L2 | `test_audl2_name_export_private_file.py` | `rnfs/cli.py` (`run_name_export`) | (uncommitted) |
-| AUD-L4 | `test_audl4_range_compression_share.py` | `rnfs/network/server.py` (`CompressionBudget.take`, `forget`, `COMPRESS_LINK_SHARE`; `RequestServer._handle_range`, `_serve`) | (uncommitted) |
-| AUD-L5 | `test_audl5_early_responses.py` | `rnfs/network/links.py` (`EarlyResponses.on_response`, `_one_packet`, `_prune`, `deliver`) | (uncommitted) |
-| AUD-L6 | `test_audl6_path_turns.py` | `rnfs/network/paths.py` (`PathRequests._take_turn`, `_give_back`, `charge`; `_Turn`) | (uncommitted) |
-| AUD-L7 | `test_audl7_link_identify_flood.py`; also `tests/test_rns_compat.py` (LINKIDENTIFY) | `rnfs/network/guards.py` (`guarded_receive`, `_identify_refused`, `MAX_IDENTIFY_PACKETS`) | (uncommitted) |
-| AUD-L8 | `test_audl8_range_block_rereads.py` | `rnfs/content/storage.py` (`Storage.get(remember=)`, `_verified`, `_delete`, `VERIFIED_MEMORY`), `rnfs/node.py` (`NodeBackend.served_block`) | (uncommitted) |
-| AUD-L9 | `test_audl9_client_announce_replay.py`; also `tests/test_node.py` (`test_announce_first_seen_log_is_kept_at_a_restart`) | `rnfs/node.py` (`_heard_client`, `_left_server_mode`), `rnfs/dht/firstseen.py` (`FirstSeenLog.last_heard`) | (uncommitted) |
-| AUD-L10 | `test_audl10_malformed_renege.py` | `rnfs/ranges.py` (`Ranges._fetch`: `BlocksResult.reneged`), `rnfs/fetcher.py` (`Fetch._handle`) | (uncommitted) |
-| AUD-L12 | `test_audl12_release_before_resume.py` | `rnfs/node.py` (`_start_network`, `_start_threads`), `rnfs/node_pins.py` (`_resume_remote_pins`, `remote_pin`) | (uncommitted) |
-| AUD-L13 | `test_audl13_event_watch_backlog.py` | `rnfs/interface.py` (`_Events.post`, `_Backlog`, `Rnfs._deliver_event`) | (uncommitted) |
-| AUD-L14 | `test_audl14_lock_audit.py` | `packaging/build-tools.lock`, `.github/workflows/audit.yml`, `.github/dependabot.yml` | (uncommitted) |
-| AUD-L15 | `test_audl15_install_downgrade.py` | `install.sh` (`installed_version`, `check_downgrade`) | (uncommitted) |
-| AUD-L16 | `test_audl16_windows_task.py` | `contrib/install-windows-task.ps1` | (uncommitted) |
-| AUD-L17 | `test_audl17_strict_dropin.py` | `contrib/rnfs.service.d/strict.conf`, `hardening.conf`, the unit's comments | (uncommitted) |
-| AUD-L18 | `test_audl18_reproducible_deb.py` | `packaging/build-deb.sh`, `.github/workflows/release.yml` (the python and deb jobs) | (uncommitted) |
+| AUD-H1 | `test_audh1_paced_answer_slot.py` | `rnfs/network/server.py` (`RequestServer._serve`: `slotted`, `unslotted`, `_untrack`, `_link_closed`) | `24fa526` |
+| AUD-H2 | `test_audh2_ipv6_loopback_squat.py` | `rnfs/api.py` (`LocalServer._bind`, `BoundedHTTPServer` sibling slots, `server_bind`, `NO_IPV6`, `PORT_TAKEN`), `rnfs/gateway.py` (`GatewayServer`) | `24fa526` |
+| AUD-H3 | `test_audh3_add_swapped_leaf.py` | `rnfs/node.py` (`RnfsNode.add_path`), `rnfs/content/builder.py` (`check_root`, `BuildOptions.root_check`), `rnfs/content/shared_folder.py` (`opened_refused_reason`, `opened_path`), `rnfs/node_content.py` (`add_sealed_path`) | `24fa526` |
+| AUD-H4 | `test_audh4_dripping_probe.py` | `rnfs/fetcher.py` (`Fetch._assign`, `_probes_overdue`, `_discover`, `_duplicate`, `_settle_duplicate`, `_handle`, `_expected_time`), `rnfs/network/client.py` (`PeerClient.blocks`, `block_range`: `slot_wait`, `NO_SLOT`), `rnfs/network/links.py` (`LinkPool.request`, `Exchange.no_slot`), `rnfs/ranges.py` (`Ranges.fetch`) | `24fa526` |
+| AUD-M1 | `test_audm1_size_estimate_poisoning.py`; also `tests/test_search.py` (`test_size_samples_only_from_keys_the_node_chose`) | `rnfs/dht/lookups.py` (`Lookups.search`, `publish`, `flags`, `widen`, `sample_due`), `rnfs/dht/density.py` (`SizeEstimate.forget`), `rnfs/node.py` (`_sample_sizes`, `_join`) | `24fa526` |
+| AUD-M2 | `test_audm2_rerun_query_cap.py` | `rnfs/dht/lookup.py` (`Lookup._iterate`: runs share `max_queries`), `rnfs/fetcher.py` (`Fetch._lookup_found`, `_add_provider`, `_rerun_lookup`) | `24fa526` |
+| AUD-M3 | `test_audm3_probe_introducer.py` | `rnfs/dht/local.py` (`PartitionMode.failed`, `_targets`, `probe_target`, `probed`), `rnfs/dht/lookup.py` (`Lookup.introducers`), `rnfs/node.py` (`_new_lookup`, `_query_failed`, `_is_senior`) | `24fa526` |
+| AUD-M4 | `test_audm4_slow_pool_runs.py` | `rnfs/network/server.py` (`ResponsePools._displaceable`, `_run_start`, `_ended`, `runs`; `Response.run_start`, `fast_interface`; `RequestServer._serve`) | `24fa526` |
+| AUD-M5 | `test_audm5_pairing_preempt.py`; also `tests/test_apps.py` (`test_deny_expiry_and_refusals`) | `rnfs/apps.py` (`PairingRequests.request`, `approve`, `MAX_PENDING`), `rnfs/api.py` (`api_app_approve`), `rnfs/apiclient.py` (`app_approve`), `rnfs/cli.py` (`run_app_approve`) | `24fa526` |
+| AUD-M6 | `test_audm6_entry_cap.py`, `test_audm6_follow_deny_entry_cap.py`, `test_n1_entry_credit.py` | `rnfs/node_pins.py` (`pin_add`, `_remote_pin_fetch`), `rnfs/node.py` (`dir_set`, `dir_rm`), `rnfs/features/follow.py` (`FollowFeature.check`), `rnfs/features/deny.py` (`DenyFeature.check`), `rnfs/fetcher.py` (`_Walk.met`: `.entries`) | `24fa526` |
+| AUD-M10 | `test_audm10_install_venv.py` | `install.sh` (`venv_ok`, `do_install`, `install_cleanup`, `recover_venv`), the Flatpak manifest's comments | `24fa526` |
+| AUD-M11 | `test_audm11_get_allocation.py` | `rnfs/node.py` (`RnfsNode.get`, `_check_write_space`), `rnfs/content/tarstream.py` (`dag_extent`, `Extent.written`) | `24fa526` |
+| AUD-L1 | `test_audl1_pairing_name_oracle.py` | `rnfs/apps.py` (`PairingRequests.request`, `approve`) | `24fa526` |
+| AUD-L2 | `test_audl2_name_export_private_file.py` | `rnfs/cli.py` (`run_name_export`) | `24fa526` |
+| AUD-L4 | `test_audl4_range_compression_share.py` | `rnfs/network/server.py` (`CompressionBudget.take`, `forget`, `COMPRESS_LINK_SHARE`; `RequestServer._handle_range`, `_serve`) | `24fa526` |
+| AUD-L5 | `test_audl5_early_responses.py` | `rnfs/network/links.py` (`EarlyResponses.on_response`, `_one_packet`, `_prune`, `deliver`) | `24fa526` |
+| AUD-L6 | `test_audl6_path_turns.py` | `rnfs/network/paths.py` (`PathRequests._take_turn`, `_give_back`, `charge`; `_Turn`) | `24fa526` |
+| AUD-L7 | `test_audl7_link_identify_flood.py`; also `tests/test_rns_compat.py` (LINKIDENTIFY) | `rnfs/network/guards.py` (`guarded_receive`, `_identify_refused`, `MAX_IDENTIFY_PACKETS`) | `24fa526` |
+| AUD-L8 | `test_audl8_range_block_rereads.py` | `rnfs/content/storage.py` (`Storage.get(remember=)`, `_verified`, `_delete`, `VERIFIED_MEMORY`), `rnfs/node.py` (`NodeBackend.served_block`) | `24fa526` |
+| AUD-L9 | `test_audl9_client_announce_replay.py`; also `tests/test_node.py` (`test_announce_first_seen_log_is_kept_at_a_restart`) | `rnfs/node.py` (`_heard_client`, `_left_server_mode`), `rnfs/dht/firstseen.py` (`FirstSeenLog.last_heard`) | `24fa526` |
+| AUD-L10 | `test_audl10_malformed_renege.py` | `rnfs/ranges.py` (`Ranges._fetch`: `BlocksResult.reneged`), `rnfs/fetcher.py` (`Fetch._handle`) | `24fa526` |
+| AUD-L12 | `test_audl12_release_before_resume.py` | `rnfs/node.py` (`_start_network`, `_start_threads`), `rnfs/node_pins.py` (`_resume_remote_pins`, `remote_pin`) | `24fa526` |
+| AUD-L13 | `test_audl13_event_watch_backlog.py` | `rnfs/interface.py` (`_Events.post`, `_Backlog`, `Rnfs._deliver_event`) | `24fa526` |
+| AUD-L14 | `test_audl14_lock_audit.py` | `packaging/build-tools.lock`, `.github/workflows/audit.yml`, `.github/dependabot.yml` | `24fa526` |
+| AUD-L15 | `test_audl15_install_downgrade.py` | `install.sh` (`installed_version`, `check_downgrade`) | `24fa526` |
+| AUD-L16 | `test_audl16_windows_task.py` | `contrib/install-windows-task.ps1` | `24fa526` |
+| AUD-L17 | `test_audl17_strict_dropin.py` | `contrib/rnfs.service.d/strict.conf`, `hardening.conf`, the unit's comments | `24fa526` |
+| AUD-L18 | `test_audl18_reproducible_deb.py` | `packaging/build-deb.sh`, `.github/workflows/release.yml` (the python and deb jobs) | `24fa526` |
