@@ -282,6 +282,30 @@ class DaemonFileTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path))
 
 
+class EarlyAnswerTest(unittest.TestCase):
+    """The answer a daemon sent before it stopped reading an upload is read, whichever error sending the rest
+    raised: a broken pipe or a reset, or on Windows an abort (WSAECONNABORTED), which test_tar_stream's cancelled
+    upload got there."""
+
+    def test_each_dropped_send_reads_the_answer(self):
+        for error in (BrokenPipeError(), ConnectionResetError(), ConnectionAbortedError()):
+            with self.subTest(error=type(error).__name__):
+                ours, daemons = socket.socketpair()
+                self.addCleanup(ours.close)
+                with daemons:
+                    daemons.sendall(b"HTTP/1.1 409 Conflict\r\nContent-Length: 2\r\n\r\n{}")
+                connection = mock.Mock(sock=ours)
+                response = ApiConnection._early_answer(connection, "POST", error)
+                self.assertIsNotNone(response)
+                self.assertEqual((response.status, response.read()), (409, b"{}"))
+
+    def test_other_errors_read_nothing(self):
+        ours, daemons = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(daemons.close)
+        self.assertIsNone(ApiConnection._early_answer(mock.Mock(sock=ours), "POST", TimeoutError()))
+
+
 class AppSupportTest(ClientTestCase):
     """The client side of what 0.2.0 added for apps: error codes, capabilities, events and shutdown."""
 

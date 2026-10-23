@@ -684,9 +684,10 @@ class ApiConnection:
                       error: Exception) -> http.client.HTTPResponse | None:
         """The answer the daemon sent before it stopped reading an upload (a refusal, or the upload's job cancelled:
         409 cancelled) and closed the connection, which sending the rest of the body then failed on; None if none
-        can be read (not a dropped connection, or nothing came)."""
+        can be read (not a dropped connection, or nothing came). Windows reports that send as aborted (WSAECONNABORTED),
+        where other systems report a broken pipe or a reset."""
         sock = connection.sock
-        if sock is None or not isinstance(error, (BrokenPipeError, ConnectionResetError)):
+        if sock is None or not isinstance(error, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
             return None
         try:
             response = http.client.HTTPResponse(sock, method=method)

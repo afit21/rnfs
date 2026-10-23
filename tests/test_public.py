@@ -1014,7 +1014,9 @@ class ClientTest(PublicTests, unittest.TestCase):
         lost = next(event for event in heard if event.lost)
         self.assertEqual(lost.fields["epoch"], self.b.events.epoch)
         cid = self.rnfs.add(b"after the restart").cid
-        wait_for(lambda: heard[-1].kind == "pin" and heard[-1].fields["cids"] == [str(cid)], what="the new event")
+        # After the marker: the add's pin event (its job's events may come before or after it)
+        wait_for(lambda: any(event.kind == "pin" and event.fields["cids"] == [str(cid)]
+                             for event in heard[heard.index(lost) + 1:]), what="the new event")
 
     def test_a_watch_begun_in_a_new_run_leaves_older_watches_hearing(self):
         """A daemon restarting while the poller waits to retry, and a new watch begun in the new run: the older
