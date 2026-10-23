@@ -13,6 +13,11 @@
 #
 # It assumes rnfs.exe in %USERPROFILE%\.local\bin (where pipx and the README put it); pass -Rnfs to use
 # another path.
+#
+# The task is your own: named for your account's SID ("rnfs daemon (S-1-5-21-...)"), and -Stop and -Uninstall
+# stop only your processes. Task names are machine-wide, so with one name for everyone (before 0.2.1: "rnfs
+# daemon") a second user got "Access is denied", and an administrator's -Stop or -Uninstall stopped the other
+# user's daemon. A task of that old name is taken over (stopped and removed) only if it runs your own wrapper.
 
 param(
     [string]$Rnfs = (Join-Path $env:USERPROFILE ".local\bin\rnfs.exe"),
@@ -21,16 +26,32 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$TaskName = "rnfs daemon"
+$Sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$TaskName = "rnfs daemon ($Sid)"
+$OldTaskName = "rnfs daemon"  # every user's, before 0.2.1
 $RnfsDir = Join-Path $env:USERPROFILE ".rnfs"
 $Log = Join-Path $RnfsDir "daemon.log"
 $Wrapper = Join-Path $RnfsDir "daemon-task.ps1"
 
-# Stops the task and every process it started. Task Scheduler ends only the process it launched (the hidden
-# PowerShell), so its descendants (cmd.exe, rnfs.exe and any process rnfs.exe started) are looked up first,
-# from the task's command line and the processes' parent IDs, and stopped after it.
-function Stop-RnfsTask {
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+# The SID of a process's owner (a Win32_Process), or $null if it can't be read
+function Get-OwnerSid($Process) {
+    try { (Invoke-CimMethod -InputObject $Process -MethodName GetOwnerSid).Sid } catch { $null }
+}
+
+# The task this script registered before 0.2.1, under the name every user shared, if it is this user's: it runs
+# this user's wrapper (another user's runs theirs, under their own profile)
+function Test-OwnOldTask {
+    $task = Get-ScheduledTask -TaskName $OldTaskName -ErrorAction SilentlyContinue
+    if (-not $task) { return $false }
+    return ([string]$task.Actions[0].Arguments).IndexOf($Wrapper, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
+# Stops the task named $Name and every process it started. Task Scheduler ends only the process it launched (the
+# hidden PowerShell), so its descendants (cmd.exe, rnfs.exe and any process rnfs.exe started) are looked up
+# first, from the task's command line and the processes' parent IDs, and stopped after it. Only this user's
+# processes are: an administrator sees every user's.
+function Stop-RnfsTask([string]$Name) {
+    $task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
     if (-not $task) { return $false }
     $arguments = [string]$task.Actions[0].Arguments
     $tree = @()
@@ -39,7 +60,7 @@ function Stop-RnfsTask {
             $processes = @(Get-CimInstance Win32_Process)
             $tree = @($processes | Where-Object {
                 $_.Name -eq "powershell.exe" -and $_.ProcessId -ne $PID -and $_.CommandLine -and
-                $_.CommandLine.Contains($arguments)
+                $_.CommandLine.Contains($arguments) -and (Get-OwnerSid $_) -eq $Sid
             })
             $ids = @($tree | ForEach-Object { $_.ProcessId })
             for ($i = 0; $i -lt $tree.Count; $i++) {  # breadth first: $tree grows as children are found
@@ -47,7 +68,7 @@ function Stop-RnfsTask {
                 foreach ($child in $processes) {
                     # (a child started before its "parent" has a parent ID that has been reused)
                     if ($child.ParentProcessId -eq $parent.ProcessId -and $ids -notcontains $child.ProcessId -and
-                            $child.CreationDate -ge $parent.CreationDate) {
+                            $child.CreationDate -ge $parent.CreationDate -and (Get-OwnerSid $child) -eq $Sid) {
                         $tree += $child
                         $ids += $child.ProcessId
                     }
@@ -57,7 +78,7 @@ function Stop-RnfsTask {
             Write-Warning "Couldn't list the task's processes ($_); stopping only the task."
         }
     }
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Stop-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
     foreach ($process in $tree) {  # the PowerShell first, so it can't restart rnfs
         Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
     }
@@ -65,13 +86,21 @@ function Stop-RnfsTask {
 }
 
 if ($Stop -or $Uninstall) {
-    if (Stop-RnfsTask) { Write-Host "Stopped the rnfs daemon." }
+    $names = @($TaskName)
+    if (Test-OwnOldTask) { $names += $OldTaskName }
+    $stopped = $false
+    foreach ($name in $names) {
+        if (Stop-RnfsTask $name) { $stopped = $true }
+    }
+    if ($stopped) { Write-Host "Stopped the rnfs daemon." }
     if ($Uninstall) {
-        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        foreach ($name in $names) {
+            if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+                Unregister-ScheduledTask -TaskName $name -Confirm:$false
+                Write-Host "Removed the '$name' task."
+            }
         }
         if (Test-Path -LiteralPath $Wrapper) { Remove-Item -LiteralPath $Wrapper -Force }
-        Write-Host "Removed the '$TaskName' task."
     }
     exit 0
 }
@@ -98,7 +127,7 @@ function ConvertTo-QuotedLiteral([string]$Text) {
 # /d skips AutoRun commands and /v:off keeps ! literal.
 $CmdArguments = '/d /v:off /s /c ""' + $Rnfs + '" daemon >> "' + $Log + '" 2>&1"'
 $Script = @'
-# Written by rnfs's contrib\install-windows-task.ps1; the "rnfs daemon" task runs it at logon.
+# Written by rnfs's contrib\install-windows-task.ps1; your "rnfs daemon (<your SID>)" task runs it at logon.
 # Runs the daemon, appending its output to the log, and restarts it 10 s after it exits with an error,
 # giving up after 5 such exits in 10 minutes. A clean exit (code 0) ends the task; code 75 is the daemon asked to
 # restart (POST /api/restart), which starts it again at once and counts as no failure.
@@ -131,8 +160,14 @@ while ($true) {
 $Script = $Script.Replace("__RNFS_LOG__", (ConvertTo-QuotedLiteral $Log))
 $Script = $Script.Replace("__RNFS_CMD_ARGUMENTS__", (ConvertTo-QuotedLiteral $CmdArguments))
 
-# Replacing a running task: stop it (and its daemon) first
-[void](Stop-RnfsTask)
+# Replacing a running task: stop it (and its daemon) first. One this script registered for this user under the
+# old shared name goes too, or it would start a second daemon at logon
+[void](Stop-RnfsTask $TaskName)
+if (Test-OwnOldTask) {
+    [void](Stop-RnfsTask $OldTaskName)
+    Unregister-ScheduledTask -TaskName $OldTaskName -Confirm:$false
+    Write-Host "Removed the '$OldTaskName' task an older version of this script registered."
+}
 # UTF-8 with a BOM: without one, Windows PowerShell 5.1 would read non-ASCII characters in the paths as ANSI
 [System.IO.File]::WriteAllText($Wrapper, $Script, (New-Object System.Text.UTF8Encoding $true))
 

@@ -42,6 +42,10 @@ Link.receive likewise drops, unread, a request packet arriving on an rnfs.dht li
 destination of such a link has no request handlers and no max_request_size, so RNS would decode any request up
 to the link's MDU and start a thread for it before finding nothing to run it. The node's server takes requests
 on incoming links only.
+It also drops, unread, an identify packet (context LINKIDENTIFY) on an incoming rnfs.dht link that already has a
+remote identity, or that has had MAX_IDENTIFY_PACKETS of them: RNS decrypts each, checks its signature and, for a
+valid one, asks Reticulum.is_blackholed (an RPC through a shared instance) before ignoring it, as it keeps the
+first identity accepted, and the requester can send one identify packet again and again (AUD-L7).
 A refused response answers its request with None, which every rnfs.dht parser refuses as malformed, so the
 requester fails it at once, as it would a malformed response.
 
@@ -207,10 +211,16 @@ def guarded_accept(advertisement_packet, callback=None, progress_callback=None, 
 PACKET_CHECK_SIZE = RNS.Reticulum.MTU  # response packets larger than RNS's default MTU are checked first
 REFUSAL_LOG_INTERVAL = 60.0  # seconds between log lines about refused responses, after the first
 
-# Whoever sends refused or unexpected responses or requests can't flood the log
+# Identify packets RNS handles on an incoming rnfs.dht link that has no identity yet: an honest requester sends one
+# (and one more after each refusal while the first may have been lost)
+MAX_IDENTIFY_PACKETS = 4
+IDENTIFY_COUNT = "rnfs_identify_packets"  # the attribute guarded_receive counts them in, on the link
+
+# Whoever sends refused or unexpected responses, requests or identify packets can't flood the log
 _log_refused_response = ThrottledLog(REFUSAL_LOG_INTERVAL)
 _log_unexpected_response = ThrottledLog(REFUSAL_LOG_INTERVAL)
 _log_unexpected_request = ThrottledLog(REFUSAL_LOG_INTERVAL)
+_log_unexpected_identify = ThrottledLog(REFUSAL_LOG_INTERVAL)
 
 
 def _answer_as_malformed(link, request_id, size: int):
@@ -277,10 +287,32 @@ def guarded_response_resource_concluded(link, resource):
     return _original_response_resource_concluded(link, resource)
 
 
+def _identify_refused(link) -> bool:
+    """Whether an identify packet arriving on an incoming rnfs.dht link is dropped: the link has a remote identity
+    already, or has had MAX_IDENTIFY_PACKETS of them; else it is counted. Runs on RNS's inbound packet thread, the only
+    one receiving the link's packets."""
+    try:
+        identified = link.get_remote_identity() is not None
+    except Exception:  # noqa: BLE001 - RNS internals: left to RNS, counted, if they fail
+        identified = False
+    seen = getattr(link, IDENTIFY_COUNT, 0)
+    if identified or seen >= MAX_IDENTIFY_PACKETS:
+        return True
+    setattr(link, IDENTIFY_COUNT, seen + 1)
+    return False
+
+
 def guarded_receive(link, packet):
-    """RNS.Link.receive, but on rnfs.dht links checking a response packet before RNS decodes it, and dropping a
-    request packet on a link this node opened; on NomadNet links checking a page answer's packet the same way, and
-    dropping requests."""
+    """RNS.Link.receive, but on rnfs.dht links checking a response packet before RNS decodes it, dropping a
+    request packet on a link this node opened, and dropping identify packets on an incoming link identified already
+    (or past MAX_IDENTIFY_PACKETS); on NomadNet links checking a page answer's packet the same way, and dropping
+    requests."""
+    if getattr(packet, "context", None) == RNS.Packet.LINKIDENTIFY and getattr(link, "initiator", None) is False \
+            and getattr(packet, "packet_type", None) == RNS.Packet.DATA and is_dht_link(link) \
+            and _identify_refused(link):
+        _log_unexpected_identify("dropped an identify packet on an incoming link that has identified already, or "
+                                 "tried too often", LOG_VERBOSE)
+        return None
     nomadnet = is_nomadnet_link(link)
     if getattr(packet, "context", None) == RNS.Packet.REQUEST and getattr(link, "initiator", False) is True \
             and getattr(packet, "packet_type", None) == RNS.Packet.DATA and (nomadnet or is_dht_link(link)):

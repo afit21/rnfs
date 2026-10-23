@@ -16,8 +16,13 @@ finish-args:
   - --share=network
   # rnfs keeps its state in ~/.rnfs and Reticulum's in ~/.reticulum, the same directories a pip-installed rnfs
   # uses, and reads files you add and writes files you get in Downloads. Not the whole home: rnfs parses
-  # untrusted network input, and a compromised daemon that can write ~/.bashrc has left the sandbox. Grant
-  # other folders yourself, e.g. a Reticulum config in ~/.config/reticulum or a data disk:
+  # untrusted network input, and a compromised daemon that can write ~/.bashrc has left the sandbox. These
+  # grants narrow that but don't close it: Reticulum programs run outside the sandbox (rnsd, NomadNet, a host
+  # rnfs) execute what ~/.reticulum's config names (a PipeInterface's command, interfaces/*.py), and a host
+  # rnfs reads ~/.rnfs/rnfs.toml (core.reticulum_dir can point it at another config). Keeping a compromised
+  # daemon in would take a Reticulum config of the app's own (under ~/.var/app), which changes where existing
+  # installs keep theirs; not done yet. Grant other folders yourself, e.g. a Reticulum config in
+  # ~/.config/reticulum or a data disk:
   #   flatpak override --user --filesystem=~/.config/reticulum io.github.afit21.rnfs
   #   flatpak override --user --filesystem=/mnt/data io.github.afit21.rnfs
   - --filesystem=~/.rnfs:create

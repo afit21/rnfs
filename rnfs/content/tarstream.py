@@ -382,6 +382,29 @@ class Extent:
         return total
 
 
+def dag_extent(expect: walker.Expect, get: walker.Get, max_entries: int) -> Extent:
+    """The Extent of the directory expect names, as walker.write_out writes it out (its written(); it has no file
+    sizes for stored(), as a write-out stores nothing): read from its stored directory and index nodes, each decoded
+    once, a subtree repeated in it counted at every place. Raises TooLarge past max_entries entries, as write_out
+    does."""
+    memo: dict = {}
+    root: dict = {}
+    count = 0
+    stack: list[tuple[walker.Expect, dict]] = [(expect, root)]
+    while stack:
+        directory, tree = stack.pop()
+        for entry, child in walker.directory_entries(directory, get, memo):
+            count += 1
+            if count > max_entries:
+                raise TooLarge(f"output has more than max_output_entries ({max_entries}) entries")
+            if entry.kind == dag.KIND_DIRECTORY:
+                tree[entry.name] = {}
+                stack.append((child, tree[entry.name]))
+            else:
+                tree[entry.name] = entry.size
+    return Extent([], root)
+
+
 def _file_blocks(size: int, unit: int) -> int:
     """What a file of size bytes takes as blocks (Extent.stored): its chunks and the nodes above them, each rounded
     up to a unit (MAX_CHILDREN children a node, a node's listing at most ENTRY_BYTES a child)."""

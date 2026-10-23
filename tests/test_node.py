@@ -95,8 +95,8 @@ class NetClient:
                 break
         return sent
 
-    def blocks(self, node_id, cids, on_progress=None):
-        """Serve from a node's backend: blocks it serves, None for the rest."""
+    def blocks(self, node_id, cids, on_progress=None, slot_wait=None):
+        """Serve from a node's backend: blocks it serves, None for the rest (no link slots to wait for)."""
         node = self.nodes.get(node_id)
         if node is None:
             return BlocksResult("failed", unsent=list(cids))
@@ -111,7 +111,7 @@ class NetClient:
         return result
 
     def block_range(self, node_id, cid, held=b"", max_bytes=0, compress=False, block_size=None, on_progress=None,
-                    answers=None):
+                    answers=None, slot_wait=None):
         """Serve a range from a node's backend as a 0.2.0 node answers /range (uncompressed)."""
         node = self.nodes.get(node_id)
         if node is None:
@@ -1000,7 +1000,7 @@ class SecurityTest(NodeTest):
         running, most = [0], [0]
         real = self.net.blocks
 
-        def counted(node_id, cids_, on_progress=None):
+        def counted(node_id, cids_, on_progress=None, slot_wait=None):
             """Count /blocks requests in flight at once."""
             running[0] += 1
             most[0] = max(most[0], running[0])
@@ -1044,7 +1044,7 @@ class SecurityTest(NodeTest):
         asked, go = threading.Event(), threading.Event()
         real = self.net.blocks
 
-        def held(node_id, cids, on_progress=None):
+        def held(node_id, cids, on_progress=None, slot_wait=None):
             """Hold every request until the test lets it go."""
             asked.set()
             go.wait(5)
@@ -1092,6 +1092,35 @@ class SecurityTest(NodeTest):
             self.a.export(cid, out)
         with open(out, encoding="utf-8") as f:
             self.assertEqual(f.read(), "someone else's file")
+        self.assertEqual([name for name in os.listdir(self.tmp.name) if name.startswith(".rnfs-")], [])
+
+    def test_export_never_leaves_a_truncated_archive_under_its_name(self):
+        """AUD-M8: the archive is written beside the output and renamed once complete, so a crash while it is
+        written (here: the moment it is half written, seen from outside) leaves nothing under the output's name; a
+        failure removes what was written."""
+        cid = self.a.add_stream(io.BytesIO(os.urandom(3 * CHUNK_SIZE)))["cid"]
+        out = os.path.join(self.tmp.name, "out.rnfs")
+        real = node_module.archive.export_archive
+        seen = []
+
+        def watched(roots, get, out_file, *args, **kwargs):
+            """Note whether anything is at out's name while the archive is written."""
+            out_file.write(b"half an archive")
+            out_file.flush()
+            seen.append(os.path.lexists(out))
+            out_file.seek(0)
+            out_file.truncate()
+            return real(roots, get, out_file, *args, **kwargs)
+
+        with mock.patch.object(node_module.archive, "export_archive", watched):
+            self.assertEqual(self.a.export(cid, out)["roots"], [cid])
+        self.assertEqual(seen, [False])
+        self.assertEqual(self.b.import_archive(out)["roots"], [cid])
+        with mock.patch.object(node_module.archive, "export_archive", side_effect=OSError("disk full")), \
+                self.assertRaises(OSError):
+            self.a.export(cid, os.path.join(self.tmp.name, "failed.rnfs"))
+        self.assertEqual(sorted(name for name in os.listdir(self.tmp.name) if name.endswith(".rnfs")
+                                or name.startswith(".rnfs-")), ["out.rnfs"])
 
 
 
@@ -1181,14 +1210,16 @@ class RestartTest(NodeTest):
         self.assertEqual(self.b.backend.find(quiet)[1], [A_ID])
 
     def test_announce_first_seen_log_is_kept_at_a_restart(self):
-        """Server announces are logged when first heard, client announces forget, and the log is saved with the
-        batched stores."""
+        """Server announces are logged when first heard, client announces forget (one emitted after the last server
+        announce: AUD-L9), and the log is saved with the batched stores."""
         server, client = bytes([0x31] * 16), bytes([0x32] * 16)
         self.b._heard_server(server)
         heard = self.b.first_seen.first_heard(server)
         self.assertIsNotNone(heard)
-        self.b._heard_server(client)
-        self.b._heard_client(client)
+        with mock.patch.object(self.b.first_seen, "clock", lambda: time.time() - 3600):
+            self.b._heard_server(client)  # its last server announce, an hour ago
+        with mock.patch("rnfs.node.RnsNetwork.emitted_time", return_value=time.time()):
+            self.b._heard_client(client)
         self.assertIsNone(self.b.first_seen.first_heard(client))
         self.b._save_state()
         self.assertEqual(state_rows(self.b.config.state_dir, "SELECT node, first_heard FROM announce_first_seen"),
@@ -1281,7 +1312,7 @@ class StopTest(NodeTest):
         asked, go = threading.Event(), threading.Event()
         self.addCleanup(go.set)
 
-        def held(node_id, cids, on_progress=None):
+        def held(node_id, cids, on_progress=None, slot_wait=None):
             """Hold every /blocks until the test ends, then fail it."""
             asked.set()
             go.wait(30)
@@ -1298,6 +1329,72 @@ class StopTest(NodeTest):
         self.assertFalse(workers[0].is_alive(), "stop didn't wait for the remote-pin worker")
         self.assertLess(time.monotonic() - started, node_module.STOP_TIMEOUT)
         self.assertEqual(state_rows(self.b.config.state_dir, "SELECT cid FROM remote_pins"), [(cid.binary,)])
+
+    def test_a_busy_feature_leaves_the_rest_their_stop_budget(self):
+        """A follow check fetching from a provider that holds its answers: stop() asks every feature and the node's
+        threads to end before it waits for any, and the fetch watches the feature's stop, so the check ends at once
+        and the node's threads still get the budget (audit M7: one busy feature took all 5 s, the threads got 0 s,
+        and the state database closed under them)."""
+        target = Cid.parse(self.a.add_stream(io.BytesIO(os.urandom(4 * CHUNK_SIZE)))["cid"])
+        self.advertise(str(target))
+        name = bytes.fromhex(self.a.name_create("site")["name"])
+        self.b.names.offer(name, 1, target, 0.0)
+        follow = self.b.feature("follow")
+        follow.follow(name)
+        asked, go = threading.Event(), threading.Event()
+        self.addCleanup(go.set)
+
+        def held(node_id, cids, on_progress=None, slot_wait=None):
+            """Hold every /blocks until the test ends, then fail it."""
+            asked.set()
+            go.wait(30)
+            return BlocksResult("failed", unsent=list(cids))
+
+        self.net.blocks = held
+        thread = follow._spawn(follow.check, "rnfs-follow", name, False)  # as its loop would, on its own thread
+        self.assertTrue(asked.wait(10))
+        budgets = []
+        join_threads = self.b._join_threads
+
+        def timed(deadline):
+            """_join_threads, recording the budget it is left."""
+            budgets.append(deadline - time.monotonic())
+            return join_threads(deadline)
+
+        started = time.monotonic()
+        with mock.patch.object(self.b, "_join_threads", timed):
+            self.b.stop()
+        self.assertFalse(thread.is_alive(), "stop didn't wait for the follow check")
+        self.assertLess(time.monotonic() - started, node_module.STOP_TIMEOUT)
+        self.assertGreater(budgets[0], node_module.STOP_TIMEOUT / 2, "the node's threads were left no budget")
+
+    def test_a_name_resolve_waiting_on_the_network_is_freed_by_the_stop(self):
+        """A follow check resolving a name nobody answers for, inside its path request's wait (path_timeout, 30 s):
+        stop() wakes the resolves, and asks every feature to end, before it waits for any (audit M7)."""
+        self.b.config.path_timeout = 30
+        name = bytes([0x5E] * 16)
+        follow = self.b.feature("follow")
+        follow.follow(name)
+        requested = threading.Event()
+        network = self.b.names._network
+        request_path = network.request_path
+        network.request_path = lambda name: requested.set() or request_path(name)
+        thread = follow._spawn(follow.check, "rnfs-follow", name, True)
+        self.assertTrue(requested.wait(10))
+        budgets = []
+        join_threads = self.b._join_threads
+
+        def timed(deadline):
+            """_join_threads, recording the budget it is left."""
+            budgets.append(deadline - time.monotonic())
+            return join_threads(deadline)
+
+        started = time.monotonic()
+        with mock.patch.object(self.b, "_join_threads", timed):
+            self.b.stop()
+        self.assertFalse(thread.is_alive(), "stop didn't wait for the follow check")
+        self.assertLess(time.monotonic() - started, node_module.STOP_TIMEOUT)
+        self.assertGreater(budgets[0], node_module.STOP_TIMEOUT / 2, "the node's threads were left no budget")
 
 
 class _CancelAfter(fetcher.Observer):
@@ -1331,7 +1428,7 @@ class PartialBlockTest(NodeTest):
         ranges = []
 
         def one_range_of_the_chunk(node_id, asked, held=b"", max_bytes=0, compress=False, block_size=None,
-                                   on_progress=None, answers=None):
+                                   on_progress=None, answers=None, slot_wait=None):
             """A's first range of the chunk, then a lost link."""
             ranges.append((asked, len(held)))
             if asked == chunk and held:
@@ -1365,7 +1462,7 @@ class FailedPinnedFetchTest(NodeTest):
         self.downloaded = 0
         real = self.net.blocks
 
-        def counting(node_id, cids, on_progress=None):
+        def counting(node_id, cids, on_progress=None, slot_wait=None):
             """NetClient.blocks, counting the blocks returned."""
             result = real(node_id, cids, on_progress)
             self.downloaded += len(result.blocks)
@@ -1460,7 +1557,7 @@ class FailedPinnedFetchTest(NodeTest):
         root = Cid.for_block(DAG, node)
         served = {root: node, child: garbage}
 
-        def serving(node_id, cids, on_progress=None):
+        def serving(node_id, cids, on_progress=None, slot_wait=None):
             """The broken file's blocks."""
             result = BlocksResult(OK)
             result.blocks = {cid: served[cid] for cid in cids if cid in served}

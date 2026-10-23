@@ -21,7 +21,8 @@ delays every other callback of the instance; close() from one doesn't wait for t
 callback is logged and dropped. Watched jobs are polled by a thread of their own, which queues a call when a
 job changes (at most every job_poll seconds) and once more when it finishes. Both threads start on first use.
 events.watch's callbacks are the exception to coalescing: each event is one call, in order (an event says what
-changed, not a state), so a callback slower than the events lets them queue up.
+changed, not a state), so a callback slower than the events lets them queue up, MAX_WATCH_QUEUE per watch at most:
+past that the oldest give way to a "lost" Event, as a Client's watch gets when it falls behind the daemon's log.
 """
 import io
 import itertools
@@ -29,14 +30,14 @@ import os
 import threading
 import time
 import warnings
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 from rnfs import ids
 from rnfs.content.cid import Cid
 from rnfs.errors import Closed, NotFound, RnfsError
-from rnfs.events import EVENT_KINDS
+from rnfs.events import EVENT_KINDS, MAX_EVENTS
 # A job's final states, and the longest wait one request for a job asks for (the API's cap)
 from rnfs.objects import (FINISHED, MAX_JOB_WAIT, Added, Cached, Capabilities, Collected, Contact, DenyState, Entry,
                           Event, EventBatch, Exported, Followed, FolderSync, Imported, Info, Kept, Peer, Pin, Ping,
@@ -48,6 +49,9 @@ FILE_BUFFER = 64 * 1024  # what a File reads at least per refill: one read() of 
 # to it, so the per-request cost is spread over more bytes; a seek starts again at FILE_BUFFER
 READ_AHEAD = 4 * 1024 * 1024
 STOP_WAIT = 5.0  # seconds close() waits for the event and job threads to end
+# Deliveries one event watch may have waiting for its callback, as many as a daemon's log keeps for a Client's: past
+# that the oldest give way to a "lost" marker (_Events.post)
+MAX_WATCH_QUEUE = MAX_EVENTS
 
 
 def node_hex(node_id) -> str | None:
@@ -140,6 +144,18 @@ class Watch:
         self.cancel()
 
 
+class _Backlog:
+    """An event watch's deliveries waiting on the event thread, guarded by _Events' condition: their keys, oldest
+    first, and the "lost" marker waiting first among them in place of those dropped, if any (an event dict whose seq
+    moves on as more are dropped)."""
+
+    def __init__(self, lost_call: Callable[[dict], Callable[[], None]]):
+        """None waiting; lost_call(marker) is the call delivering a marker to the watch."""
+        self.lost_call = lost_call
+        self.keys: deque = deque()
+        self.marker: dict | None = None
+
+
 class _Events:
     """The event thread: calls queued callbacks one at a time, in the order queued, the latest per key."""
 
@@ -148,6 +164,7 @@ class _Events:
         self._thread_name = thread_name
         self._report = report
         self._cond = threading.Condition()  # innermost: never held while calling out
+        # key -> (call, the event watch's _Backlog it counts in or None, (seq, epoch) of the event it delivers)
         self._pending: OrderedDict = OrderedDict()
         self._thread: threading.Thread | None = None
         self._stopped = False
@@ -160,14 +177,38 @@ class _Events:
             self._thread = threading.Thread(target=self._run, name=self._thread_name, daemon=True)
             self._thread.start()
 
-    def post(self, key, call):
+    def post(self, key, call, backlog: _Backlog | None = None, position: tuple[int, str] | None = None):
         """Queue call() under key, replacing one queued under key that hasn't run yet. Never blocks: safe to call
-        holding any lock."""
+        holding any lock.
+
+        backlog: an event watch's, for a call delivering the event at position (its seq, and the epoch of its run)
+        under a key never used before. Once more than MAX_WATCH_QUEUE of the watch's deliveries wait (its callback
+        is slower than the events), the oldest is dropped, and a "lost" marker waits in its place: its seq the last
+        dropped (the watch goes on after it), its fields the run's epoch, as a Client's watch gets on "lost"."""
         with self._cond:
             if self._stopped:
                 return
-            self._pending[key] = call
+            self._pending[key] = (call, backlog, position)
+            if backlog is not None:
+                backlog.keys.append(key)
+                if len(backlog.keys) > MAX_WATCH_QUEUE:
+                    self._drop_oldest(backlog)
             self._cond.notify()
+
+    def _drop_oldest(self, backlog: _Backlog):
+        """Drop backlog's oldest delivery, for the "lost" marker to stand for it (condition held). The marker is
+        always the watch's oldest, so it is delivered first."""
+        if backlog.marker is None:
+            # The oldest becomes the marker, in its place
+            first = backlog.keys[0]
+            _, _, (seq, epoch) = self._pending[first]
+            backlog.marker = {"seq": seq, "kind": "lost", "time": None, "epoch": epoch}
+            self._pending[first] = (backlog.lost_call(backlog.marker), backlog, None)
+        # The marker is the oldest: the next goes too, and the marker moves on past it
+        dropped = backlog.keys[1]
+        del backlog.keys[1]
+        _, _, (seq, epoch) = self._pending.pop(dropped)
+        backlog.marker.update(seq=seq, epoch=epoch)
 
     def _run(self):
         """Call what is queued until stopped."""
@@ -177,7 +218,10 @@ class _Events:
                     self._cond.wait()
                 if self._stopped:
                     return
-                _, call = self._pending.popitem(last=False)
+                _, (call, backlog, _) = self._pending.popitem(last=False)
+                if backlog is not None:
+                    backlog.keys.popleft()  # the watch's oldest: the marker, if one waits
+                    backlog.marker = None
             try:
                 call()
             except Exception as e:  # noqa: BLE001 - an app's callback mustn't end the thread
@@ -246,6 +290,7 @@ class _EventWatch:
         self.after = 0
         self.pending: list[tuple[str, dict]] = []
         self.handle: Watch | None = None
+        self.backlog: _Backlog | None = None  # its deliveries waiting on the event thread (Rnfs._watch_events)
 
     def begin(self, after: int, epoch: str, deliver) -> list[dict]:
         """Set the position the watch begins at and deliver(event) the events heard meanwhile that are after it,
@@ -955,6 +1000,7 @@ class Rnfs:
         key = next(self._event_keys)
         watch = _EventWatch(kinds, callback)
         watch.handle = Watch(lambda: self._end_event_watch(key))
+        watch.backlog = _Backlog(lambda marker: self._event_call(watch, marker))
         self._events.start()
         with self._watch_lock:
             self._event_watches[key] = watch
@@ -991,14 +1037,21 @@ class Rnfs:
         self._events_heard(epoch, [{"seq": next_seq, "kind": "lost", "time": None, "epoch": epoch}])
 
     def _deliver_event(self, watch: "_EventWatch", event: dict):
-        """Queue watch's callback with event, under a key of its own: events are never coalesced."""
-        value = Event.from_dict(event)
+        """Queue watch's callback with event, under a key of its own: events are never coalesced, but a watch has at
+        most MAX_WATCH_QUEUE waiting (_Events.post). Called with watch's lock held, its position now event's."""
+        self._events.post(("event", next(self._event_keys)), self._event_call(watch, event), watch.backlog,
+                          (event["seq"], watch.epoch))
+
+    @staticmethod
+    def _event_call(watch: "_EventWatch", event: dict) -> Callable[[], None]:
+        """The call delivering event to watch's callback, unless cancelled since: the Event is made when it runs, as
+        a "lost" marker's seq moves on until then."""
 
         def call():
             """The app's callback, unless cancelled since."""
             if watch.handle.active:
-                watch.callback(value)
-        self._events.post(("event", next(self._event_keys)), call)
+                watch.callback(Event.from_dict(event))
+        return call
 
     def _event_baseline(self) -> tuple[int, str]:
         """(the sequence of the last event published, the run's epoch) now, the event source started if needed
@@ -1595,8 +1648,9 @@ class Events:
     def watch(self, callback, kinds=None) -> Watch:
         """Call callback(event) on the event thread for each event of kinds (a kind or several; None: all)
         published from now on, in order, one call each. If events were missed (a Client fell more than the node's
-        1024 kept events behind, or the daemon restarted), callback gets an Event of kind "lost" (event.lost) in
-        their place: read again what the app shows. A Client polls on a thread of its own
+        1024 kept events behind, or the daemon restarted; or the callback is so slow that 1024 of its calls wait,
+        when the oldest are dropped), callback gets an Event of kind "lost" (event.lost) in their place: read again
+        what the app shows. A Client polls on a thread of its own
         (rnfs-client-event-watch), within its timeout as the name poller does. Raises ValueError (an unknown
         kind); a Client NoSuchEndpoint from a daemon without events."""
         return self._owner._watch_events(frozenset(kinds) if (kinds := event_kinds(kinds)) else None, callback)

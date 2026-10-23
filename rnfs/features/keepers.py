@@ -67,6 +67,7 @@ REASONS = (USER, FOLLOW, OWN)
 MAX_PENDING = 64  # kept names waiting for a background refresh; more wait for the next round robin retry
 RNS_CACHE_TRIES = 4  # a shared instance forwards an announce to its clients before caching it
 RNS_CACHE_WAIT = 0.5
+STOP_POLL = 0.5  # seconds between checks of the feature's stop while a batch of /name is waited for
 LOOP_INTERVAL = 60.0  # the background thread syncs own names and saves at least this often
 KEEPER_CANDIDATES = 3  # the search for a name's keepers runs until 3 × alpha are known (from 2+ sources)
 KEEPER_ROUNDS = 3  # batches of alpha keepers one query asks at most (2 on slow nodes)
@@ -496,7 +497,10 @@ class _KeeperQuery:
 
     def should_stop(self) -> bool:
         """True if the search should stop: enough new candidates, or some once lookup_timeout / SEARCH_SHARE has
-        passed since it started. Candidates are asked only once it stops, so reply order doesn't choose them."""
+        passed since it started, or the feature is stopping. Candidates are asked only once it stops, so reply order
+        doesn't choose them."""
+        if self.feature._stop.is_set():
+            return True  # not cut_short: a stopping feature asks no keeper, and resumes no search
         if not self._fresh():
             return False
         budget = self.node.config.lookup_timeout / SEARCH_SHARE
@@ -648,11 +652,16 @@ class KeepersFeature(Feature):
         """Start the background refresher."""
         self._spawn(self._loop, "rnfs-keepers")
 
+    def stopping(self):
+        """Ask the refresher to end: a keeper query in progress ends its search and stops waiting for answers (as
+        Feature.stopping), and none starts from now on."""
+        self._stop.set()
+        self._wake.set()
+
     def stop(self, deadline: float | None = None):
         """Stop the refresher, wait for it until deadline, then save: so the last save comes after its last
         change, and the node doesn't close the state database under it."""
-        self._stop.set()
-        self._wake.set()
+        self.stopping()
         self._join(deadline)
         self.save()
 
@@ -910,13 +919,15 @@ class KeepersFeature(Feature):
         keepers time to answer. If the candidates run out first, a search stopped early is resumed for more
         (_KeeperQuery.resume). Each verifying record is returned; the caller keeps the highest sequence.
         """
+        if self._stop.is_set():
+            return []  # the node is stopping: what is held will do
         query = _KeeperQuery(self, name)
         if not query.search():
             _log(f"no keepers found for name {name.hex()}")
             return []
         wait = name_wait(self.node.config)
         batches = 0
-        while batches < self.keeper_rounds():
+        while batches < self.keeper_rounds() and not self._stop.is_set():
             batch = query.next_batch()
             if not batch:
                 if query.resume():
@@ -930,8 +941,14 @@ class KeepersFeature(Feature):
                        for provider in batch]
             for thread in threads:
                 thread.start()
-            for thread in threads:
-                thread.join(max(0.0, deadline - time.monotonic()))
+            # In steps, so the node's stop needn't wait out a batch (name_wait is 87.5 s at the defaults): the
+            # answers still out are then dropped, as at the deadline
+            while not self._stop.is_set():
+                alive = [thread for thread in threads if thread.is_alive()]
+                left = deadline - time.monotonic()
+                if not alive or left <= 0:
+                    break
+                alive[0].join(min(left, STOP_POLL))
             if query.settled():
                 break
         records = query.records()

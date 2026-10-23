@@ -83,7 +83,9 @@ class NodePins:
         root, names = self._parse_target(target)
         with self.pinned_fetch(root, names) as fetch:
             expect = fetch.resolve()
-            fetch.fetch_dag(expect)
+            # At most max_output_entries entries, as get takes: a tree of empty files declares 0 bytes, and its
+            # directory nodes pay for themselves under the DAG byte bound (AUD-M6)
+            fetch.fetch_dag(expect, self.config.max_output_entries)
             self.storage.pin(expect.cid, source)
         self._app_still_there(source, [expect.cid])
         if target != str(expect.cid):  # a path or a contact nick says more than the CID does
@@ -630,8 +632,10 @@ class NodePins:
                 # (fetch_dag also bounds them by what the size can hold, whichever is lower)
                 fetch.max_dag_bytes = quota - used
                 try:
-                    fetch.fetch_dag(expect)
+                    fetch.fetch_dag(expect, self.config.max_output_entries)  # as pin_add (AUD-M6)
                 except TooLarge as e:
+                    if getattr(e, "entries", False):
+                        raise  # too many entries, not its quota: dropped as too_large (below)
                     why = (f"its blocks would exceed its quota ({size(used)} of {size(quota)} used) or what its size "
                            f"can hold: {e}")
                     log(f"dropping remote pin of {cid} for {source}: {why}", LOG_WARNING)

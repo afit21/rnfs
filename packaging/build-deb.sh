@@ -18,6 +18,11 @@
 # (pip --require-hashes), and the rnfs wheel is built with the setuptools pinned in
 # packaging/build-backend.lock, in a build venv without pip's build isolation (which would fetch the newest).
 #
+# The build is reproducible: built twice from the same commit (and --wheel, if given), the .deb is the same file.
+# Every file's mtime is SOURCE_DATE_EPOCH (https://reproducible-builds.org/specs/source-date-epoch/; if it isn't
+# set, the time of the checkout's last commit), which the rnfs wheel built here takes its timestamps from too,
+# and pip's record of the path it installed rnfs from (direct_url.json) is left out.
+#
 # Needs: python3 with venv and pip (or another Python, via $PYTHON), dpkg-deb, network access to PyPI.
 set -eu
 umask 022
@@ -40,7 +45,7 @@ while [ $# -gt 0 ]; do
         --arch) ARCH=$2; shift 2 ;;
         --wheel) WHEEL=$2; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
         *) echo "build-deb.sh: unknown option $1" >&2; exit 2 ;;
     esac
 done
@@ -50,6 +55,18 @@ case "$ARCH" in
     arm64) MACHINE=aarch64 ;;
     *) echo "build-deb.sh: unsupported architecture $ARCH (amd64 or arm64)" >&2; exit 2 ;;
 esac
+
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+    SOURCE_DATE_EPOCH=$(git -C "$REPO" log -1 --format=%ct 2>/dev/null || true)
+    if [ -z "$SOURCE_DATE_EPOCH" ]; then
+        SOURCE_DATE_EPOCH=$(date +%s)
+        echo "build-deb.sh: warning: not a git checkout and SOURCE_DATE_EPOCH isn't set, so the build isn't reproducible" >&2
+    fi
+fi
+case "$SOURCE_DATE_EPOCH" in
+    ""|*[!0-9]*) echo "build-deb.sh: SOURCE_DATE_EPOCH must be a number of seconds: $SOURCE_DATE_EPOCH" >&2; exit 2 ;;
+esac
+export SOURCE_DATE_EPOCH
 
 VERSION=$(sed -n 's/^__version__ = ["'\'']\([^"'\'']*\)["'\''].*/\1/p' "$REPO/rnfs/__init__.py")
 [ -n "$VERSION" ] || { echo "build-deb.sh: can't read __version__ from rnfs/__init__.py" >&2; exit 1; }
@@ -141,6 +158,17 @@ fi
 
 # Console scripts pip made for the build machine's Python (rnsd, lxmd, ...): not part of this package
 rm -rf "${LIB:?}/bin"
+# pip's record of where it installed each package from: for rnfs, the wheel's path in this build's temporary
+# directory, which differs in every build and means nothing on the machine the package is installed on. It goes,
+# with its line in the package's RECORD
+for direct_url in "$LIB"/*.dist-info/direct_url.json; do
+    if [ -f "$direct_url" ]; then
+        info=$(dirname -- "$direct_url")
+        grep -v -F "$(basename -- "$info")/direct_url.json," "$info/RECORD" > "$WORK/RECORD" || true
+        cat "$WORK/RECORD" > "$info/RECORD"
+        rm -f "$direct_url"
+    fi
+done
 find "$LIB" -name __pycache__ -type d -prune -exec rm -rf {} +
 
 mkdir -p "$ROOT/opt/rnfs/bin" "$ROOT/usr/bin" "$ROOT/usr/lib/systemd/user" "$ROOT/usr/share/doc/rnfs" "$ROOT/DEBIAN"
@@ -236,6 +264,9 @@ EOF
 (cd "$ROOT" && find . -path ./DEBIAN -prune -o -type f -print | sed 's|^\./||' | LC_ALL=C sort |
     while IFS= read -r file; do md5sum -- "$file"; done) > "$ROOT/DEBIAN/md5sums"
 chmod 0644 "$ROOT/DEBIAN/md5sums"
+
+# Every file and directory dated SOURCE_DATE_EPOCH (dpkg-deb dates the archive's own members from it)
+find "$ROOT" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
 mkdir -p "$OUT"
 DEB="$OUT/rnfs_${VERSION}_${ARCH}.deb"

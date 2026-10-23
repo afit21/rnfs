@@ -50,7 +50,7 @@ class FollowQuotaTest(unittest.TestCase):
         self.downloaded = 0
         real = self.net.blocks
 
-        def counting(node_id, cids, on_progress=None):
+        def counting(node_id, cids, on_progress=None, slot_wait=None):
             """KeeperNet.blocks, adding up the bytes returned."""
             result = real(node_id, cids, on_progress)
             self.downloaded += sum(len(block) for block in result.blocks.values())

@@ -302,7 +302,8 @@ class Ranges:
         return self.support.answers(node_id) is not False
 
     def fetch(self, client, node_id: bytes, cid: Cid, target: int, ratio: float, compress: bool,
-              block_size: int | None, on_progress=None) -> peer_client.BlocksResult | None:
+              block_size: int | None, on_progress=None,
+              slot_wait: float | None = None) -> peer_client.BlocksResult | None:
         """Ask node_id for the next range of cid's block after what is held from it (a request thread's work), and
         return what came of it as a /blocks request's result: the block (verified whole), progress (.partial), a
         status, or UNSUPPORTED if node_id left the request unanswered and isn't known to answer /range (a silence,
@@ -311,18 +312,20 @@ class Ranges:
 
         target is the range's size on the wire; with compress, the bytes asked for are target times ratio (the
         compression node_id's last range achieved, MAX_RATIO at most), unless a range of this block came back
-        uncompressed. block_size is the block's length if its parent declares it.
+        uncompressed. block_size is the block's length if its parent declares it. slot_wait bounds the wait for the
+        link's /blocks slot (PeerClient.block_range: a probe's).
         """
         partial = self.partials.acquire(cid, node_id)
         if partial is None:
             return None
         try:
-            return self._fetch(client, node_id, cid, partial, target, ratio, compress, block_size, on_progress)
+            return self._fetch(client, node_id, cid, partial, target, ratio, compress, block_size, on_progress,
+                               slot_wait)
         finally:
             self.partials.release(partial)
 
     def _fetch(self, client, node_id: bytes, cid: Cid, partial: Partial, target: int, ratio: float, compress: bool,
-               block_size: int | None, on_progress) -> peer_client.BlocksResult:
+               block_size: int | None, on_progress, slot_wait: float | None = None) -> peer_client.BlocksResult:
         """fetch(), with partial held."""
         if block_size is not None and partial.size is not None and partial.size != block_size:
             self.partials.reset(partial)  # not the block its parent declares: start again (the answer is checked)
@@ -343,7 +346,8 @@ class Ranges:
         if known is not None:
             max_bytes = max(1, min(max_bytes, known - len(held)))
         answers = self.support.answers(node_id)
-        result = client.block_range(node_id, cid, held, max_bytes, compress, known, on_progress, answers=answers)
+        result = client.block_range(node_id, cid, held, max_bytes, compress, known, on_progress, answers=answers,
+                                    slot_wait=slot_wait)
         if result.silent and answers is not True:
             # As an older node leaves it (no handler for /range, section 3), or a lost packet on a lossy path: asked
             # with /blocks for the rest of this fetch; twice in a row and it is taken for an older node
@@ -359,9 +363,12 @@ class Ranges:
         if result.status == peer_client.OK or result.reason in ("busy", "cancelled", "malformed response"):
             self.support.answered(node_id)
         if result.status != peer_client.OK:
+            reneged = False
             if result.reason == "malformed response":
                 self.partials.forget(partial)
-            return peer_client.BlocksResult(result.status, unsent=[cid], reason=result.reason)
+                # After ranges of the block, it wasted their airtime as much as an answer of [] does (AUD-L10)
+                reneged = bool(held)
+            return peer_client.BlocksResult(result.status, unsent=[cid], reason=result.reason, reneged=reneged)
         if result.missing:
             self.partials.forget(partial)
             return peer_client.BlocksResult(peer_client.OK, missing=[cid], elapsed=result.elapsed, reneged=bool(held))

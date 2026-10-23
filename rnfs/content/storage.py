@@ -70,6 +70,9 @@ APP_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 PIN_KEY = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 MAX_CACHE_RECORDS = 10_000  # cached fetches remembered; past this the least recently used record is dropped
 MISSING_MEMO = 10_000  # incomplete DAGs whose missing block dag_blocks remembers; past this the oldest is forgotten
+# Blocks get(remember=True) checked against their CIDs, kept in memory (at most 1 MiB of them): the node serves one
+# again, a /range answer of a few bytes at a time, without reading and hashing the whole block each time (AUD-L8)
+VERIFIED_MEMORY = 8
 EVICT_MARGIN = 32  # eviction frees max_storage / EVICT_MARGIN more than it must, so it runs rarely
 DISK_RESERVE_MIN = 256 * MIB  # free disk space fetches always leave on the blocks' filesystem...
 DISK_RESERVE_FRACTION = 0.02  # ...or this fraction of the filesystem, if larger
@@ -397,6 +400,9 @@ class Storage:
         # so eviction over max_storage with nothing to evict needn't walk everything again
         self._maybe_garbage = True
         self._reported_damaged: set[Cid] = set()  # damaged DAG nodes already logged as stopping collection
+        # The last VERIFIED_MEMORY blocks get(remember=True) verified, with their files' signatures, least recently used
+        # first; forgotten as each is deleted (_delete), under the lock get checks a block is stored with
+        self._verified: OrderedDict[Cid, tuple[bytes, tuple[int, int, int]]] = OrderedDict()
         self.deny = denylist.NONE  # what put() refuses; the node sets its DenyList
         try:
             self._load()
@@ -614,11 +620,34 @@ class Storage:
         with self._lock:
             return cid in self._sizes
 
-    def get(self, cid: Cid, verify: bool = False) -> bytes | None:
-        """The stored block, or None. With verify, a block that no longer matches its CID is deleted, giving None."""
+    def get(self, cid: Cid, verify: bool = False, remember: bool = False) -> bytes | None:
+        """The stored block, or None. With verify, a block that no longer matches its CID is deleted, giving None.
+
+        With remember too, the block is kept in memory once verified, among the last VERIFIED_MEMORY, with its file's
+        signature (BlockStore.signature), and given from there, unread and unhashed, while it stays stored and its
+        file keeps that signature: a file rewritten or replaced since is read and checked again.
+        """
+        signature = None
         with self._lock:
             if cid not in self._sizes:
                 return None
+            remembered = self._verified.get(cid) if verify and remember else None
+        if remembered is not None:
+            block, kept = remembered
+            try:
+                signature = self.blocks.signature(cid)
+            except OSError:
+                signature = None
+            if signature is not None and signature == kept:
+                with self._lock:
+                    if cid in self._verified:
+                        self._verified.move_to_end(cid)
+                return block
+        if verify and remember and signature is None:
+            try:
+                signature = self.blocks.signature(cid)  # before the read: a change after it is seen at the next one
+            except OSError:
+                signature = None
         try:
             block = self.blocks.get(cid)
         except OSError as e:
@@ -633,6 +662,13 @@ class Storage:
                     log(f"storage: block {cid} {problem}; removing it", LOG_ERROR)
                     self._delete({cid})  # if Windows defers it, verify() or the next read tries again
             return None
+        if verify and remember and signature is not None:
+            with self._lock:
+                if cid in self._sizes:  # not deleted while it was read: _delete forgets it under this lock
+                    self._verified[cid] = (block, signature)
+                    self._verified.move_to_end(cid)
+                    while len(self._verified) > VERIFIED_MEMORY:
+                        self._verified.popitem(last=False)
         return block
 
     def _block_problem(self, cid: Cid) -> str | None:
@@ -1164,6 +1200,7 @@ class Storage:
                     deferred = True
                     continue
                 deleted.add(cid)
+                self._verified.pop(cid, None)
                 length = self._sizes.pop(cid)
                 freed += length
                 released += self._allocation(length)

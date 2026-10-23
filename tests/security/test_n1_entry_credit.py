@@ -5,9 +5,13 @@ directory of more than about 331,000 long-named entries could no longer be pinne
 
 B pins a 0-byte directory of 2,600 entries pointing at the empty file plus 20 distinct 118 KB file nodes of empty
 chunks: it must be refused with TooLarge after downloading at most the directory, 16 bytes per entry, dag_bound(0)
-and about one block. B, with max_output_entries 1,000, pins an honest directory of 4,000 entries with the longest
-names (1.2 MB of directory nodes, more than 1,000 credits of 1 KiB): every entry now brings its own bytes, so it is
-pinned (get and export of it are still refused by max_output_entries).
+and about one block. B, with max_output_entries 1,000, pinned an honest directory of 4,000 entries with the longest
+names (1.2 MB of directory nodes, more than 1,000 credits of 1 KiB): every entry now brings its own bytes, so it was
+pinned (get and export of it still refused by max_output_entries).
+
+Since AUD-M6 (0.2.1), pin add stops at max_output_entries entries as get and export do (a tree of empty files
+declares 0 bytes and its directory nodes pay for themselves, so nothing else bounded it): that directory is now
+refused at 1,000, and pinned at 4,000, where its 1.2 MB of directory nodes must still pass the DAG byte bound.
 """
 import os
 import unittest
@@ -44,27 +48,50 @@ class DuplicateEntriesTest(TwoNodeTest):
         self.assertNotIn(directory, self.b.storage.pins())
 
 
-class LargeHonestDirectoryTest(TwoNodeTest):
-    """A directory with more entries than max_output_entries, each with the longest name."""
+class _HonestDirectory(TwoNodeTest):
+    """A directory of ENTRIES entries, each with the longest name, that A serves (no tests of its own)."""
+
+    ENTRIES = 4000
+
+    def setUp(self):
+        """A serves the directory."""
+        super().setUp()
+        with self.a.storage.protect() as session:
+            empty = builder.build_bytes(b"", session.put).cid
+            self.built = builder.build_directory([dag.Entry(f"{i:05d}".ljust(255, "n"), empty, 0, dag.KIND_FILE)
+                                                  for i in range(self.ENTRIES)], session.put)
+            self.a.storage.pin(self.built.cid, USER)
+        self.a.publisher.refresh()
+        self.a.records.store(self.built.cid.key, A_ID)
+
+
+class LargeHonestDirectoryTest(_HonestDirectory):
+    """B's max_output_entries is the directory's entry count."""
+
+    b_settings = {"max_output_entries": _HonestDirectory.ENTRIES}
+
+    def test_pin_goes_ahead(self):
+        try:
+            self.b.pin_add(str(self.built.cid))
+        except TooLarge as e:
+            self.fail(f"an honest directory of max_output_entries entries wasn't pinned: {e}")
+        self.assertIn(USER, self.b.storage.pins()[self.built.cid])
+        self.assertTrue(self.b.storage.is_complete(self.built.cid))
+        self.b.get(str(self.built.cid), os.path.join(self.tmp.name, "out"))  # as many entries as a write-out may have
+
+
+class TooManyEntriesTest(_HonestDirectory):
+    """B's max_output_entries is 1,000."""
 
     b_settings = {"max_output_entries": 1000}
 
-    def test_pin_goes_ahead(self):
-        with self.a.storage.protect() as session:
-            empty = builder.build_bytes(b"", session.put).cid
-            built = builder.build_directory([dag.Entry(f"{i:05d}".ljust(255, "n"), empty, 0, dag.KIND_FILE)
-                                             for i in range(4000)], session.put)
-            self.a.storage.pin(built.cid, USER)
-        self.a.publisher.refresh()
-        self.a.records.store(built.cid.key, A_ID)
-        try:
-            self.b.pin_add(str(built.cid))
-        except TooLarge as e:
-            self.fail(f"an honest directory larger than max_output_entries wasn't pinned: {e}")
-        self.assertIn(USER, self.b.storage.pins()[built.cid])
-        self.assertTrue(self.b.storage.is_complete(built.cid))
+    def test_pin_is_refused_as_get_is(self):
+        with self.assertRaises(TooLarge) as caught:
+            self.b.pin_add(str(self.built.cid))
+        self.assertIn("max_output_entries", str(caught.exception))
+        self.assertNotIn(self.built.cid, self.b.storage.pins())
         with self.assertRaises(TooLarge):  # more entries than a write-out may have
-            self.b.get(str(built.cid), os.path.join(self.tmp.name, "out"))
+            self.b.get(str(self.built.cid), os.path.join(self.tmp.name, "out"))
 
 
 if __name__ == "__main__":

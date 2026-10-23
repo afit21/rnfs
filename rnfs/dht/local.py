@@ -25,7 +25,11 @@ records and the local-first search. No RNS dependency: the node judges each serv
   table or first-seen log, or with an identity or path RNS knows): an off-island server's /find reply can name made-up
   IDs, which fail, and 3 of them used to enter partition mode at once. Known servers' failures too only ask for a
   probe, as a server can name 3 identities it announced and lets fail: the probe goes to an off-island server that
-  answered or announced itself recently, never to an ID that only ever failed. With none to probe (nothing beyond the
+  answered or announced itself recently, never to an ID that only ever failed. Nor, while there is another, to a server
+  whose answer named a failing ID (the failures' `named_by`): it was the most recent to answer, so it was probed first,
+  and dropped the probe (AUD-M3); a senior one (`senior`: heard for provider_seniority, so not an identity made for the
+  attack) that hasn't failed since is preferred. A probe unanswered after an off-island server answered or announced
+  itself while it was out doesn't enter partition mode either. With none to probe (nothing beyond the
   island answered or announced this run) the failures enter partition mode. A failure for want of a path doesn't count
   either (`no_path`: the node's path request went unanswered, rnfs.network.paths.PathRequests.lacked): an island relay
   in RNS's default `full` mode never forwards a request for a path it lacks, and a hub drops requests over its limit,
@@ -43,7 +47,7 @@ forgotten first): an island has tens of servers, but local_interfaces may name a
 import threading
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 
 from rnfs.dht.routing import distance
 
@@ -177,20 +181,23 @@ class PartitionMode:
     """Whether this node is cut off from the servers beyond its island (see the module docstring). Thread-safe.
 
     is_local(id) says which servers are local; the rest are off-island. known(id) says which servers the node knows:
-    only their failures count; no_path(id) says a failure was for want of a path, which doesn't count. The node reports off-island answers (answered), failures (failed) and fresh announces
-    (announced), asks probe_due() and probe_target() and reports the probe's outcome (probed); on_change(active) is
-    called, without the lock, on entering and leaving, and on_probe() when failures make a probe due (so the node can
-    send it at once). clock is monotonic, wall_clock gives since's wall time."""
+    only their failures count; no_path(id) says a failure was for want of a path, which doesn't count; senior(id) says
+    which servers a probe outside partition mode prefers. The node reports off-island answers (answered), failures
+    (failed, with the servers whose answers named the ID) and fresh announces (announced), asks probe_due() and
+    probe_target() and reports the probe's outcome (probed); on_change(active) is called, without the lock, on entering
+    and leaving, and on_probe() when failures make a probe due (so the node can send it at once). clock is monotonic,
+    wall_clock gives since's wall time."""
 
     def __init__(self, is_local: Callable[[bytes], bool], slow: bool = False,
                  on_change: Callable[[bool], object] = lambda active: None,
                  clock: Callable[[], float] = time.monotonic, wall_clock: Callable[[], float] = time.time,
                  known: Callable[[bytes], bool] = _always, on_probe: Callable[[], object] = lambda: None,
-                 no_path: Callable[[bytes], bool] = _never):
+                 no_path: Callable[[bytes], bool] = _never, senior: Callable[[bytes], bool] = _never):
         """Not in partition mode, nothing heard yet."""
         self.is_local = is_local
         self.known = known
         self.no_path = no_path
+        self.senior = senior
         self.slow = slow
         self.on_change = on_change
         self.on_probe = on_probe
@@ -208,6 +215,9 @@ class PartitionMode:
         self._gaps: deque[float] = deque(maxlen=GAP_SAMPLES)
         self._recent: OrderedDict[bytes, None] = OrderedDict()  # off-island servers heard or answered, oldest first
         self._unreached: OrderedDict[bytes, None] = OrderedDict()  # off-island servers that failed, oldest first
+        self._suspects: OrderedDict[bytes, None] = OrderedDict()  # servers that named the failures in a row's IDs
+        self._contacts = 0  # off-island answers and fresh announces so far
+        self._probe_contacts: int | None = None  # _contacts when the last probe target was taken
         self._probe_interval = SLOW_PROBE_INTERVAL if slow else PROBE_INTERVAL
         self._next_probe: float | None = None  # in partition mode: when the next probe is due
         self._turn = 0  # probe targets taken in turn
@@ -224,21 +234,26 @@ class PartitionMode:
             self._failures = 0
             self._wanted = False
             self._last_contact = self.clock()
+            self._contacts += 1
+            self._suspects.clear()
             self._unreached.pop(node_id, None)
             _remember(self._recent, node_id)
             left = self._leave()
         if left:
             self.on_change(False)
 
-    def failed(self, node_id: bytes):
+    def failed(self, node_id: bytes, named_by: Iterable[bytes] = ()):
         """A /find or /provide to node_id failed. Only an off-island server the node knows counts (a reply can name
         made-up IDs), and only if the failure wasn't for want of a path (no_path): the FAILURES_TO_ENTER-th such failure
-        in a row asks for a probe (on_probe), or with no server to probe enters partition mode."""
+        in a row asks for a probe (on_probe), or with no server to probe enters partition mode. named_by: the servers
+        whose answers named node_id (a lookup's), which that probe avoids."""
         if self.is_local(node_id) or not self.known(node_id) or self.no_path(node_id):
             return
         with self._lock:
             self._failures += 1
             _remember(self._unreached, node_id)
+            for introducer in named_by:
+                _remember(self._suspects, introducer)
             if self.active or self._wanted or self._failures < FAILURES_TO_ENTER:
                 return
             self._failures = 0
@@ -258,6 +273,8 @@ class PartitionMode:
                 self._gaps.append(now - self._last_announce)
             self._last_announce = now
             self._last_contact = now
+            self._contacts += 1
+            self._suspects.clear()
             self._failures = 0
             self._wanted = False
             self._unreached.pop(node_id, None)
@@ -298,22 +315,31 @@ class PartitionMode:
     def probe_target(self) -> bytes | None:
         """The off-island server to probe: in turn, those recently heard or answered that haven't failed since (most
         recent first), then those that have; None if none is known. An ID that never answered nor announced itself
-        is never one: a reply can name made-up IDs, which would fail every probe."""
+        is never one: a reply can name made-up IDs, which would fail every probe. Outside partition mode (the probe
+        failures or silence ask for), not a server that named the failures' IDs while there is another, and only the
+        senior ones that haven't failed since if there are any, else only those that haven't."""
         with self._lock:
             targets = self._targets()
             if not targets:
                 return None
             self._turn += 1
+            self._probe_contacts = self._contacts
             return targets[(self._turn - 1) % len(targets)]
 
     def _targets(self) -> list[bytes]:
         """probe_target()'s choices, in order (lock held)."""
         recent = [n for n in reversed(self._recent) if not self.is_local(n)]
+        if not self.active:
+            # The server that named the failing IDs answered last, so it came first, and could drop the probe (AUD-M3)
+            recent = [n for n in recent if n not in self._suspects] or recent
+            reached = [n for n in recent if n not in self._unreached]
+            recent = [n for n in reached if self.senior(n)] or reached or recent
         return [n for n in recent if n not in self._unreached] + [n for n in recent if n in self._unreached]
 
     def probed(self, node_id: bytes, answered: bool):
-        """The probe of node_id was answered or not. Unanswered after silence or failures, partition mode is entered;
-        in it, the next probe is scheduled (on slow nodes later each time)."""
+        """The probe of node_id was answered or not. Unanswered after silence or failures, partition mode is entered,
+        unless an off-island server answered or announced itself since its target was taken; in it, the next probe is
+        scheduled (on slow nodes later each time)."""
         if answered:
             self.answered(node_id)
             return
@@ -322,6 +348,9 @@ class PartitionMode:
         with self._lock:
             self._wanted = False
             _remember(self._unreached, node_id)
+            contacted, self._probe_contacts = self._probe_contacts not in (None, self._contacts), None
+            if contacted and not self.active:
+                return  # an off-island server answered (or announced itself) while the probe was out: not cut off
             if self.active:
                 if self.slow:
                     self._probe_interval = min(SLOW_PROBE_MAX, 2 * self._probe_interval)

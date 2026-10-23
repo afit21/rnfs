@@ -148,8 +148,8 @@ class Peer:
                                lambda key: [], SLOW_DISJOINT_PATHS if self.slow else DISJOINT_PATHS,
                                **(slow_budgets if self.slow and budgets else {}))
         rng = random.Random(self.id)
-        for _ in range(SIZE_SAMPLES):  # the size estimate's samples, from complete lookups for other keys
-            self.lookups.search(rng.randbytes(ID_LENGTH)).find_closest()
+        for _ in range(SIZE_SAMPLES):  # the size estimate's samples, from lookups for random keys (searches feed none)
+            self.lookups.sample_due(rng.randbytes(ID_LENGTH))
 
     def query(self, node_id: bytes, key: bytes):
         """A /find, counted; an identity it learns of is known from then on (its path request answered). One to a

@@ -456,7 +456,7 @@ class FakeNode:
             raise NotFound(f"name {name} not resolved")
         return {"name": name, **self.records[name], "age": 5.0}
 
-    def export(self, target, output):
+    def export(self, target, output, temporary=None):
         self.record("export", target, output)
         cid = self._resolve(target)
         with open(output, "wb") as f:

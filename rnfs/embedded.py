@@ -145,7 +145,8 @@ class Node(interface.Rnfs):
 
     def _published(self, event: dict):
         """The event log's listener (any thread, perhaps under the names or storage lock): queue the event for the
-        event watches. A Node hears every event of its own run, so it never reports any lost."""
+        event watches. A Node hears every event of its own run, so it reports some lost only to a watch whose
+        callback fell MAX_WATCH_QUEUE behind (rnfs.interface._Events.post)."""
         self._events_heard(self._node.events.epoch, [event])
 
     def _event_baseline(self) -> tuple[int, str]:

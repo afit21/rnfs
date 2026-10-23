@@ -1,4 +1,4 @@
-"""Local JSON API of a running node (specification section 11), bound to 127.0.0.1 only.
+"""Local JSON API of a running node (specification section 11), bound to the loopback only (127.0.0.1 and ::1).
 
 Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; node IDs and names are
 32 hex characters; paths are absolute paths on the daemon's machine. Successful responses are JSON
@@ -55,9 +55,9 @@ code}` (below).
 | POST | /api/apps/add | JSON `name` | `app_add(name)`: `{"name", "created", "token"}`, the only time the token is given |
 | POST | /api/apps/rm | JSON `name` | `app_rm(name)`: `{"released"}`, the app's token revoked and its pins released |
 | POST | /api/apps/request | header `X-Rnfs-Pairing: <name>`, JSON `description`; no token | `app_request(name, description)` (0.2.1): `{"id", "secret", "code", "expires"}`, the app's request for a token, for the user to approve (below) |
-| GET  | /api/apps/request | `id`, header `X-Rnfs-Pairing-Secret: <secret>`; no token | `{"name", "state": "pending" \| "approved" \| "denied", "token" (approved: given once), "expires"}` (404 once collected, expired, or for a wrong secret) |
+| GET  | /api/apps/request | `id`, header `X-Rnfs-Pairing-Secret: <secret>`; no token | `{"name", "state": "pending" \\| "approved" \\| "denied", "token" (approved: given once), "expires"}` (404 once collected, expired, or for a wrong secret) |
 | GET  | /api/apps/requests | | `{"requests": [{"id", "name", "description", "code", "requested", "expires"}]}`, the apps waiting for an answer (the CLI's token only) |
-| POST | /api/apps/approve, /api/apps/deny | JSON `id` | approve: `{"name", "created"}`, the app added, its token kept for its requester; deny: `{"name"}` (the CLI's token only) |
+| POST | /api/apps/approve, /api/apps/deny | JSON `id`; approve: `code` (optional, the one the app shows) | approve: `{"name", "created"}`, the app added, its token kept for its requester, the others asking under its name denied; deny: `{"name"}` (the CLI's token only) |
 
 The features (rnfs.features, each's `api_routes()`) add these; `name` is a name or a name contact's nick:
 
@@ -112,9 +112,14 @@ a `wait=0` call never waits, so it is always answered), so watchers can't take t
 MAX_WATCHED names stay watched.
 
 Security:
-- The Host header must be `127.0.0.1:<port>` or `localhost:<port>`, which blocks DNS rebinding.
-- Every request except `GET /api/status` must carry `X-Rnfs-Api: <token>`, the random token the daemon
-  writes to `<rnfs dir>/api_token` (mode 0600) at each start. Every local process, of every user, can
+- The API listens on 127.0.0.1:<port> and [::1]:<port> (LocalServer; ::1 only where the host has IPv6), so no other
+  local user can take `localhost` on ::1, which browsers and curl try first, while the daemon runs (AUD-H2).
+  Clients dial 127.0.0.1 itself (rnfs.apiclient does).
+- The Host header must be `127.0.0.1:<port>` or `localhost:<port>`, which blocks DNS rebinding; `[::1]:<port>` is
+  refused like any other host.
+- Every request except `GET /api/status` and pairing's two routes (`POST` and `GET /api/apps/request`, below) must
+  carry `X-Rnfs-Api: <token>`, the random token the daemon writes to `<rnfs dir>/api_token` (mode 0600) at each
+  start. Every local process, of every user, can
   connect to 127.0.0.1, and the API reads and writes files as the daemon's user, so only those who can
   read the rnfs directory may use it. A custom header also forces a CORS preflight, which fails because
   the API never sends CORS headers, and a web page can't know the token anyway. Status stays open for
@@ -141,9 +146,14 @@ Security:
   itself in X-Rnfs-Pairing, a custom header, so no web page can ask: its request would need a CORS preflight, which
   fails) and gets a request id, a secret and a 6-digit code it shows its user. The user sees the request, with the
   same code, where the CLI's token is (rnfs app requests; an app such as RNFS Desktop, told by an "apps" event) and
-  approves or denies it: the code tells their app's request from one another process made under its name. Approving
-  adds the app; the app collects its token with the secret (GET /api/apps/request), once, and the approver never
-  sees it. Requests live in memory, at most 8 waiting, for 10 minutes (an approved token for 5 more). A process
+  approves or denies it: the code tells their app's request from one another process made under its name. Any
+  process may ask under any name, as often as it likes (AUD-M5): a name can have several requests waiting, each with
+  its own code, and approve takes the code the app shows (`code`, which the CLI asks the user for) and refuses
+  another (400), so asking first under an app's name gets a squatter nothing. Approving adds the app and denies the
+  others asking under its name; a name an app already has is refused only then (400, a name clash), never when
+  asked, so the open route doesn't say which apps exist (AUD-L1). The app collects its token with the secret (GET
+  /api/apps/request), once, and the approver never sees it. Requests live in memory, at most 32 waiting (a new one
+  beyond takes the oldest's place), for 10 minutes (an approved token for 5 more). A process
   squatting the API port while the daemon is down can answer a pairing app as any listener can: an app that can
   read the rnfs dir should prefer rnfs app add, and every app should show the code for the user to compare.
 - Errors map to statuses as design.md says (rnfs.errors.STATUSES): ValueError 400, NotFound 404, TooLarge 413,
@@ -159,6 +169,7 @@ Connections (both this API and the gateway, through LocalServer):
 - At most max_connections are served at once; more get an immediate 503 and are closed, so held-open
   connections can't exhaust threads or file descriptors.
 """
+import errno
 import hmac
 import io
 import json
@@ -196,6 +207,15 @@ WATCH_GRACE = 60.0  # seconds a name stays watched after the last call naming it
 MAX_WATCHED = 1024  # names watched for API clients at most; the soonest to end go first
 MAX_EVENT_WAITERS = 8  # GET /api/events calls waiting at once
 LINE_POLL = 0.5  # seconds between checks that the client of a streamed answer (send_lines) is still there
+# What binding ::1 fails with where the host has no IPv6 (none in the kernel, or a loopback without ::1): LocalServer
+# then listens on 127.0.0.1 alone. On Windows Python gives socket errors their WSA numbers, under these names
+NO_IPV6 = frozenset(getattr(errno, name) for name in ("EADDRNOTAVAIL", "EAFNOSUPPORT", "EPROTONOSUPPORT",
+                                                      "WSAEADDRNOTAVAIL", "WSAEAFNOSUPPORT", "WSAEPROTONOSUPPORT")
+                    if hasattr(errno, name))
+# A port another socket holds (Windows answers WSAEACCES where that socket binds it exclusively)
+PORT_TAKEN = frozenset(getattr(errno, name) for name in ("EADDRINUSE", "WSAEADDRINUSE", "WSAEACCES")
+                       if hasattr(errno, name))
+BIND_ATTEMPTS = 16  # ports LocalServer tries for port 0, while ::1 has the one 127.0.0.1 gave
 DEFAULT_LOG_LINES = 200  # lines GET /api/log answers without limit=
 # What this daemon offers beyond the routes themselves (GET /api/capabilities), each a promise kept once released
 CAPABILITIES = ("error_codes", "capabilities", "events", "shutdown", "daemon_json", "pin_details", "pin_label",
@@ -545,20 +565,30 @@ class BoundedHTTPServer(ThreadingHTTPServer):
     LINGER_BYTES = 256 * 1024  # most a closing connection drains before closing anyway
     MAX_CLOSERS = 16  # refused connections closed gently at once
 
-    def __init__(self, address, handler_class, max_connections: int):
-        """Bind to address; handler_class.busy_response() is sent to connections over max_connections."""
-        self.slots = threading.BoundedSemaphore(max_connections)
-        self.closers = threading.BoundedSemaphore(self.MAX_CLOSERS)
+    def __init__(self, address, handler_class, max_connections: int, sibling: "BoundedHTTPServer | None" = None):
+        """Bind to address (an IPv6 one if its host has a ":"); handler_class.busy_response() is sent to connections
+        over max_connections. With a sibling (the same port on the other loopback, LocalServer), its connection and
+        closer slots are shared, so both together serve at most max_connections."""
+        if sibling is None:
+            self.slots = threading.BoundedSemaphore(max_connections)
+            self.closers = threading.BoundedSemaphore(self.MAX_CLOSERS)
+        else:
+            self.slots, self.closers = sibling.slots, sibling.closers
+        if ":" in address[0]:
+            self.address_family = socket.AF_INET6
         super().__init__(address, handler_class)
 
     def server_bind(self):
-        """Bind the listening socket, exclusively on Windows."""
+        """Bind the listening socket, exclusively on Windows; an IPv6 one to IPv6 only."""
         if fsutil.IS_WINDOWS:
             # There SO_REUSEADDR (HTTPServer's default) lets another socket bind a port already listening, so a
             # second daemon, or another local program listening in on API tokens, could share it
             self.allow_reuse_address = False
             if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
                 self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        if self.address_family == socket.AF_INET6:
+            # ::1 and nothing else: 127.0.0.1 is the sibling's
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
         super().server_bind()
 
     def process_request(self, request, client_address):
@@ -643,7 +673,13 @@ class BoundedHTTPServer(ThreadingHTTPServer):
 
 
 class LocalServer:
-    """A BoundedHTTPServer on 127.0.0.1 run on a daemon thread. Port 0 picks a free port.
+    """BoundedHTTPServers on 127.0.0.1 and [::1], on the same port, each run on a daemon thread. Port 0 picks a port
+    free on both.
+
+    Browsers and curl try a *.localhost name (the gateway's sites) or localhost on ::1 first, so another local user
+    listening on [::1]:<port> while the daemon runs would get them (AUD-H2): the daemon holds both, with the same
+    handler and connection slots. A port taken on ::1 stops it as one taken on 127.0.0.1 does; only a host without
+    IPv6 (NO_IPV6) runs on 127.0.0.1 alone, where nobody can listen on ::1 either. self.server is 127.0.0.1's.
 
     The connection limits are class attributes (see the module docstring), read when the server is made.
     """
@@ -655,12 +691,33 @@ class LocalServer:
     max_connections = 32
 
     def __init__(self, handler_class, port: int, **attributes):
-        """Bind to 127.0.0.1:port with handler_class; attributes are set on a subclass of it."""
+        """Bind to 127.0.0.1:port and [::1]:port with handler_class; attributes are set on a subclass of it.
+        Raises OSError if either is taken."""
         attributes.update(request_timeout=self.request_timeout, body_timeout=self.body_timeout,
                           response_timeout=self.response_timeout)
         handler = type(handler_class.__name__, (handler_class,), attributes)
-        self.server = BoundedHTTPServer(("127.0.0.1", port), handler, self.max_connections)
-        self.thread = threading.Thread(target=lambda: self.server.serve_forever(self.poll_interval), daemon=True)
+        self.servers = self._bind(handler, port)
+        self.server = self.servers[0]
+        self.threads = [threading.Thread(target=server.serve_forever, args=(self.poll_interval,), daemon=True)
+                        for server in self.servers]
+
+    def _bind(self, handler, port: int) -> list[BoundedHTTPServer]:
+        """The servers on 127.0.0.1:port and [::1]:port (127.0.0.1's alone on a host without IPv6). For port 0,
+        another port is tried while ::1 has the one 127.0.0.1 got. Raises OSError."""
+        for _ in range(BIND_ATTEMPTS if port == 0 else 1):
+            ipv4 = BoundedHTTPServer(("127.0.0.1", port), handler, self.max_connections)
+            bound = ipv4.server_address[1]
+            try:
+                return [ipv4, BoundedHTTPServer(("::1", bound), handler, self.max_connections, sibling=ipv4)]
+            except OSError as e:
+                if e.errno in NO_IPV6 or not socket.has_ipv6:
+                    log(f"no IPv6 here for [::1]:{bound} ({e}): listening on 127.0.0.1:{bound} only", LOG_NOTICE)
+                    return [ipv4]
+                ipv4.server_close()
+                if port == 0 and e.errno in PORT_TAKEN:
+                    continue
+                raise OSError(e.errno, f"[::1]:{bound}: {e.strerror or e}") from e
+        raise OSError(errno.EADDRINUSE, f"no port free on both 127.0.0.1 and ::1 in {BIND_ATTEMPTS} tries")
 
     @property
     def port(self) -> int:
@@ -669,13 +726,15 @@ class LocalServer:
 
     def start(self):
         """Start serving requests in the background."""
-        self.thread.start()
+        for thread in self.threads:
+            thread.start()
 
     def stop(self):
-        """Stop serving and close the listening socket. Requests still running finish on their threads."""
-        if self.thread.is_alive():
-            self.server.shutdown()
-        self.server.server_close()
+        """Stop serving and close the listening sockets. Requests still running finish on their threads."""
+        for server, thread in zip(self.servers, self.threads):
+            if thread.is_alive():
+                server.shutdown()
+            server.server_close()
 
 
 class NameWatches:
@@ -807,13 +866,15 @@ class NameWatches:
 class ApiServer(LocalServer):
     """The local API for node (an RnfsNode, or anything with its facade methods).
 
-    Every request but status must carry token (self.token); the daemon writes it to <rnfs dir>/api_token.
+    Every request but status and pairing's (ApiHandler.OPEN_ROUTES) must carry token (self.token); the daemon writes it
+    to <rnfs dir>/api_token.
     """
 
     max_connections = 32  # the CLI makes one connection per command; this is plenty for scripts too
 
     def __init__(self, node, port: int, token: str | None = None, shutdown=None, restart=None):
-        """Bind to 127.0.0.1:port, requiring token (a new random one if None); serves once start() is called.
+        """Bind to 127.0.0.1:port and [::1]:port (LocalServer), requiring token (a new random one if None); serves
+        once start() is called.
         shutdown, if given, is called (with no arguments) once POST /api/shutdown has been answered: the daemon
         passes what its signal handlers do. Without it that route answers 404 unsupported. restart (0.2.1) is
         POST /api/restart's, likewise: the daemon passes it where it can restart itself (rnfs.launch)."""
@@ -1711,8 +1772,10 @@ class ApiHandler(TimedHandler):
         self.send_json(200, {"requests": self.node.app_requests()})
 
     def api_app_approve(self):
-        """POST /api/apps/approve {"id"}: add the app, its token kept for it alone (the CLI's token only)."""
-        self.send_json(200, self.node.app_approve(self.json_body().get("id")))
+        """POST /api/apps/approve {"id", "code"}: add the app, its token kept for it alone, if code (optional) is the
+        one it shows (the CLI's token only)."""
+        body = self.json_body()
+        self.send_json(200, self.node.app_approve(body.get("id"), body.get("code")))
 
     def api_app_deny(self):
         """POST /api/apps/deny {"id"}: refuse the app's request (the CLI's token only)."""

@@ -10,7 +10,9 @@ resolution too. A node therefore paces its own:
   path request rnfs sends (link opens, so lookups, stores, fetches and keeper queries; a lookup's path check; name
   resolves; NomadNet adds) takes a turn, at least `spacing` (SPACING, 1 s) after the last. Requests 1 s apart peak at
   an estimate of 1.5 a second at the next hop, half a new interface's limit. Waiting for a turn isn't a failure and
-  isn't part of `path_timeout`, which starts once the request is sent. Turns are taken in order of asking. On a slow
+  isn't part of `path_timeout`, which starts once the request is sent. Turns are taken in order of asking. A waiter
+  that leaves before its turn (its path or identity arrived, or it was cancelled) gives the turn up, and turns given up
+  at the end of the queue are free again, so callers after them don't wait for nothing (AUD-L6). On a slow
   node the spacing stretches while the radio's channel is busy (stretch: rnfs.network.channel.ChannelLoad.stretch,
   which the node sets), up to 4 s.
 - **A ceiling**: before a request goes, the busiest interface's `outgoing_pr_frequency` (RNS's estimate of the path
@@ -74,6 +76,17 @@ PATH_REQUEST_TIMEOUT = 15  # RNS.Transport.PATH_REQUEST_TIMEOUT: RNS's own wait 
 MIN_SAMPLES = 20  # path-response times measured before candidate_wait shortens anything
 MAX_SAMPLES = 100  # the most recent path-response times kept
 PERCENTILE = 0.95  # candidate_wait waits as long as this share of the path responses measured took
+
+
+class _Turn:
+    """A turn reserved for a path request, until it is taken or given up (PathRequests._turns)."""
+
+    __slots__ = ("at", "given_up")
+
+    def __init__(self, at: float):
+        """A turn at at, still wanted."""
+        self.at = at
+        self.given_up = False
 
 
 def _rns_transport():
@@ -145,6 +158,8 @@ class PathRequests:
         self._lock = threading.Lock()
         self._next_turn = -math.inf  # the earliest time the next turn may be
         self._last_went = -math.inf  # when the last turn was actually taken (a request went)
+        self._turns: list[_Turn] = []  # turns reserved and not yet taken, in order (_take_turn, _give_back)
+        self._kept_until = -math.inf  # _next_turn never goes back before this: the end of the last turn charged
         self._waits: dict[bytes, threading.Event] = {}  # destination -> set when its owner's wait ends
         self._sent: OrderedDict[bytes, float] = OrderedDict()  # destination -> when last requested, oldest first
         self._lacked: OrderedDict[bytes, None] = OrderedDict()  # destinations whose last wait found no path
@@ -215,7 +230,7 @@ class PathRequests:
         spacing = self._spacing()
         with self._lock:
             now = self.clock()
-            self._next_turn = max(now, self._next_turn) + spacing
+            self._next_turn = self._kept_until = max(now, self._next_turn) + spacing
             self._remember_sent(destination, now)
             self.charged += 1
 
@@ -297,12 +312,18 @@ class PathRequests:
         request needed) or cancel was set."""
         started = self.clock()
         held_since: float | None = None
+        reserved: _Turn | None = None
+        went = False
         try:
             while True:
                 spacing = self._spacing()  # outside the lock: it may read the interface stats
                 with self._lock:
+                    if reserved is not None:
+                        self._turns.remove(reserved)  # its time has passed: the ceiling held it back
                     turn = max(self.clock(), self._next_turn)
                     self._next_turn = turn + spacing
+                    reserved = _Turn(turn)
+                    self._turns.append(reserved)
                 while (now := self.clock()) < turn:
                     if ready() or (cancel is not None and cancel.is_set()):
                         return False
@@ -310,19 +331,36 @@ class PathRequests:
                 if ready() or (cancel is not None and cancel.is_set()):
                     return False
                 if not self._over_ceiling():
-                    return self._go(spacing, ready, cancel)
+                    went = self._go(spacing, ready, cancel)
+                    return went
                 if held_since is None:
                     held_since = self.clock()
                     with self._lock:
                         self.held += 1
                 elif self.clock() - held_since >= CEILING_HOLD:
-                    return self._go(spacing, ready, cancel)
+                    went = self._go(spacing, ready, cancel)
+                    return went
         finally:
+            self._give_back(reserved, went)
             waited = self.clock() - started
             with self._lock:
                 self.waited += waited
             if waited >= self.spacing:
                 log(f"path request for {node_name(destination)} waited {waited:.0f}s for its turn", LOG_DEBUG)
+
+    def _give_back(self, reserved: _Turn | None, went: bool):
+        """A turn reserved is over: taken (went), or given up by a waiter leaving before it. While the last turn
+        reserved is one given up, _next_turn goes back to its time, so turns nobody will take don't hold later callers
+        back (a turn given up between two kept ones stays a gap until those are over)."""
+        if reserved is None:
+            return
+        with self._lock:
+            if went:
+                self._turns.remove(reserved)
+                return
+            reserved.given_up = True
+            while self._turns and self._turns[-1].given_up:
+                self._next_turn = max(self._turns.pop().at, self._kept_until)
 
     def _go(self, spacing: float, ready: Callable[[], bool], cancel: threading.Event | None) -> bool:
         """Take the turn: at least spacing after the last one taken, whatever the turns reserved say. A thread that

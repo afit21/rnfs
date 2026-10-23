@@ -154,7 +154,7 @@ class AppRegistry:
 
 
 # Pairing (0.2.1): an app asks for a token and the user approves it, instead of copying one by hand
-MAX_PENDING = 8  # pairing requests waiting at once; more are refused (Busy) until one is answered or expires
+MAX_PENDING = 32  # pairing requests waiting at once; a new one beyond takes the place of the oldest (AUD-M5)
 REQUEST_LIFE = 600.0  # seconds a request waits for the user's answer
 PICKUP_LIFE = 300.0  # seconds an approved request's token waits for its app to collect it
 MAX_DESCRIPTION = 200  # characters of what an app says of itself
@@ -184,11 +184,18 @@ class PairingRequests:
     - request(name, description) holds a request for REQUEST_LIFE and gives its requester the request's id, a
       secret and a code. The code is shown both by the app and where the user approves (rnfs app requests, an app
       such as RNFS Desktop), so the user can tell the app's request from one another process made under its name.
-    - approve(id) adds the app (AppRegistry.add) and keeps its token for the requester alone, for PICKUP_LIFE: the
-      approver never sees it. state(id, secret) gives the requester the request's state and, once approved, the
-      token, a single time (the request is then forgotten). A wrong secret is a request there isn't (NotFound).
-    - At most MAX_PENDING requests wait at once, a name at most once; a name an app already has is refused, as is
-      one that isn't valid. Requests from web pages can't be made: the route needs a custom header (rnfs.api).
+    - approve(id, code) adds the app (AppRegistry.add) and keeps its token for the requester alone, for PICKUP_LIFE:
+      the approver never sees it; the other requests waiting under its name are denied. code, which the CLI asks
+      the user for, must be the one the request's app shows. state(id, secret) gives the requester the request's
+      state and, once approved, the token, a single time (the request is then forgotten). A wrong secret is a
+      request there isn't (NotFound).
+    - Any local process can ask, under any name (0.2.1 audit, AUD-M5), so a name may have several requests waiting,
+      each with its own code: asking first under an app's name doesn't keep the app from asking. At most
+      MAX_PENDING wait at once, and a new one beyond takes the place of the oldest, so filling them once doesn't
+      shut pairing out: that takes a flood faster than the user answers, which the user sees. A name that isn't
+      valid is refused; one an app already has only when the user approves it, so the open route doesn't say which
+      apps exist (AUD-L1, as REV9 for the proof). Requests from web pages can't be made: the route needs a custom
+      header (rnfs.api).
     """
 
     def __init__(self, registry: AppRegistry, clock: Callable[[], float] = time.time):
@@ -205,24 +212,25 @@ class PairingRequests:
 
     def request(self, name: str, description: str | None = None) -> dict:
         """Ask for a token for app name: {"id", "secret", "code", "expires"}. Raises ValueError (an invalid name or
-        description, an app of that name, one asked for already), Busy (MAX_PENDING waiting)."""
-        from rnfs.errors import Busy
+        description). Never looks at the apps there are, so every valid name is answered alike (AUD-L1)."""
         check_app_name(name)
         if description is not None:
             if not isinstance(description, str) or len(description) > MAX_DESCRIPTION or not description.isprintable():
                 raise ValueError(f"description is printable text of at most {MAX_DESCRIPTION} characters")
             description = description.strip() or None
-        if name in self.registry:
-            raise ValueError(f"there is an app called {name} already")
         with self._lock:
             now = self.clock()
             self._expire(now)
-            if any(request.name == name for request in self._requests.values()):
-                raise ValueError(f"app {name} has asked for a token already; wait for the user's answer")
-            if sum(1 for request in self._requests.values() if request.state == PENDING) >= MAX_PENDING:
-                raise Busy(f"{MAX_PENDING} apps are waiting for an answer already")
+            # In the order they came (a dict keeps it): the oldest make way
+            waiting = [request for request in self._requests.values() if request.state == PENDING]
+            dropped = waiting[:max(0, len(waiting) - MAX_PENDING + 1)]
+            for old in dropped:
+                del self._requests[old.id]
             request = _Request(name, description, now)
             self._requests[request.id] = request
+        if dropped:
+            log(f"apps: {MAX_PENDING} requests for a token were waiting; forgot the oldest, from "
+                f"{', '.join(old.name for old in dropped)}", LOG_WARNING)
         log(f"apps: {name} asks for a token (code {request.code}): rnfs app approve {request.id}", LOG_NOTICE)
         return {"id": request.id, "secret": request.secret, "code": request.code, "expires": request.until}
 
@@ -244,14 +252,29 @@ class PairingRequests:
             raise NotFound(f"no app is waiting for an answer as request {request_id}")
         return request
 
-    def approve(self, request_id: str) -> dict:
-        """Add the app request_id asks for, keeping its token for the requester: {"name", "created"}. Raises
-        NotFound (no such request waiting), ValueError (an app of that name was added meanwhile)."""
+    def approve(self, request_id: str, code: str | None = None) -> dict:
+        """Add the app request_id asks for, keeping its token for the requester, and deny the other requests waiting
+        under its name: {"name", "created"}. code, if given, must be the request's: the one its app shows. Raises
+        NotFound (no such request waiting), ValueError (another code; an app of that name already: a name clash,
+        the request maybe another program's under that app's name). A request refused so stays waiting."""
+        if code is not None and not isinstance(code, str):
+            raise ValueError("code must be the 6 digits the app shows")
         with self._lock:
             request = self._waiting(request_id)
+            if code is not None and not hmac.compare_digest(code.encode("utf-8", "replace"), request.code.encode()):
+                raise ValueError(f"that isn't the code of request {request_id} (app {request.name}): approve the "
+                                 f"request showing the code the app shows")
+            if request.name in self.registry:
+                raise ValueError(f"there is an app called {request.name} already: a name clash, and this request may "
+                                 f"be another program's using its name. Deny it; to replace that app, remove it "
+                                 f"first (rnfs app rm {request.name})")
             added = self.registry.add(request.name)
             request.state, request.token = APPROVED, added["token"]
             request.until = self.clock() + PICKUP_LIFE
+            # Only one of them gets the name: the others asking under it are told no
+            for other in self._requests.values():
+                if other.name == request.name and other.state == PENDING:
+                    other.state, other.until = DENIED, request.until
         return {"name": added["name"], "created": added["created"]}
 
     def deny(self, request_id: str) -> dict:

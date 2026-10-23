@@ -24,11 +24,19 @@ No RNS dependency: the node gives Lookups (its routing table, client and callbac
 - **Local first** (specification section 6, "LoRa islands"): a search's first lookup asks the closest local servers
   (local_first(key), none on a node without them) before any other, and their answers seed the rest of it; its
   fallback doesn't.
+- **The size estimate's samples** (rnfs.dht.density): only from lookups for keys the node chose itself, its publish
+  lookups and lookups for random keys (sample_due), never from a search: anyone can make a node search keys of their
+  choosing (through the gateway, say), and 9 keys inside one tight cluster of identities inflated the estimate a
+  million times, turning the density check off (AUD-M1). A key flags() flags loses its sample, and a widened lookup
+  takes none: their d_K is the anomaly, not the network's size. A node that publishes little runs a lookup for a random
+  key while the estimate holds fewer than SIZE_SAMPLES samples or none came for SAMPLE_REFRESH (the node's join thread
+  asks, paced like the fallback on slow nodes).
 """
+import os
 import threading
 from collections.abc import Callable
 
-from rnfs.constants import K
+from rnfs.constants import ID_LENGTH, K
 from rnfs.dht import density
 from rnfs.dht.disjoint import DisjointLookup
 from rnfs.dht.lookup import Lookup, NodeCallback
@@ -38,6 +46,7 @@ DISJOINT_PATHS = 3  # paths of a publisher's lookups and a search's fallback (ec
 SLOW_DISJOINT_PATHS = 2  # on slow nodes, whose every /find costs seconds of airtime
 SLOW_PUBLISH_UNKNOWNS = 10  # unknown IDs (path requests) a slow node's publishing lookup tries at most (alpha: 1)
 SLOW_SEARCH_UNKNOWNS = 3  # unknown IDs a slow node's search (and its fallback) tries at most
+SAMPLE_REFRESH = 3600.0  # seconds without a size sample after which a lookup for a random key takes one
 
 # new_lookup(key, start nodes, **Lookup options) -> a Lookup wired to the node (routing table, client, callbacks)
 NewLookup = Callable[..., Lookup]
@@ -193,8 +202,9 @@ class Search:
 
 class Lookups:
     """The node's recipe for lookups: new_lookup makes a Lookup wired to it, start(key) gives the start nodes,
-    seniors(key) the senior servers (the announce first-seen log's), sizes the size estimate (fed by every complete
-    lookup); paths disjoint paths per publish lookup and fallback; pace (slow nodes) paces the fallback;
+    seniors(key) the senior servers (the announce first-seen log's), sizes the size estimate (fed by the complete
+    publish lookups and sample_due's, not by searches); paths disjoint paths per publish lookup and fallback; pace
+    (slow nodes) paces the fallback and sample_due;
     publish_unknowns and search_unknowns the budgets of unknown IDs of a publishing lookup and of a search (and of its
     fallback), split among disjoint paths (None: alpha per Lookup, as on nodes that aren't slow); local_first(key) the
     local servers a search asks first. checks counts how often the density check ran and fired, for the status (a
@@ -219,34 +229,39 @@ class Lookups:
 
     def search(self, key: bytes) -> Search:
         """A provider search for key: the closest local servers asked first, density-checked, the senior rule, and
-        disjoint paths only as a fallback."""
+        disjoint paths only as a fallback. Not sampled for the size estimate: key may be anyone's choice."""
         size, seniors = self.sizes.estimate(key), self.seniors(key)
         local = self.local_first(key)
-        first = self.new_lookup(key, self.start(key), size=size, seniors=seniors, on_complete=self.sizes.note,
+        first = self.new_lookup(key, self.start(key), size=size, seniors=seniors,
                                 **({"first": local} if local else {}), **_budget(self.search_unknowns))
         return Search(first, lambda left, queries: self._disjoint(key, size, seniors, left, queries,
                                                                   self.search_unknowns), self.pace, self.checks)
 
     def publish(self, key: bytes) -> Lookup | DisjointLookup:
-        """A region's closest-nodes lookup for key, over disjoint paths."""
-        return self._disjoint(key, unknowns=self.publish_unknowns)
+        """A region's closest-nodes lookup for key, over disjoint paths, sampled for the size estimate (the node
+        provides key: its own choice)."""
+        return self._disjoint(key, unknowns=self.publish_unknowns, sampled=True)
 
     def flags(self, key: bytes, region) -> bool:
-        """The density check for key over what its region's lookup learned (a sweep.Region), counted in checks."""
+        """The density check for key over what its region's lookup learned (a sweep.Region), counted in checks. A key
+        flagged loses its size sample (its region's lookup may have taken one)."""
         size = self.sizes.estimate(key)
         if size is None:
             return False
         distances = sorted(distance(node_id, key) for node_id in region.nodes)
         flagged = density.dense_core(distances, size) > 0
         self.checks.note(flagged)
+        if flagged:
+            self.sizes.forget(key)
         return flagged
 
     def widen(self, key: bytes, region) -> list[bytes]:
         """The widened lookup of a key that flags() flagged: a Lookup with both checks, so it finds and asks the
-        servers beyond the dense core. Returns K servers of each ring, from what it and the region learned."""
+        servers beyond the dense core. Returns K servers of each ring, from what it and the region learned. Not
+        sampled for the size estimate: the key's neighbourhood is the anomaly."""
         size = self.sizes.estimate(key)
         lookup = self.new_lookup(key, self.start(key), size=size, seniors=self.seniors(key),
-                                 on_complete=self.sizes.note, **_budget(self.publish_unknowns))
+                                 **_budget(self.publish_unknowns))
         lookup.find_closest()
         nodes = dict(region.nodes)
         for node_id, tier in lookup.candidates().items():
@@ -254,21 +269,34 @@ class Lookups:
         ranked = sorted(nodes, key=lambda n: distance(n, key))
         return density.rings(ranked, [distance(n, key) for n in ranked], size, K, later=nodes.__getitem__)
 
+    def sample_due(self, key: bytes | None = None) -> bool:
+        """Take a size sample if one is due: a closest-nodes lookup for key (a random one if None) while the estimate
+        holds fewer than its samples or none came for SAMPLE_REFRESH, and on a slow node only if the pacing (pace)
+        allows it now. True if a lookup ran."""
+        if len(self.sizes) >= self.sizes.samples and self.sizes.clock() - self.sizes.updated < SAMPLE_REFRESH:
+            return False
+        if self.pace is not None and self.pace() > 0:
+            return False
+        key = os.urandom(ID_LENGTH) if key is None else key
+        self.new_lookup(key, self.start(key), on_complete=self.sizes.note).find_closest()
+        return True
+
     def _disjoint(self, key: bytes, size: float | None = None, seniors: list[bytes] | tuple = (),
                   timeout: float | None = None, queries: int | None = None,
-                  unknowns: int | None = None) -> Lookup | DisjointLookup | None:
+                  unknowns: int | None = None, sampled: bool = False) -> Lookup | DisjointLookup | None:
         """A lookup for key over self.paths disjoint paths (one Lookup for a single path), each with the checks given,
         within timeout (the node's lookup_timeout if None) and sending queries in all, split among the paths (each
         path's run its own max_queries if None); None if that leaves a path none. unknowns unknown IDs are split among
-        the paths too (split_budget)."""
+        the paths too (split_budget). sampled: its complete runs feed the size estimate (a key the node chose)."""
         options = {} if timeout is None else {"timeout": timeout}
+        sample = {"on_complete": self.sizes.note} if sampled else {}
         if queries is not None:
             if queries < self.paths:
                 return None
             options["max_queries"] = queries // self.paths
         if self.paths == 1:
-            return self.new_lookup(key, self.start(key), size=size, seniors=seniors, on_complete=self.sizes.note,
-                                   **options, **_budget(unknowns))
+            return self.new_lookup(key, self.start(key), size=size, seniors=seniors, **sample, **options,
+                                   **_budget(unknowns))
         # DisjointLookup makes the paths in order, one call each: path i takes the i-th share
         shares = iter(split_budget(unknowns, self.paths))
 
@@ -277,4 +305,4 @@ class Lookups:
             return self.new_lookup(key, start, size=size, seniors=senior, claim=claim, taken=taken, **options,
                                    **_budget(next(shares)))
 
-        return DisjointLookup(key, self.start(key), path, self.paths, seniors, on_complete=self.sizes.note)
+        return DisjointLookup(key, self.start(key), path, self.paths, seniors, **sample)

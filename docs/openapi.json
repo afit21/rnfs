@@ -3,8 +3,8 @@
   "info": {
     "title": "rnfs local API",
     "version": "0.2.0",
-    "summary": "The JSON API of a running rnfs daemon, on 127.0.0.1 only.",
-    "description": "The local API of a running rnfs daemon (specification.md section 11; the route tables in `rnfs/api.py`). The CLI uses it for every command, and `rnfs.Client` is built on it; programs in other languages use it directly.\n\n**Not stable yet.** No API stability is promised until rnfs 1.0.0: `rnfs.API_STATUS` is `provisional` (and `x-api-status` here), and routes, fields and statuses may change in 0.2.x releases. Ask `GET /api/capabilities` what a daemon offers. This document describes the API of the source tree it is in, whose `rnfs.__version__` is `info.version` (between releases that is the last release's, and what is marked \"since 0.2.0\" comes with the next); `tests/test_openapi.py` checks it against the code.\n\n**Requests.**\n- The API listens on 127.0.0.1 only (`api_port`, default 8788; a running daemon also writes it to `<rnfs dir>/daemon.json`). The `Host` header must be `127.0.0.1:<port>` or `localhost:<port>` (403 `bad_host`).\n- Every route but `GET /api/status` needs the token (security schemes `token` and `app`); without it: 403 `unauthorized`. The API never sends CORS headers.\n- Before a client first sends the token, it should send `X-Rnfs-Challenge` on `GET /api/status` and check the `X-Rnfs-Proof` answered, so another program listening on the port while the daemon is down learns nothing (`rnfs.apiclient.api_proof`).\n- GET parameters are in the query string; flags are true for `1`, `true` or `yes`. POST routes take a JSON object (at most 1 MiB; an empty body is `{}`), except the streamed uploads, whose bodies are the data. Bodies use Content-Length or chunked encoding. The API doesn't read Content-Type.\n- Paths in parameters (`path`, `output`) are absolute paths on the daemon's machine.\n- One request per connection (the connection is closed after it), but for a proof request kept open for one more.\n- A known path asked with another method gets 405 `method_not_allowed` and `Allow`; an unknown path 404 `no_such_endpoint`.\n- Every response carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.\n\n**Responses.** Successes are 200 with a JSON object, except the byte responses (`cat`, `name export`, `get/stream`, `export/stream`). Clients must ignore fields they don't know: fields are added in later versions.\n\n**Errors** are `{\"error\": message, \"code\": code}` (`Error`, `ErrorCode`): the node's errors by status (ValueError 400 `bad_request`, NotFound 404 `not_found`, TooLarge 413 `too_large`, Denied 451 `denied`, InvalidDag 422 `invalid_dag`, Busy 503 `busy`, StorageFull 507 `storage_full`, anything else 500 `internal`), and the API's own refusals. Each operation lists the statuses it typically answers; any other is answered as `default` says. A 503 carries `Retry-After: 10`.\n\n**Limits.** The request line, headers and a JSON body must arrive within 15 s (408 `timeout`); a streamed upload may pause up to 60 s between reads. At most 32 connections are served at once; more get 503 `too_many_connections` at once.",
+    "summary": "The JSON API of a running rnfs daemon, on the loopback only.",
+    "description": "The local API of a running rnfs daemon (specification.md section 11; the route tables in `rnfs/api.py`). The CLI uses it for every command, and `rnfs.Client` is built on it; programs in other languages use it directly.\n\n**Not stable yet.** No API stability is promised until rnfs 1.0.0: `rnfs.API_STATUS` is `provisional` (and `x-api-status` here), and routes, fields and statuses may change in 0.2.x releases. Ask `GET /api/capabilities` what a daemon offers. This document describes the API of the source tree it is in, whose `rnfs.__version__` is `info.version` (between releases that is the last release's, and what is marked \"since 0.2.0\" comes with the next); `tests/test_openapi.py` checks it against the code.\n\n**Requests.**\n- The API listens on the loopback only: 127.0.0.1 and, where the host has IPv6, ::1, on the same port (`api_port`, default 8788; a running daemon also writes it to `<rnfs dir>/daemon.json`). Clients must dial 127.0.0.1 itself. The `Host` header must be `127.0.0.1:<port>` or `localhost:<port>` (403 `bad_host`), whichever address the request came to.\n- Every route but `GET /api/status` and pairing's two (`POST` and `GET /api/apps/request`, which an app with no token yet uses) needs the token (security schemes `token` and `app`); without it: 403 `unauthorized`. The API never sends CORS headers.\n- Before a client first sends the token, it should send `X-Rnfs-Challenge` on `GET /api/status` and check the `X-Rnfs-Proof` answered, so another program listening on the port while the daemon is down learns nothing (`rnfs.apiclient.api_proof`).\n- GET parameters are in the query string; flags are true for `1`, `true` or `yes`. POST routes take a JSON object (at most 1 MiB; an empty body is `{}`), except the streamed uploads, whose bodies are the data. Bodies use Content-Length or chunked encoding. The API doesn't read Content-Type.\n- Paths in parameters (`path`, `output`) are absolute paths on the daemon's machine.\n- One request per connection (the connection is closed after it), but for a proof request kept open for one more.\n- A known path asked with another method gets 405 `method_not_allowed` and `Allow`; an unknown path 404 `no_such_endpoint`.\n- Every response carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.\n\n**Responses.** Successes are 200 with a JSON object, except the byte responses (`cat`, `name export`, `get/stream`, `export/stream`). Clients must ignore fields they don't know: fields are added in later versions.\n\n**Errors** are `{\"error\": message, \"code\": code}` (`Error`, `ErrorCode`): the node's errors by status (ValueError 400 `bad_request`, NotFound 404 `not_found`, TooLarge 413 `too_large`, Denied 451 `denied`, InvalidDag 422 `invalid_dag`, Busy 503 `busy`, StorageFull 507 `storage_full`, anything else 500 `internal`), and the API's own refusals. Each operation lists the statuses it typically answers; any other is answered as `default` says. A 503 carries `Retry-After: 10`.\n\n**Limits.** The request line, headers and a JSON body must arrive within 15 s (408 `timeout`); a streamed upload may pause up to 60 s between reads. At most 32 connections are served at once; more get 503 `too_many_connections` at once.",
     "license": {
       "name": "See the LICENSE file of rnfs",
       "url": "https://github.com/afit21/rnfs/blob/main/LICENSE"
@@ -4330,7 +4330,7 @@
         "tags": [
           "apps"
         ],
-        "description": "No token: an app that has none asks for one. Show its code to the user, who approves the request where the CLI's token is (rnfs app requests, approve; an app such as RNFS Desktop, told by an `apps` event of change `requested`) after checking it shows the same code; then collect the token with GET /api/apps/request. At most 8 requests wait at once (503), each for 10 minutes; a name an app has, or one asked for already, is refused (400). The custom header keeps web pages from asking: their request would need a CORS preflight, which fails.",
+        "description": "No token: an app that has none asks for one. Show its code to the user, who approves the request where the CLI's token is (rnfs app requests, approve; an app such as RNFS Desktop, told by an `apps` event of change `requested`) after checking it shows the same code; then collect the token with GET /api/apps/request. Any valid name is answered alike, whether or not an app has it (a name taken is refused when the user approves), and a name may have several requests waiting, each with its own code. At most 32 requests wait at once, each for 10 minutes: a new one beyond takes the place of the oldest, whose app then finds it gone (404), as when it expires. The custom header keeps web pages from asking: their request would need a CORS preflight, which fails.",
         "security": [
           {}
         ],
@@ -4577,7 +4577,7 @@
         "tags": [
           "apps"
         ],
-        "description": "The CLI's token only. Adds the app; its token is kept for the requester, who collects it (GET /api/apps/request): the approver never sees it.",
+        "description": "The CLI's token only. Adds the app; its token is kept for the requester, who collects it (GET /api/apps/request): the approver never sees it. The other requests waiting under its name are denied. With `code`, approves only if it is the request's: 400 otherwise, the request still waiting. A name an app already has is refused here (400, a name clash), not when asked.",
         "security": [
           {
             "token": []
@@ -4594,6 +4594,13 @@
                   "id": {
                     "type": "string",
                     "description": "The request's id (GET /api/apps/requests)."
+                  },
+                  "code": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The code the app shows its user (optional: without it the request is approved unchecked). Approved only if it is the request's code, else 400. The CLI asks the user for it."
                   }
                 },
                 "required": [
@@ -4715,7 +4722,7 @@
         "type": "apiKey",
         "in": "header",
         "name": "X-Rnfs-Api",
-        "description": "The CLI's token, which the daemon writes to `<rnfs dir>/api_token` (mode 0600) at each start; or, with `X-Rnfs-App`, that app's token (`rnfs app add`). Compared in constant time. Without `X-Rnfs-App` only the CLI's token passes, and with it only that app's. Every route but `GET /api/status` needs it (403 `unauthorized`)."
+        "description": "The CLI's token, which the daemon writes to `<rnfs dir>/api_token` (mode 0600) at each start; or, with `X-Rnfs-App`, that app's token (`rnfs app add`). Compared in constant time. Without `X-Rnfs-App` only the CLI's token passes, and with it only that app's. Every route but `GET /api/status` and pairing's `POST` and `GET /api/apps/request` needs it (403 `unauthorized`)."
       },
       "app": {
         "type": "apiKey",

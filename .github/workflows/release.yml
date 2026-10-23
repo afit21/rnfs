@@ -83,6 +83,10 @@ jobs:
       - name: Install the build tools (packaging/build-tools.lock, hash-checked)
         run: |
           python -m pip install --require-hashes --only-binary=:all: -r packaging/build-tools.lock
+      # Reproducible builds: the wheel's timestamps are the commit's time, so rebuilding the commit gives the
+      # same file
+      - name: SOURCE_DATE_EPOCH from the commit
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
       # twine check and the sdist's contents are checked in the tests job (tests.yml's packaging job)
       - run: python -m build --no-isolation
       - name: Smoke test the wheel (with the locked dependencies)
@@ -100,7 +104,7 @@ jobs:
 
   deb:
     name: deb (${{ matrix.arch }})
-    needs: version
+    needs: [version, python]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -113,9 +117,19 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
-      - run: sh packaging/build-deb.sh --arch "$ARCH" --out dist
+      # The rnfs in the .deb is the release's own wheel (the python job's), not one built again here
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: release-python
+          path: wheel
+      # Reproducible builds: every file in the .deb is dated the commit's time, so rebuilding the commit (with
+      # the same wheel) gives the same file (build-deb.sh)
+      - name: SOURCE_DATE_EPOCH from the commit
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - run: sh packaging/build-deb.sh --arch "$ARCH" --wheel "wheel/rnfs-$VERSION-py3-none-any.whl" --out dist
         env:
           ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.version.outputs.version }}
       - run: dpkg-deb --info dist/*.deb && dpkg-deb --contents dist/*.deb | grep -v '/opt/rnfs/lib/.'
       - name: Install and smoke test (Ubuntu runner)
         if: matrix.arch == 'amd64'
@@ -232,7 +246,8 @@ jobs:
     needs: [tests, version, python, deb, flatpak, windows]
     runs-on: ubuntu-latest
     # Protection rules (required reviewers, which tags may deploy) are set on this environment in the
-    # repository's settings, so publishing can be gated beyond whoever can push a v* tag
+    # repository's settings (CONTRIBUTING.md, "Repository settings"). Only a required reviewer gates publishing
+    # beyond whoever can push a v* tag; without one, the environment adds nothing but the tag rule
     environment: release
     permissions:
       contents: write      # create the release
@@ -264,8 +279,10 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         # A release already made for this tag on GitHub's release page gets the files attached rather than
         # failing (its notes are left as they are); otherwise the release is created here, with the version's
-        # CHANGELOG.md section as its notes. Files already attached are never replaced (no --clobber): users may
-        # have downloaded and checked them, so a re-run with the same names fails instead
+        # CHANGELOG.md section as its notes. This workflow never replaces files already attached (no --clobber):
+        # users may have downloaded and checked them, so a re-run with the same names fails instead. That binds
+        # only this workflow: unless the repository's release immutability setting is on, anyone with write
+        # access can still replace a release's files (CONTRIBUTING.md, "Repository settings")
         run: |
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY"

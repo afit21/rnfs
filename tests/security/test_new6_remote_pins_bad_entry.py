@@ -10,7 +10,8 @@ first start, skipping malformed entries the same way, and malformed rows in the 
 
 The pinning node is an offline node; a provider joined to it by tests.test_node's NetClient holds the content.
 The file (or row) is written as a damaged or hand-edited one might be, and the node is started the way
-RnfsNode.__init__ starts it (_start_threads).
+RnfsNode.__init__ starts it (_resume_remote_pins, which _start_network runs before it accepts links since AUD-L12,
+then _start_threads).
 """
 import io
 import json
@@ -84,6 +85,7 @@ class RemotePinsBadEntryTest(unittest.TestCase):
         node = self.open("b", B_ID)
         node.routing.heard(A_ID)
         try:
+            node._resume_remote_pins()
             node._start_threads()
         except TypeError as error:
             # NEW-6: fails until each saved entry's types are checked inside the try, so a bad one is skipped

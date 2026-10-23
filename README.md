@@ -187,8 +187,11 @@ rnfs daemon
 The app can use the network, `~/.rnfs` and `~/.reticulum`, and your Downloads folder: not the rest of your home
 folder, nor any device. Grant more with `flatpak override --user --device=all io.github.afit21.rnfs` (RNode and
 other serial interfaces) or `flatpak override --user --filesystem=<folder> io.github.afit21.rnfs` (another
-folder, or `~/.config/reticulum` if your Reticulum config is there); `--reset` takes them back. Until 0.1.6 the app had your whole home folder and every
-device: after updating, grant the ones you used again. Update by installing the newer `.flatpak`; uninstall
+folder, or `~/.config/reticulum` if your Reticulum config is there); `--reset` takes them back. This limits what
+the app can reach, but doesn't contain a compromised daemon: it can write `~/.reticulum`, whose config can name
+programs (a `PipeInterface`'s command, `interfaces/*.py`) that Reticulum programs you run outside the sandbox
+(`rnsd`, NomadNet, a pip-installed `rnfs`) then run, and `~/.rnfs`, whose `rnfs.toml` a host `rnfs` reads.
+Until 0.1.6 the app had your whole home folder and every device: after updating, grant the ones you used again. Update by installing the newer `.flatpak`; uninstall
 with `flatpak uninstall --user io.github.afit21.rnfs`.
 
 ## macOS
@@ -226,15 +229,20 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
 curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --uninstall  # remove it (keeps ~/.rnfs)
 ```
 
-- Running it again updates rnfs and restarts the service if you installed it.
+- Running it again updates rnfs and restarts the service if you installed it. It won't install an older version
+  over a newer one, nor the latest release over a `--main` install of the same version number (which may be
+  newer), since a daemon that ran the newer one may refuse its upgraded state: `--force` does it anyway.
 - `--main` installs the main branch instead (no checksum to check; give it on every update).
 - `--system`, as root, installs for all users in `/opt/rnfs` and `/usr/local/bin/rnfs`.
 - `--python PATH` picks the Python; `--force` replaces another `rnfs` command (e.g. pipx's);
   `RNFS_SOURCE=<dir, archive, .whl or URL>` installs something other than the latest release (nothing checks
   it; a plain `http://` URL gets a warning).
-- With the service, `loginctl enable-linger $USER` keeps it running while you're logged out. More sandboxing
-  (`ProtectSystem`, `PrivateTmp`) needs unprivileged user namespaces, so it is an optional drop-in, for this
-  unit or the `.deb`'s: see [`contrib/rnfs.service.d/hardening.conf`](contrib/rnfs.service.d/hardening.conf).
+- With the service, `loginctl enable-linger $USER` keeps it running while you're logged out. The unit limits the
+  daemon's system calls, but not what it can write in your home folder. Sandboxing that does needs
+  unprivileged user namespaces, so it is an optional drop-in, for this unit or the `.deb`'s:
+  [`contrib/rnfs.service.d/strict.conf`](contrib/rnfs.service.d/strict.conf) makes your home read-only except
+  `~/.rnfs`, `~/.reticulum` and `~/Downloads` (so `rnfs get -o` writes only there), and
+  [`hardening.conf`](contrib/rnfs.service.d/hardening.conf) adds only `ProtectSystem` and `PrivateTmp`.
 
 ## Checking a download
 
@@ -464,7 +472,7 @@ quiet_hours = "22:00-06:00"
 | `deny_lists` | `[]` | [Deny lists](#keeping-content-off-your-node) to apply |
 | `keep_max_names` | `100` | Names you keep or follow for others |
 | `follow_quota` | 1 GiB | Storage each followed name's target may use; a larger one isn't fetched and the previous one stays pinned (up to twice this while it changes). `0` stops fetching followed names |
-| `api_port`, `gateway_port` | `8788`, `8789` | Local API and gateway ports (127.0.0.1 only) |
+| `api_port`, `gateway_port` | `8788`, `8789` | Local API and gateway ports (loopback only: 127.0.0.1 and ::1) |
 | `gateway_scripts` | `true` | Let gateway pages run scripts |
 | `debug_log` | `false` | Write `~/.rnfs/debug.log` (readable by you only) for diagnosing problems (`daemon --debug-log`) |
 | `verbosity` | `0` | Extra logging: 1 per-query detail, 2 RNS debug output (`daemon -v`, `-vv`) |

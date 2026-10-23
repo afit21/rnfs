@@ -53,7 +53,7 @@ class GatedClient(NetClient):
         self.waiting = 0  # requests held at the gate now
         self._lock = threading.Lock()
 
-    def blocks(self, node_id, cids, on_progress=None):
+    def blocks(self, node_id, cids, on_progress=None, slot_wait=None):
         """Record, maybe hold at the gate, then serve (cut to per_request)."""
         cids = list(cids)
         with self._lock:
@@ -162,6 +162,85 @@ class JobsTest(JobsBase):
         self.assertEqual(job["state"], "failed")
         self.assertIsNone(job["retry_at"])
         self.assertFalse(os.path.exists(self.out("big")))
+
+    def test_a_finished_run_lets_go_of_what_it_met(self):
+        """Once a run ends, the CIDs it met (each counted once), its partial blocks and its rate samples are let go:
+        each of the max_finished_jobs jobs kept held a set of every block's CID (about 175 B a block, 35 MB for a
+        12 GiB fetch; audit M9). Its counts stay, and a new run starts them afresh."""
+        cid = self.share(os.urandom(3 * CHUNK_SIZE + 5))
+        job_id = self.jobs.submit("get", cid, self.out("file"))["id"]
+        self.assertEqual(self.finished(job_id)["blocks"], 5)
+        job = self.jobs._job(job_id)
+        self.assertEqual((job._seen, job._partial, len(job._samples)), (set(), {}, 0))
+        self.assertEqual(self.jobs.get(job_id)["blocks"], 5)
+        self.assertIsNone(job.rate())
+        job.begin_run()  # as a run resuming it
+        job.block(Cid.parse(cid), 10, True)
+        self.assertEqual((job.blocks, len(job._seen)), (1, 1))
+
+    def test_a_job_whose_thread_cant_start_is_queued_again(self):
+        """Its thread failing to start (out of threads or memory) leaves the job queued, holding no max_jobs slot,
+        rather than running with no thread until a restart (audit L11); the next schedule starts it."""
+        cid = self.share(b"started later")
+        real = threading.Thread.start
+
+        def start(thread):
+            """Thread.start, failing for job threads."""
+            if thread.name.startswith("rnfs-job-"):
+                raise RuntimeError("can't start new thread")
+            return real(thread)
+
+        with mock.patch.object(threading.Thread, "start", start), mock.patch("rnfs.features.jobs._log") as log:
+            job_id = self.jobs.submit("pin", cid)["id"]
+        self.assertEqual(self.jobs.get(job_id)["state"], "queued")
+        self.assertEqual(self.jobs.status(), {"jobs_running": 0, "jobs_queued": 1})
+        self.assertEqual(self.jobs._threads, {})
+        self.assertEqual(self.saved()[0]["state"], "queued")
+        self.assertEqual(self.saved()[0]["runs"], 0)
+        self.assertTrue(any("can't start new thread" in call.args[0] for call in log.call_args_list))
+        self.assertTrue(self.jobs._schedule())
+        self.assertEqual(self.finished(job_id)["state"], "done")
+
+    def test_the_retry_loop_survives_a_failing_round(self):
+        """A round of the retry loop raising is logged, and the loop goes on (audit L11)."""
+        calls = []
+
+        def schedule():
+            """Fail the first time."""
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("broken round")
+            return False
+
+        with mock.patch.object(jobs, "RETRY_POLL", 0.05), mock.patch.object(self.jobs, "_schedule", schedule), \
+                mock.patch.object(self.jobs, "_jobs", {"x": mock.Mock(state=jobs.QUEUED, retry_at=0)}), \
+                mock.patch("rnfs.features.jobs._log") as log:
+            thread = threading.Thread(target=self.jobs._retry_loop, daemon=True)
+            thread.start()
+            wait_for(lambda: len(calls) >= 2, what="a second round")
+            self.jobs._stop_event.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(any("broken round" in call.args[0] for call in log.call_args_list))
+
+    def test_a_run_failing_as_the_node_stops_resumes(self):
+        """A run that fails while the node stops (its links closed under it before its fetch saw the stop) is
+        queued again, to resume at the next start, as one the stop cancelled is."""
+        from rnfs.errors import NotFound
+        started = threading.Event()
+
+        def pin_add(target, **kwargs):
+            """A fetch failing once the links close at the stop."""
+            started.set()
+            self.jobs._stop_event.wait(10)
+            raise NotFound("no provider answered")
+
+        with mock.patch.object(self.b, "pin_add", pin_add):
+            job_id = self.jobs.submit("pin", self.share(b"interrupted"))["id"]
+            self.assertTrue(started.wait(10))
+            self.jobs.stop()
+        self.assertEqual(self.jobs.get(job_id)["state"], "queued")
+        self.assertEqual(self.saved()[0]["state"], "queued")
 
     def waiting(self, job_id: str) -> dict:
         """Wait for a job to be queued again, to be tried later, and saved so; its dict."""
@@ -498,6 +577,60 @@ class JobsTest(JobsBase):
         with open(self.out("same"), "rb") as f:
             self.assertEqual(f.read(), data)
         with open(self.out("other"), "rb") as f:
+            self.assertEqual(f.read(), b"someone else's")
+        self.assertEqual([name for name in os.listdir(self.tmp.name) if name.startswith(".rnfs-")], [])
+
+    def test_export_resume_removes_what_an_interrupted_run_left(self):
+        """AUD-M8: an export job wrote straight to its output, so a crash left a truncated archive there and the
+        resumed run failed "already exists". It writes beside it under names of its own, which the resumed run
+        removes, and renames the archive into place once complete."""
+        cid = self.share(os.urandom(3 * CHUNK_SIZE))
+        self.b.pin_add(cid)  # its blocks stored: the resumed run only writes the archive
+        self.b.stop()
+        output = self.out("x.rnfs")
+        write_legacy(os.path.join(self.tmp.name, "b", "state"), "jobs.json",
+                     {"jobs": [{"id": "0123abcd", "kind": "export", "target": cid, "output": output,
+                                "state": "running", "created": 1.0}]})
+        left = [os.path.join(self.tmp.name, ".rnfs-job-0123abcd.partial"),
+                os.path.join(self.tmp.name, ".rnfs-job-0123abcd.write.partial")]
+        for path in left:
+            with open(path, "wb") as f:
+                f.write(b"the first bytes of an archive")
+        b2 = self.make_node("b", B_ID)
+        manager = b2.feature("jobs")
+        manager.start()
+        self.assertTrue(wait_for(lambda: manager.get("0123abcd")["state"] in jobs.FINISHED))
+        self.assertEqual(manager.get("0123abcd")["state"], "done", manager.get("0123abcd"))
+        imported = self.a.import_archive(output)
+        self.assertEqual((imported["roots"], imported["incomplete"]), ([cid], []))
+        self.assertEqual([name for name in os.listdir(self.tmp.name) if name.startswith(".rnfs-")], [])
+
+    def test_export_resume_finds_its_output_already_in_place(self):
+        """As a get job's: an export job whose archive was renamed into place before a crash kept its outcome from
+        being saved is done when the resumed run writes the same archive; a different file there fails it, left as
+        it is."""
+        cid = self.share(os.urandom(CHUNK_SIZE + 10))
+        submitted = [self.jobs.submit("export", cid, self.out("same.rnfs"))["id"],
+                     self.jobs.submit("export", cid, self.out("other.rnfs"))["id"]]
+        for job_id in submitted:
+            self.assertEqual(self.finished(job_id)["state"], "done")
+        with open(self.out("same.rnfs"), "rb") as f:
+            archive = f.read()
+        with open(self.out("other.rnfs"), "wb") as f:
+            f.write(b"someone else's")
+        self.b.stop()
+        for record in self.saved():  # as a crash between the rename and the save leaves them
+            state_execute(self.b.config.state_dir, "UPDATE jobs SET record = ? WHERE id = ?",
+                          (statedb.dump({**record, "state": "running"}), record["id"]))
+        b2 = self.make_node("b", B_ID)
+        manager = b2.feature("jobs")
+        manager.start()
+        self.assertTrue(wait_for(lambda: all(manager.get(i)["state"] in jobs.FINISHED for i in submitted)))
+        self.assertEqual([manager.get(i)["state"] for i in submitted], ["done", "failed"])
+        self.assertIn("already exists", manager.get(submitted[1])["error"])
+        with open(self.out("same.rnfs"), "rb") as f:
+            self.assertEqual(f.read(), archive)
+        with open(self.out("other.rnfs"), "rb") as f:
             self.assertEqual(f.read(), b"someone else's")
         self.assertEqual([name for name in os.listdir(self.tmp.name) if name.startswith(".rnfs-")], [])
 

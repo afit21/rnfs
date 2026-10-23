@@ -39,8 +39,12 @@ RestrictSUIDSGID=yes
 # is left out: libffi closures, which cffi (under cryptography) can use, may need writable executable memory.
 SystemCallFilter=@system-service
 SystemCallArchitectures=native
-# ProtectSystem and PrivateTmp are left out: in a user unit they need unprivileged user namespaces, which some
-# systems turn off. Where that works, add them with the drop-in in contrib/rnfs.service.d/hardening.conf
+# These limit the system calls and sockets the daemon can use; they don't keep a compromised daemon from writing
+# your home folder (~/.bashrc, autostart entries, other user units) or from asking your systemd user manager to
+# start an unsandboxed process. The file system settings that would (ProtectHome, ReadWritePaths, ...) are left
+# out: in a user unit they need unprivileged user namespaces, which some systems turn off, and they limit where
+# `rnfs get` can write. Where that works, add them with the drop-in contrib/rnfs.service.d/strict.conf, or just
+# ProtectSystem and PrivateTmp with contrib/rnfs.service.d/hardening.conf
 # (https://github.com/afit21/rnfs/blob/main/contrib/rnfs.service.d/hardening.conf). UMask is left out too: what
 # `rnfs get` writes gets its permissions from your umask.
 

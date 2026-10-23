@@ -118,9 +118,9 @@ PRIVATE_SUBDIRS = ("storage", "names", "state", "blocks", "lxmf")
 
 
 def opened_path(handle: builder.Handle, st: os.stat_result, path: str) -> str:
-    """The real path of the directory open as handle (from builder.open_path(path), whose stat is st): what the
-    walk of handle reads, wherever path leads by now. Raises builder.Changed if path no longer leads to it where
-    the system can't name an open directory, OSError if it can't be resolved.
+    """The real path of the file or directory open as handle (from builder.open_path(path), whose stat is st): what
+    a build of handle reads, wherever path leads by now. Raises builder.Changed if path no longer leads to it where
+    the system can't name an open file or directory, OSError if it can't be resolved.
     """
     if not isinstance(handle, int):
         return handle.root  # a path walk's root: its real path, checked against st as it was opened
@@ -152,8 +152,20 @@ def add_refused_reason(path: str, rnfs_dir: str) -> str | None:
     """Why `add` may not add path, or None: what refused_reason refuses (the rnfs dir, a directory holding it, or
     anything inside its PRIVATE_SUBDIRS), and anything else inside the rnfs dir but outside its shared folder,
     files/, such as api_token, rnfs.toml or the Reticulum config (audit REV1). path is resolved, a link at its end
-    too (add follows it); what is in files/ is shared anyway."""
-    real = os.path.realpath(path)
+    too (add follows it); what is in files/ is shared anyway. add_path checks again, on what it opened
+    (opened_refused_reason)."""
+    return _add_refused_real(os.path.realpath(path), rnfs_dir)
+
+
+def opened_refused_reason(handle: builder.Handle, st: os.stat_result, path: str, rnfs_dir: str) -> str | None:
+    """add_refused_reason of the file or directory open as handle (from builder.open_path(path), whose stat is st),
+    decided from what was opened (opened_path) rather than from where path leads by now: path swapped for a link
+    into the rnfs dir after the first check is refused here (audit AUD-H3). Raises as opened_path does."""
+    return _add_refused_real(opened_path(handle, st, path), rnfs_dir)
+
+
+def _add_refused_real(real: str, rnfs_dir: str) -> str | None:
+    """add_refused_reason of the real path real."""
     reason = refused_reason(real, rnfs_dir)
     if reason is not None:
         return reason

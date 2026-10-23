@@ -193,11 +193,15 @@ class FollowFeature(Feature):
                 self._due[name] = (first, True)
         self._spawn(self._loop, "rnfs-follow")
 
-    def stop(self, deadline: float | None = None):
-        """Stop the background thread and wait for it until deadline (a fetch in progress stops at its next network
-        wait), so the node doesn't close the state database under it."""
+    def stopping(self):
+        """Ask the background thread to end: a fetch in progress ends at its next step (as Feature.stopping)."""
         self._stop.set()
         self._wake.set()
+
+    def stop(self, deadline: float | None = None):
+        """Stop the background thread and wait for it until deadline, so the node doesn't close the state database
+        under it."""
+        self.stopping()
         self._join(deadline)
 
     def close(self):
@@ -279,6 +283,7 @@ class FollowFeature(Feature):
         record held wasn't heard within MISSED_ANNOUNCES x announce_interval; network=False uses the record held
         whatever its age (the network only when none is held).
         """
+        from rnfs import fetcher
         with self._lock:
             if name not in self._pinned:
                 return True
@@ -305,17 +310,19 @@ class FollowFeature(Feature):
         try:
             if quota == 0:
                 raise TooLarge("follow fetches are off (follow_quota is 0)")
-            with self.node.pinned_fetch(target, explicit=False) as fetch:
+            # Ends at its next step once the feature is asked to stop, so the node's stop needn't wait it out
+            with fetcher.cancel_when(self._stop.is_set), self.node.pinned_fetch(target, explicit=False) as fetch:
                 # A pinned fetch never stops at max_storage, so without this the name's owner could fill the disk
                 expect = fetch.resolve()
                 content = fetch.size_of(expect)
                 if content > quota:
                     raise TooLarge(f"{content} bytes would exceed follow_quota ({quota})")
                 # A DAG of empty files has size 0 yet can hold gigabytes of directory nodes: count its blocks too
-                # (fetch_dag also bounds them by what the size can hold, whichever is lower)
+                # (fetch_dag also bounds them by what the size can hold, whichever is lower), and its entries, as a
+                # get of it would
                 fetch.max_dag_bytes = quota
                 try:
-                    fetch.fetch_dag(expect)
+                    fetch.fetch_dag(expect, self.node.config.max_output_entries)
                 except TooLarge as e:
                     if fetch.dag_bytes <= quota:
                         raise  # the bound of its size, not the quota

@@ -72,9 +72,13 @@ class PeersFeature(Feature):
         """Start the thread publishing "peer" events (an offline test node calls check() itself)."""
         self._spawn(self._run, "rnfs-peers")
 
+    def stopping(self):
+        """Ask the events thread to end (as Feature.stopping)."""
+        self._stop.set()
+
     def stop(self, deadline: float | None = None):
         """Stop the events thread, waiting for it until deadline (as Feature.stop)."""
-        self._stop.set()
+        self.stopping()
         self._join(deadline)
 
     def _run(self):

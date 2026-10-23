@@ -298,7 +298,10 @@ class BuildScriptsTest(unittest.TestCase):
         self.assertIn("rnfs.egg-info", skipped)
 
     def test_flatpak_sandbox_is_narrow(self):
-        """The Flatpak reaches only rnfs's and Reticulum's directories and Downloads, and no device (SUP-5)."""
+        """The Flatpak reaches only rnfs's and Reticulum's directories and Downloads, and no device (SUP-5). This
+        narrows what a compromised daemon reaches but doesn't contain it (AUD-M10): the read-write ~/.reticulum holds
+        config (a PipeInterface's command, interfaces/*.py) that Reticulum programs outside the sandbox run, and
+        ~/.rnfs/rnfs.toml is read by a host rnfs. The manifest and README say so."""
         manifest = read(os.path.join(REPO, "packaging", "flatpak", "io.github.afit21.rnfs.yml"))
         block = re.search(r"(?m)^finish-args:\n((?: +.*\n)+)", manifest)
         self.assertTrue(block)
@@ -309,6 +312,8 @@ class BuildScriptsTest(unittest.TestCase):
         for text in (block.group(1), read(os.path.join(REPO, "README.md"))):
             for override in ("--device=all", "--filesystem="):
                 self.assertIn(f"flatpak override --user {override}", text)
+            # and so is what the ~/.reticulum grant leaves open
+            self.assertIn("interfaces/*.py", text)
 
     def test_release_waits_for_the_tests(self):
         """The release job needs the whole tests workflow, called from release.yml."""

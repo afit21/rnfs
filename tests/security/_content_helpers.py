@@ -60,9 +60,9 @@ class CountingNetClient(NetClient):
         self.downloaded_blocks = 0
         self.downloaded_bytes = 0
 
-    def blocks(self, node_id, cids, on_progress=None):
+    def blocks(self, node_id, cids, on_progress=None, slot_wait=None):
         """NetClient.blocks, counted."""
-        result = super().blocks(node_id, cids, on_progress)
+        result = super().blocks(node_id, cids, on_progress, slot_wait)
         self.downloaded_blocks += len(result.blocks)
         self.downloaded_bytes += sum(len(block) for block in result.blocks.values())
         return result

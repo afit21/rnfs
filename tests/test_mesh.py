@@ -845,7 +845,7 @@ class PeerClientCountingTest(unittest.TestCase):
         client = PeerClient(links, Config())
         cid, data = block_of(1000, 1)
         results = iter([BlocksResult(OK, blocks={cid: data}), BlocksResult(BUSY), BlocksResult(FAILED)])
-        client._blocks = lambda node_id, cids, on_progress=None: next(results)
+        client._blocks = lambda node_id, cids, on_progress=None, slot_wait=None: next(results)
         for _ in range(3):
             client.blocks(P1, [cid])
         peer = client.traffic.peer(P1)

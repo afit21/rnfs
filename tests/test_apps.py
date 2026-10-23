@@ -16,7 +16,7 @@ from rnfs.apps import AppRegistry, PairingRequests
 from rnfs.config import Config
 from rnfs.content.cid import Cid
 from rnfs.content.storage import USER, app_source
-from rnfs.errors import Busy, NotFound
+from rnfs.errors import NotFound
 from rnfs.node import RnfsNode
 from tests.support import failing_commits, state_execute, state_rows
 from tests.test_names import FakeNetwork
@@ -446,17 +446,25 @@ class PairingTest(unittest.TestCase):
         self.now += apps.REQUEST_LIFE
         with self.assertRaises(NotFound):
             self.pairing.state(later["id"], later["secret"])
-        self.registry.add("taken")
-        for name, description in (("taken", None), ("Bad Name", None), ("ok", "x" * 201), ("ok", "line\nbreak")):
+        for name, description in (("Bad Name", None), ("ok", "x" * 201), ("ok", "line\nbreak")):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 self.pairing.request(name, description)
-        self.pairing.request("twice")
+        # A name an app has is refused when approved, not when asked (AUD-L1: the open route mustn't say which apps
+        # exist); a name may be asked for more than once (AUD-M5: tests/security/test_audm5_pairing_preempt.py)
+        self.registry.add("taken")
+        taken = self.pairing.request("taken")
         with self.assertRaises(ValueError):
-            self.pairing.request("twice")
-        for n in range(apps.MAX_PENDING - 1):
+            self.pairing.approve(taken["id"])
+        twice = [self.pairing.request("twice"), self.pairing.request("twice")]
+        self.assertEqual(self.pairing.approve(twice[1]["id"])["name"], "twice")
+        self.assertEqual(self.pairing.state(twice[0]["id"], twice[0]["secret"])["state"], "denied")
+        # Beyond MAX_PENDING waiting, the oldest makes way rather than the newest being refused
+        first = self.pairing.request("app0")
+        for n in range(1, apps.MAX_PENDING + 1):
             self.pairing.request(f"app{n}")
-        with self.assertRaises(Busy):
-            self.pairing.request("one-too-many")
+        self.assertEqual(len(self.pairing.pending()), apps.MAX_PENDING)
+        with self.assertRaises(NotFound):
+            self.pairing.state(first["id"], first["secret"])
 
 
 class PairingApiTest(unittest.TestCase):

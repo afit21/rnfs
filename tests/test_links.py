@@ -326,6 +326,29 @@ class LinkPoolTest(unittest.TestCase):
         release.set()
         opener.join(5)
 
+    def test_no_link_opens_once_the_pool_is_closed(self):
+        """After close_all (the node stopping) get() and one-shot opens refuse at once, opening nothing: a link
+        opened then would outlive the node (audit M7)."""
+        self.pool.close_all()
+        self.assertIsNone(run(self, lambda: self.pool.get(NODE)))
+        self.assertIsNone(run(self, lambda: self.pool.open_identified(NODE)))
+        self.assertEqual(FakeLink.created, [])
+        self.assertFalse(self.pool.has_link(NODE))
+
+    def test_a_link_opening_while_the_pool_closes_is_closed(self):
+        """An opener whose path comes just as close_all runs: the link it then establishes is closed, not added to
+        the pool (audit M7: an embedded node's LinkPool.get opened links after close_all)."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        pool, opener = self.joined_pool(lambda node_id, timeout, cancel=None, measure=True: release.wait(10))
+        pool.close_all()
+        release.set()
+        opener.join(5)
+        self.assertFalse(opener.is_alive())
+        self.assertEqual(pool.opened, [None])
+        self.assertFalse(pool.has_link(NODE))
+        self.assertTrue(all(link.status == FakeLink.CLOSED for link in FakeLink.created), FakeLink.created)
+
     def test_identified_link_is_separate(self):
         shared = run(self, lambda: self.pool.get(NODE))
         identified = run(self, lambda: self.pool.open_identified(NODE))

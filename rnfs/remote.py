@@ -89,7 +89,7 @@ class Client(interface.Rnfs):
         6-digit code to show the user, who approves the request where it shows the same code (rnfs app requests,
         approve; or an app such as RNFS Desktop). Returns (a Client as app, its token: keep it, as rnfs app add's,
         for the next start). Raises AuthFailed (refused), TimeoutError (no answer within wait seconds), ValueError
-        (an invalid name, or one taken or asked for already), NoSuchEndpoint (a daemon before 0.2.1)."""
+        (an invalid name), NoSuchEndpoint (a daemon before 0.2.1)."""
         token = ApiConnection(rnfs_dir, port=port, timeout=timeout).pair(app, description, wait, on_code)
         return cls(rnfs_dir, port=port, timeout=timeout, app=app, token=token), token
 

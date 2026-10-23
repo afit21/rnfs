@@ -11,8 +11,8 @@ from rnfs.constants import ID_LENGTH, K
 from rnfs.content.storage import Storage
 from rnfs.dht.density import SIZE_SAMPLES, CheckCounts, SizeEstimate
 from rnfs.dht.lookup import Lookup
-from rnfs.dht.lookups import (SLOW_DISJOINT_PATHS, SLOW_PUBLISH_UNKNOWNS, SLOW_SEARCH_UNKNOWNS, Lookups, Search,
-                              split_budget)
+from rnfs.dht.lookups import (SAMPLE_REFRESH, SLOW_DISJOINT_PATHS, SLOW_PUBLISH_UNKNOWNS, SLOW_SEARCH_UNKNOWNS,
+                              Lookups, Search, split_budget)
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
 from rnfs.dht.sweep import Region
@@ -157,8 +157,8 @@ class LookupsTest(LookupTestCase):
         self.lookups = Lookups(self.new_lookup, lambda key: self.table.closest(key, K), self.sizes,
                                lambda key: [], paths=3)
         rng = random.Random(43)
-        for _ in range(SIZE_SAMPLES):
-            self.lookups.search(rng.randbytes(ID_LENGTH)).find_closest()
+        for _ in range(SIZE_SAMPLES):  # lookups for random keys: searches don't feed the estimate (AUD-M1)
+            self.lookups.sample_due(rng.randbytes(ID_LENGTH))
 
     def new_lookup(self, key, start, **options):
         """A Lookup over the network."""
@@ -196,6 +196,32 @@ class LookupsTest(LookupTestCase):
         lookup = self.lookups.publish(other)
         region = Region(other, 0, lookup.find_closest(), lookup.candidates())
         self.assertFalse(self.lookups.flags(other, region))
+
+    def test_size_samples_only_from_keys_the_node_chose(self):
+        """Searches don't feed the size estimate (their keys may be anyone's choice: AUD-M1); publish lookups do, and
+        lookups for random keys while the estimate isn't full or no sample came for SAMPLE_REFRESH, on a slow node
+        only when the pacing allows one."""
+        clock = FakeClock()
+        sizes = SizeEstimate(clock=clock)
+        wait = [5.0]
+        lookups = Lookups(self.new_lookup, lambda key: self.table.closest(key, K), sizes, lambda key: [], 3,
+                          pace=lambda: wait[0])
+        rng = random.Random(45)
+        lookups.search(rng.randbytes(ID_LENGTH)).find_closest()
+        self.assertEqual(len(sizes), 0)
+        self.assertFalse(lookups.sample_due())  # paced
+        wait[0] = 0.0
+        self.assertTrue(lookups.sample_due())
+        lookups.publish(rng.randbytes(ID_LENGTH)).find_closest()
+        self.assertEqual(len(sizes), 2)
+        for _ in range(SIZE_SAMPLES):
+            if not lookups.sample_due(rng.randbytes(ID_LENGTH)):
+                break
+        self.assertEqual(len(sizes), SIZE_SAMPLES)
+        clock.now += SAMPLE_REFRESH - 1
+        self.assertFalse(lookups.sample_due())
+        clock.now += 1
+        self.assertTrue(lookups.sample_due())
 
     def test_no_check_before_the_estimate_warms_up(self):
         lookups = Lookups(self.new_lookup, lambda key: self.table.closest(key, K), SizeEstimate(), lambda key: [])
@@ -245,7 +271,8 @@ class LookupsTest(LookupTestCase):
         self.assertEqual(counted(), (0, 0, 0, 0))
         # Lookups made without checks keep counts of their own
         self.assertIsInstance(self.lookups.checks, CheckCounts)
-        self.assertGreater(self.lookups.checks.status()["density_checked_day"], 0)  # setUp's searches, once warm
+        self.lookups.search(other).find_closest()
+        self.assertGreater(self.lookups.checks.status()["density_checked_day"], 0)
 
     def test_one_path_is_a_plain_lookup(self):
         lookups = Lookups(self.new_lookup, lambda key: self.table.closest(key, K), self.sizes, lambda key: [], 1)

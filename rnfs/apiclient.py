@@ -982,9 +982,10 @@ class ApiConnection:
         "expires"}] (0.2.1)."""
         return self.get("/api/apps/requests")["requests"]
 
-    def app_approve(self, request_id: str) -> dict:
-        """Approve an app's request (0.2.1): {"name", "created"}; its token goes to the app alone."""
-        return self.post("/api/apps/approve", id=request_id)
+    def app_approve(self, request_id: str, code: str | None = None) -> dict:
+        """Approve an app's request (0.2.1): {"name", "created"}; its token goes to the app alone. code, the one the
+        user reads off the app, is checked against the request's (BadRequest if it isn't)."""
+        return self._post("/api/apps/approve", id=request_id, code=code)
 
     def app_deny(self, request_id: str) -> dict:
         """Refuse an app's request (0.2.1): {"name"}."""

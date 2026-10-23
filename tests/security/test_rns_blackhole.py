@@ -93,8 +93,8 @@ class BlackholedNodeTest(unittest.TestCase):
         self.victim.blackhole.interval = 0  # read at every maintenance pass
         self.asked: list[bytes] = []
         blocks = self.net.blocks
-        self.net.blocks = lambda node_id, cids, on_progress=None: (self.asked.append(node_id),
-                                                                   blocks(node_id, cids, on_progress))[1]
+        self.net.blocks = lambda node_id, cids, on_progress=None, slot_wait=None: (
+            self.asked.append(node_id), blocks(node_id, cids, on_progress))[1]
 
     def node(self, name: str, node_id: bytes) -> RnfsNode:
         """An offline node with its own directory."""

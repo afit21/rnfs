@@ -329,7 +329,7 @@ def run_daemon(args):
                                  restart=restart if started["can_restart"] else None))
         servers.append(GatewayServer(node, config, config.gateway_port))
     except (OSError, OverflowError) as e:  # OverflowError: a port over 65535, which validate() should have refused
-        abort(f"can't listen on 127.0.0.1: {e}. Is another daemon running? (--api-port, --gateway-port)")
+        abort(f"can't listen on 127.0.0.1 and ::1: {e}. Is another daemon running? (--api-port, --gateway-port)")
     api, gateway = servers
     # A new token each start, so one copied while an old daemon ran is useless now
     token_file = token_path(config.root)
@@ -926,20 +926,21 @@ def run_name_rm(args):
 
 
 def run_name_export(args):
-    """Write a name's key to -o (created with mode 0600) or stdout."""
+    """Write a name's key to -o (a new file only this user can read: mode 0600, and on Windows, which ignores the
+    mode, a private access list, AUD-L2) or stdout."""
     if not args.output and sys.stdout.isatty():
         fail("refusing to write a private key to the terminal; use -o <file> or redirect stdout")
+    if args.output and os.path.lexists(args.output):
+        fail(f"{args.output} already exists")  # before the key is exported (and marked so), as app add does
     response = client(args).request("POST", "/api/name/export", json_body={"alias": args.alias})
     key = read_all(response)
     if args.output:
         try:
-            fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | fsutil.O_BINARY, 0o600)
+            fsutil.write_atomic(args.output, key, mode=0o600, private=True, exclusive=True)
         except FileExistsError:
             fail(f"{args.output} already exists")
         except OSError as e:
             fail(f"can't write {args.output}: {e}")
-        with os.fdopen(fd, "wb") as out:
-            out.write(key)
     else:
         sys.stdout.buffer.write(key)
         sys.stdout.buffer.flush()
@@ -1130,8 +1131,26 @@ def run_app_requests(args):
 
 
 def run_app_approve(args):
-    """Approve an app's request for a token: the app collects the token itself."""
-    added = client(args).app_approve(args.id)
+    """Approve an app's request for a token: the app collects the token itself. The daemon checks the code the app
+    shows (--code, or asked for at a terminal), so a request another program made under the app's name, which shows
+    another code, isn't approved in its place (AUD-M5)."""
+    api = client(args)
+    code = args.code
+    if code is None and sys.stdin.isatty():
+        request = next((request for request in api.app_requests() if request["id"] == args.id), None)
+        if request is None:
+            fail(f"no app is waiting for an answer as request {args.id}")
+        about = f" ({request['description']})" if request.get("description") else ""
+        # Typed, not shown: the code is to come from the app, which another program asking under its name can't show
+        print(printable(f"app {request['name']}{about} asks for a token, which lets it do anything rnfs can"),
+              file=sys.stderr)
+        print("type the code the app shows (Enter to cancel): ", end="", file=sys.stderr, flush=True)
+        code = sys.stdin.readline().strip()
+        if not code:
+            fail("not approved")
+    added = api.app_approve(args.id, code)
+    if code is None:
+        warn("approved without checking the code the app shows (--code)")
     print(printable(f"approved app {added['name']}: it can now do anything rnfs can (rnfs app rm "
                     f"{added['name']} revokes it)"))
 
@@ -1439,8 +1458,10 @@ def build_parser() -> argparse.ArgumentParser:
     app_requests = command(app_commands, "requests", run_app_requests,
                            "list the apps asking for a token, with the code each shows")
     app_requests.add_argument("--json", action="store_true")
-    command(app_commands, "approve", run_app_approve,
-            "give an app that asked a token (check it shows the same code first)").add_argument("id")
+    app_approve = command(app_commands, "approve", run_app_approve,
+                          "give an app that asked a token, once you give the code it shows")
+    app_approve.add_argument("id")
+    app_approve.add_argument("--code", help="the code the app shows (asked for at a terminal)")
     command(app_commands, "deny", run_app_deny, "refuse an app's request for a token").add_argument("id")
 
     command(commands, "status", run_status, "node ID, known nodes, records held, storage use")

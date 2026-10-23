@@ -43,11 +43,13 @@ or import job; `rnfs jobs` lists, shows, waits for, cancels and clears jobs.
   through eviction and gc, also across a restart (the sessions are opened when the jobs are loaded, before
   any eviction runs). Failed and cancelled jobs release theirs; starting the transfer again refetches
   whatever was evicted meanwhile.
-- A get job writes to <output's directory>/.rnfs-job-<id>.partial and renames that to its output once
-  complete, so an interrupted write-out never leaves a partial output behind, and a resumed run removes what
-  an earlier run left there. With sealed_name, a sealed file this node opens is renamed to its sealed name
-  (if fit, fsutil.safe_default_name) in the output's directory instead: for a sealed folder unpacked, the
-  name of the directory written. With no_extract, a sealed folder is written as its tar rather than unpacked
+- A get or export job writes to <output's directory>/.rnfs-job-<id>.partial and renames that to its output
+  once complete, so an interrupted write-out never leaves a partial output behind, and a resumed run removes
+  what an earlier run left there; an output already in place when a resumed run ends is accepted only if it
+  holds the same content (that run's, renamed before a crash kept its outcome from being saved). With
+  sealed_name, a sealed file this node opens is renamed to its sealed name (if fit,
+  fsutil.safe_default_name) in the output's directory instead: for a sealed folder unpacked, the name of the
+  directory written. With no_extract, a sealed folder is written as its tar rather than unpacked
   (node.get's no_extract). With fallback_dht, a get whose from node fails is retried with ordinary DHT
   discovery.
 - A get, pin or export job submitted with retry true (kept in its record) whose content no provider could supply
@@ -290,6 +292,23 @@ class Job:
             self._partial = {}
             self._samples = deque([(time.monotonic(), 0)])
             self._last_event = time.monotonic()  # the "running" event has just been published
+
+    def undo_run(self):
+        """Take back begin_run for a run that never started (its thread couldn't): queued again, due when it was."""
+        with self._lock:
+            self.state = QUEUED
+            self.retry_at, self.retry_due = self.retry_due, None
+            self.runs -= 1
+        self.end_run()
+
+    def end_run(self):
+        """Let go of what this run kept to count its progress (each block met, partial blocks, rate samples): its
+        counts stay, and the next run (begin_run) starts them afresh. A finished job kept them until forgotten:
+        about 175 bytes a block met, 35 MB for a 12 GiB fetch."""
+        with self._lock:
+            self._seen = set()
+            self._partial = {}
+            self._samples = deque()
 
     def _prune(self, now: float):
         """Drop samples older than RATE_WINDOW, keeping one at or before the window's start as the base to
@@ -697,21 +716,29 @@ class JobsFeature(Feature):
     def _retry_loop(self):
         """Start the queued jobs whose retry_at has come, every RETRY_POLL, until the node stops."""
         while not self._stop_event.wait(RETRY_POLL):
-            now = time.time()
-            with self._lock:
-                due = any(job.state == QUEUED and job.retry_at is not None and job.retry_at <= now
-                          for job in self._jobs.values())
-            if due:
-                self._schedule()
+            try:
+                now = time.time()
+                with self._lock:
+                    due = any(job.state == QUEUED and job.retry_at is not None and job.retry_at <= now
+                              for job in self._jobs.values())
+                if due:
+                    self._schedule()
+            except Exception as e:  # noqa: BLE001 - the loop must outlive one failed round, or no retry runs again
+                _log(f"starting the jobs due failed: {e!r}", LOG_ERROR)
 
-    def stop(self, deadline: float | None = None):
-        """Ask running jobs to stop (they are saved as queued, to resume), wait for them until deadline (as
-        Feature.stop), save."""
+    def stopping(self):
+        """Ask running jobs to stop (they are saved as queued, to resume) and start no more (as
+        Feature.stopping)."""
         with self._lock:
             self._started = False
+        self._stop_event.set()
+
+    def stop(self, deadline: float | None = None):
+        """Ask running jobs to stop (stopping), wait for them until deadline (as Feature.stop), save."""
+        self.stopping()
+        with self._lock:
             # Not one _schedule has registered but not started yet (it can't be joined): it sees the stop at once
             threads = [thread for thread in self._threads.values() if thread.ident is not None]
-        self._stop_event.set()
         self._join(deadline, threads)
         try:
             self.save()  # only if something changed: offline test nodes with no jobs write nothing
@@ -746,11 +773,23 @@ class JobsFeature(Feature):
                 running += 1
         for job, _ in starting:
             self._publish(job)  # before its thread runs, so its first progress event comes after
-        for _, thread in starting:
-            thread.start()
+        started = False
+        for job, thread in starting:
+            try:
+                thread.start()
+                started = True
+            except RuntimeError as e:  # can't start new thread: out of threads or memory
+                # Queued again rather than left running with no thread, holding a job slot until a restart; the next
+                # schedule (a job submitted or ending, a retry due) tries again
+                with self._lock:
+                    self._threads.pop(job.id, None)
+                    job.undo_run()
+                    self._store.changed(job.id)
+                _log(f"job {job.id} ({job.kind} {job.subject}) couldn't start: {e}; queued again", LOG_ERROR)
+                self._publish(job)
         if starting:
             self._save_quietly()
-        return bool(starting)
+        return started
 
     def _run(self, job: Job):
         """Run a job to its end on this thread, then start the next."""
@@ -768,6 +807,10 @@ class JobsFeature(Feature):
             error = str(e) or type(e).__name__
             if self._retries(job, e):
                 state = QUEUED
+            elif self._stop_event.is_set() and not job.cancel_requested:
+                # Failed as the node stops (its links close before every fetch has seen the stop): resumed at the next
+                # start, as a run the stop cancelled is
+                state, error = QUEUED, None
         except Exception as e:  # noqa: BLE001 - a job's failure mustn't take its thread's bookkeeping with it
             error = str(e) or type(e).__name__
             _log(f"job {job.id} ({job.kind} {job.subject}) failed: {e!r}", LOG_ERROR)
@@ -820,7 +863,7 @@ class JobsFeature(Feature):
         elif job.kind == "pin":
             result = node.pin_add(job.target, **_source(job))
         elif job.kind == "export":
-            result = node.export(job.target, job.output)
+            result = self._export(job)
         elif job.kind == "add":
             result = self._add(job)
         else:
@@ -864,23 +907,28 @@ class JobsFeature(Feature):
                 name = fsutil.safe_default_name(result.get("name"), None)
                 if name is not None:
                     output = os.path.join(os.path.dirname(job.output), name)
-            try:
-                fsutil.rename_new(partial, output)
-            except FileExistsError:
-                # A run before a crash may have renamed its output into place without its outcome being saved: the
-                # same content there is that run's
-                if job.runs <= 1 or not fsutil.same_content(partial, output):
-                    raise
-                fsutil.remove_tree(partial)
+            _rename_into_place(job, partial, output)
         except BaseException:
-            try:
-                fsutil.remove_tree(partial)  # stored blocks stay, so a retry or resume writes it out again quickly
-            except OSError as e:  # the job's own error matters more; the next run tries again
-                _log(f"job {job.id}: removing {partial} failed: {e!r}", LOG_WARNING)
+            _remove_partial(job, partial)  # stored blocks stay, so a retry or resume writes it out again quickly
             raise
         with self._lock:
             job.output = output
         return {**result, "output": output}
+
+    def _export(self, job: Job) -> dict:
+        """An export job: node.export to its partial path (written under its write path first), then rename that to
+        the output, as a get job does (AUD-M8: written straight to the output, an export cut off by a crash left a
+        truncated archive there, which the resumed run then refused to overwrite)."""
+        partial = partial_path(job)
+        fsutil.remove_tree(partial)  # what an interrupted earlier run (or a crash) left
+        fsutil.remove_tree(write_path(job))  # and the archive it was writing
+        try:
+            result = self.node.export(job.target, partial, temporary=write_path(job))
+            _rename_into_place(job, partial, job.output)
+        except BaseException:
+            _remove_partial(job, partial)
+            raise
+        return result
 
     def _fetch_to(self, job: Job, path: str) -> dict:
         """node.get of the job's target to path: from its from node, then (fallback_dht) by DHT discovery."""
@@ -925,6 +973,8 @@ class JobsFeature(Feature):
             if state in FINISHED:
                 job.finished = time.time()
                 job.retry_at = job.retry_since = None
+            if state != RUNNING:
+                job.end_run()
             self._threads.pop(job.id, None)
             self._store.changed(job.id)
             self._cap_finished()
@@ -1038,6 +1088,7 @@ class JobsFeature(Feature):
                 job.finished = time.time()
                 if state == DONE and job.total_bytes is None:
                     job.total_bytes = job.done_bytes
+                job.end_run()
                 self._cap_finished()
             self._publish(job)
             job.ended.set()
@@ -1159,14 +1210,35 @@ def _answer_progress(job: Job):
 
 
 def partial_path(job: Job) -> str:
-    """Where a get job writes before renaming to its output: hidden, beside it, named by the job's ID."""
+    """Where a get or export job writes before renaming to its output: hidden, beside it, named by the job's ID."""
     return os.path.join(os.path.dirname(job.output), f".rnfs-job-{job.id}{PARTIAL_SUFFIX}")
 
 
 def write_path(job: Job) -> str:
-    """Where node.get writes a get job's target before renaming it to the job's partial path: named by the job's ID
-    too, so a run resuming it after a crash finds and removes what the crashed one left."""
+    """Where node.get (node.export) writes a get (export) job's target before renaming it to the job's partial path:
+    named by the job's ID too, so a run resuming it after a crash finds and removes what the crashed one left."""
     return os.path.join(os.path.dirname(job.output), f".rnfs-job-{job.id}.write{PARTIAL_SUFFIX}")
+
+
+def _rename_into_place(job: Job, partial: str, output: str):
+    """Rename what a get or export job wrote to partial to output. A run before a crash may have renamed its output
+    into place without its outcome being saved: the same content there is that run's, and partial is removed; anything
+    else there fails the job (FileExistsError), left as it is."""
+    try:
+        fsutil.rename_new(partial, output)
+    except FileExistsError:
+        if job.runs <= 1 or not fsutil.same_content(partial, output):
+            raise
+        fsutil.remove_tree(partial)
+
+
+def _remove_partial(job: Job, partial: str):
+    """Remove a failed run's partial output; a failure is logged (the job's own error matters more; the next run
+    tries again)."""
+    try:
+        fsutil.remove_tree(partial)
+    except OSError as e:
+        _log(f"job {job.id}: removing {partial} failed: {e!r}", LOG_WARNING)
 
 
 # API handlers: handler is the ApiHandler; every route requires the API token

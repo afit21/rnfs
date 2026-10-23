@@ -1061,8 +1061,8 @@ class _RangeLinks:
     def call(self, peer, path, request, **kwargs):
         """The exchange of one request: answered at once."""
         response = wire(self.answer(path, wire(request)))
-        return types.SimpleNamespace(stalled=None, cancelled=False, answered=True, receipt=object(), sent_at=0.0,
-                                     response_started=0.0, response=response,
+        return types.SimpleNamespace(stalled=None, cancelled=False, no_slot=False, answered=True, receipt=object(),
+                                     sent_at=0.0, response_started=0.0, response=response,
                                      response_size=len(umsgpack.packb(response)))
 
 

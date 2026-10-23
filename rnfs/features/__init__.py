@@ -14,8 +14,10 @@ Rules for feature modules:
   malformed, or that rnfs or another feature defines too, stops the node with a FeatureError.
 - CLI commands are added with the `command(subparsers, name, run, help)` helper the CLI passes in, and run
   functions talk to the daemon with `rnfs.cli.client(args)` (import rnfs.cli inside the function).
-- Background threads are started with `self._spawn(...)`; `stop(deadline)` asks them to end, then waits for them
-  with `self._join(deadline)`, so the node's stop budget bounds every feature's.
+- Background threads are started with `self._spawn(...)`; `stopping()` asks them to end without waiting, and
+  `stop(deadline)` asks them too, then waits for them with `self._join(deadline)`. The node calls every feature's
+  stopping() (and stops its own threads and closes its links) before it calls any stop(deadline), so they all wind
+  down at once within the node's one stop budget, rather than each in turn.
 - A feature that uses another declares it: in `requires` if it can't work without it (that feature must come
   before it in FEATURE_MODULES, or the node refuses to load), in `optional` if it uses it when loaded. It
   reaches it with `self.dependency(name)`, which refuses a name it didn't declare. What the contacts feature
@@ -111,12 +113,19 @@ class Feature:
     def start(self):
         """Start background work, once the node's own services run. Not called on offline test nodes."""
 
+    def stopping(self):
+        """Ask background work to end, without waiting for it: set the flags its threads and fetches watch. The node
+        calls this on every feature, once, before it calls any feature's stop (a feature written for rnfs before
+        0.2.1 has only the base's, which does nothing: its stop asks). It may be called again, by stop."""
+
     def stop(self, deadline: float | None = None):
-        """Stop background work and save state. Called before the node stops its own services.
+        """Stop background work and save state. Called before the node stops its own services, after every
+        feature's stopping().
 
         deadline is when to stop waiting for the feature's threads, a time.monotonic() value (the node passes
-        its stop budget's); None waits STOP_WAIT from now. An override asks its threads to end, then calls
-        self._join(deadline); the base only waits for the threads _spawn started.
+        its stop budget's); None waits STOP_WAIT from now. An override asks its threads to end (stopping(), for a
+        host program calling stop() alone), then calls self._join(deadline); the base only waits for the threads
+        _spawn started.
         """
         self._join(deadline)
 
@@ -186,6 +195,14 @@ class Feature:
     @classmethod
     def cli_commands(cls, commands, command):
         """Add this feature's subcommands: command(commands, name, run, help) returns an argparse parser."""
+
+
+def ask_to_stop(feature: Feature):
+    """feature.stopping(), if it has one: a feature class not derived from Feature, written for rnfs before 0.2.1,
+    may not (its stop asks its threads to end)."""
+    stopping = getattr(feature, "stopping", None)
+    if callable(stopping):
+        stopping()
 
 
 def stop_feature(feature: Feature, deadline: float):

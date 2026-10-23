@@ -21,7 +21,9 @@ from rnfs import mesh
 OK = "ok"  # the node answered; see blocks, missing, unsent and bad
 BUSY = "busy"  # refused (False) under the node's limits, or the node cancelled the response (displaced or
 #               past its deadline, .reason "cancelled"), or closed the link (.reason "closed": no room for another
-#               incoming link, say); retry after a short delay. The link stays open unless the node closed it
+#               incoming link, say); retry after a short delay. The link stays open unless the node closed it.
+#               Also a request not sent, as its link's /blocks slot didn't come free within its slot_wait (.reason
+#               NO_SLOT: the node did nothing)
 FAILED = "failed"  # no link (no path, or closed by this node), or a malformed answer
 # No answer the way a lossy link loses one: RNS timed the request out (the request or its answer lost), the response
 # transfer failed, the link timed out under it, or a new link to a node with a path wasn't established. Retry it on
@@ -31,6 +33,7 @@ STALLED = "stalled"  # the response stopped making progress or missed its deadli
 # The node left a /range unanswered, as nodes before 0.2.0 do (they have no handler for it): the fetcher asks for the
 # block with /blocks instead, at once, and remembers that the node doesn't answer /range (rnfs.ranges)
 UNSUPPORTED = "unsupported"
+NO_SLOT = "no free slot"  # a BUSY result's reason: see BUSY
 
 
 @dataclass
@@ -40,7 +43,8 @@ class BlocksResult:
     status: str
     blocks: dict[Cid, bytes] = field(default_factory=dict)
     missing: list[Cid] = field(default_factory=list)  # answered None: not held or not served
-    reneged: bool = False  # missing a block it had sent ranges of (rnfs.ranges): the airtime of those ranges wasted
+    # Missing a block it had sent ranges of, or answering malformed after them (rnfs.ranges): their airtime wasted
+    reneged: bool = False
     unsent: list[Cid] = field(default_factory=list)  # not answered: cut by the batch size or budget, or not OK
     bad: list[Cid] = field(default_factory=list)  # blocks that didn't match their CID: ban the provider
     reason: str = ""  # why the request stalled or failed, for logs
@@ -243,10 +247,13 @@ class PeerClient:
 
     # /blocks
 
-    def blocks(self, node_id: bytes, cids: list[Cid],
-               on_progress: Callable[[float], None] | None = None) -> BlocksResult:
-        """_blocks(), counted in traffic (mesh): the outcome, verified bytes received and bad blocks."""
-        result = self._blocks(node_id, cids, on_progress)
+    def blocks(self, node_id: bytes, cids: list[Cid], on_progress: Callable[[float], None] | None = None,
+               slot_wait: float | None = None) -> BlocksResult:
+        """_blocks(), counted in traffic (mesh): the outcome, verified bytes received and bad blocks (not a request
+        that wasn't sent for want of a slot)."""
+        result = self._blocks(node_id, cids, on_progress, slot_wait)
+        if result.reason == NO_SLOT:
+            return result
         if result.status != OK or result.blocks or result.missing or result.bad:
             outcome = {OK: mesh.ANSWERED, BUSY: mesh.REFUSED}.get(result.status, mesh.FAILED)
             self.traffic.request(node_id, outcome, sum(len(block) for block in result.blocks.values()),
@@ -258,12 +265,13 @@ class PeerClient:
         peer = self.links.shared_peer(node_id)
         return mesh.interface_label(getattr(getattr(peer, "link", None), "attached_interface", None))
 
-    def _blocks(self, node_id: bytes, cids: list[Cid],
-                on_progress: Callable[[float], None] | None = None) -> BlocksResult:
+    def _blocks(self, node_id: bytes, cids: list[Cid], on_progress: Callable[[float], None] | None = None,
+                slot_wait: float | None = None) -> BlocksResult:
         """Ask node_id for blocks over its shared link, verifying each against its CID.
 
         Sends as many of cids (duplicates dropped) as fit one packet; the rest come back in .unsent.
-        on_progress(fraction) is called from this thread as the response arrives.
+        on_progress(fraction) is called from this thread as the response arrives. With slot_wait, it waits that many
+        seconds at most for the link's /blocks slot, and comes back BUSY (NO_SLOT), unsent, if it isn't free by then.
         """
         wanted = list(dict.fromkeys(cids))
         if not wanted:
@@ -285,8 +293,11 @@ class PeerClient:
 
         exchange = self.links.call(peer, BLOCKS_PATH, protocol.encode_blocks(max_bytes, batch), blocks=True,
                                    max_response_size=protocol.max_response_size(max_bytes),
-                                   watchdog=self._stall_watchdog(rate), on_progress=on_progress)
+                                   watchdog=self._stall_watchdog(rate), on_progress=on_progress,
+                                   slot_wait=slot_wait)
         name = node_name(node_id)
+        if exchange.no_slot:
+            return BlocksResult(BUSY, unsent=wanted, reason=NO_SLOT)
         if exchange.stalled:
             self._close_stalled(peer, f"/blocks from {name} stalled ({exchange.stalled})")
             return BlocksResult(STALLED, unsent=wanted, reason=exchange.stalled)
@@ -324,7 +335,7 @@ class PeerClient:
 
     def block_range(self, node_id: bytes, cid: Cid, held: bytes = b"", max_bytes: int = 0, compress: bool = False,
                     block_size: int | None = None, on_progress: Callable[[float], None] | None = None,
-                    answers: bool | None = None) -> RangeResult:
+                    answers: bool | None = None, slot_wait: float | None = None) -> RangeResult:
         """Ask node_id for at most max_bytes of cid's block after the held bytes (the start of the block, received
         from node_id before), compressed if compress, over its shared link; counted in traffic (mesh). answers: whether
         node_id is known to answer /range (rnfs.ranges.RangeSupport); one not known to may leave it unanswered on a
@@ -333,8 +344,12 @@ class PeerClient:
         The answer is checked (protocol.parse_range_response: its size against block_size, if known, and the length
         of its bytes, decompressed within that bound); a range that completes the block has the whole block, held
         and data, verified against cid. on_progress(fraction) is called from this thread as the answer arrives.
+        slot_wait bounds the wait for the link's /blocks slot, as for blocks().
         """
-        result = self._range(node_id, cid, held, max_bytes, compress, block_size, on_progress, answers is not True)
+        result = self._range(node_id, cid, held, max_bytes, compress, block_size, on_progress, answers is not True,
+                             slot_wait)
+        if result.reason == NO_SLOT:
+            return result
         if result.status != OK or result.block is not None or result.missing or result.bad:
             outcome = {OK: mesh.ANSWERED, BUSY: mesh.REFUSED}.get(result.status, mesh.FAILED)
             if not result.silent:  # an older node's silence isn't its failure (rnfs.ranges)
@@ -345,7 +360,8 @@ class PeerClient:
         return result
 
     def _range(self, node_id: bytes, cid: Cid, held: bytes, max_bytes: int, compress: bool, block_size: int | None,
-               on_progress: Callable[[float], None] | None, silence_expected: bool = False) -> RangeResult:
+               on_progress: Callable[[float], None] | None, silence_expected: bool = False,
+               slot_wait: float | None = None) -> RangeResult:
         """block_range(), uncounted."""
         peer = self.links.get(node_id)
         if peer is None:
@@ -360,8 +376,10 @@ class PeerClient:
         exchange = self.links.call(peer, RANGE_PATH, request, blocks=True,
                                    max_response_size=protocol.range_max_response_size(max_bytes),
                                    watchdog=self._stall_watchdog(rate), on_progress=on_progress,
-                                   silence_expected=silence_expected)
+                                   silence_expected=silence_expected, slot_wait=slot_wait)
         name = node_name(node_id)
+        if exchange.no_slot:
+            return RangeResult(BUSY, reason=NO_SLOT)
         if exchange.stalled:
             self._close_stalled(peer, f"/range from {name} stalled ({exchange.stalled})")
             return RangeResult(STALLED, reason=exchange.stalled)

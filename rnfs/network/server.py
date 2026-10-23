@@ -73,6 +73,7 @@ FAR_BEHIND = 1 / 4
 # retries on a lossy path does
 NO_PROGRESS_FRACTION = 1 / 4
 COOLDOWN_MEMORY = 4096  # links and identities on a /blocks cooldown remembered at most
+RUN_MEMORY = 4096  # links and identities whose run of slow-pool responses is remembered at most (ResponsePools.runs)
 # Requests per incoming link (section 3): a token bucket of REQUEST_BURST, refilled at REQUEST_RATE a second.
 # An honest requester waits for its answers, with at most MAX_REQUESTS_PER_LINK in progress, so it sends at most
 # that many per round trip. Over real RNS on loopback (the shortest round trip there is), a 10,000-key /provide
@@ -92,9 +93,12 @@ REQUEST_OK, REQUEST_REFUSED, REQUEST_DROPPED = "ok", "refused", "dropped"
 # /range compression (section 7): bz2 costs about a hundred times what re-checking a block's hash does (about 5 ms for
 # 128 KiB on a desktop), so the node compresses at most COMPRESS_RATE bytes of ranges a second, in bursts of up to
 # COMPRESS_BURST, and sends the rest as they are. Only slow links ask for compression, whose ranges arrive a few KiB a
-# second at most, so it binds only on a requester asking for more than any slow link carries
+# second at most, so it binds only on a requester asking for more than any slow link carries. Each link may spend at
+# most a COMPRESS_LINK_SHARE-th of the budget (64 KiB a second, in bursts of 256 KiB, still several times what a slow
+# link carries), so one can't take it all (AUD-L4)
 COMPRESS_RATE = 256 * KIB
 COMPRESS_BURST = 1 * MIB
+COMPRESS_LINK_SHARE = 4
 
 
 class Backend(Protocol):
@@ -253,9 +257,10 @@ class Response:
     cancelled it) and link-closed callbacks (_link_closed, on the thread that tore the link down). Python
     assigns attributes atomically; what matters is who may write a field, under which lock, and in what order:
     - link_id, request_id, pool and started: set at construction, never changed.
-    - grace, floor, interface and identity: set by ResponsePools.reserve under ResponsePools.lock, before the
-      response is visible to any other thread. grace is set again, with no lock, by the handler thread at
-      handover, dropping the pacing wait it covered until then: a reader sees one value or the other.
+    - grace, floor, interface, identity, fast_interface and run_start: set by ResponsePools.reserve under
+      ResponsePools.lock, before the response is visible to any other thread. grace is set again, with no lock, by
+      the handler thread at handover, dropping the pacing wait it covered until then: a reader sees one value or
+      the other.
     - size, deadline, due, find_until and untracked: written once each by the handler thread at handover, size
       first (under RequestServer.lock, and only if the response isn't finished, so _cancel tells a response
       handed to RNS from one it need only finish) and the others after it with no lock, before it returns the
@@ -314,6 +319,10 @@ class Response:
         self.grace_start = started  # restarted when it is handed to RNS and when its Resource is advertised
         self.floor = 0.0  # bytes/s it must keep up after its grace to stay protected
         self.interface = None  # the RNS interface its request arrived on, if known
+        self.fast_interface = False  # that interface's bitrate is known and at least slow_bitrate
+        # When its link's (or identity's) back-to-back run of slow-pool responses started: its age for the
+        # slowest-response rule (ResponsePools._displaceable). started outside a run, and in the fast pool
+        self.run_start = started
         self.progress_at = started  # when sent last grew (or it was handed to RNS)
         self.first_progress = None  # when sent was first seen above 0
         self.idle = False  # displaced or cancelled for making no progress: its requester cools down
@@ -381,9 +390,16 @@ class ResponsePools:
       marked idle, and its requester cools down);
     - else, if the newcomer's interface holds no slot in the pool, the oldest response with nothing sent from
       an interface holding two or more that is past half its grace, at most once per grace per interface;
+    - else, in the slow pool, for a newcomer not on a known-fast interface (a bitrate known and at least
+      slow_bitrate) when every response is on one, the one that has sent least, newest on a tie: a requester
+      decides itself whether its link is slow, so links over a fast interface can't keep every slot meant for
+      slow links (AUD-M4);
     - else, if neither the newcomer's link nor its identity holds a slot in the pool, the pool's response with the
       lowest throughput, if it is older than deadline_slack and past its grace (marked idle if it is far behind
-      the rate it needs to be done when it is due).
+      the rate it needs to be done when it is due). In the slow pool its age counts from the start of its link's
+      (or identity's) run of responses, each reserved within deadline_slack of the last one's end, and a response
+      continuing a run older than that may be taken within its grace (not marked idle then): a requester asking
+      again at once can't keep its responses young (AUD-M4).
     Otherwise it is refused.
     """
 
@@ -397,36 +413,45 @@ class ResponsePools:
         self.active: dict[str, list[Response]] = {SLOW_POOL: [], FAST_POOL: []}
         # id(interface) -> when it last lost a response to a newcomer from another interface
         self.fairness_at: dict[int, float] = {}
+        # Link ID or identity hash -> (when its run of slow-pool responses started, when its last one ended), the
+        # earliest end first: a response reserved within deadline_slack of that end continues the run
+        self.runs: OrderedDict[bytes, tuple[float, float]] = OrderedDict()
         self.lock = threading.Lock()
 
     def reserve(self, pool: str, link_id: bytes, request_id: bytes, grace: float | None = None, floor: float = 0.0,
-                interface=None, identity: bytes | None = None) -> tuple[Response | None, Response | None]:
+                interface=None, identity: bytes | None = None,
+                fast_interface: bool = False) -> tuple[Response | None, Response | None]:
         """Take a slot in pool: (new response, or None if refused; displaced response to cancel, or None).
 
-        grace (default deadline_slack), floor, interface and identity (its requester's identity hash, if it
-        identified) are the new response's (section 3).
+        grace (default deadline_slack), floor, interface, identity (its requester's identity hash, if it
+        identified) and fast_interface (interface's bitrate is known and at least slow_bitrate) are the new
+        response's (section 3).
         """
         with self.lock:
             now = self.clock()
             members = self.active[pool]
             displaced = None
             if len(members) >= self.capacity[pool]:
-                displaced = self._displaceable(members, link_id, interface, identity, now)
+                displaced = self._displaceable(pool, members, link_id, interface, identity, fast_interface, now)
                 if displaced is None:
                     return None, None
                 members.remove(displaced)
+                self._ended(displaced, now)
             response = Response(link_id, request_id, pool, now)
             response.grace = self.deadline_slack if grace is None else grace
             response.floor = floor
             response.interface = interface
             response.identity = identity
+            response.fast_interface = fast_interface
+            if pool == SLOW_POOL:
+                response.run_start = self._run_start(members, link_id, identity, now)
             members.append(response)
             return response, displaced
 
-    def _displaceable(self, members: list[Response], link_id: bytes, interface, identity: bytes | None,
-                      now: float) -> Response | None:
-        """The member a newcomer on link_id (of identity) arriving on interface may displace, or None. Caller
-        holds the lock."""
+    def _displaceable(self, pool: str, members: list[Response], link_id: bytes, interface, identity: bytes | None,
+                      fast_interface: bool, now: float) -> Response | None:
+        """The member a newcomer on link_id (of identity) arriving on interface (fast_interface: of a known bitrate
+        at least slow_bitrate) may displace from pool, or None. Caller holds the lock."""
         others = [r for r in members if r.link_id != link_id]
         idle = [r for r in others if not r.protected(now)]
         if idle:
@@ -437,17 +462,53 @@ class ResponsePools:
             displaced = self._fairness_pick(others, now)
             if displaced is not None:
                 return displaced
+        own_slot = any(r.link_id == link_id or (identity is not None and r.identity == identity) for r in members)
+        # The slow pool is for slow links, which the requester declares: links over a fast interface holding every
+        # slot leave one reachable from the others, the one losing least (none of them did anything wrong)
+        if pool == SLOW_POOL and not fast_interface and not own_slot and all(r.fast_interface for r in members):
+            reachable = [r for r in others if not r.untracked]
+            if reachable:
+                return min(reachable, key=lambda r: (r.sent, -r.started))
         # The slowest moving response, for a newcomer holding nothing in the pool: a requester can't keep its own
-        # responses young by displacing them from its own link or identity
-        if any(r.link_id == link_id or (identity is not None and r.identity == identity) for r in members):
+        # responses young by displacing them from its own link or identity, nor (run_start) by asking again at once
+        if own_slot:
             return None
         slowest = min(members, key=lambda r: r.throughput(now))
-        if now - slowest.started <= self.deadline_slack or slowest.in_grace(now):
+        continuing = slowest.run_start < slowest.started  # its grace was had earlier in its run
+        if now - slowest.run_start <= self.deadline_slack or (slowest.in_grace(now) and not continuing):
             return None
         # Far behind what it needs to finish in time: no better than making no progress, so its requester cools
-        # down (else one taking a little of each response could renew its slots this way from a spare link)
-        slowest.idle = slowest.far_behind(now)
+        # down (else one taking a little of each response could renew its slots this way from a spare link). One
+        # still within its grace has had no time to show it
+        slowest.idle = not slowest.in_grace(now) and slowest.far_behind(now)
         return slowest
+
+    def _run_start(self, members: list[Response], link_id: bytes, identity: bytes | None, now: float) -> float:
+        """When the run of slow-pool responses a new one on link_id (of identity) continues started: the earliest of
+        its link's and identity's responses in the pool and of their runs that ended within deadline_slack; now if
+        none. Caller holds the lock."""
+        while self.runs and (len(self.runs) > RUN_MEMORY
+                             or now - next(iter(self.runs.values()))[1] > self.deadline_slack):
+            self.runs.popitem(last=False)
+        keys = [key for key in (link_id, identity) if key is not None]
+        starts = [self.runs[key][0] for key in keys if key in self.runs]
+        starts += [r.run_start for r in members
+                   if r.link_id == link_id or (identity is not None and r.identity == identity)]
+        return min([now] + starts)
+
+    def _ended(self, response: Response, now: float):
+        """A slow-pool response has left the pool: its link and identity may continue its run (runs). Caller holds
+        the lock."""
+        if response.pool != SLOW_POOL:
+            return
+        for key in (response.link_id, response.identity):
+            if key is None:
+                continue
+            start = response.run_start
+            if key in self.runs and now - self.runs[key][1] <= self.deadline_slack:
+                start = min(start, self.runs[key][0])
+            self.runs.pop(key, None)
+            self.runs[key] = (start, now)
 
     def _fairness_pick(self, others: list[Response], now: float) -> Response | None:
         """For a newcomer from an interface holding no slot: the oldest response with nothing sent from an
@@ -470,6 +531,7 @@ class ResponsePools:
             members = self.active[response.pool]
             if response in members:
                 members.remove(response)
+                self._ended(response, self.clock())
                 return True
             return False
 
@@ -675,28 +737,42 @@ class Cooldowns:
 
 
 class CompressionBudget:
-    """The bytes /range may compress: a token bucket of burst bytes, refilled at rate bytes a second, starting full.
-    Thread-safe."""
+    """The bytes /range may compress: a token bucket of burst bytes, refilled at rate bytes a second, starting full;
+    and for each key (a link) a bucket of a share-th of that, so one can't spend it all. Thread-safe."""
 
-    def __init__(self, rate: float, burst: float, clock: Callable[[], float] = time.monotonic):
-        """A full bucket."""
+    def __init__(self, rate: float, burst: float, clock: Callable[[], float] = time.monotonic, share: int = 1):
+        """Full buckets."""
         self.rate = rate
         self.burst = burst
         self.clock = clock
+        self.share = share
         self.tokens = float(burst)
         self.updated = clock()
+        self.keys: dict[bytes, tuple[float, float]] = {}  # key -> (its tokens, when updated); full ones left out
         self.lock = threading.Lock()
 
-    def take(self, nbytes: int) -> bool:
-        """Spend nbytes if the bucket holds them; False (nothing spent) if not: send that range as it is."""
+    def take(self, nbytes: int, key: bytes | None = None) -> bool:
+        """Spend nbytes (of key's share too, if given) if the buckets hold them; False (nothing spent) if not: send
+        that range as it is."""
         with self.lock:
             now = self.clock()
             self.tokens = min(float(self.burst), self.tokens + max(0.0, now - self.updated) * self.rate)
             self.updated = now
-            if self.tokens < nbytes:
+            own = None
+            if key is not None:
+                tokens, updated = self.keys.get(key, (self.burst / self.share, now))
+                own = min(self.burst / self.share, tokens + max(0.0, now - updated) * self.rate / self.share)
+            if self.tokens < nbytes or (own is not None and own < nbytes):
                 return False
             self.tokens -= nbytes
+            if own is not None:
+                self.keys[key] = (own - nbytes, now)
             return True
+
+    def forget(self, key: bytes):
+        """Drop key's bucket (a closed link's)."""
+        with self.lock:
+            self.keys.pop(key, None)
 
 
 class UploadPacer:
@@ -758,7 +834,8 @@ class RequestServer:
         self.incoming = IncomingLinks(config.max_incoming_links, clock)
         self.pacer = UploadPacer(clock)
         self.cooldowns = Cooldowns(config.blocks_cooldown, clock)
-        self.compression = CompressionBudget(COMPRESS_RATE, COMPRESS_BURST, clock)  # /range's bz2 (section 7)
+        # /range's bz2 (section 7), a share of it per link
+        self.compression = CompressionBudget(COMPRESS_RATE, COMPRESS_BURST, clock, COMPRESS_LINK_SHARE)
         # mesh: airtime controls on /blocks and the traffic counters (shared with the client by the node)
         self.airtime = mesh.AirtimePolicy(config, clock)
         self.traffic = traffic if traffic is not None else mesh.Traffic()
@@ -768,6 +845,9 @@ class RequestServer:
         self.rates = rates.RateEstimates(config.min_rate_sample)
         self.links: dict[bytes, RNS.Link] = {}
         self.watched: set[bytes] = set()  # links whose outgoing Resource registrations we see
+        # link ID -> its responses in progress outside the pools (answers sent as one packet, fits_packet), so a
+        # link closing finishes them as it does its pooled ones
+        self.unslotted: dict[bytes, set[Response]] = {}
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.closing = False  # set by close(): the node is stopping, and every request is refused
@@ -873,13 +953,15 @@ class RequestServer:
         with self.lock:
             self.links.pop(link_id, None)
             self.watched.discard(link_id)
-        for response in self.pools.responses():
+            unslotted = list(self.unslotted.pop(link_id, ()))
+        for response in self.pools.responses() + unslotted:
             if response.link_id == link_id:
                 self._finish(response)
         self.incoming.remove(link_id)
         self.cooldowns.forget(link_id)
         self.pacer.forget(link_id)
         self.rates.forget(link_id)
+        self.compression.forget(link_id)
 
     def _find_link(self, link_id: bytes):
         """The incoming link with this ID (RNS gives handlers only the ID), or None."""
@@ -1061,7 +1143,8 @@ class RequestServer:
 
         def build(limit: int):
             """The answer: [size, encoding, bytes], [] if the block isn't served, False past its end. The range is
-            sent whole, whatever the budget left (limit), as /blocks's first served block is."""
+            sent whole, whatever the budget left (limit), as /blocks's first served block is. Compressed within the
+            link's share of the compression budget."""
             block = self.backend.served_block(cid)
             if block is None:
                 return [], False, f"nothing: {cid} isn't served"
@@ -1069,7 +1152,7 @@ class RequestServer:
                 return False, False, f"offset {offset} is past the end of {cid} ({len(block)} bytes)"
             data = block[offset:offset + protocol.range_length(len(block), offset, max_bytes)]
             encoding, payload = protocol.RANGE_RAW, data
-            if flags & RANGE_BZ2 and data and self.compression.take(len(data)):
+            if flags & RANGE_BZ2 and data and self.compression.take(len(data), link_id):
                 compressed = protocol.compress_range(data)
                 if len(compressed) < len(data):
                     encoding, payload = RANGE_BZ2, compressed
@@ -1097,7 +1180,7 @@ class RequestServer:
         return self._serve(RANGE_PATH, link_id, request_id, remote_identity, max_bytes, build, unserved, fits_packet)
 
     def _serve(self, path: str, link_id: bytes, request_id: bytes, remote_identity, max_bytes: int,
-               build: Callable[[int], tuple], unserved: Callable[[], object],
+               build: Callable[[int, bool], tuple], unserved: Callable[[], object],
                fits_packet: Callable[[int], bool] = lambda mdu: False):
         """Answer a /blocks or /range request within the per-link limit, the response pools, upload pacing and the
         budget: one path for both, so /range counts against everything /blocks does (section 7).
@@ -1108,7 +1191,8 @@ class RequestServer:
         packet, without a response slot, so a request for nothing can't displace a response in progress (REL-2).
         fits_packet(mdu) is True if the answer surely fits one packet on a link of that MDU: it then takes no
         response slot either (it is sent as RNS gets it, so it holds none for long, and would displace one for
-        nothing), though everything else (pacing, the budget) applies as to any response.
+        nothing), though everything else (pacing, the budget) applies as to any response, unless it must wait for
+        upload pacing: then it holds its link's /blocks slot for that long, and takes a pool slot as any other.
         """
         link = self._find_link(link_id)
         if link is None:
@@ -1163,7 +1247,9 @@ class RequestServer:
                 reserved, displaced = self.pools.reserve(pool, link_id, request_id,
                                                          grace=min(self.config.deadline_slack, grace + wait),
                                                          floor=progress_floor(bitrate, hops, self.config),
-                                                         interface=interface, identity=identity)
+                                                         interface=interface, identity=identity,
+                                                         fast_interface=bool(bitrate)
+                                                         and bitrate >= self.config.slow_bitrate)
                 if displaced is not None:
                     self._cancel(displaced, "made no progress; displaced by a new request" if displaced.idle
                                  else "displaced by a new request")
@@ -1171,8 +1257,10 @@ class RequestServer:
                     log(f"refused {path}: every {'slow' if slow else 'fast'}-link response slot is busy", LOG_VERBOSE)
                 return reserved
 
-            # An answer that surely fits one packet holds no slot (fits_packet): a response outside the pools
-            slotted = not fits_packet(mdu)
+            # An answer that surely fits one packet holds no slot (fits_packet): a response outside the pools. Unless
+            # it must wait for pacing: a link waiting holds its /blocks slot, which keeps IncomingLinks from closing
+            # it, so links in a pacing wait are bounded by the pools (AUD-H1)
+            slotted = wait > 0 or not fits_packet(mdu)
             if slotted:
                 response = reserve()
                 if response is None:
@@ -1180,6 +1268,10 @@ class RequestServer:
             else:
                 response = Response(link_id, request_id, pool, self.clock())
                 response.interface, response.identity = interface, identity
+                with self.lock:
+                    if link_id not in self.links:
+                        return False  # closed meanwhile: _link_closed has run
+                    self.unslotted.setdefault(link_id, set()).add(response)
             if wait > 0:
                 self._pace(response, wait)
                 if response.finished:
@@ -1209,10 +1301,13 @@ class RequestServer:
             if not single and not slotted:
                 # Larger than fits_packet foresaw (a stored size out of date): it needs a slot after all
                 unslotted, response = response, reserve()
+                self._untrack(unslotted)  # not finished: the new response holds the link's /blocks slot now
                 if response is None:
                     return False
                 response.requester = unslotted.requester
                 slotted = True
+                if unslotted.finished:
+                    return False  # its link closed while it was built
             untracked = link_id not in self.watched
             # The upload budget is charged for responses carrying blocks (answers of only None are tiny), as
             # they are sent: up front only a reservation of about one packet (its advertisement), or all of it
@@ -1381,10 +1476,20 @@ class RequestServer:
             if response.finished:
                 return
             response.finished = True
+        self._untrack(response)
         response.done.set()
         self._settle(response)
         self.pools.release(response)
         self.incoming.finish_request(response.link_id, blocks=True)
+
+    def _untrack(self, response: Response):
+        """Forget response as one of its link's responses outside the pools, if it is one."""
+        with self.lock:
+            unslotted = self.unslotted.get(response.link_id)
+            if unslotted is not None:
+                unslotted.discard(response)
+                if not unslotted:
+                    del self.unslotted[response.link_id]
 
     def _admit(self, response: Response, cost: int, reservation: int) -> bool:
         """Charge upload_budget reservation of a response that will cost it cost bytes, if the budget allows

@@ -58,13 +58,127 @@ Added (the local API, `rnfs.Client`/`rnfs.Node`, and the CLI where it helps):
 - **Reticulum's interfaces, read-only:** `GET /api/stats` (`Stats.reticulum_interfaces`, `rnfs stats`) gives each
   interface's state, mode, bitrate, bytes and speeds (the shared instance's when attached to one). rnfs still never
   edits Reticulum's config.
+- **The code checked at approval:** `POST /api/apps/approve` takes `code` (`ApiConnection.app_approve(id, code=)`,
+  `rnfs app approve <id> --code`), and `rnfs app approve` at a terminal asks for the code the app shows. Without it
+  the request is approved unchecked, as before.
 
 Changed:
 - **Sizes are written in decimal units everywhere** (KB, MB, as `rnfs jobs`, `rnfs peers` and the log already
   wrote them): `rnfs status`'s record store line was in KiB and MiB. One function writes them all
   (`rnfs.units.human_size`).
+- **The API and the gateway also listen on `[::1]`** (AUD-H2, below), on the same ports: a port another program
+  holds on `[::1]` stops the daemon, as one taken on `127.0.0.1` does. Only a host without IPv6 runs on
+  `127.0.0.1` alone. `[::1]` is still not an accepted `Host`.
+- **`pin add`, remote pins, following, `dir set` and `dir rm` stop at `max_output_entries` entries** (AUD-M6, below),
+  as `get` and `export` did: pinning a folder of more entries (100,000 by default) is refused; raise the setting to
+  pin it.
+- **Pairing:** a name may have several requests waiting, each with its own code; approving one denies the others,
+  and a name already taken is refused when approved, not when asked. A full table of 32 requests drops the oldest
+  instead of refusing new ones (AUD-M5, AUD-L1, below).
+- **The network size estimate is sampled by lookups the node chooses** (AUD-M1, below): up to 8 lookups of random
+  keys after joining, then one while the estimate is short of samples or an hour old (paced on slow nodes),
+  besides publishing's.
+
+Security (the 0.2.1 audit, AUD: each fix has a regression test in `tests/security`, listed in its README):
+- **Links waiting out upload pacing are bounded again** (AUD-H1, a 0.2.1 regression; specification section 3): an
+  answer that fits one packet took no response slot even while it waited for upload pacing, holding its link's
+  `/blocks` slot, and a link with one in progress is never closed to make room. So `max_incoming_links` links
+  looping on tiny paced answers (about 8 KB/s) had every new incoming link refused. An answer that must wait now
+  takes a pool slot, as in 0.2.0, and one outside the pools ends when its link closes.
+- **The gateway's sites and the API can't be taken over on `[::1]`** (AUD-H2, section 11): the daemon listened on
+  127.0.0.1 only, but browsers and curl try `*.localhost` and `localhost` on ::1 first, so another local user
+  listening on `[::1]:<port>` while the daemon ran could serve their own pages in every site's origin and relay
+  what clients sent. The API and the gateway now also listen on `[::1]:<port>`, sharing their connection cap.
+- **`add` can't be led into the rnfs dir by a path swapped while it runs** (AUD-H3, section 8): `add` checked the
+  path against the rnfs dir, then opened it again following a link, so a file or folder swapped for a link to
+  `api_token`, the identity or a name key between the two was added, pinned and provided. The check is made again
+  on what was opened (its own final path), for plain, sealed and only-hash adds.
+- **A node asked first can't hold off the provider search by dripping its answer** (AUD-H4, section 7): once a probe
+  runs past `deadline_slack` (longer over slow links) the search starts, and a provider it finds is asked for the
+  block as end-game duplication does; a probe waits for its link's `/blocks` slot no longer than that, so another
+  fetch's dripping response can't make later fetches fail without searching; and a remembered provider whose probe
+  was cancelled, or ran that long without sending anything, is forgotten.
+- **Searches no longer feed the network size estimate** (AUD-M1, section 6): anyone can make a node search keys of
+  their choosing, through the gateway for one, and 9 keys inside one tight cluster of identities inflated the
+  estimate up to a million times, which turned the density check off. Samples come from publish lookups and from
+  lookups for random keys; a key the density check flags loses its sample, and widened lookups take none.
+- **A fetch's searches share one `/find` cap again** (AUD-M2, section 6): runs of a lookup together send at most
+  8 × K `/find`, and a run counts as having found providers only if the fetch could use one. Sybils listing
+  made-up providers in every answer had one fetch send 66,426 `/find` in 15 s.
+- **Partition mode's probe doesn't go to the server that named the failing identities** (AUD-M3, section 6) while
+  another target exists, and prefers senior servers; a probe left unanswered doesn't enter partition mode if
+  another off-island server answered or announced itself while it was out.
+- **Links posing as slow can't hold the slow pool for good** (AUD-M4, section 3): two links on a fast path that kept
+  their MTU at 500 and asked again the moment each response ended held both slow-pool slots, and a LoRa requester
+  was refused for as long as they did. A slow-pool response's age counts from the start of its link's (or
+  identity's) back-to-back run, and a newcomer not on a known-fast interface may take a slot when every one is held
+  by links on one.
+- **Another program can't take an app's place in pairing** (AUD-M5, section 11): asking first under an app's name had
+  the real app refused, so the user could only approve the other program's request. Several requests may wait under
+  one name, each with its own code, which `rnfs app approve` asks for and checks.
+- **Directory trees declaring 0 bytes are bounded** (AUD-M6, section 8): `pin add`, remote pins, following, deny
+  lists, `dir set` and `dir rm` fetched a DAG with no entry cap, and directory nodes pay for themselves, so a tree
+  of empty files was unbounded. They stop at `max_output_entries`; a remote pin refused for it is dropped as
+  `too_large`.
+- **`get` counts what a folder's entries allocate** (AUD-M11, section 8): its free-space check counted the content's
+  bytes, so a DAG of many empty directories or tiny files (5,000 empty directories: checked as 0 bytes, 20 MB
+  written) could fill the disk past the reserve. It now counts allocation units, as the sealed unpack does (REV10).
+- **install.sh keeps a working install when an update fails** (AUD-M10): it repairs a venv a distro Python upgrade
+  broke (every update failed with "No module named pip"), and builds before touching the venv, moving a venv it
+  must re-create aside and putting it back if the install fails, where it used to delete it first.
+- **Pairing no longer tells which apps are installed** (AUD-L1, section 11): `POST /api/apps/request` answers every
+  valid name alike, as REV9 made the proof do.
+- **`rnfs name export -o` writes a private file on Windows** (AUD-L2): the user-and-SYSTEM access list, as
+  `rnfs app add -o` already did, instead of inheriting its folder's.
+- **One link can't spend the node's `/range` compression budget** (AUD-L4, section 7): each link may spend at most a
+  quarter of it.
+- **Early responses are kept only if they came as one packet** (AUD-L5, section 3): a responder answering with
+  Resources under made-up request IDs had up to 16 of about 1 MiB each kept per link until it closed; they also
+  expire on hand-over now.
+- **Path-request turns given up are given back** (AUD-L6, section 3): a waiter whose path arrived before its turn
+  left its turn reserved, so callers after it waited for nothing (about 28 s after 30 such waiters).
+- **Identify floods are dropped before RNS** (AUD-L7, section 3): on an incoming `rnfs.dht` link, identify packets are
+  dropped once the link has identified, and after 4 on one that hasn't; RNS checked each one's signature and asked
+  the shared instance whether it was blackholed before ignoring it.
+- **A `/range` of a few bytes at a time doesn't re-read the block for each answer** (AUD-L8, section 6): the last 8
+  blocks served are kept verified in memory, forgotten when deleted and read again if their files have changed (0.067 ms
+  to 0.001 ms an answer for a 128 KiB block).
+- **A replayed client-mode announce doesn't reset a server's seniority** (AUD-L9, section 6): the first-seen log
+  forgets a server only for a client announce emitted more than 5 minutes after its last server announce; an older
+  one only takes it out of the routing table until it announces server mode again.
+- **A provider that answers malformed after sending ranges of a block is scored as one that sent a bad block**
+  (AUD-L10), as REL-20 does for an answer of `[]`.
+- **A remote-pin release sent while the node starts is no longer lost** (AUD-L12, section 6): remote pins saved as
+  waiting are queued before the node accepts links, where a release arriving first was ignored and the pin then
+  resumed.
+- **An embedded node's event watch is bounded** (AUD-L13, section 11): `events.watch` holds at most 1024 events
+  waiting for a slow callback; past that the oldest are dropped and the callback gets a "lost" Event in their place,
+  as a Client's watch does. Remote announces drive some event kinds.
+- **Supply chain** (AUD-L14 to L18): certifi 2026.10.19 in `build-tools.lock` (GHSA-6q48-6c7w-9gw2), and a daily OSV
+  audit of every lock (`.github/workflows/audit.yml`), since Dependabot doesn't read them; install.sh refuses to
+  downgrade rnfs, or to replace a `--main`/`RNFS_SOURCE` install with a release of the same version, unless
+  `--force`; the Windows logon task is per user (`rnfs daemon (<SID>)`) and stops only your processes; an opt-in
+  `contrib/rnfs.service.d/strict.conf` (read-only home but `~/.rnfs`, `~/.reticulum` and `~/Downloads`), and the
+  unit's comments no longer overstate `hardening.conf`; a reproducible .deb (`SOURCE_DATE_EPOCH`, no
+  `direct_url.json`, built from the released wheel).
+- **Docs:** the Flatpak's `~/.reticulum` grant doesn't contain a compromised daemon (host RNS programs run what that
+  config names), and CONTRIBUTING lists the repository settings releases rely on (AUD-M10); the API reference no
+  longer says every route but status needs the token (AUD-L3).
 
 Fixed:
+- **Stopping leaves every part its time** (AUD-M7): stopping asks every feature, the node's threads and the waiting
+  name resolves to end, and closes the links, before it waits for any of them; follow and deny fetches and keeper
+  queries end when their feature stops. One busy feature (a follow fetch, a keeper query) no longer uses up the whole
+  5 s stop budget, leaving the jobs and the node's threads none with the state closed under them. No link opens
+  once the node's links are closed, and a job whose run fails while the node stops resumes at the next start.
+  Features get an optional `stopping()` hook.
+- **A crash during `export` leaves no truncated archive** (AUD-M8): `export` wrote straight to its output, so a crash
+  left a truncated archive there and the resumed export job failed "already exists". It writes beside the output,
+  syncs and renames once complete; an export job resumes as a get job does.
+- **A finished job lets go of what it met** (AUD-M9): it kept every CID its last run met (about 175 bytes a block,
+  35 MB for a 12 GiB fetch) until it was forgotten.
+- **A job whose thread can't start is queued again** (AUD-L11), instead of staying "running" with no thread and
+  holding a `max_jobs` slot until a restart; the jobs' retry loop survives a failing round.
 - **`install.sh --update --service` runs the version it installed:** with the service already running, the
   installer's `systemctl --user enable --now` left the old daemon running, so an updated node kept the previous
   version until someone restarted it. `--service` now restarts the unit (starting it if it was stopped).

@@ -315,6 +315,79 @@ class FeatureLifecycleTest(unittest.TestCase):
                 self.assertEqual(order[0], "loop ended")
                 self.assertFalse(any(thread.is_alive() for thread in feature._spawned))
 
+    def test_a_keeper_query_ends_once_keepers_is_asked_to_stop(self):
+        """A keeper query's search, and its batch of /name, end once keepers is asked to stop, not at
+        lookup_timeout or name_wait (87.5 s at the defaults): the node's stop waited them out (audit M7)."""
+        from rnfs.config import Config
+        from rnfs.node import RnfsNode
+        from tests.test_names import FakeNetwork
+        from tests.test_node import N1, NetClient
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        node = RnfsNode.offline(Config(rnfs_dir=os.path.join(tmp.name, "n"), slow="no"), N1, NetClient(),
+                                FakeNetwork())
+        self.addCleanup(node.stop)
+        keepers = node.feature("keepers")
+        release = threading.Event()
+        self.addCleanup(release.set)
+        keeper = bytes([0x4B] * 16)
+
+        class Lookup:
+            """A search that reports provider, if any, and otherwise runs until should_stop() (at most 30 s)."""
+
+            def __init__(self, provider):
+                """A search reporting provider (None: none)."""
+                self.provider = provider
+                self.entered = threading.Event()
+
+            def find_providers(self, on_provider, should_stop):
+                """Report the provider and end, or wait for should_stop()."""
+                self.entered.set()
+                if self.provider is not None:
+                    on_provider(self.provider)
+                    return
+                end = time.monotonic() + 30
+                while not should_stop() and time.monotonic() < end:
+                    time.sleep(0.02)
+
+            def listing_nodes(self):
+                """No node listed a provider."""
+                return []
+
+            def listers(self, provider):
+                """No node listed provider."""
+                return []
+
+            def remaining(self):
+                """The lookup's time left."""
+                return 30.0
+
+        for what, provider in (("search", None), ("batch", keeper)):
+            with self.subTest(what):
+                keepers._stop.clear()
+                lookup = Lookup(provider)
+                asked = threading.Event()
+
+                def name_record(node_id, name, asked=asked):
+                    """A keeper that never answers (until the test ends)."""
+                    asked.set()
+                    release.wait(30)
+                    return None
+
+                done = []
+                with mock.patch.object(node, "_lookup", lambda key, lookup=lookup: lookup), \
+                        mock.patch.object(keepers, "client", mock.Mock(name_record=name_record)):
+                    thread = threading.Thread(target=lambda: done.append(keepers.ask_keepers(bytes([0x5E] * 16))),
+                                              daemon=True)
+                    thread.start()
+                    self.assertTrue((asked if provider is not None else lookup.entered).wait(10))
+                    started = time.monotonic()
+                    keepers.stop(time.monotonic() + 5)
+                    thread.join(10)
+                self.assertFalse(thread.is_alive())
+                self.assertLess(time.monotonic() - started, 3)
+                self.assertEqual(done, [[]])
+
 
 def handler(*_args):
     """A request or API handler that is never called."""
@@ -461,6 +534,20 @@ class FeatureNodeLifecycleTest(OfflineNodes, unittest.TestCase):
         node.stop()
         self.assertEqual(self.events, [("second", "stop"), ("first", "stop"), ("first", "save"),
                                        ("second", "save"), ("second", "close"), ("first", "close")])
+
+    def test_every_feature_is_asked_to_stop_before_any_is_waited_for(self):
+        """stopping() of every feature (in reverse) before the first stop(), so they wind down together within the
+        one budget rather than each in turn (audit M7); a feature class without stopping() is still stopped."""
+        def stopping(feature):
+            """Record stopping."""
+            feature.events.append((feature.name, "stopping"))
+
+        legacy = feature_class("legacy", base=Recorder, events=self.events, stopping=None)  # none to call
+        self.install(feature_class("first", base=Recorder, events=self.events, stopping=stopping),
+                     feature_class("second", base=Recorder, events=self.events, stopping=stopping), legacy)
+        self.node().stop()
+        self.assertEqual(self.events[:5], [("second", "stopping"), ("first", "stopping"), ("legacy", "stop"),
+                                           ("second", "stop"), ("first", "stop")])
 
     def test_a_failing_start_is_isolated(self):
         """One feature's start() raising is logged; the others still start, and the node runs on."""
