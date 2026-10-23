@@ -23,6 +23,13 @@ No centralized servers
 
 <img width="700" alt="rnfs demo" src="https://raw.githubusercontent.com/afit21/rnfs/refs/heads/main/docs/rnfs-demo.gif" />
 
+### Embed content on Nomadnet sites by linking to a CID
+
+No support rnfs required by the Nomadnet node. This means you can post embedded content on Nomadnet forums, group chats, etc, and other users on browsers that support rnfs can view the content.
+
+<img width="705" height="572" alt="image" src="https://github.com/user-attachments/assets/684f74bc-e11a-47ce-9b87-628a4b03168e" />
+
+
 <hr>
 
 **Contents**
@@ -41,12 +48,7 @@ RNFS provides a number of benefits compared to other 'torrenting for RNS' or fil
 
 ### Key Features
 
-***📃 Share File With A Single Line (CID) -*** To fetch a file, all someone needs it's a 'CID'. For example: Moby Dick book .txt file - ```bagaibqabciqfweclrlsfdkqgkhtmbavijftqfkiogrprcntnew5jalakjsykq4q```
-
-<p align="center">
-<img width="500" alt="rnfs-cid" src="https://github.com/user-attachments/assets/01a4b717-9647-4df1-a924-254f92031141" />
-</p>
-
+* ***📃 Share File With A Single Line (CID) -*** To fetch a file, all someone needs it's a 'CID'. For example: Moby Dick book .txt file - ```bagaibqabciqfweclrlsfdkqgkhtmbavijftqfkiogrprcntnew5jalakjsykq4q```
 * ***🔖 Names (links that can change) -*** A CID is permanent, but a name can point to a new version. Others can follow a name to keep the latest version pinned, and keepers keep it resolvable while you're offline.
 * ***⚡ Multi-source, resumable downloads -*** Pulls pieces from several seeders at once, preferring nearby, fast and long-standing nodes, and picks up where it left off after an interruption.
 * ***🌐 Global Namespace -*** CIDs are deterministic hashes of the actual files. No tracker is required like in traditional torrents
