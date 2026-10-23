@@ -114,6 +114,8 @@ rnfs/
   constants.py config.py ids.py errors.py log.py   shared foundation
   debuglog.py         the debug log file, <rnfs dir>/debug.log (debug_log)
   fsutil.py           cross-platform file operations: replace/remove retried on Windows, O_BINARY, IS_WINDOWS
+  winacl.py           owner-only access on Windows: a protected DACL for the rnfs dir and its secret files
+  units.py            sizes as people read them (human_size), in decimal units as RNS writes them; no RNS
   retry.py            when content not found yet is tried again (remote pins, jobs): next_retry, no imports
   statedb.py          the state database, <rnfs dir>/state/rnfs.db: schema, transactions, JSON state migration
   content/            no networking; uses RNS's bundled msgpack and RNS logging, so importing it loads RNS
@@ -144,11 +146,16 @@ rnfs/
     lookups.py        Lookups: which lookups searching and publishing run; Search: the fallback to disjoint paths (6)
     sweep.py          sweep providing: regions of due keys, the far half's extra /find, Sweep (section 6)
     recent.py         RecentCounts: events per minute over the last day, for the network status (section 11)
+    local.py          LocalServers: the DHT servers on this node's own island, for two-level records and the
+                      local-first search; judged from the path to each (section 6, LoRa islands)
   network/            everything that talks to RNS
     protocol.py       message encoding/validation, batch sizes (sections 3, 6, 7, 8)
     rates.py          rate estimates, slow links, slow node detection (section 2); the /blocks size rules both
                       ends share: response_capacity, default_upload_cap (sections 3, 7)
     links.py          LinkPool: shared unidentified links, identified one-shot links, idle close (section 3)
+    paths.py          PathRequests: one budget for every path request the node makes (section 3)
+    channel.py        pacing by the radio's measured load (section 3, Measured airtime)
+    blackhole.py      honouring RNS's identity blackhole (section 10)
     guards.py         guards rejecting oversized, compressed or request Resource advertisements (on every
                       link in the daemon, on rnfs.dht links only in an embedded node) and, on rnfs.dht links,
                       responses that fail a msgpack header check before RNS decodes them (3, 10); the
@@ -167,38 +174,50 @@ rnfs/
                       RNS (section 9)
   name_sync.py        NameSync: names kept pointing at a folder's content, settle time, hourly limit (section 9)
   denylist.py         DenyList: denied CIDs and file hashes, local entries, accepted lists (section 8)
+  pin_names.py        PinNames: where each pin came from on this machine and the label its user gave it
+                      (rnfs pin ls)
+  remote_pins.py      AskedPins, ServedPins: the status of remote pins this node asked for and was asked
+                      for; local only, /pin is unchanged (section 8)
   fetcher.py          fetching a target from providers; observing() for job progress (sections 6, 7)
   ranges.py           /range on the requesting side: which nodes answer it (persisted), partial blocks, one range
                       fetched into one (section 7)
   publisher.py        provide strategy, batched /provide, republish, withdrawal, extra key sources (section 6)
   node.py             RnfsNode: wires everything; the facade below
   node_content.py     node side of --no-pin, sealing/unsealing, raw blocks and archive streams
+  node_pins.py        NodePins, which RnfsNode inherits: the pin facade (pin add/rm/ls/label, the details pin ls
+                      shows) and remote pins, asked and served, with their workers and saved state (section 8)
   apps.py             AppRegistry: the apps rnfs app add issued tokens to, their verifiers (section 11)
   uris.py             rnfs: URIs and the LXMF link map (Link, parse_uri, format_uri, encode_field,
                       decode_field): the interop contract LXMF apps use, exported as rnfs.Link and so on; no RNS
                       (section 13)
   entry_names.py      the entry name rule (check_name, is_valid_name), which rnfs.content.dag re-exports; no RNS,
-                      so uris.py and nomadnet.py check names without loading it (section 5)
+                      so uris.py and nomadnet_links.py check names without loading it (section 5)
+  nomadnet_links.py   NomadNet links' syntax (parse, snapshot_name, is_not_allowed); no RNS, so the CLI checks
+                      them; the fetch is network/nomadnet.py (section 11)
   lxmf_messages.py    the lxmf_messages table rnfs's LXMF left (before 0.2.0) for an LXMF app: only the import of
                       0.1.4's lxmf_inbox.json and lxmf_outbox.json into it (section 13)
-  api.py              local API, 127.0.0.1:8788 (section 11)
+  api.py              local API, 127.0.0.1:8788 and [::1]:8788 (section 11)
   apiclient.py        the local API's protocol layer (ApiConnection) under rnfs.Client and the CLI: token, proof
                       check, typed errors (section 11)
+  events.py           EventLog: what changed on the node, for GET /api/events' long poll (section 11); no RNS
   objects.py          the public API's typed objects (Added, Entry, Info, Record, ...); no RNS
   interface.py        the public API both classes share (Rnfs, Names, Jobs, Deny, File, Watch); no RNS
   embedded.py         rnfs.Node: a node inside a program (imports RNS)
   remote.py           rnfs.Client: the daemon through its API (no RNS)
-  gateway.py          gateway, 127.0.0.1:8789 (section 11)
+  gateway.py          gateway, 127.0.0.1:8789 and [::1]:8789 (section 11)
   gateway_formats.py  ?format=raw|archive (section 11)
   cli.py              command line (section 11)
   features/           optional features, one module each (below)
     __init__.py       Feature base class, FEATURE_MODULES, feature API routes
+    _common.py        helpers the feature modules share (the feature an API route reaches, logging)
     peers.py          rnfs peers, rnfs stats
     jobs.py           background jobs (section 11)
     keepers.py        /name, kept names (section 9)
     follow.py         followed names (section 9)
     contacts.py       address book (section 11)
     deny.py           deny_lists sources: fetched, checked, followed; rnfs deny (section 8)
+    settings.py       rnfs config, GET /api/config, POST /api/config/set: settings read and changed through the
+                      daemon, live ones applied at once (section 12)
 examples/             rnfs_share.py: the public API with either class
 install.sh            Linux installer of the latest release (or --main): venv, command, optional systemd user
                       unit; --update, --uninstall
@@ -253,8 +272,12 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   renamed; a directory replaced while written raises `ValueError("output was changed while being written")`).
 
 `storage.py` — `Storage(blocks_dir, state_dir, max_storage)`, thread-safe:
-- blocks: `has(cid)`, `get(cid, verify=False) -> bytes | None` (with `verify`, a block no longer matching its
-  CID is deleted), `put(cid, block)` (verifies, even a block already stored; atomic, the file fsynced),
+- blocks: `has(cid)`, `get(cid, verify=False, remember=False) -> bytes | None` (with `verify`, a block no longer
+  matching its CID is deleted; with `remember` too, the block verified is kept in memory, the last
+  `VERIFIED_MEMORY`, 8, in `_verified` with its file's signature (`BlockStore.signature`: inode, size, mtime), and
+  given from there unread while it is stored and its file keeps that signature (one rewritten or replaced is read
+  and checked again): `_delete` forgets it under
+  the lock `get` checks `_sizes` with; `NodeBackend.served_block` passes it, AUD-L8), `put(cid, block)` (verifies, even a block already stored; atomic, the file fsynced),
   `used_bytes()` (the blocks' bytes), `allocated_bytes()` (what they take on disk: each block's size rounded up
   by `fsutil.allocated` to `allocation_unit`, which `fsutil.allocation_unit(blocks_dir)` gives once at the start,
   kept as a running total beside `used_bytes` and derived from the block sizes at each start, so nothing extra is
@@ -484,8 +507,9 @@ right for deciding when the database reaches the budget, wrong as a figure to sh
 `Lookup(key, start_nodes, query, own_id, alpha, beta, k, timeout, is_known, on_answer, on_failure, exclude, report,
 unreliable, may_retry, max_queries, on_useful, size, seniors, claim, taken, on_complete, unknowns, slow_path,
 check_path, first, allowed, named)` with `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. Besides
-completion and the deadline, a run (`_iterate`) ends once it has sent `max_queries` (`MAX_QUERIES`, 8 × K) queries and
-their answers are in ("query cap"), or after `STALL_WINDOWS` (3) × max(alpha, beta) answers in a row that leave the bit
+completion and the deadline, a run (`_iterate`) ends once the lookup's runs have sent `max_queries` (`MAX_QUERIES`, 8 ×
+K) queries in all (`sent`; 0.2.1, AUD-M2: a run sends what the earlier ones left) and their answers are in ("query
+cap"), or after `STALL_WINDOWS` (3) × max(alpha, beta) answers in a row that leave the bit
 length of the beta-th closest known distance (`_reach`) unchanged ("no progress"). A run ranks its nodes by `tier()`,
 then distance (`rank`), for its queries, its termination, the checks' nodes and `find_closest`'s result: `FIRST`
 (answered, or nothing against it), `SLOW_PATH` (`slow_path` said so and it hasn't answered in the lookup: `slow`, kept
@@ -506,8 +530,10 @@ not given, never fewer). `listing_nodes()` is the nodes that have answered with 
 `listers(provider)` those that listed a given provider, so the keeper search can tell who vouches for its candidates
 (and the fetcher whose answers led to a provider that served). `on_useful(id)` (local scores): a run notes which node's
 answer first named each node (`introduced`); when a node answers that is closer to the key than the node that named it,
-that node is passed to `on_useful`, once per lookup (`_useful`, `_credit`). For sweep providing, `candidates()` gives
-every node `find_closest` chooses from (`_choices`), with its tier (nodes named only by late answers judged by
+that node is passed to `on_useful`, once per lookup (`_useful`, `_credit`). `introducers(id)` gives the nodes whose
+answers named id (the first, `_named_by`, and every reply in `_replies` listing it), which partition mode's probe
+avoids (AUD-M3). For sweep providing, `candidates()` gives every node `find_closest` chooses from (`_choices`), with its
+tier (nodes named only by late answers judged by
 `_is_slow`), plus the answers that came after the run ended (a run that completes leaves queries out; the workers keep
 every answer about the key in `_replies`), and `ask(node, key)` sends one more `/find` about a nearby key within the
 deadline, counted through `on_answer`/`on_failure` (a node still out at the deadline stays out of the candidates,
@@ -532,9 +558,11 @@ They skip `check_path`, and count as `extras` when outside the window. `allowed(
 is part of `_usable`, so nodes it rejects never join a run, and is asked again just before each query: a node rejected
 since it joined is dropped then, as a claimed one is; `_choices` leaves out unanswered nodes it rejects.
 
-`density.py` — `SizeEstimate(state_dir=None, samples=16, minimum=8)`, a `node.Store`: `note(key, kth)` keeps the
-latest sample per key, at most `samples` (an `OrderedDict`, least recent first); `estimate(key=None)` is (K − 1/3)
-× 2^128 over the median of the samples of other keys, None below `minimum`. Saved as one blob (key and d_K, 32 bytes
+`density.py` — `SizeEstimate(state_dir=None, samples=16, minimum=8, clock=time.monotonic)`, a `node.Store`:
+`note(key, kth)` keeps the latest sample per key, at most `samples` (an `OrderedDict`, least recent first), and sets
+`updated` (`clock()`; made or loaded counts as fresh); `forget(key)` drops key's sample (`Lookups.flags`);
+`estimate(key=None)` is (K − 1/3) × 2^128 over the median of the samples of other keys, None below `minimum`. Saved as
+one blob (key and d_K, 32 bytes
 a sample) in the `meta` table (`size_estimate`, `samples`) with the batched saves, only when changed; a malformed
 blob is ignored. It imports the state database only when given a state directory, since lookups import this module
 and `rnfs.statedb` loads RNS. `dense_core(distances, size)` (last rank j >= K closer than j × 2^128 / (T × size),
@@ -556,18 +584,24 @@ reporting into one queue; the caller's thread passes providers on (once each, `_
 `should_stop`, setting the paths' stop flag and waking them. `candidates()` merges the paths' (a node takes the
 lowest tier a path knowing it gives it); `path_candidates()` each path's own; `ask` goes through the path knowing
 the node; `remaining`, `allow_unknown` (the first path's budget), `listing_nodes`, `listers`, `closest_answered`,
-`dense`, `ended`. It samples the size estimate once per call if every path completed: `verified_sample` over the
-paths' `known_distances()` merged, a node verified if any path's `verified()` accepts it.
+`dense`, `ended`. It samples the size estimate (its `on_complete`, none by default) once per call if every path
+completed: `verified_sample` over the paths' `known_distances()` merged, a node verified if any path's `verified()`
+accepts it.
 
 `lookups.py` — `Lookups(new_lookup, start, sizes, seniors, paths=DISJOINT_PATHS, pace=None, publish_unknowns=None,
 search_unknowns=None)`: the node's recipe.
 `search(key)` is a `Search` whose first lookup has `size=sizes.estimate(key)` and `seniors=seniors(key)` and whose
 fallback is `_disjoint(key, size, seniors, time left, queries left)` (the queries left, the first lookup's
 `max_queries` less what it sent (`Lookup.sent`), split among the paths, and no fallback when that leaves a path
-none); `publish(key)` is `_disjoint(key)` (no checks: the region's keys are checked one by one afterwards);
-`flags(key, region)` runs `dense_core` over the region's nodes; `widen(key, region)` runs a `Lookup` with both checks
-for the key and returns `K` of each ring from its candidates and the region's. `_disjoint` gives a plain Lookup for
-one path. `Search(first, fallback, pace)` quacks like a Lookup: `find_providers` runs the first lookup (the fallback
+none); `publish(key)` is `_disjoint(key, sampled=True)` (no checks: the region's keys are checked one by one
+afterwards); `flags(key, region)` runs `dense_core` over the region's nodes, and `sizes.forget(key)` for a key it
+flags; `widen(key, region)` runs a `Lookup` with both checks for the key and returns `K` of each ring from its
+candidates and the region's. `_disjoint` gives a plain Lookup for one path. Only `publish` and `sample_due(key=None)`
+feed `sizes` (`on_complete=sizes.note`; `_disjoint(sampled=True)` gives it to the `DisjointLookup`, not to each path):
+a search's key may be anyone's choice, and a widened lookup's d_K is the anomaly (AUD-M1). `sample_due` runs a
+`find_closest` for a random key (`os.urandom`; tests pass one) when `sizes` holds fewer than `sizes.samples` or
+`sizes.updated` is `SAMPLE_REFRESH` (3600 s) old, and `pace()` (slow nodes) returns 0; True if it ran one.
+`Search(first, fallback, pace)` quacks like a Lookup: `find_providers` runs the first lookup (the fallback
 once escalated), then, if no provider was ever reported, time and queries are left and `should_stop` is False,
 waits for `pace()` (slow nodes: `Publisher.pace_lookups`) only while the wait fits in the time left, and runs the
 fallback; providers are passed on once each across both. So a search sends at most `MAX_QUERIES` `/find` in all, as
@@ -621,7 +655,9 @@ The node wires it: lookups' `on_failure` is `_query_failed` (the routing table's
 `on_useful` is `scores.useful_answer`, and the join's unanswered bootstrap nodes go through `_query_failed` too;
 the fetcher (`Fetcher(scores=)`, in memory only if not given) calls `served` for each response with verified
 blocks and `useful_answer` once per fetch for each of its lookup's `listers` of that provider (`Fetch._served`),
-`failed` in `_fail` and `bad_block` with the ban.
+`failed` in `_fail` and `bad_block` with the ban, and without one for a `/range` provider that reneges
+(`BlocksResult.reneged`, set by `Ranges._fetch`: after sending ranges of a block it answers `[]` (REL-20) or a
+malformed range (AUD-L10, 0.2.1)).
 
 `local.py` — local servers (specification section 6, "LoRa islands"), no RNS. `LocalServers(max_servers=1024,
 max_judged=4096)`: `note(id, local)` (a judgement from the path to a server; an `OrderedDict` of judgements and one of
@@ -632,17 +668,21 @@ becomes exactly those it found local, and earlier local ones it didn't see are j
 `PathInfo`s of the destinations that are known servers. `first_count(named)`: `LOCAL_FIRST` (1) when
 `local_interfaces` names the island, else `LOCAL_FIRST_RADIUS` (3). `Lookups(local_first=)` passes those nodes as a
 search's first lookup's `first`. `PartitionMode(is_local, slow, on_change, clock=monotonic, wall_clock, known,
-on_probe, no_path)`: `active`, `since` (wall time), `entered`; `allows(id)` (not active, or local); `answered(id)`
-(off-island: resets the failures, notes contact, ends it), `failed(id)` (off-island, `known(id)` and not
-`no_path(id)`, a failure for want of a path: the `FAILURES_TO_ENTER`-th in
+on_probe, no_path, senior)`: `active`, `since` (wall time), `entered`; `allows(id)` (not active, or local);
+`answered(id)` (off-island: resets the failures and `_suspects`, notes contact (`_contacts` counts them), ends it),
+`failed(id, named_by=())` (off-island, `known(id)` and not `no_path(id)`, a failure for want of a path: `named_by`, the
+servers whose answers named it, join `_suspects`; the `FAILURES_TO_ENTER`-th in
 a row sets `_wanted`, a probe due at once, and calls `on_probe()`, or with no `_targets()` enters it), `announced(id)`
 (a fresh off-island announce: a gap sample in `_gaps`, a deque of `GAP_SAMPLES`, only if no partition mode since the
-last (`_clean`); contact; ends it); `silence_limit()` (None below `MIN_GAPS`, else max(`MIN_SILENCE`,
+last (`_clean`); contact, as `answered`; ends it); `silence_limit()` (None below `MIN_GAPS`, else max(`MIN_SILENCE`,
 `SILENCE_FACTOR` × the mean)); `probe_due()` (active: `_next_probe` passed; else `_wanted`, or silence since
 `_last_contact` over the limit); `probe_target()` (`_targets()`: the off-island servers of `_recent`, heard or
 answered, most recent first, those not in `_unreached` (failed since) before those in it, each at most
-`RECENT_OFF_ISLAND`, taken in turn; an ID only in `_unreached` is never one, REV4); `probed(id, answered)` (answered:
-as `answered`; else outside partition mode it enters; in it the next probe is `PROBE_INTERVAL`, 300 s, later, or on
+`RECENT_OFF_ISLAND`, taken in turn; an ID only in `_unreached` is never one, REV4; outside partition mode, those not
+in `_suspects` if any, then of those the `senior` ones not in `_unreached` if any, else those not in `_unreached` if
+any, AUD-M3; it notes `_contacts` in `_probe_contacts`); `probed(id, answered)` (answered: as `answered`; else outside
+partition mode it enters, unless `_contacts` moved since the target was taken; in it the next probe is `PROBE_INTERVAL`,
+300 s, later, or on
 slow nodes `SLOW_PROBE_INTERVAL`, 900 s, doubling to `SLOW_PROBE_MAX`, 7200 s, reset at each entry); `no_target()`
 (silence counts from now; if `_wanted`, enters it); `state()` (`partition`, `partition_since`).
 `on_change(active)` runs outside its lock.
@@ -651,7 +691,9 @@ slow nodes `SLOW_PROBE_INTERVAL`, 900 s, doubling to `SLOW_PROBE_MAX`, 7200 s, r
 seniority=DEFAULT_SENIORITY, silence=DEFAULT_SILENCE)` (the node passes `provider_seniority` and 2 ×
 `announce_interval`), a `node.Store`:
 `heard(node_id)` (the node's `_heard_server`, for every server-mode announce or path response, before the routing
-table), `forget(node_id)` (`_heard_client`), `first_heard(node_id)`, `len()`, and `closest(key, count=K, min_age=0,
+table), `forget(node_id)` (`_heard_client`, for a client announce `_left_server_mode` judges emitted after the last
+server announce: `RnsNetwork.emitted_time` over `last_heard` + `EMISSION_SKEW`, AUD-L9), `first_heard(node_id)`,
+`last_heard(node_id)`, `len()`, and `closest(key, count=K, min_age=0,
 exclude, heard_within=None)`: the count closest to key of the servers first heard at least min_age ago (publishers
 and searchers pass `provider_seniority`), heard within `heard_within` seconds if given, not excluded (`exclude` runs
 under the log's lock). Memory: a dict node ID -> first heard, in the order first heard (loaded `ORDER BY
@@ -672,7 +714,8 @@ of the announce), which orders forgetting and is the last-heard time after a res
 
 `server.py` — `RequestServer(destination, config, backend)`. `backend` provides:
 `is_dht_server() -> bool`, `find(key) -> (providers, nodes)`, `provide(publisher_id, keys, withdrawn) -> bool`,
-`served_block(cid) -> bytes | None` (only blocks in the DAG of a currently provided CID, re-verified),
+`served_block(cid) -> bytes | None` (only blocks in the DAG of a currently provided CID, re-verified, or
+verified when it was served recently: the node's `Storage.get(remember=True)`),
 optionally `served_block_size(cid) -> int | None` (so `/blocks` stops at the block over its budget unread),
 `remote_pin(identity_hash, cid, pin) -> bool`, `is_member(identity_hash) -> bool` (private mode), and
 optionally `feature_requests() -> {path: handler(data, remote_identity)}` (features' request paths, served within
@@ -699,8 +742,13 @@ fetcher counts as busy, never as pacing), `block_range(node_id, cid, held, max_b
 compress, block_size, on_progress) -> RangeResult` (0.2.0: the next range after the `held` bytes, checked by
 `protocol.parse_range_response`; `.block` the whole block once a range ends it, verified; `.bad` if that fails;
 `.silent` when RNS timed it out with the link up, as an older node leaves `/range`; counted in traffic only once the
-block verifies, and a silence not at all), `pin(node_id, cid, pin) -> bool`,
-`ping(node_id) -> float | None`, `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs.dht`
+block verifies, and a silence not at all). Both take `slot_wait` (0.2.1, AUD-H4: the fetcher's probes): the seconds
+`LinkPool.request` waits at most for the link's `/blocks` slot, after which the request isn't sent
+(`Exchange.no_slot`) and comes back `BUSY` with `.reason` `NO_SLOT`, not counted in traffic. `pin(node_id, cid, pin)
+-> bool`,
+`ping(node_id) -> float | None`, `ping_reason(node_id, on_stage=None) -> (rtt or None, None or why: links.OPEN_FAILURES)`
+(0.2.1: `LinkPool.try_oneshot`, `_open` setting `PeerLink.failure` where it gives up and calling `on_stage` with
+`path`, `identity` and `link` as each step begins), `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs.dht`
 destination of the identity RNS recalls, and only if its hash is the node ID asked for (in private mode, also only if
 that identity is on `members`); the idle sweep (`LinkPool.sweep`) closes a shared link with no request in progress
 once it has had no data, and hasn't been handed out by `LinkPool.get()`, for its idle limit (`links.idle_limit`:
@@ -709,6 +757,9 @@ once it has had no data, and hasn't been handed out by `LinkPool.get()`, for its
 not within `link_idle_timeout` of the end of a `hold`. The `rnfs-link-sweeper` thread sweeps when the next link kept
 is due (`LinkPool.next_sweep`, at least `MIN_SWEEP_WAIT`, 0.25 s, at most a quarter of `link_idle_timeout` within 1 to
 30 s), and is woken (`LinkPool.wake`) by each request on a shared link ending and each link `get()` hands out.
+Once `close_all` has run (the node stopping) `get()` and `try_oneshot` refuse at once, `_open` gives up before it
+creates a link, and a shared link established as it ran is closed rather than added to the pool (0.2.1, audit M7: an
+embedded node could open links after `close_all`, which outlived it).
 A request on a shared link that RNS fails (`RECEIPT_FAILED`, nothing of an answer started) while the link, still
 active, received nothing since it was sent (`Link.no_inbound_for()` longer than the request took: `_went_dead`) closes
 that link (not one opened since), unless another thread uses it or the caller expected silence (`silence_expected`: a
@@ -717,10 +768,11 @@ would notice only at its keepalive. The exchange is marked `went_dead`, and `Pee
 again on a new link, failing the provider only `max_failures` times in a row), not `FAILED`: over LoRa a lone lost
 request looks the same.
 Every link `LinkPool` opens gets an `EarlyResponses` (`PeerLink.early`, 0.2.0) in place of its `handle_response`
-(RNS looks it up on the link): a response no `Link.pending_requests` entry matches is kept (at most
-`MAX_EARLY_RESPONSES`, 16, for `EARLY_RESPONSE_LIFE`, 30 s), and `LinkPool._request`, once `Link.request` has
-returned the registered receipt, hands RNS the one kept for it (`deliver`), both under one lock, so an answer that
-beat its receipt (RNS registers it only after sending) isn't dropped. NomadNet fetches (`nomadnet.py`) install one on
+(RNS looks it up on the link): a response no `Link.pending_requests` entry matches is kept if it came as one packet
+(`_one_packet`: its transfer size at most the link's `mdu`; AUD-L5), at most `MAX_EARLY_RESPONSES`, 16, for
+`EARLY_RESPONSE_LIFE`, 30 s (`_prune`, on each response kept and each `deliver`), and `LinkPool._request`, once
+`Link.request` has returned the registered receipt, hands RNS the one kept for it (`deliver`), both under one lock,
+so an answer that beat its receipt (RNS registers it only after sending) isn't dropped. NomadNet fetches (`nomadnet.py`) install one on
 their own link too (0.2.0).
 
 `paths.py` — `PathRequests(transport=lambda: RNS.Transport, reticulum=RNS.Reticulum.get_instance, clock, sleep,
@@ -732,8 +784,10 @@ cancel)` (a turn, `request_path`, then `known()` polled every `POLL`: `LinkPool.
 `send(destination)` (a turn, then `request_path`, unwaited: names), `charge(destination)` (`LinkPool._open` and
 NomadNet's `open_link` on a link not established: a turn taken, and the destination counted as requested). A turn
 (`_take_turn`) reserves `max(now, _next_turn)` and moves `_next_turn` a `spacing` on, so turns go in order of asking and
-never closer; `ready()` (the path or identity arrived) or `cancel` end the wait with nothing sent, and a turn lost so
-leaves a gap. At its turn a request goes unless `busiest_pr_frequency(get_interface_stats())` is over `CEILING` (1.5),
+never closer; `ready()` (the path or identity arrived) or `cancel` end the wait with nothing sent, and give the turn
+up (`_give_back`): each reserved turn is kept in `_turns` until it is taken or given up, and while the last one is given
+up `_next_turn` goes back to its time (never before `_kept_until`, the end of a turn `charge` took), so turns given up
+at the end of the queue are free again (AUD-L6); one given up between kept turns stays a gap until they are over. At its turn a request goes unless `busiest_pr_frequency(get_interface_stats())` is over `CEILING` (1.5),
 else it reserves the next turn, for `CEILING_HOLD` (15 s) at most. `_waits` keeps one owner per destination; later
 callers wait on its event (polling `ready()`). `_sent` (an `OrderedDict`, at most `MAX_TRACKED`, older than
 `PATH_REQUEST_MI` forgotten) makes a wait within `PATH_REQUEST_MI` of the last request poll for `timeout` without
@@ -823,9 +877,9 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | Method | Returns |
 |---|---|
 | `add_path(path, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True, chunker=None)` | `{"cid", "size", "warnings": [str]}` (+ `"sealed"`); file or directory, pinned `user` (or cached with `pin=False`); with `to`/`to_self` a directory is packed as one tar and sealed as `<name>.tar` (`node_content.add_sealed_path`, `tarstream.folder_chunks`) |
-| `add_stream(stream, size=None, name=None, only_hash=False, …)` | as above; `name` wraps it as that entry (sealed: the sealed name) |
+| `add_stream(stream, size=None, name=None, only_hash=False, …, origin=None)` | as above; `name` wraps it as that entry (sealed: the sealed name); recorded in pin_names as `origin` (`POST /api/add/stream`'s, 0.2.1: `api.parse_origin`, at most `MAX_NAME_LENGTH`), else `name`, `seal_name` or `(stdin)` |
 | `add_nomadnet(link, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True, chunker=None, name=None, identify=False, progress=None)` | as `add_stream` (+ `"name"`, the snapshot's name, and `"link"`): a snapshot of what a NomadNet node serves at `link` (`node_content.add_nomadnet`, "Adding from NomadNet" below); recorded in pin_names as the link; `progress(received, total)` is an add job's |
-| `add_tar(stream, name=None, only_hash=False, pin=True, chunker=None)` | as above (+ `"warnings_total"` past 100): the directory a tar stream holds (`POST /api/add/stream?format=tar`), built by `tarstream.build_tar` as it is read; at most `max_output_entries` files and directories; recorded in pin_names as `name` or `(tar upload)` |
+| `add_tar(stream, name=None, only_hash=False, pin=True, chunker=None, to=None, to_self=False, seal_name=True, origin=None)` | as above (+ `"warnings_total"` past 100): the directory a tar stream holds (`POST /api/add/stream?format=tar`), built by `tarstream.build_tar` as it is read; at most `max_output_entries` files and directories; recorded in pin_names as `origin`, `name` or `(tar upload)`. With `to`/`to_self` (0.2.1) sealed as a folder named `name` (required): `tarstream.repack_chunks` reads it as `build_tar` does (`_place`, the same bounds and warnings) and writes the members again as `folder_chunks` does, under `name/` after the marker, into `seal.SealingReader`, so no plaintext block is stored; the tree's DAG depth is checked once the stream ends (TooLarge then, the add failing before anything is pinned) |
 | `get(target, output, from_node=None, raw=False, no_extract=False)` | `{"cid", "warnings"}` (+ `"warnings_total"` past 100; + `"sealed", "name"`, the name only if `safe_default_name` accepts it; + `"extracted"` for a sealed folder unpacked, `name` then the directory's); fetches and writes the file or directory under `.rnfs-get-<random>.partial` beside `output`, then renames it to `output` (`rename_new`), decrypting a sealed file unless `raw` and unpacking a sealed folder unless `no_extract` (`node_content.get_sealed`); a directory output is first checked to still be the one `write_out` made (`walker.check_unchanged`) and, on Windows, made to inherit its folder's access list (`winacl.inherit_from_parent`; if that fails it stays private, with a warning logged) |
 | `info(target, for_gateway=False, from_node=None, raw=False)` | `{"cid", "type": "file"\|"directory", "size", "executable"}` (+ `"sealed", "recipient", "stored_size", "name"`, and for a recipient `"sealed_folder"`; the sealed name is None unless `safe_default_name` accepts it) |
 | `stored_head(target, length)` | a file's first `length` bytes if stored, else None; never fetches (the user's own gateway `HEAD` and ranges not at 0); `Denied` as a read: a denied CID met, or while there are file hashes a file that fails `_check_file` (one not wholly stored gives None) |
@@ -845,9 +899,11 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `pin_remote(node_id, cid, pin)` | `bool` accepted; recorded (`AskedPins.record`) |
 | `pin_remote_ls(node_id=None, cid=None, check=False)` | `[{"node", "cid", "pin", "accepted", "asked", "state", "done", "checked", "seen"}]`, most recently asked first; `check` runs `AskedPins.check_now` first (Remote pin status, below) |
 | `pin_remote_served()` | `{"pins": [{"identity", "cid", "state", "reason", "at", "detail", "retry_at"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}` |
-| `gc()` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}` |
-| `providers(cid)` | `[node_id bytes]` |
+| `gc(dry_run=False)` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}`; `dry_run` (0.2.1): `Storage.gc_preview()` (the DAG nodes warmed without the lock, then one walk under it: what pins reach, what pins and sessions reach, what `_live` reaches, so what `gc` would delete and the stored bytes by what keeps them), `records_bytes` and `"dry_run": true`, nothing changed. `ApiConnection.gc(dry_run=True)` checks the `gc_dry_run` capability first, as an older daemon ignores `dry_run` and collects |
+| `providers(cid, on_provider=None, should_stop=None)` | `[node_id bytes]`; `on_provider(node_id)` as each is found (the records held first), the lookup ended early once `should_stop()` (0.2.1) |
 | `ping(node_id)` | round-trip seconds, or None |
+| `routing_info()` (0.2.1) | `RoutingTable.snapshot()` (`GET /api/routing`: the buckets holding a node, each node's first seen, last heard, unanswered queries and whether stale; the dropped count; unreliable nodes and bans, at most `MAX_LISTED` (256) each with their totals, a ban's reason kept in memory from `ban(node_id, reason)`, none for one restored at start) and `blackholed` (`Blackhole.listed_count()`) |
+| `ping_info(node_id, on_stage=None)` (0.2.1) | `{"rtt", "reason", "hops", "interface", "path_since"}`: `client.ping_reason`, then the path as `RnsPaths.info` and `since` (the path table entry's timestamp) read it |
 | `name_create(alias)`, `name_import(alias, key_bytes)` | `{"alias", "name", "warning"}` (`warning`: how to back the key up, `names.key_backup_warning`) |
 | `name_rm(alias)`, `name_export(alias)` | `None`, key bytes |
 | `name_list()` | `[{"alias", "name", "cid" or None, "sequence", "exported"}]` (`exported`: the key was exported or imported) |
@@ -1011,7 +1067,18 @@ and `POST /api/add/stream?format=tar`. `GET /api/info` and `POST /api/get` take
 an optional `from` (node ID), as does `GET /api/cat`; `GET /api/name/resolve?name=` takes a name or a name
 contact's nick.
 
-The API requires `X-Rnfs-Api: <token>` on every request except `GET /api/status`, which without a valid token
+The API and the gateway are each an `api.LocalServer`: a `BoundedHTTPServer` on `127.0.0.1:<port>` and a second on
+`[::1]:<port>` (`IPV6_V6ONLY`; the same handler class, sharing the first's `slots` and `closers`, so
+`max_connections` counts both; bound exclusively on Windows like the first), each served by a daemon thread of its
+own. `::1` is held so that no other local user can listen there while the daemon runs: browsers and curl try
+`localhost` and `*.localhost` (the gateway's sites) on `::1` first (audit AUD-H2). A port taken on `::1` raises
+`OSError` as one taken on `127.0.0.1` does, so the daemon stops; an error in `api.NO_IPV6` (`EADDRNOTAVAIL`,
+`EAFNOSUPPORT`, `EPROTONOSUPPORT`, and Windows' WSA ones) means the host has no IPv6, and it listens on `127.0.0.1`
+alone, with a notice. Port 0 tries up to `BIND_ATTEMPTS` ports for one free on both. `host_allowed` is the same on
+both: `[::1]:<port>` is no accepted host. Clients (`apiclient`) dial `127.0.0.1` itself.
+
+The API requires `X-Rnfs-Api: <token>` on every request except `GET /api/status` and an app's pairing
+(`POST` and `GET /api/apps/request`, `ApiHandler.OPEN_ROUTES`: below); status without a valid token
 answers only `{"version"}` (health checks, and `verify_daemon`, which reads the proof header, then the
 version); the CLI sends the token with every other request, `rnfs status` included (without a readable token it
 prints the version and says why). The daemon writes a new random token to `<rnfs dir>/api_token` (mode 0600, in the 0700 rnfs dir) at each start and the CLI reads it, so other
@@ -1135,6 +1202,21 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   are computed for every name, so the answer and its time are the same whether or not the app exists, and anyone
   who can reach the port can't list the apps (REV9). A node without `apps` (a stand-in) lets no app in and sends
   no proof for one.
+- **Pairing** (0.2.1). `rnfs/apps.py`'s `PairingRequests` (`RnfsNode.pairing`, in memory): `request(name,
+  description)` (`POST /api/apps/request`, an open route needing `X-Rnfs-Pairing`) holds a `_Request` with a random
+  id, secret (32 bytes) and 6-digit code for `REQUEST_LIFE` (600 s), at most `MAX_PENDING` (32) waiting, a new one
+  beyond taking the place of the oldest waiting (logged as a warning). It never looks at `AppRegistry` (AUD-L1: the
+  answer is the same for every valid name), and a name may have several requests waiting, each with its own code
+  (AUD-M5: whoever asks first under an app's name doesn't keep the app from asking). `approve(id, code)` (`POST
+  /api/apps/approve`, CLI token) refuses (ValueError) a `code` that isn't the request's (compared in constant time;
+  `None`, an older client's, isn't checked) and a name `AppRegistry` has (a name clash), the request still waiting;
+  else it runs `AppRegistry.add`, keeps the token on the request for `PICKUP_LIFE` (300 s) and denies the other
+  requests waiting under the name. `rnfs app approve <id>` sends `--code`, or at a terminal shows the request's name
+  and description (not its code) and asks for the code the app shows. `state(id, secret)` (`GET
+  /api/apps/request`, open, the secret in `X-Rnfs-Pairing-Secret`, compared in constant time; a wrong one is a
+  request there isn't) gives it once and forgets the request. The node publishes `apps` events `requested` (with
+  id and code), `added`, `denied`. `ApiConnection.pair()` and `rnfs.Client.pair()` request, call `on_code`, and
+  poll every 2 s.
 - **Discovery.** `cli.run_daemon` writes `<rnfs dir>/daemon.json` (`apiclient.DAEMON_FILE`; `cli.write_daemon_info`,
   `fsutil.write_atomic`, 0600, private) once its servers listen and its token is written, and removes it when it
   stops if it still names its PID (`remove_daemon_info`). `apiclient.read_daemon_info` reads it without following a
@@ -1170,7 +1252,13 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   node's own, kept, followed or resolved — or watched), `remote_pin` (`side` "asked": `node`, `cid`, `state`, as
   a remote pin this node asked for is recorded or a check changes its state; `side` "served": `identity`, `cid`,
   `state`, `reason`, for each outcome of one another identity asked of it: Remote pin status, below), and `job`
-  and `peer` from their features. `GET /api/events` waits at most 30 s, `MAX_EVENT_WAITERS` (8) calls at once
+  and `peer` from their features. From 0.2.1: `config` (`changed`, `applied`, `restart_required`, `pending`: the
+  settings feature's `set`, not a dry run, `pending` being every setting a restart would change, so Settings
+  shows a change made elsewhere and a restart due), `name_sync` (a sync's entry and `removed`: `NameSync.on_change`,
+  the node's `_name_sync_event`, told outside the locks when a sync starts or stops and when a scan changes its
+  state, reason or published root), `apps` (`change`: added or removed, `name`: `app_add`, `app_rm`) and `status`
+  (`changed`: the top-level `status()` fields that differ from the last check, `status_event`, which the
+  maintenance pass runs every `STATUS_EVENT_INTERVAL`, 30 s; the first only records). `GET /api/events` waits at most 30 s, `MAX_EVENT_WAITERS` (8) calls at once
   (`ApiHandler.event_waiters`, a semaphore per server; 503 beyond).
 - **Reference.** `docs/openapi.json`, an OpenAPI 3.1 document (JSON, so the standard library can read it; no
   runtime use): every core and feature route with its parameters, bodies (streamed ones too), answers, error codes
@@ -1183,6 +1271,24 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   over an offline node behind an `ApiServer`, that status, capabilities, pin ls, name list, peers, stats, config, apps,
   remote pins, events and the calls making them answer exactly the documented fields (no undocumented field, every
   required one) with the documented JSON types, in list items too.
+- **Log lines** (0.2.1). `rnfs/recentlog.py`: `LINES`, a `RecentLines` ring of the last `MAX_LINES` (2000), each
+  `{"seq", "time", "level", "level_name", "source", "text"}`. `rnfs.log.log` adds rnfs's messages at RNS's loglevel
+  or more severe (what the console shows); the daemon's `recentlog.capture()`, after the debug log's hook, makes
+  RNS's log callback one that calls the one before it (the debug log's) or prints, then adds RNS's own lines,
+  their level read as the debug log reads them (`debuglog.RNS_LINE`), skipping rnfs's (`log.passing_through()`, now
+  set whether or not the debug log runs). `GET /api/log?after=&limit=&level=`: the last `limit` (200, at most 1000)
+  after `after`, of `level` or more severe, with `next` and `dropped`. In memory only. An embedded Node's are rnfs's
+  messages (its program owns RNS's output).
+- **Restart** (0.2.1). `rnfs/launch.py`: `how_started()` gives daemon.json's `started_by`, `service`, `sandbox` and
+  `can_restart` (a systemd service by `INVOCATION_ID` and a `.service` cgroup, as a terminal's shell may inherit the
+  variable; launchd as macOS's parent 1; `RNFS_STARTED_BY`, which the Windows task wrapper sets to `windows_task`
+  and an app may set, first). `ApiServer(restart=)`, passed only where `can_restart`: `POST /api/restart` answers
+  `{"restarting": true}`, then sets `restarting` and `stopping`; once the daemon has stopped as on SIGTERM,
+  `cli.restart_daemon` runs `Reticulum.exit_handler()` (what `RNS.exit()` does before `os._exit`), unlocks the rnfs
+  dir and `os.execv`s `launch.restart_argv()` (`sys.orig_argv` with the interpreter, or a frozen build's own argv), so
+  the same process starts again with the same command line and environment; the wrapper's daemon exits with
+  `EXIT_RESTART` (75), which the wrapper starts again at once. `ApiConnection.restart(wait=)` polls `GET /api/events`
+  until its epoch changes (a new run; the client reads the new token when its proof fails).
 - **Shutdown.** `ApiServer(shutdown=)`: the daemon passes its `stopping.set`, the event its signal handlers set,
   so `POST /api/shutdown` answers `{"stopping": true}`, flushes, then stops the daemon exactly as SIGTERM does
   (the servers stop, `daemon.json` and the token are removed, the node saves and stops). Without one (tests) it is
@@ -1332,14 +1438,16 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `EventBatch` | `events: tuple[Event]`, `next`, `lost`, `epoch` | — |
 | `Capabilities` | `version`, `capabilities: frozenset[str]` (`has(name)`), `routes: tuple[(method, path)]`, `features`, `event_kinds`, `error_codes`; empty from a daemon before 0.2.0 | — |
 | `Setting` | `rnfs.config.settings_schema()`'s `name`, `group`, `type`, `choices`, `nullable`, `default`, `unit`, `minimum`, `maximum`, `exclusive_minimum`, `description`, `live`, and `value`, `file`, `overridden`, `pending` (lists as tuples) | the name |
-| `Settings` / `SettingsChange` | `path`, `settings: tuple[Setting]` (`settings["max_jobs"]`, iteration), `file_error`, `warnings` / `path`, `applied`, `restart_required`, `overridden`, `warnings` | — |
+| `Settings` / `SettingsChange` | `path`, `settings: tuple[Setting]` (`settings["max_jobs"]`, iteration), `file_error`, `warnings` / `path`, `applied`, `restart_required`, `overridden`, `warnings`, `dry_run` (0.2.1) | — |
 | `Record` | `name: bytes`, `cid`, `sequence`, `age` (seconds since heard, or None) | — |
-| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `allocated_bytes`, `allocation_unit`, `names`, `unexported_names`, `announces_held`, `clock_offset`, `local_servers`, `partition`, `partition_since`, `network`, `record_store`, `nomadnet_identity_hash`, `features: dict` (every other field) | — |
-| `Collected` / `Verified` | `removed_blocks`, `freed_bytes` / `checked`, `bad: tuple[Cid]` | — |
+| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `allocated_bytes`, `allocation_unit`, `names`, `unexported_names`, `announces_held`, `clock_offset`, `local_servers`, `partition`, `partition_since`, `network`, `record_store`, `nomadnet_identity_hash`, `shared_folder` (0.2.1: `SharedFolder.status()`: `path`, `entries`, `bytes`, `scanning`, `last_scan`, `refused`, `error`, `failed`, `failures`; each a field the scan replaces whole, read without its lock, the entries' sizes read from their root blocks once per CID), `features: dict` (every other field) | — |
+| `Collected` / `Verified` | `removed_blocks`, `freed_bytes`, and for a dry run (0.2.1; None otherwise) `dry_run`, `allocated_bytes`, `held_back`, `cached_fetches`, `pinned_bytes`, `cached_bytes`, `protected_bytes`, `unreferenced_bytes`, `records_bytes` / `checked`, `bad: tuple[Cid]` | — |
 | `Exported` / `Imported` | `roots: tuple[Cid]`, `blocks` / and `incomplete` | — |
 | `DenyState` | `entries: tuple[str]`, `lists: tuple[dict]` | — |
-| `Peer` | `node_id`, `mode`, `in_table`, `seniority`, `senior`, `hops`, `interface`, `bitrate`, `link`, `rate`, `last_heard`, `last_active`, `banned`, `sent`, `received`, `requests`, `answered`, `refused`, `failed`, `bad`, and (None from a daemon before 0.2.0) `first_heard`, `rtt`, `rtt_at`, `online` | node ID hex |
-| `Stats` | `since`, `totals: dict`, `refused: dict`, `interfaces: dict`, `upload_budget`, `upload_budget_left` | — |
+| `Peer` | `node_id`, `mode`, `in_table`, `seniority`, `senior`, `hops`, `interface`, `bitrate`, `link`, `rate`, `last_heard`, `last_active`, `banned`, `sent`, `received`, `requests`, `answered`, `refused`, `failed`, `bad`, and (None from a daemon before 0.2.0) `first_heard`, `rtt`, `rtt_at`, `online`, and (None before 0.2.1) `last_seen` | node ID hex |
+| `Ping` (0.2.1) | `rtt`, `reason`, `hops`, `interface`, `path_since`; `reachable` (property) | — |
+| `Routing` (0.2.1) | `k`, `buckets`, `nodes`, `dropped`, `unreliable`, `unreliable_total`, `bans`, `bans_total`, `blackholed` | — |
+| `Stats` | `since`, `totals: dict`, `refused: dict`, `interfaces: dict`, `upload_budget`, `upload_budget_left`, `reticulum_interfaces` (0.2.1: `mesh.interface_states`, from `Reticulum.get_interface_stats()`, the shared instance's through its RPC: name, full name, type, online, mode, bitrate, bytes and speeds, clients; read-only, as rnfs never edits Reticulum's config) | — |
 | `Contact` | `nick`, `kind` ("name", "node", "lxmf"), `id: bytes` | the nick |
 | `Kept` | `name: bytes`, `reasons: tuple[str]` ("user", "follow", "own"), `sequence`, `cid`, `emitted` (the record held, or None) | name hex |
 | `Followed` | `name: bytes`, `pinned`, `latest` (CIDs or None), `sequence`, `state` | name hex |
@@ -1367,7 +1475,7 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 |---|---|---|
 | `status() -> Status` | | `status()` / `GET /api/status` |
 | `node_id -> bytes` (property) | | `node_id` / status, read once |
-| `add(source, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None) -> Added` | `ValueError` (options: `name` with a path, `wrap` without `name`, a source neither a path, bytes nor a binary file), `NotFound` (path), `Denied` (a file's hash), `StorageFull`, `OSError` | a path (str or PathLike): `add_path` / `POST /api/add`; bytes or a binary file: `add_stream(name=name)` / `POST /api/add/stream`, sealing with `name` as the sealed name unless `seal_name` is False |
+| `add(source, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, origin=None) -> Added` | `ValueError` (options: `name` or `origin` with a path, `wrap` without `name`, a source neither a path, bytes nor a binary file), `NotFound` (path), `Denied` (a file's hash), `StorageFull`, `OSError` | a path (str or PathLike): `add_path` / `POST /api/add`; bytes or a binary file: `add_stream(name=name, origin=origin)` / `POST /api/add/stream`, sealing with `name` as the sealed name unless `seal_name` is False |
 | `add_nomadnet(link, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, identify=False) -> Added` | `ValueError` (a malformed link or option), `NotFound` (unreachable, no answer, "Request Not Allowed"), `TooLarge`, `Denied`, `StorageFull` | `add_nomadnet` / `POST /api/add` with `nomadnet` |
 | `get(target, output, *, from_node=None, raw=False, no_extract=False) -> Written` | fetch errors, `ValueError` (output exists), `OSError` | `get` / `POST /api/get` (`no_extract` sent only when set) |
 | `open(target, *, from_node=None, raw=False) -> File` | fetch errors, `ValueError` (a directory) | `info`, then `read(target, offset, length)` per refill / `GET /api/info`, then `GET /api/cat?offset=&length=&from=` per refill |
@@ -1382,18 +1490,18 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 | `pins(cid=None) -> list[Pin]` | | `pin_ls` / `GET /api/pin/ls` |
 | `pin_remote(node_id, cid, pin=True) -> bool` | | `pin_remote` / `POST /api/pin/remote` |
 | `remote_pins(node_id=None, cid=None, *, check=False) -> list[RemotePin]`, `served_pins() -> ServedPins` (`pins: tuple[ServedPin]`, `usage: tuple[RemotePinUsage]`, `quota`) | `ValueError`; a Client: `NoSuchEndpoint` (an older daemon: its 405 for the GET is turned into it) | `pin_remote_ls`, `pin_remote_served` / `GET /api/pin/remote`, `GET /api/pin/remote/served` |
-| `providers(cid) -> list[bytes]`, `ping(node_id) -> float \| None` | | `providers`, `ping` / `GET /api/providers`, `/api/ping` |
+| `providers(cid, *, on_provider=None) -> list[bytes]`, `ping(node_id) -> float \| None`, `ping_info(node_id, *, on_stage=None) -> Ping` (`rtt`, `reason`, `hops`, `interface`, `path_since`, `reachable`; 0.2.1) | | `providers(on_provider=)`, `ping`, `ping_info(on_stage=)` / `GET /api/providers`, `/api/ping`; with a callback, `stream=1` (`ApiConnection.providers_stream`, `ping_stream`: `apiclient.json_lines`), the callback called on the caller's thread as each line comes, before the call returns |
 | `export(target, output) -> Exported`, `import_archive(path) -> Imported` | fetch errors, `ValueError`, `OSError` | `export`, `import_archive` / `POST /api/export`, `/api/import` |
-| `add_tar(source, *, name=None, pin=True, only_hash=False, chunker=None) -> Added` (bytes or a binary file, read up to the tar's end; `Added.warnings_total`) | `ValueError` (a malformed tar, a chunker), `Denied`, `TooLarge`, `StorageFull` | `add_tar` / `POST /api/add/stream?format=tar` |
+| `add_tar(source, *, name=None, pin=True, only_hash=False, chunker=None, to=None, to_self=False, origin=None) -> Added` (bytes or a binary file, read up to the tar's end; `Added.warnings_total`; `to`/`to_self` seal it as the folder `name`, 0.2.1) | `ValueError` (a malformed tar, a chunker, sealing without `name`), `Denied`, `TooLarge`, `StorageFull` | `add_tar` / `POST /api/add/stream?format=tar` |
 | `get_tar(target) -> Iterator[bytes]`, `export_stream(target) -> Iterator[bytes]` (sent once iterated, as `cat`; the whole DAG fetched first; `close()` stops early) | fetch errors, `ValueError`, possibly once iterated | `get_tar`, `export_chunks` (the chunks, closed when done) / `GET /api/get/stream?format=tar`, `/api/export/stream` |
 | `import_stream(source) -> Imported` (bytes or a binary file, read to its end) | `InvalidDag`, `Denied`, `StorageFull`, `ValueError` | `import_stream` / `POST /api/import/stream` |
 | `label_pin(cid, label) -> Pin` (None or "" clears it) | `NotFound` (not pinned), `ValueError` | `pin_label` / `POST /api/pin/label` |
 | `cache() -> list[Cached]`, `uncache(cid) -> Uncached` | `uncache`: `NotFound` (no cached fetch leads to it) | `cache_ls`, `cache_rm` / `GET /api/cache/ls`, `POST /api/cache/rm` |
 | `capabilities() -> Capabilities` | | `api.capabilities(node, without=embedded.NODE_LACKS)` (a Node: not "shutdown" or "daemon_json") / `GET /api/capabilities` (`{}` from an older daemon) |
-| `shutdown(wait=None) -> bool`, `daemon_info() -> dict \| None` | `shutdown`: `Unsupported` (a Node: `close()` stops it; a daemon without a way to stop it), `NoSuchEndpoint` (an older daemon) | a Node: refused / None; a Client: `ApiConnection.shutdown`, `daemon_info` (`daemon.json`, read locally) |
-| `config() -> Settings`, `config_set(settings) -> SettingsChange` | `ValueError` (unknown, refused or malformed settings), `Busy` (rnfs.toml changed meanwhile), `NotFound` (no settings feature) | `SettingsFeature.describe`, `set` (a Node: through JSON, as the API carries them) / `GET /api/config`, `POST /api/config/set` |
+| `shutdown(wait=None) -> bool`, `restart(wait=None) -> bool` (0.2.1), `daemon_info() -> dict \| None` | `shutdown`: `Unsupported` (a Node: `close()` stops it; a daemon without a way to stop it), `NoSuchEndpoint` (an older daemon) | a Node: refused / None; a Client: `ApiConnection.shutdown`, `daemon_info` (`daemon.json`, read locally) |
+| `config() -> Settings`, `config_set(settings, *, dry_run=False) -> SettingsChange` (`dry_run`, 0.2.1: only checked; a Client checks the `config_dry_run` capability first, as an older daemon would write) | `ValueError` (unknown, refused or malformed settings), `Busy` (rnfs.toml changed meanwhile), `NotFound` (no settings feature) | `SettingsFeature.describe`, `set` (a Node: through JSON, as the API carries them) / `GET /api/config`, `POST /api/config/set` |
 | `events.watch(callback, kinds=None) -> Watch`, `events.since(after=None, kinds=None, wait=0, epoch=None) -> EventBatch` (epoch "" is None; a Client's wait fits its timeout, pausing up to a second on an empty answer when that leaves none) | `ValueError` (an unknown kind, after or wait not a whole number ≥ 0); a Client: `NoSuchEndpoint` (an older daemon), `since`: `Busy` (8 polls waiting) | `EventLog.add_listener`, `since` / `GET /api/events` (below) |
-| `gc() -> Collected`, `verify() -> Verified` | | `gc`, `verify` / `POST /api/gc`, `/api/verify` |
+| `gc(*, dry_run=False) -> Collected`, `verify() -> Verified` | `gc(dry_run=True)`: a Client `Unsupported` from a daemon before 0.2.1 | `gc`, `verify` / `POST /api/gc` (`{"dry_run": true}`), `/api/verify` |
 | `names.create(alias) -> Name`, `names.import_key(alias, key) -> Name` | `ValueError` (alias invalid or taken, key malformed) | `name_create`, `name_import` / `POST /api/name/create`, `/api/name/import` |
 | `names.get(alias) -> Name`, `names.list() -> list[Name]` | `NotFound` | `name_list` / `GET /api/name/list` |
 | `names.remove(alias)` | `NotFound` | `name_rm` / `POST /api/name/rm` |
@@ -1402,10 +1510,12 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 | `names.sync(alias, path) -> FolderSync` (a relative path made absolute where the program runs), `names.unsync(alias)`, `names.syncs() -> list[FolderSync]` | `sync`: `NotFound` (no such name or folder), `ValueError` (not a folder, one in the rnfs dir); a `RuntimeWarning` in private mode; `unsync`: `NotFound` (not synced) | `name_sync`, `name_unsync`, `name_syncs` / `POST /api/name/sync`, `/api/name/unsync`, `GET /api/name/syncs` |
 | `Name`: `alias`, `name: bytes`, `cid`, `sequence`, `str()` hex; `publish(target) -> Record`, `export_key() -> bytes`, `remove()`, `refresh() -> Name` | `publish`: `NotFound` (path not stored), `ValueError`, `RnfsError` (highest sequence) | `name_publish`, `name_export`, `name_rm` / `POST /api/name/publish`, `/api/name/export`, `/api/name/rm` |
 | `jobs.get(target, output, *, from_node=None, sealed_name=False, fallback_dht=False, on_progress=None, no_extract=False, retry=False) -> Job`, `jobs.pin(target, *, on_progress=None, retry=False) -> Job`, `jobs.export(target, output, *, on_progress=None, retry=False) -> Job`, `jobs.add(path, *, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, on_progress=None) -> Job`, `jobs.add_nomadnet(link, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, identify=False, on_progress=None) -> Job`, `jobs.import_archive(path, *, on_progress=None) -> Job` | `ValueError` (output exists or in use, an option), `NotFound` (add, import: no such path), `Busy` (1000 active) | `JobsFeature.submit` / `POST /api/jobs` |
-| `jobs.job(job_id) -> Job`, `jobs.list() -> list[Job]`, `jobs.clear(job_id=None) -> int` | `NotFound`, `ValueError` (not finished) | `JobsFeature.get`, `list`, `clear` / `GET /api/jobs/get`, `GET /api/jobs`, `POST /api/jobs/clear` |
+| `jobs.job(job_id) -> Job`, `jobs.list() -> list[Job]` (from 0.2.1 a Client's lists the daemon's uploads too, `Job.stream` and `stream_name`: `JobsFeature.uploading`, the API's `upload_job` around `POST /api/add/stream` and `/api/import/stream`, reading through `api._Counted`; a cancelled one is answered 409 `cancelled`, which `ApiConnection._early_answer` reads after its send fails on the closed connection), `jobs.clear(job_id=None) -> int` | `NotFound`, `ValueError` (not finished) | `JobsFeature.get`, `list`, `clear` / `GET /api/jobs/get`, `GET /api/jobs`, `POST /api/jobs/clear` |
 | `Job`: `id`, `kind`, `target` (None for add and import), `output`, `from_node`, `sealed_name`, `fallback_dht`, `no_extract`, `path`, `options` (add and import), `source` (pin, add and import), `nomadnet` (an add of a NomadNet link), `state`, `error`, `result: dict`, `total_bytes`, `done_bytes`, `downloaded_bytes`, `blocks`, `blocks_total`, `rate`, `eta`, `created`, `started`, `finished`, `runs`, `retry_at`, `retry_since` (queued again as its content wasn't found), `retry` (True: submitted to be), `providers` and `searching` (while running: its fetch's providers in use and whether it is searching), `done` (finished); `refresh() -> Job`, `wait(timeout=None) -> Job`, `cancel() -> Job`, `watch(callback) -> Watch` | `wait`: `TimeoutError`; `NotFound` once cleared | `JobsFeature.get(wait=)`, `cancel` / `GET /api/jobs/get?wait=`, `POST /api/jobs/cancel` |
 | `deny.list() -> DenyState`, `deny.add(entries) -> list[str]`, `deny.remove(entries) -> list[str]` | `ValueError` (malformed entry, too many), `NotFound` (remove: not on it) | `node.deny.entries`/`add`/`remove`, `DenyFeature.lists` / `GET /api/deny`, `POST /api/deny/add`, `/api/deny/rm` |
 | `timeout(seconds) -> context manager` | `ValueError` (not None or a positive number) | a Client: `ApiConnection.using_timeout`; a Node: nothing (above) |
+| `routing() -> Routing` (0.2.1) | a Client: `NoSuchEndpoint` (an older daemon) | `routing_info` / `GET /api/routing` |
+| `log(*, after=None, limit=None, level=None) -> dict` (0.2.1) | `ValueError`; a Client: `NoSuchEndpoint` | `recentlog.LINES.since` / `GET /api/log` |
 | `peers() -> list[Peer]`, `stats() -> Stats` | `NotFound` (no peers feature) | `PeersFeature.peers`, `stats` / `GET /api/peers`, `/api/stats` |
 | `contacts.list() -> list[Contact]`, `contacts.get(nick) -> Contact`, `contacts.add(nick, id, kind=None) -> Contact` (id: bytes, hex or a `Name`; kind None: the node tells), `contacts.remove(nick)` | `ValueError` (nick, id or kind invalid, a kind it can't tell, full), `NotFound` (no such contact; no contacts feature) | `ContactsFeature.list`, `get`, `add`, `remove` / `GET /api/contacts`, `/api/contacts/get`, `POST /api/contacts/add`, `/api/contacts/rm` |
 | `names.keep(name) -> Kept`, `names.unkeep(name)`, `names.kept() -> list[Kept]` (name: bytes, hex, `Name` or a name contact's nick) | `ValueError` (malformed, unknown nick, `keep_max_names`), `NotFound` (unkeep: not kept by the user; no keepers feature) | `KeepersFeature.keep`, `unkeep`, `kept` / `POST /api/name/keep`, `/api/name/unkeep`, `GET /api/name/kept` |
@@ -1450,13 +1560,18 @@ ValueError)`. So `except rnfs.NotFound` and `except ValueError` catch both class
 |---|---|---|---|
 | `names.watch(name, callback)` | `Record`, each time a record of `name` newer than the last delivered (or than the one held when `watch` was called) is accepted under the sequence rules (section 9): announces, path responses, keepers' answers, this node's own publishes | `NameManager.watch(name)` (its announces count as asked in `_heard`, so a full name table never refuses them) and a record listener (`add_record_listener`), which `_offer` calls when it accepts a record and `publish` when it commits one, for watched names, with the names lock held; it only queues the record. Records heard before the watch knows its baseline wait and are compared with it (`_NameWatch.begin`). The keepers listener (`KeepersFeature.add_listener`) isn't used: its records reach `NameManager.offer` too | the `GET /api/name/watch` long poll, on the thread `rnfs-client-name-watch` |
 | `on_progress` / `Job.watch(callback)` | `Job`, at most twice a second (Node) or once a second (Client) while it changes, and once at its final state | the job-watch thread (`rnfs-job-watch`) polls `JobsFeature.get(id)` (a snapshot made under the jobs lock) every `fetcher.POLL` (0.5 s); `fetcher.observing` and the `Observer` (the `Job`, on the job's thread) stay the jobs feature's | `rnfs-client-job-watch` polls `GET /api/jobs/get?id=` once a second; `wait()` loops `GET /api/jobs/get?id=&wait=30` |
-| `events.watch(callback, kinds=None)` | `Event`, one call per event of `kinds` published after `watch()`, in order and never coalesced (an event says what changed, not a state); a "lost" `Event` (`event.lost`) where events were missed, after which the app reads again what it shows | the event log's listener (`EventLog.add_listener`, added at the first watch, removed at `close()`), called after `publish` releases the log's condition, perhaps under the names or storage lock: it only queues. The baseline is the log's `last` and `epoch`; a Node never misses events | `GET /api/events` long-polled for every kind on `rnfs-client-event-watch`, from the first watch's baseline (`after` absent, inside `watch()`, so an older daemon raises `NoSuchEndpoint` there), passing back `next` and `epoch`; on `lost` (fell over 1024 events behind, or the daemon restarted) each watch gets the marker and polling goes on from `next`. Idle, forgetting its position, while no watch is left; a failed poll is reported and retried after 5 s |
+| `events.watch(callback, kinds=None)` | `Event`, one call per event of `kinds` published after `watch()`, in order and never coalesced (an event says what changed, not a state); a "lost" `Event` (`event.lost`) where events were missed, after which the app reads again what it shows | the event log's listener (`EventLog.add_listener`, added at the first watch, removed at `close()`), called after `publish` releases the log's condition, perhaps under the names or storage lock: it only queues. The baseline is the log's `last` and `epoch`; a Node misses events only behind a slow callback (below) | `GET /api/events` long-polled for every kind on `rnfs-client-event-watch`, from the first watch's baseline (`after` absent, inside `watch()`, so an older daemon raises `NoSuchEndpoint` there), passing back `next` and `epoch`; on `lost` (fell over 1024 events behind, or the daemon restarted) each watch gets the marker and polling goes on from `next`. Idle, forgetting its position, while no watch is left; a failed poll is reported and retried after 5 s |
 
 Rules, the same for both:
 - Every callback runs on the instance's event thread (`rnfs-events` in a Node, `rnfs-client-events` in a
   Client), one at a time, in the order events arrived. Events are coalesced per name and per job, so a slow
   callback gets the latest state, not a backlog; `events.watch`'s are not (each is posted under a key of its own),
-  so a callback slower than the events lets them queue. Each event watch (`interface._EventWatch`) keeps its
+  so a callback slower than the events lets them queue, up to `MAX_WATCH_QUEUE` (1024, what the daemon's log keeps)
+  per watch (0.2.1, audit L13: a Node's queue had no bound, and remote announces drive some kinds): past that the
+  oldest is dropped and a "lost" marker waits in its place, its `seq` the last dropped and its `epoch` the run's,
+  so the app reads again what it shows, as a Client's watch does on `lost` (`interface._Backlog`, kept under
+  `_Events`' condition: the watch's keys waiting, the marker always first among them). Each event watch
+  (`interface._EventWatch`) keeps its
   position, the run's epoch and the last sequence it passed: events heard before its baseline is known wait in it
   and only those after it are delivered, and a "lost" marker moves it to the new run unless it began after it.
   Its deliveries are queued under its lock, so they reach the event thread in the order its position passed them,
@@ -1639,7 +1754,7 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   can come once part of the folder has been sealed, and what was stored is then unreferenced, for the next
   collection. A file's size is its open `fstat`'s; a file growing meanwhile is cut there, one shrinking fails
   the add.
-- **Adding from NomadNet** (`rnfs add <destination>:/page/<path>`, specification section 11). `rnfs/nomadnet.py`
+- **Adding from NomadNet** (`rnfs add <destination>:/page/<path>`, specification section 11). `rnfs/nomadnet_links.py`
   (no RNS: the CLI uses it) parses links (`parse`, `looks_like` for the CLI's `./` escape), names a snapshot
   (`snapshot_name`) and recognises NomadNet's "Request Not Allowed" page (`is_not_allowed`, NomadNet's
   `DEFAULT_NOTALLOWED` text). `node_content.add_nomadnet` checks the options (recipients, chunker) before any
@@ -1741,7 +1856,9 @@ interface (at most 64) and in total, never persisted.
   shared link, or `last_seen` within `ONLINE_WINDOW` (900 s: three `link_idle_timeout`s, far below
   `announce_interval`) on the monotonic clock, a negative age being offline.
 - The peers feature (`features/peers.py`) lists them (`first_heard` is the earliest of `Traffic`'s, the routing
-  table's entry (now − seniority) and RNS's `known_destinations` time, `_earliest`) and publishes `peer` events
+  table's entry (now − seniority) and RNS's `known_destinations` time, `_earliest`; `last_seen`, from 0.2.1, is
+  `Traffic`'s turned into wall time against the monotonic clock read at the same moment, `_wall`, never later than
+  now) and publishes `peer` events
   (`{"node_id", "change": "new" | "online" | "offline", "online"}`) from its `rnfs-peers` thread: `check()` every
   `CHECK_INTERVAL` (30 s) computes `mesh.online` for every peer `Traffic` counts or with an open link (both
   bounded; not the listing, which a routing table beyond `MAX_PEERS` cuts, and whose routing-only peers are never
@@ -1763,9 +1880,22 @@ interface (at most 64) and in total, never persisted.
   interface (a window of parts per response in flight there). A full pool displaces the least-progressing
   unprotected response; else (`_fairness_pick`), for a newcomer whose interface holds no slot, the oldest
   zero-progress response past half its grace from an interface holding two or more, at most once per grace
-  per interface (`fairness_at`); else, for a newcomer whose link and identity hold no slot, the slowest
-  response older than `deadline_slack` and past its grace, marked idle if `Response.far_behind` (below a
-  quarter of `needed_rate`, measured against `Response.due`). Never one on the newcomer's own link.
+  per interface (`fairness_at`); else, in the slow pool, for a newcomer not on a known-fast interface
+  (`fast_interface`, which `_serve` sets from `link_path`'s bitrate against `slow_bitrate`) whose identity holds no
+  slot, when every response there is on one, the one that has sent least (newest on a tie), not marked idle (AUD-M4);
+  else, for a newcomer whose link and identity hold no slot, the slowest response older than `deadline_slack` and
+  past its grace, marked idle if `Response.far_behind` (below a quarter of `needed_rate`, measured against
+  `Response.due`) and past its grace. In the slow pool the age counts from `Response.run_start`, the start of its
+  link's or identity's back-to-back run (`ResponsePools.runs`: key -> (run start, last end), at most `RUN_MEMORY`,
+  an end older than `deadline_slack` forgotten; `_run_start` on reserve, `_ended` as a response leaves the pool),
+  and a response continuing a run (`run_start < started`) may go within its grace. Never one on the newcomer's own
+  link. A request
+  takes no slot (`_serve`) if nothing it asks for is served, if it is a `/range` past the block's stored end, or if
+  its handler's `fits_packet` (the stored sizes of what it serves) says the answer fits one packet and it needn't
+  wait for upload pacing (one that must wait holds its link's `/blocks` slot meanwhile, which `IncomingLinks` never
+  closes, so it takes a pool slot: AUD-H1): that one gets a `Response` outside the pools, charged as any, tracked
+  in `RequestServer.unslotted` so `_link_closed` finishes it, and reserves a slot after all if the answer built is
+  larger than foreseen.
   `check_responses` cancels and refunds a response that has sent nothing once its grace plus `deadline_slack`
   has passed, or that makes no progress for `stall_timeout`. `Cooldowns` then refuses `/blocks` from a link
   (and its identity, if identified) whose response was displaced or cancelled idle, for `blocks_cooldown`,
@@ -1799,7 +1929,8 @@ interface (at most 64) and in total, never persisted.
   `check_responses` charges progress as it reads it (`_charge_progress`), and `_settle` (from `_finish`)
   makes the charge final: the cost if completed or progress is unreadable, else progress × size, refunding
   an unused reservation. One requester's responses in flight may cost at most half the bucket's capacity
-  (`_budget_share_left` cuts the budget, or refuses).
+  (`_budget_share_left` cuts the budget, or refuses: once before a slot is reserved, so a requester at its share
+  displaces nothing, and again after any pacing wait).
   `RequestServer.traffic` and `PeerClient.traffic` share one `Traffic`.
 - `network/guards.py` also rejects, on `rnfs.dht` links only (recognised by the link's destination or owner
   name `rnfs.dht.<hex>`; an incoming link's destination is set by `Link.validate_request` before it is
@@ -1819,7 +1950,9 @@ interface (at most 64) and in total, never persisted.
   response is handed to `Link.handle_response` as `None`, which every parser refuses, so the request fails as
   malformed; refusals are logged at most once a minute. `guarded_receive` drops a response packet on an
   incoming `rnfs.dht` link, and a request packet on one this node opened (`link.initiator`), without
-  decrypting it. Everything else goes to RNS's own methods unchanged.
+  decrypting it, and (`_identify_refused`, AUD-L7) an identify packet (context `LINKIDENTIFY`) on an incoming
+  `rnfs.dht` link that has a remote identity already, or has had `MAX_IDENTIFY_PACKETS` (4; counted in the link's
+  `rnfs_identify_packets` attribute, on RNS's inbound thread). Everything else goes to RNS's own methods unchanged.
 - On NomadNet links this node opened (`guards.mark_nomadnet`: an attribute on the link, so another program's
   NomadNet links in the process aren't touched) `refusal` applies, in both scopes, the checks that cover every link
   in the daemon, never the `rnfs.dht`-only three, and `guarded_accept` leaves the decompression limit the fetch's
@@ -1838,8 +1971,13 @@ interface (at most 64) and in total, never persisted.
 
 `rnfs/features/__init__.py` defines `Feature` and `FEATURE_MODULES` (in start order: peers, jobs, keepers, follow,
 contacts, deny, settings). The node builds every feature in its constructor (`node.feature(name)`), starts them after
-its own threads and stops them, in reverse, before its own services. A feature may override: `start()`,
-`stop(deadline=None)` (asks its threads to end, then waits for them until `deadline`, a `time.monotonic()` value:
+its own threads and stops them, in reverse, before its own services. It stops in two phases (0.2.1, audit M7): it
+calls every feature's `stopping()`, sets its own `stop_event`, wakes its loops and the resolves waiting
+(`NameManager.stopping`: a resolve's path wait ends, and none waits after) and closes the links, and only then
+calls each feature's `stop(deadline)`, so all of them wind down at once rather than one busy feature using up the
+budget the others are then waited for within. A feature may override: `start()`, `stopping()` (0.2.1: asks its
+threads to end without waiting; the base's does nothing, and `features.ask_to_stop` skips a feature class without
+one, so a feature written before asks in its `stop()`), `stop(deadline=None)` (asks its threads to end, then waits for them until `deadline`, a `time.monotonic()` value:
 the node passes its stop budget's, so `STOP_TIMEOUT`, 5 s, bounds the features' threads and its own together;
 `None` waits `features.STOP_WAIT`; the base's `_spawn(target, name)` starts a thread that `_join(deadline)` waits
 for; the node calls a `stop()` with no `deadline` parameter as before, `features.stop_feature`),
@@ -1955,7 +2093,7 @@ at most every `EVENT_INTERVAL` (1 s) on the job's thread, its progress is a `job
 | `rnfs-lookup`, `rnfs-lookup-path`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin`, `rnfs-publish-lookup`, `rnfs-publish-provide` | per operation | lookups, a disjoint lookup's paths (all but the first, which runs in the caller's thread; every path for `find_providers`), fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting), a publishing round's region lookups (up to 4 at once) and its `/provide`s (`rnfs-publish-provide`, up to 16 at once), both ended with the round and none on slow nodes |
 | `rnfs-slow-step` | `log.SlowStep` (storage, node) | while a start step that can take minutes runs (listing every block, the first provide set): says what it does after 10 s, that it still is every 30 s, and how long it took (`SlowStep`) |
 | `rnfs-write` | storage | an add's, shared-folder import's or archive import's block writes (`Session.writer()`), up to 16 at once, ended with it |
-| `rnfs-job-<id>` | jobs | one per running job, at most `max_jobs`; `stop()` waits for them until the node's stop deadline |
+| `rnfs-job-<id>` | jobs | one per running job, at most `max_jobs`; `stop()` waits for them until the node's stop deadline. One that can't be started (`RuntimeError`) leaves its job queued again (`Job.undo_run`), holding no slot, for the next `_schedule` (0.2.1); a run ending lets go of the CIDs it met, its partial blocks and its rate samples (`Job.end_run`: they were kept by every finished job), and a run failing once the node is stopping is queued again, as one the stop cancels is |
 | `rnfs-keepers`, `rnfs-keeper-query` | keepers | pending refreshes (≤ 64 queued), own-name sync, saves, re-asking every `announce_interval`; parallel `/name` queries |
 | `rnfs-follow` | follow | every check and fetch, one at a time |
 | `rnfs-name-sync` | node (`NameSync.run`) | the synced folders' scans and publishes, one at a time: each when due (`scan_interval`, sooner to settle a change or once the hourly limit lets it publish), woken at once by a sync started or stopped |
@@ -2107,9 +2245,13 @@ Free text that may hold lone surrogates (file names, cache paths) is stored as J
 deleted. The JSON files of 0.1.4 and earlier, once imported, stay as `<name>.migrated`. Elsewhere:
 `storage/identity` (0600), `names/<alias>` (name keys), `api_token` (while the daemon runs), `daemon.lock` (locked while
 the daemon, or an embedded `rnfs.Node`, uses the dir: `node.lock_rnfs_dir`).
-Outputs being written live beside the output as `.rnfs-get-<random>.partial` (`RnfsNode.get`) or `.rnfs-job-<id>.partial` (get jobs) until renamed; a failed, cancelled or shut-down job removes its partial,
-and a resumed job removes one left by a crash. A get job runs `RnfsNode.get` with its `.rnfs-job-<id>.partial` as
-the output, so it is written in a `.rnfs-get-<random>.partial` beside that and renamed twice.
+Outputs being written live beside the output as `.rnfs-get-<random>.partial` (`RnfsNode.get`),
+`.rnfs-export-<random>.partial` (`RnfsNode.export`, synced before its rename; AUD-M8: it wrote the output itself, so
+a crash left a truncated archive there) or `.rnfs-job-<id>.partial` (get and export jobs) until renamed; a failed,
+cancelled or shut-down job removes its partial, and a resumed job removes one left by a crash. A get (export) job
+runs `RnfsNode.get` (`export`) with its `.rnfs-job-<id>.partial` as the output and `.rnfs-job-<id>.write.partial` as
+the temporary name, so a resumed run finds and removes both, and renames twice; a resumed run that finds its output
+in place keeps it if it holds the same content (`jobs._rename_into_place`, `fsutil.same_content`).
 A directory partial is private while written (audit CONT-2), so nobody can swap one of its directories for a
 link and have the DAG's files created elsewhere: on POSIX (`walker._FdOutput`, where `FD_WRITE`) it is made with
 `mkdir`, opened `O_DIRECTORY | O_NOFOLLOW`, checked to be this user's, `fchmod`ed to 0700 (setgid kept, so
@@ -2157,13 +2299,16 @@ Everything in the specification is implemented, with these simplifications and a
   whose `hops` `_start_network` sets to `RnsPaths.hops`) and `check_path=self._check_path` (`_path_check` once
   Reticulum runs, None before: a node RNS had no path to when the lookup ranked it gets its path awaited,
   `PeerClient.await_path`, and is judged again). Slow nodes' `Lookups` get `SLOW_PUBLISH_UNKNOWNS` and
-  `SLOW_SEARCH_UNKNOWNS`. `RnfsNode.sizes` is the size estimate (`SizeEstimate`, a batched store); every complete
-  lookup's run feeds it.
+  `SLOW_SEARCH_UNKNOWNS`. `RnfsNode.sizes` is the size estimate (`SizeEstimate`, a batched store); the complete runs
+  of publish lookups feed it, and of the lookups for random keys the `rnfs-join` thread runs (`_sample_sizes(n)`: up
+  to n `Lookups.sample_due()` while each runs one; `MIN_SIZE_SAMPLES` after the first join, then one each
+  `REJOIN_DELAY` check), never searches (AUD-M1).
 - Local servers (specification section 6, "LoRa islands"): `RnfsNode.local` is a `LocalServers`, used only when
   `local_on` (set at start: `local_interfaces` named, or `rates.has_slow_interface`; offline nodes take `local=`).
   `_heard_server` judges each server heard (`_judge_local`: with no interface named, a path longer than
   `local_hops` by `_path_hops` alone, so no RPC; else `mesh.is_local_path(_path_of(id), ...)`), `_heard_client`
-  forgets one. The `rnfs-local` thread (`_run_local`, every `LOCAL_CHECK`, 30 s; only when `local_on`) runs
+  forgets one (and takes it out of the routing table; the first-seen log only as `_left_server_mode` says). The
+  `rnfs-local` thread (`_run_local`, every `LOCAL_CHECK`, 30 s; only when `local_on`) runs
   `check_local`, which calls `scan_local` every `SCAN_INTERVAL` (600 s): `_scan_paths(max_hops)` (`RnsPaths.scan`,
   `max_hops` = `local_hops` unless `local_interfaces` is set) judged by `judge_all` over the servers the routing table
   or the first-seen log know (`_is_server`), replacing the set; a scan that raises clears it (nothing is local).
@@ -2172,7 +2317,9 @@ Everything in the specification is implemented, with these simplifications and a
   search's first nodes: `local.closest(key, first_count(bool(local_interfaces)))`, leaving out what `_not_for_us`
   rejects (banned, or in private mode not a member: the senior servers' rule too).
 - Partition mode: `RnfsNode.partition` (`PartitionMode` over `local.is_local`), fed only when `local_on`: `_answered`
-  and `_query_failed` (every lookup's, the join's too) pass each `/find` outcome on; `_announced` passes an announce
+  and `_query_failed` (every lookup's, the join's too) pass each `/find` outcome on (`_new_lookup`'s `on_failure` passes
+  `Lookup.introducers(id)`, the nodes whose answers named it, as `named_by`; its `senior` is `_is_senior`, first heard
+  at least `provider_seniority` ago); `_announced` passes an announce
   `Traffic.announced` counts as fresh to `_fresh_announce`, which tells it of servers `_heard_server` judged off-island
   (`local.judged(id) is False`); the publisher (`set_islands`) each `/provide` that recorded keys or opened no link.
   `_wired_lookup` adds `allowed=partition.allows`, and `_start_nodes` puts the K closest local servers first while it
@@ -2216,10 +2363,17 @@ Everything in the specification is implemented, with these simplifications and a
   are clamped to now.
 - A CID whose lookup found no nodes to publish to is retried after 30 s rather than at the next republish.
 - When every provider has failed, the provider lookup runs again only if its previous run found a new
-  provider (and time is left).
+  provider the fetch took up (`Fetch._lookup_found`, counted by `_add_provider`: not one it skipped, as an unknown
+  identity over the path-request budget) and time is left. The runs share the lookup's `max_queries` (`Lookup.sent`:
+  each run sends what the earlier ones left), so a search sends at most `MAX_QUERIES` `/find` however often it runs
+  again (AUD-M2, 0.2.1: identities listing fresh made-up providers in every answer kept one fetch searching again,
+  66,426 `/find` in 15 s).
 - `max_download_size` is checked against the target's verified size, or the range's size, before anything
   below the target is fetched, and the DAG-node bytes a fetch downloads count against it too, so directories
-  of empty files can't get around it. Listing and writing out also stop fetching at `max_output_entries`.
+  of empty files can't get around it. Listing and writing out also stop fetching at `max_output_entries`, and so do
+  `pin_add`, the remote-pin fetch (`_remote_pin_fetch`) and `dir_set`/`dir_rm` (AUD-M6, 0.2.1: directory nodes pay
+  for themselves under the DAG byte bound, so a tree of empty files was otherwise unbounded). `_Walk.met`'s
+  `TooLarge` carries `.entries = True`, so a remote pin refused for it is dropped as `too_large`, not `quota`.
 - **DAG byte bound** (`fetcher.dag_bound`, `Fetch.dag_limit`; the bookkeeping is `fetcher._DagBudget`, pure,
   the fetch's own in `Fetch.budget`). `fetch_dag` counts the bytes of the distinct
   blocks of its target's DAG, stored or downloaded, against `dag_bound(size)` = size + `DAG_GRANULE_OVERHEAD`
@@ -2298,7 +2452,10 @@ Everything in the specification is implemented, with these simplifications and a
   output must leave the same reserve free there, and when the destination is on the blocks' filesystem, `get`
   (and a sealed file's write-out) counts what it still has to fetch too (the verified size less the bytes of
   the target's DAG already stored). If the destination's free space can't be read, the check raises the
-  `OSError` (same errno, saying so) instead of letting the write go ahead unchecked.
+  `OSError` (same errno, saying so) instead of letting the write go ahead unchecked. A directory `get` checks
+  again once its DAG is stored, before writing (`node._check_write_space`, audit AUD-M11): what its entries
+  allocate, `tarstream.dag_extent(...).written(fsutil.allocation_unit(output's directory))`, the sealed unpack's
+  count (REV10), since 5,000 empty directories passed a check for 0 bytes and took 20 MB.
 - Roots found invalid are remembered in the state database's `invalid` table (at most 10 000, oldest dropped), and there is
   no command to clear them. Cache records are capped at 10 000 (LRU). Both are saved every 30 s and at stop.
 - A remote pin's usage is the larger of its content size and its DAG's block bytes. It is dropped once the
@@ -2308,7 +2465,9 @@ Everything in the specification is implemented, with these simplifications and a
   `_remote_workers` in the same critical section in which it finds its queue empty, so a `/pin` arriving as it
   exits starts a new one; if `Thread.start()` fails the pin is given back and refused. The pins waiting are
   saved to the `remote_pins` table by maintenance (when changed; rewritten whole, a few rows) and at stop, and `_resume_remote_pins` queues
-  them again at start (skipping those already pinned or whose identity left `remote_pin_identities`); workers
+  them again at start (skipping those already pinned or whose identity left `remote_pin_identities`), in
+  `_start_network` before the destination accepts links (0.2.1, audit L12: a release arriving first found nothing
+  to release, and the pin was resumed after it); workers
   wait for the first join before fetching, and a fetch cut short by stopping stays queued. Stop cancels their
   fetches (an observer bound to `stop_event`, so a fetch ends at its next step) and waits for the workers
   (`_remote_workers` maps each source to its thread) within its budget.
@@ -2410,8 +2569,9 @@ Everything in the specification is implemented, with these simplifications and a
   on `missing`, `bad`, a malformed answer or the completed block). Server side, `_handle_range` parses
   (`protocol.parse_range_request`), and `_serve`, the path `_handle_blocks` takes too, applies every `/blocks` rule
   before its `build(limit)` makes the answer: the served block's range, whole, compressed (`protocol.compress_range`,
-  bz2 at level 9) if asked, smaller, and `RequestServer.compression` (a `CompressionBudget` of `COMPRESS_RATE`, 256
-  KiB/s, bursts of `COMPRESS_BURST`, 1 MiB) allows; `[]` if not served, `False` past its end. `protocol.
+  bz2 at level 9) if asked, smaller, and `RequestServer.compression`
+  (a `CompressionBudget` of `COMPRESS_RATE`, 256 KiB/s, bursts of `COMPRESS_BURST`, 1 MiB, and a bucket per link of
+  a `COMPRESS_LINK_SHARE`-th, a quarter, of that, forgotten when the link closes) allows; `[]` if not served, `False` past its end. `protocol.
   parse_range_response` checks an answer and decompresses it with `decompress_range` (at most the expected length
   plus one byte; refused unless one complete stream with nothing after it), and `body_refusal` accepts the answer's
   shape (`_range_answer_end`).
@@ -2421,14 +2581,23 @@ Everything in the specification is implemented, with these simplifications and a
   roots. `Fetcher.remembered(root)` gives them most recent first, dropping those older than `REMEMBER_FOR` (3 h) and
   banned ones. `Fetch._discover` probes, within `max_parallel`, the hint, then the remembered providers, then the open
   links, each group ranked by `_rank` (its own order breaking ties), and the probe takes the first missing CID from
-  `pending` (requeued by `_handle_event` if no probe brings it). A remembered provider probed (`_remembered_asked`)
-  that answers without the block and isn't `BUSY` is forgotten for the root (`Fetcher.forget`), as is any provider
-  `_fail` fails. A `/find` reply's providers aren't remembered until they serve, so an attacker's reply can't plant
-  entries. A probe of the hint, a remembered provider or a node known to answer `/range` uses `/range` where a provider
-  would (`Fetch._plan`, which `_range_plan` calls with the provider's state); one that sends part of the block makes
-  its node a provider (if the lookup hasn't already) owning the partial unless another probe's partial got there first,
-  and one left unanswered as an older node leaves it (`UNSUPPORTED`) is sent again with `/blocks` by `_handle_event`,
-  for what no other probe brought meanwhile.
+  `pending` (requeued by `_handle_event` if no probe brings it). Probes are timed as requests are (`_sent_at`,
+  `_expected` from the link's rate estimate, else the path's next-hop bitrate, and `_expects` for their CID), so
+  `_duplicate_after` gives each a patience (AUD-H4, 0.2.1): `_assign` starts the lookup (`_discover`) once only probes
+  are in flight and one has run past it (`_probes_overdue`), leaving them to go on; `_duplicate` asks a provider found
+  meanwhile for the probe's block as for any batch (`copied` keeps one CID that several probes carry from being
+  duplicated twice); and the probe's request waits for its link's `/blocks` slot no longer than it (`slot_wait`,
+  `PeerClient.blocks`/`block_range`, `LinkPool.request`), coming back `BUSY` with `NO_SLOT`, unsent and not counted in
+  traffic. A remembered provider probed (`_remembered_asked`) that answers without the block is forgotten for the root
+  (`Fetcher.forget`) unless it was `BUSY` at once (refused, or a link closed) or its slot never came free: one whose
+  answer was cancelled, or that ran past its patience (`_handle`'s `overdue`, or abandoned to a duplicate in
+  `_settle_duplicate`), is forgotten too, as is any provider `_fail` fails. A `/find` reply's providers aren't
+  remembered until they serve, so an attacker's reply can't plant entries. A probe of the hint, a remembered provider
+  or a node known to answer `/range` uses `/range` where a provider would (`Fetch._plan`, which `_range_plan` calls
+  with the provider's state); one that sends part of the block makes its node a provider (if the lookup hasn't
+  already) owning the partial unless another probe's partial got there first, and one left unanswered as an older node
+  leaves it (`UNSUPPORTED`) is sent again with `/blocks` by `_handle_event`, for what no other probe brought
+  meanwhile (timed again, with its `slot_wait`).
 - Searching again (0.2.0): `Fetch._search_again`, each pass of `_download`, on a node that isn't slow and without a
   `from_node`, starts a new lookup (`make_lookup`; the old one's time budget is spent) when none runs, some provider is
   live but fewer than `max_parallel` can be asked now (not failed, `busy_until` passed), and `_search_wait` has passed
@@ -2508,7 +2677,12 @@ Everything in the specification is implemented, with these simplifications and a
   `build_path` and `add_sealed_path` refuse a root in it (`check_root`), the shared folder refuses a folder in it
   (`_check_target`) and skips a top-level entry in it (`_scan_item`), name sync refuses a folder in it
   (`_opened_problem`), and an add job's `tree_size` doesn't count it. On Windows the listed stat comes from the
-  path (`listed_stat`), which has the file index as `st_ino`.
+  path (`listed_stat`), which has the file index as `st_ino`. The path check is made twice by `add_path`: on the
+  path, then on what the build opened (`BuildOptions.root_check`, called by `builder.check_root` in `build_path`
+  and `add_sealed_path`, plain, sealed and only-hash: `shared_folder.opened_refused_reason`, the same reasons for
+  `opened_path`, the descriptor's `fsutil.final_path`, or where the system can't say, the real path checked to
+  still be the opened device and inode). Audit AUD-H3: the path was checked, then opened again following a link,
+  so a leaf swapped for a link to `api_token` between the two was added.
 - The identity file (`network/identity.py`) is opened with `O_NOFOLLOW | O_NONBLOCK` after an lstat that must
   show a regular file, not a link; the descriptor must be that same regular file (device and inode), owned by
   the user, and is tightened through `fchmod` if loose. The key is read from it (`RNS.Identity.from_bytes`),
@@ -2555,7 +2729,9 @@ Everything in the specification is implemented, with these simplifications and a
   query's state is a `_KeeperQuery` (`search`, `next_batch`, `ask` on a thread per keeper, `settled`, `resume`).
   Its search stops (`should_stop`) once enough candidates are found, or once some are and `lookup_timeout` /
   `SEARCH_SHARE` (5) has passed; candidates aren't asked while it runs. Each batch is joined for
-  max(`Lookup.remaining()`, `name_wait(config)`), the latter 87.5 s at the defaults. When the candidates run out
+  max(`Lookup.remaining()`, `name_wait(config)`), the latter 87.5 s at the defaults. Once the feature is stopping
+  (0.2.1), a query asks nothing more: its search stops, its batch is waited for no longer (checked every
+  `STOP_POLL`, 0.5 s), and a new query returns no record at once. When the candidates run out
   unsettled with batches left, `resume` runs `find_providers` again, but only if the last search was stopped
   early (`cut_short`) and some of its candidates were asked, so resumes stay within the batch bound and the
   lookup's deadline.
@@ -2637,7 +2813,10 @@ Everything in the specification is implemented, with these simplifications and a
   retried after 300 s, doubling up to `announce_interval`, and a failed fetch is retried with the record held
   (no path request). The fetch checks the resolved target's size against `follow_quota` and sets it as
   `max_dag_bytes` (as remote pins do with their quota, but per name rather than per source: the old target's
-  pin isn't counted, so a swap peaks at twice the quota); 0 refuses before opening the fetch.
+  pin isn't counted, so a swap peaks at twice the quota); 0 refuses before opening the fetch. It meets at most
+  `max_output_entries` directory entries, as a `get` of the target would (0.2.1, audit M6), and ends at its next step
+  once the feature is stopping (`fetcher.cancel_when(self._stop.is_set)`, an observer passing reports on to one
+  already watching the thread); deny-list fetches do both too.
 - **Contacts.** Every `<name>` argument (`name resolve|keep|unkeep|follow|unfollow`) takes a name contact's
   nick; the gateway never expands nicks. A nick at the start of a target reuses the CID resolved for it for
   60 s (`EXPAND_AGE`) from the time of the resolve, not from when the record was heard.
@@ -2651,9 +2830,9 @@ Everything in the specification is implemented, with these simplifications and a
   (a fresh block store's shard directories, up to 4 MiB once) falls within the disk reserve. Where the output's name must be chosen before the get (a
   daemon without the job manager, or a path target ending in `.tar`, whose job keeps its visible name), the CLI
   asks `GET /api/info` first and drops `.tar` only when it says `sealed_folder`; an older daemon doesn't say
-  it, and doesn't unpack. `POST /api/add/stream?format=tar`
-  can't seal (a tar uploaded by an app would have to be repacked under one top directory): sealed folders are
-  added from a path.
+  it, and doesn't unpack. `POST /api/add/stream?format=tar` with `to` (0.2.1) repacks the uploaded tar under one
+  top directory as it streams (`tarstream.repack_chunks`), so an app whose files the daemon can't open seals a
+  folder too.
 - **Sealed files.** `get` of a *directory* containing sealed files writes them as stored (get each with
   `get <cid>/<path>`). Sealing hides content and name but not size, recipients or wrapper names, and gives no
   sender authentication. A recipient opens it with its node identity's private key, which the node holds
@@ -2666,8 +2845,9 @@ Everything in the specification is implemented, with these simplifications and a
 - **Packaging.** Release artifacts (`.deb` for amd64/arm64, x86_64 Flatpak, Windows x64 exe, wheel and sdist)
   are built by `.github/workflows/release.yml`. Only a pushed `vX.Y.Z` tag matching `rnfs/__init__.py`'s
   `__version__` publishes them, once the whole of `tests.yml` (which release.yml calls) has passed, with
-  `SHA256SUMS` and signed build provenance (`gh attestation verify`), never replacing files already attached;
-  a manual run only builds, as do the runs for a pull request touching `packaging/**`, `pyproject.toml` or
+  `SHA256SUMS` and signed build provenance (`gh attestation verify`), never replacing files already attached
+  (which binds only the workflow: what stops anyone else is the repository's release immutability setting, one
+  of the settings CONTRIBUTING.md lists); a manual run only builds, as do the runs for a pull request touching `packaging/**`, `pyproject.toml` or
   `.github/**` and the weekly scheduled run. The Windows exe isn't code-signed, and unpacks itself on each start.
   - `rns>=1.5.6,<1.6` is the one dependency (`pyproject.toml`; LXMF was one too until 0.2.0 moved it out of rnfs).
     The upper bound keeps unpinned installs off RNS releases rnfs hasn't been tested with, since it relies on
@@ -2685,7 +2865,11 @@ Everything in the specification is implemented, with these simplifications and a
     their dependencies), hashed the same way. Every build installs these with `--require-hashes` and builds
     without build isolation, so nothing unpinned is fetched for a build; the Flatpak's `build-sources.json` comes from
     `build-backend.lock`. `build-deb.sh` fails if a supported Python has no cffi backend, caps `python3` below
-    3.15, and writes a DEP-5 `copyright` and `md5sums`.
+    3.15, and writes a DEP-5 `copyright` and `md5sums`. It is reproducible: every file is dated
+    `SOURCE_DATE_EPOCH` (the release jobs export the commit's time; unset, build-deb.sh takes the checkout's),
+    pip's `direct_url.json` (the wheel's temporary path) is dropped, and the release's `.deb` is built from the
+    released wheel (`--wheel`), so building a commit twice gives the same `.deb`. `.github/workflows/audit.yml`
+    checks every lock's pins against OSV daily and when a lock changes (Dependabot doesn't read them).
   - `install.sh` installs the latest release's sdist (`rnfs-X.Y.Z.tar.gz`, the tag taken from where
     `releases/latest` redirects, so no GitHub API), the main branch's archive with `--main`, or `RNFS_SOURCE`
     (with a warning for a plain `http://` URL). A release's sdist must match the release's `SHA256SUMS` and,
@@ -2699,6 +2883,11 @@ Everything in the specification is implemented, with these simplifications and a
     wheels only (`RNFS_ALLOW_SOURCE_BUILDS=1` builds missing ones from hashed sources with unpinned build
     tools), builds rnfs in a separate venv with the locked setuptools, sets `umask 022` in system mode, and
     replaces or removes only a systemd unit it wrote (marked in its first line; `--force` replaces another). It
+    fetches, checks and builds everything before touching the venv; a venv that must be re-created (its Python
+    gone, or unable to import pip, as after a distro Python upgrade) is moved to `venv.old` and put back if the
+    install fails (a venv can't be built elsewhere and renamed: its scripts hold its path). It refuses (unless
+    `--force`) an older version than the installed one (read from its dist-info), and a release over an install
+    from `--main` or `RNFS_SOURCE` (recorded in the venv's `rnfs-install-origin`) of the same version number. It
     doesn't upgrade the venv's pip, runs every Python with `-I` from `/` once its paths are absolute (so
     modules in the caller's directory are never imported), refuses a relative `HOME`, ignores relative
     `XDG_DATA_HOME`/`XDG_CONFIG_HOME`, and writes the systemd unit's `ExecStart` quoted with `%` as `%%`
@@ -2706,7 +2895,10 @@ Everything in the specification is implemented, with these simplifications and a
     the same way, sandboxed (`NoNewPrivileges`, `RestrictAddressFamilies`, …) and gives up after 5 failed
     starts in 10 minutes; `contrib/install-windows-task.ps1` doubles quotes in paths, refuses `%` in them, runs
     the daemon through a wrapper script that restarts it on errors (likewise giving up), and
-    `-Stop`/`-Uninstall` stop the task's whole process tree.
+    `-Stop`/`-Uninstall` stop the task's whole process tree; the task is named for the user's SID and only
+    the user's own processes are stopped (the pre-0.2.1 shared name only if that task runs the user's wrapper).
+    `contrib/rnfs.service.d/strict.conf` is an opt-in drop-in that makes the home read-only except `~/.rnfs`,
+    `~/.reticulum` and `~/Downloads` and hides `$XDG_RUNTIME_DIR` (the user manager and session bus).
   - CI: `tests.yml` has `permissions: contents: read`; both workflows pin actions to commit SHAs, the release's
     Flatpak container is pinned by digest, workflow values reach `run:` scripts only through `env:`, checkout
     doesn't persist credentials, and build tools come from `build-tools.lock`. The install.sh job checks that a

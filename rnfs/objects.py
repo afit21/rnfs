@@ -9,10 +9,17 @@ from dataclasses import MISSING, dataclass, field, fields
 
 from rnfs.content.cid import Cid
 
+# A job's states (Job.state; rnfs.features.jobs runs them), and the longest wait= GET /api/jobs/get may ask for, in
+# seconds: the API's, which the jobs feature and rnfs.Client both follow
+QUEUED, RUNNING, DONE, FAILED, CANCELLED = "queued", "running", "done", "failed", "cancelled"
+ACTIVE = frozenset({QUEUED, RUNNING})
+FINISHED = frozenset({DONE, FAILED, CANCELLED})
+MAX_JOB_WAIT = 30
+
 __all__ = ["Cid", "Added", "Written", "Entry", "Info", "Stat", "Pin", "Record", "Status", "Collected", "Verified",
            "Exported", "Imported", "DenyState", "Peer", "Stats", "Contact", "Kept", "Followed", "Cached",
            "Uncached", "Event", "EventBatch", "Capabilities", "Setting", "Settings", "SettingsChange", "RemotePin",
-           "ServedPin", "RemotePinUsage", "ServedPins", "FolderSync"]
+           "ServedPin", "RemotePinUsage", "ServedPins", "FolderSync", "Ping", "Routing"]
 
 
 def _cid(text) -> Cid:
@@ -247,6 +254,9 @@ class Status(_Object):
     # What `add --identify` identifies to NomadNet nodes as, for a page's operator to list (rnfs 0.2.0); after the
     # others, so they keep their places for a caller giving them by position
     nomadnet_identity_hash: bytes | None = _field(_hex, None)
+    # The shared folder as its last scan left it (rnfs 0.2.1): {"path", "entries", "bytes", "scanning", "last_scan",
+    # "refused", "error", "failed", "failures": [{"name", "reason"}]}
+    shared_folder: dict | None = None
     features: dict = field(default_factory=dict, repr=False, metadata={"json": False})
 
     def to_dict(self) -> dict:
@@ -264,10 +274,23 @@ class Status(_Object):
 
 @dataclass(frozen=True)
 class Collected(_Object):
-    """What gc() removed."""
+    """What gc() removed; with dry_run (rnfs 0.2.1), what it would, nothing removed: then also what those blocks take
+    on disk, whether a damaged DAG node holds collection back (nothing would be removed), the cached fetches it would
+    evict, the stored block bytes by what keeps them (pins, cached fetches only, operations in progress only,
+    nothing) and what counts against record_budget (the state database: provider records and the rest of rnfs's
+    state). None where not a dry run."""
 
     removed_blocks: int = 0
     freed_bytes: int = 0
+    dry_run: bool = False
+    allocated_bytes: int | None = None
+    held_back: bool | None = None
+    cached_fetches: int | None = None
+    pinned_bytes: int | None = None
+    cached_bytes: int | None = None
+    protected_bytes: int | None = None
+    unreferenced_bytes: int | None = None
+    records_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -311,7 +334,9 @@ class Peer(_Object):
     active (Unix times), whether banned, the traffic counted since the node started (bytes sent and received,
     requests made, answered, refused, failed, and bad blocks), and from 0.2.0 when it was first heard, the
     round-trip seconds of the last link to it (rtt, measured at rtt_at) and whether it is online now (None from a
-    daemon that predates them)."""
+    daemon that predates them), and from 0.2.1 last_seen: when it last showed it was up (an answer, a request of its
+    own, a link, a fresh announce; Unix time, None if not this run), which last_heard, refreshed by path responses
+    any node may send, isn't."""
 
     node_id: bytes = _field(_hex)
     mode: str | None = None
@@ -337,10 +362,49 @@ class Peer(_Object):
     rtt: float | None = None
     rtt_at: float | None = None
     online: bool | None = None
+    last_seen: float | None = None
 
     def __str__(self) -> str:
         """The node ID in hex."""
         return self.node_id.hex()
+
+
+@dataclass(frozen=True)
+class Ping(_Object):
+    """What ping_info() measured (rnfs 0.2.1): the round trip of a new link (seconds), or None and why not (reason:
+    "no_path", "no_identity", "wrong_identity", "not_member", "link_refused", "link_closed", "link_timeout"), and the
+    path to the node as it stood after: hops, the next-hop interface, and when RNS learned it (path_since, Unix time);
+    None where not known (all but rtt from a daemon before 0.2.1)."""
+
+    rtt: float | None = None
+    reason: str | None = None
+    hops: int | None = None
+    interface: str | None = None
+    path_since: float | None = None
+
+    @property
+    def reachable(self) -> bool:
+        """Whether the link was established."""
+        return self.rtt is not None
+
+
+@dataclass(frozen=True)
+class Routing(_Object):
+    """The DHT routing table (routing(); rnfs 0.2.1): a bucket's size (k), the buckets holding a node ({"index",
+    "nodes": [{"node_id", "first_seen", "last_heard", "failures", "stale"}]}, times Unix), how many nodes, how many
+    left keeping their seniority for a while (dropped), the nodes avoided as unreliable ({"node_id", "failures",
+    "retry_at"}, at most 256 and their total), the bans ({"node_id", "until", "reason"}, at most 256 and their total)
+    and the identities RNS blackholes."""
+
+    k: int = 0
+    buckets: tuple = _field(tuple, ())
+    nodes: int = 0
+    dropped: int = 0
+    unreliable: tuple = _field(tuple, ())
+    unreliable_total: int = 0
+    bans: tuple = _field(tuple, ())
+    bans_total: int = 0
+    blackholed: int = 0
 
 
 @dataclass(frozen=True)
@@ -356,6 +420,9 @@ class Stats(_Object):
     interfaces: dict = field(default_factory=dict)
     upload_budget: int | None = None
     upload_budget_left: int | None = None
+    # Reticulum's interfaces (rnfs 0.2.1): [{"name", "full_name", "type", "online", "mode", "bitrate", "rx_bytes",
+    # "tx_bytes", "rx_speed", "tx_speed", "clients"}]; () from an older daemon
+    reticulum_interfaces: tuple = _field(tuple, ())
 
 
 @dataclass(frozen=True)
@@ -536,7 +603,8 @@ class Uncached(_Object):
 @dataclass(frozen=True)
 class Event(_Object):
     """Something that changed on the node (events): seq (1, 2, ... in the node's run), kind ("job", "pin",
-    "cache", "name", "peer", "remote_pin"; design.md, "Events", lists each kind's fields), time (Unix), and
+    "cache", "name", "peer", "remote_pin", and from rnfs 0.2.1 "config", "name_sync", "apps", "status"; design.md,
+    "Events", lists each kind's fields), time (Unix), and
     the kind's own fields in fields. kind "lost" (lost is True) is no node's: events.watch delivers it when events
     were missed (the watch fell behind, or the daemon restarted), so what the app shows should be read again; its
     fields hold the run's "epoch"."""
@@ -672,10 +740,11 @@ class Settings(_Object):
 class SettingsChange(_Object):
     """What config_set() did to rnfs.toml (path): the settings applied to the running node now, those whose new
     value applies at the next start (restart_required), those the command line overrides (overridden, which keeps
-    winning), and the warnings reading the file gave."""
+    winning), and the warnings reading the file gave; with dry_run (rnfs 0.2.1), what it would do, nothing changed."""
 
     path: str | None = None
     applied: tuple[str, ...] = _field(tuple, ())
     restart_required: tuple[str, ...] = _field(tuple, ())
     overridden: tuple[str, ...] = _field(tuple, ())
     warnings: tuple[str, ...] = _field(tuple, ())
+    dry_run: bool = False

@@ -26,7 +26,7 @@ class EventLogTest(unittest.TestCase):
     def test_unknown_kind_refused(self):
         """Only the documented kinds are published."""
         with self.assertRaises(ValueError):
-            EventLog().publish("config")
+            EventLog().publish("settings")
 
     def test_falling_behind_is_reported(self):
         """A client after a sequence the log no longer holds gets lost and everything held."""

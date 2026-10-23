@@ -105,6 +105,24 @@ class NameSyncTest(unittest.TestCase):
         self.assertEqual(self.state()["published_at"], self.wall.now)
         self.assertEqual(self.node.storage.pins()[Cid.parse(cid)], {PIN_SOURCE_PREFIX + "site"})
 
+    def test_events(self):
+        """A "name_sync" event (0.2.1) for a sync started, each change of its state or published root, and its stop;
+        a scan that changes nothing publishes none."""
+        start = self.node.events.last
+
+        def seen() -> list:
+            """(state, published, removed) of the name_sync events since the start."""
+            return [(event["state"], event["published"], event["removed"])
+                    for event in self.node.events.since(start, ["name_sync"])["events"]]
+
+        cid = self.synced()
+        self.tick(1)  # nothing changed
+        self.node.name_unsync("site")
+        self.assertEqual(seen(), [("new", None, False), ("settling", None, False), ("synced", cid, False),
+                                  ("synced", cid, True)])
+        event = self.node.events.since(start, ["name_sync"])["events"][0]
+        self.assertEqual((event["alias"], event["path"]), ("site", self.folder))
+
     def test_a_sync_of_a_name_whose_key_was_deleted_stops(self):
         """REL-16: a key deleted by hand released its name's pins at the next start, but its sync stayed, paused: a new,
         unrelated name made under the alias later got the old folder published to it."""

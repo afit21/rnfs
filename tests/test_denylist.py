@@ -56,6 +56,11 @@ class ParseTest(unittest.TestCase):
         text = f"# a deny list\r\n\r\n{cid}  # spam\r\n  sha256:{digest.hex()}\n#{Cid.for_block(RAW, b'z')}\n"
         self.assertEqual(parse_list(text.encode()), (frozenset({cid.binary}), frozenset({digest})))
         self.assertEqual(parse_list(b""), (frozenset(), frozenset()))
+        # Only \n, \r and \r\n end a line: a comment holding U+2028, NEL or \x0b stays a comment
+        for separator in (" ", "\x85", "\x1c", "\x0b"):
+            with self.subTest(separator=repr(separator)):
+                text = f"{cid}  # replaced{separator}{Cid.for_block(RAW, b'z')}\n"
+                self.assertEqual(parse_list(text.encode()), (frozenset({cid.binary}), frozenset()))
 
     def test_bad_lists_are_refused(self):
         """A line that isn't an entry (saying which), text that isn't UTF-8, and lists over the limits."""
@@ -342,7 +347,7 @@ class FetchRefusalTest(DenyNodeTest):
         """A /pin of a denied CID is refused, and a get job fails with the deny list's message, no fallback."""
         cid = self.shared(b"denied content")
         self.deny(self.b, cid)
-        with mock.patch("rnfs.node.log"):
+        with mock.patch("rnfs.node_pins.log"):
             self.assertFalse(self.b.remote_pin(IDENTITY, cid, True))
         jobs = self.b.feature("jobs")
         jobs.start()  # offline nodes start no feature
@@ -692,6 +697,19 @@ class SourceTest(DenyNodeTest):
             again = self.node_with()
         self.assertFalse(again.deny.denies(denied))
         self.assertEqual(again.storage.pinned_by(DENY), set())
+
+    def test_a_stop_during_the_join_is_prompt(self):
+        """The feature's thread waits for the join in steps: a stop before the node has joined (minutes on a radio)
+        ends it at once, rather than holding the node's stop until its deadline, which left the other features' and
+        the node's threads no time."""
+        c = self.node_with()
+        c.joined.clear()  # still joining
+        feature = c.feature("deny")
+        feature.start()
+        started = time.monotonic()
+        feature.stop(time.monotonic() + 5)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertFalse(any(thread.is_alive() for thread in feature._spawned))
 
     def test_settings(self):
         """deny_lists takes <cid>[/path] and name/<name>[/path], nothing else."""

@@ -14,10 +14,16 @@ Providers, in the order they are tried:
    isn't slow, none of the last two over a slow link (below). A probe uses /range where a provider would (Ranges,
    below: over a slow link that is a single-chunk file's root), and one that sends part of the block becomes its
    provider, owning the partial. A remembered provider that answers None, or whose request fails, is forgotten for the
-   root; one that is busy is kept;
+   root; one that refuses at once is kept, but not one whose answer was cancelled or that ran past the probe's
+   patience (below) without sending anything. A probe waits for its link's /blocks slot (another fetch's response may
+   hold it) no longer than that patience, then comes back busy, a miss (AUD-H4);
 2. if none has it, providers found by a Lookup running in the background, so downloading starts with
    the first one found; the search ends once max_parallel_providers providers are known and the root
-   block has arrived, when the lookup is complete, or at lookup_timeout. Providers in the routing table
+   block has arrived, when the lookup is complete, or at lookup_timeout. It starts once every probe has answered, or
+   once one has run past its patience (Fetch._probes_overdue: deadline_slack, or DUPLICATE_AFTER times its block's
+   transfer time at its link's rate estimate, else its next-hop interface's bitrate, if longer: minutes over a radio)
+   while the probes go on; a provider it finds is asked for the probe's block as end-game duplication asks (below), so
+   a node asked first that drips its answer, never stalling, holds nothing up. Providers in the routing table
    for over provider_seniority are tried first, the rest after them; within each group, a better local score
    first (by band), then fewer hops, then a faster next-hop interface (rnfs.mesh.provider_rank), then reply
    order. Open links are ranked the same way. Hops and bitrates come from path_info (the node passes RNS's;
@@ -51,11 +57,11 @@ not matching its CID much further.
 
 End-game duplication (NET-4; section 7): once nothing is left to ask for, an idle provider is also asked for a
 batch another has had in flight for longer than deadline_slack (and, on a link with a rate estimate, DUPLICATE_AFTER
-times its blocks' transfer time at it), so a response dripping in (never stalling, its deadline hours away at
-unmeasured_bitrate) doesn't hold the fetch up. Each request is duplicated at most once, only while fewer than
-max_parallel_providers requests are in flight, and never over a slow link (so never on a slow node). The first
-verified copy wins: the request still sending what has arrived has its link closed (unless another fetch has a
-request on it: then it is left to finish), and its outcome isn't counted against its provider.
+times its blocks' transfer time at it), a probe's too (AUD-H4), so a response dripping in (never stalling, its
+deadline hours away at unmeasured_bitrate) doesn't hold the fetch up. Each request is duplicated at most once, only
+while fewer than max_parallel_providers requests are in flight, and never over a slow link (so never on a slow node).
+The first verified copy wins: the request still sending what has arrived has its link closed (unless another fetch
+has a request on it: then it is left to finish), and its outcome isn't counted against its provider.
 
 Upload pacing (section 3): a responder starts a slow link's next /blocks response no sooner than its size at the upload
 cap (by default half the rate estimate) after the previous one started, and refuses a request it would have to hold back
@@ -303,6 +309,49 @@ def observing(observer: Observer):
         _observers.current = previous
 
 
+class _Stopping(Observer):
+    """An Observer cancelled once stopped() is true or the observer it stands in front of (outer, if any) is; every
+    report goes on to outer."""
+
+    def __init__(self, stopped: Callable[[], bool], outer: Observer | None):
+        """Cancelled by stopped() or outer.cancelled(); reports passed on to outer."""
+        self.stopped = stopped
+        self.outer = outer
+
+    def total(self, size: int):
+        """Passed on to outer."""
+        if self.outer is not None:
+            self.outer.total(size)
+
+    def block(self, cid: Cid, length: int, downloaded: bool):
+        """Passed on to outer."""
+        if self.outer is not None:
+            self.outer.block(cid, length, downloaded)
+
+    def partial(self, cid: Cid, held: int):
+        """Passed on to outer."""
+        if self.outer is not None:
+            self.outer.partial(cid, held)
+
+    def providers(self, count: int, searching: bool):
+        """Passed on to outer."""
+        if self.outer is not None:
+            self.outer.providers(count, searching)
+
+    def cancelled(self) -> bool:
+        """True once stopped() is, or outer asks."""
+        return self.stopped() or (self.outer is not None and self.outer.cancelled())
+
+
+@contextmanager
+def cancel_when(stopped: Callable[[], bool]):
+    """Within it, every fetch this thread opens raises Cancelled once stopped() is true (a feature's stop flag, so
+    the node's stop needn't wait out a fetch), as well as when the observer already watching the thread asks, which
+    still hears every report."""
+    with observing(_Stopping(stopped, getattr(_observers, "current", None))) as observer:
+        yield observer
+
+
 class _DagBudget:
     """The byte limits on the distinct blocks a fetch meets, and what it has counted against them (the module
     docstring's "Limits"). Pure bookkeeping: no storage, network or clock, and only the fetch thread uses it.
@@ -454,7 +503,7 @@ class ProviderEvent(NamedTuple):
 class LookupDone(NamedTuple):
     """A lookup run ended, queued by the lookup thread."""
 
-    found: int  # providers it reported
+    found: int  # providers it reported (the fetch may have skipped some: Fetch._lookup_found counts those it took)
     answered: bool = False  # it ran to its end (the fetch didn't stop it) and some node answered it
 
 
@@ -526,7 +575,7 @@ class _Walk:
         Raises TooLarge once more than max_entries entries are met, counted per block before its children are
         fetched: the entries of the distinct directory nodes met, plus one for each index child queued and not
         met yet, which holds at least one entry below it (its first_name), so an index tree can't grow unchecked
-        either.
+        either. The error's .entries is True, telling it from the DAG byte bound's.
         """
         self.index_queued.discard(expect)
         self.entries += sum(1 for child in children if child.kind is not None)
@@ -538,7 +587,9 @@ class _Walk:
                 if walker.is_index_step(child):
                     self.index_queued.add(child)
         if self.max_entries is not None and self.entries + len(self.index_queued) > self.max_entries:
-            raise TooLarge(f"more than max_output_entries ({self.max_entries}) entries")
+            error = TooLarge(f"more than max_output_entries ({self.max_entries}) entries")
+            error.entries = True  # not the DAG byte bound or a quota: a remote pin is dropped as too_large for it
+            raise error
         return follow
 
 
@@ -813,7 +864,9 @@ class Fetch:
         self._probed = from_node is not None  # open links are only asked when the DHT may be used
         self._lookup = None
         self._lookup_running = False
-        self._lookup_found = 0  # providers the last lookup run reported
+        # Providers the fetch took up (_add_provider) from the last lookup run, not those it reported: a run whose
+        # providers were all skipped (unknown identities over the budget, say) found nothing new (_rerun_lookup)
+        self._lookup_found = 0
         self._lookups: list = []  # every search of this fetch, the latest last (their listers earn the credit)
         # When the last search ended (the fetch thread's clock); until one has, when the fetch began, so a fetch whose
         # first request brought the root (a probe) also looks for more providers if it runs long
@@ -822,10 +875,10 @@ class Fetch:
         self._events: queue.Queue = queue.Queue()
         # provider -> (CIDs asked for, is a probe); kept across _download calls, since a request may outlive one
         self._in_flight: dict[bytes, tuple[list[Cid], bool]] = {}
-        # What each CID of a request in flight (not a probe) was asked for as, so a block arriving after the
+        # What each CID of a request in flight was asked for as, so a block arriving after the
         # _download call that asked for it has returned is checked and stored rather than dropped
         self._expects: dict[Cid, list[Expect]] = {}
-        # End-game duplication (_duplicate): when each request in flight (not a probe) was sent, by the fetch
+        # End-game duplication (_duplicate): when each request in flight (a probe's too) was sent, by the fetch
         # thread's clock; a request duplicated -> its duplicate, and back, while each is in flight; and the
         # requests whose links were closed because the other copy won, whose outcome isn't counted
         self._sent_at: dict[bytes, float] = {}
@@ -1292,7 +1345,6 @@ class Fetch:
         elif isinstance(event, LookupDone):
             self._lookup_running = False
             self._report_providers()
-            self._lookup_found = event.found
             self._searched_at = self.fetcher.clock()
             if event.found == 0 and len(self._lookups) > 1 and self._lookups[-1] is self._lookup:
                 self._lookups.pop()  # a later search that found nobody has nobody to credit (_served)
@@ -1301,19 +1353,24 @@ class Fetch:
         elif isinstance(event, ResultEvent):
             cids = event.cids
             _, probe = in_flight.pop(event.node_id, (cids, False))
+            sent_at = self._sent_at.get(event.node_id)
+            overdue = sent_at is not None and self.fetcher.clock() - sent_at > self._duplicate_after(event.node_id)
             self._sent_at.pop(event.node_id, None)
             self._expected.pop(event.node_id, None)
             abandoned = event.node_id in self._abandoned
             self._abandoned.discard(event.node_id)
             asked_now = [cid for cid in cids if cid in outstanding]
             self._handle(event.node_id, cids, event.result, probe, wanted, children, outstanding, budget,
-                         event.sent_at, event.rate, counted=not abandoned)
+                         event.sent_at, event.rate, counted=not abandoned, overdue=overdue)
             left = [cid for cid in cids if cid in outstanding]  # not brought meanwhile by another probe
             if probe and event.result.status == peer_client.UNSUPPORTED and left and not self.closed:
                 # A probe with /range left unanswered, as an older node leaves it: asked again at once with /blocks,
                 # on the same link, as a provider would be (rnfs.ranges counted the silence)
                 in_flight[event.node_id] = (left, True)
-                self._send(event.node_id, left)
+                self._sent_at[event.node_id] = self.fetcher.clock()
+                self._expected[event.node_id] = self._expected_time(event.node_id, left, wanted,
+                                                                    self._path(event.node_id).bitrate)
+                self._send(event.node_id, left, slot_wait=self._duplicate_after(event.node_id))
             self._settle_duplicate(event.node_id, in_flight)
             still_asked = {cid for asked, _ in in_flight.values() for cid in asked}
             requeue = [cid for cid in cids if cid in outstanding and cid not in pending and cid not in still_asked]
@@ -1398,7 +1455,7 @@ class Fetch:
         """Send requests to idle providers, after finding providers if there are none."""
         now = self.fetcher.clock()
         usable = self._usable()
-        if not usable and not in_flight:
+        if not usable and (not in_flight or self._probes_overdue(in_flight, now)):
             self._discover(pending, in_flight, wanted)
             return
         busy_providers = sum(1 for _, probe in in_flight.values() if not probe)
@@ -1428,6 +1485,14 @@ class Fetch:
                 slots.add(slot)
         if not pending and busy_providers < self.fetcher.max_parallel:
             self._duplicate(usable, in_flight, busy_providers, now)
+
+    def _probes_overdue(self, in_flight: dict, now: float) -> bool:
+        """True if only probes are in flight and one has run past _duplicate_after: the search then starts while they
+        go on (_discover), rather than wait for every probe to answer. A node asked first that drips its answer, never
+        stalling, would otherwise hold the search off for its whole deadline, hours at unmeasured_bitrate (AUD-H4)."""
+        return (all(probe for _, probe in in_flight.values())
+                and any(now - self._sent_at[node_id] > self._duplicate_after(node_id)
+                        for node_id in in_flight if node_id in self._sent_at))
 
     def _others_owned(self, pending: _Pending, node_id: bytes) -> list[Cid]:
         """Take from pending's front the blocks another usable provider holds part of (_owners), to put back once
@@ -1488,11 +1553,14 @@ class Fetch:
                       if node_id in in_flight and now - sent_at > self._duplicate_after(node_id)
                       and node_id not in self._duplicated and node_id not in self._duplicates
                       and node_id not in self._abandoned)
+        # The CIDs a duplicate in flight carries: the probes all ask for one block, which one duplicate brings
+        copied = {cid for node_id in self._duplicates if node_id in in_flight for cid in in_flight[node_id][0]}
         for sent_at, node_id in slow:
             if not idle or busy_providers >= self.fetcher.max_parallel:
                 return
             # Its blocks not stored yet, as they were asked for (every CID in flight has its expectations here)
-            left = [cid for cid in in_flight[node_id][0] if cid in self._expects and not self.storage.has(cid)]
+            left = [cid for cid in in_flight[node_id][0]
+                    if cid in self._expects and not self.storage.has(cid) and cid not in copied]
             if not left:
                 continue
             provider = idle[0]
@@ -1508,12 +1576,14 @@ class Fetch:
             self._expected[provider.node_id] = self._expected_time(provider.node_id, batch, self._expects)
             self._duplicated[node_id] = provider.node_id
             self._duplicates[provider.node_id] = node_id
+            copied.update(batch)
             self._send(provider.node_id, batch)
             busy_providers += 1
 
     def _duplicate_after(self, node_id: bytes) -> float:
         """Seconds node_id's request in flight must have taken before it is duplicated: deadline_slack, or
-        DUPLICATE_AFTER times its expected time if longer."""
+        DUPLICATE_AFTER times its expected time if longer. A probe's is also how long the search waits for it
+        (_probes_overdue), and how long it waits for its link's /blocks slot."""
         expected = self._expected.get(node_id)
         return max(self.config.deadline_slack, DUPLICATE_AFTER * expected if expected is not None else 0.0)
 
@@ -1557,6 +1627,10 @@ class Fetch:
         if any(not self.storage.has(cid) for cid in in_flight[other][0]):
             return  # it still carries blocks nobody else has sent
         self._abandoned.add(other)
+        if in_flight[other][1] and other in self._remembered_asked:
+            # A remembered provider whose probe ran past deadline_slack without sending anything: not asked first
+            # again (_handle), as this fetch may end before its answer comes (AUD-H4)
+            self.fetcher.forget(self.root, other)
         log(f"{node_name(node_id)} sent what {node_name(other)} was still sending; closing that link unless "
             "another fetch uses it", LOG_VERBOSE)
         self._close_link(other)
@@ -1616,20 +1690,25 @@ class Fetch:
         known = wanted[cid][0].size if cid.is_raw and cid in wanted else None
         return known if known is not None else (CHUNK_SIZE if cid.is_raw else DAG_NODE_GUESS)
 
-    def _expected_time(self, node_id: bytes, batch: list[Cid], wanted: dict[Cid, list[Expect]]) -> float | None:
+    def _expected_time(self, node_id: bytes, batch: list[Cid], wanted: dict[Cid, list[Expect]],
+                       bitrate: float | None = None) -> float | None:
         """Seconds batch's blocks (as _guess takes them, at most what one response carries beyond its first) take at
-        the rate estimate of the link to node_id; None if it has none."""
-        rate = self.client.rate_estimate(node_id)
+        the rate estimate of the link to node_id, else at bitrate (a probe's: its next-hop interface's) if given; None
+        if neither is known."""
+        estimate = self.client.rate_estimate(node_id)
+        rate = estimate or bitrate
         if not rate:
             return None
-        carried = rates.response_capacity(rates.requester_max_bytes(rate, self.config), rate, None,
+        carried = rates.response_capacity(rates.requester_max_bytes(estimate, self.config), estimate, None,
                                           self.config.response_target)
         size = sum(self._guess(cid, wanted) for cid in batch)
         return rates.transfer_seconds(min(size, max(carried, self._guess(batch[0], wanted))), rate)
 
-    def _send(self, node_id: bytes, cids: list[Cid], plan: RangePlan | None = None):
+    def _send(self, node_id: bytes, cids: list[Cid], plan: RangePlan | None = None, slot_wait: float | None = None):
         """Ask node_id for cids on a request thread, which queues the result: with /blocks, or with plan, the next
-        range of the one block in cids with /range (rnfs.ranges; /blocks if its partial is in use elsewhere)."""
+        range of the one block in cids with /range (rnfs.ranges; /blocks if its partial is in use elsewhere). With
+        slot_wait (a probe's), the request waits that many seconds at most for its link's /blocks slot, and comes back
+        busy (peer_client.NO_SLOT) if it isn't free by then: another fetch's response holds it."""
         self._links_closed.discard(node_id)  # a link closed before (a lost request's) isn't this request's
         def progress(fraction: float):
             """The response is arriving: the fetch isn't hung (on the request thread, so only _heard_at is written)."""
@@ -1647,9 +1726,10 @@ class Fetch:
                 result = None
                 if plan is not None:
                     result = self.fetcher.ranges.fetch(self.client, node_id, cids[0], plan.target, plan.ratio,
-                                                       plan.compress, plan.size, on_progress=progress)
+                                                       plan.compress, plan.size, on_progress=progress,
+                                                       slot_wait=slot_wait)
                 if result is None:
-                    result = self.client.blocks(node_id, cids, on_progress=progress)
+                    result = self.client.blocks(node_id, cids, on_progress=progress, slot_wait=slot_wait)
             except Exception as e:  # noqa: BLE001 - any client failure is a failed request, retried elsewhere; logged
                 # The client reports network failures in its result, so this is a bug: logged here, inside the
                 # except, so the debug log has its traceback
@@ -1704,8 +1784,16 @@ class Fetch:
                 log(f"asking {plural(len(candidates), 'node')} for {first} before searching"
                     + (f" ({len(self._remembered_asked)} remembered)" if self._remembered_asked else "")
                     + f": {', '.join(node_name(node_id) for node_id in candidates)}", LOG_VERBOSE)
+                now = self.fetcher.clock()
+                self._expects[first] = wanted[first]  # so a provider found meanwhile can be asked too (_duplicate)
                 for node_id in candidates:
                     in_flight[node_id] = ([first], True)
+                    path = paths[node_id] if node_id in paths else self._path(node_id)
+                    # Timed as any request (end-game duplication), by its block's transfer time at the link's rate
+                    # estimate or, before the link has one, at its next-hop interface's bitrate: a probe over a radio
+                    # has minutes before the search starts without it (_probes_overdue), one over TCP deadline_slack
+                    self._sent_at[node_id] = now
+                    self._expected[node_id] = self._expected_time(node_id, [first], wanted, path.bitrate)
                     # With /range where a provider would be asked with it: over a slow link the probe is most often
                     # what brings a single-chunk file, so it is compressed and resumable as any other request there.
                     # Only of a node likely to hold it (the hint, a remembered provider) or known to answer /range: an
@@ -1713,9 +1801,8 @@ class Fetch:
                     likely = node_id in hinted or node_id in self._remembered_asked
                     plan = None
                     if likely or self.fetcher.ranges.support.answers(node_id):
-                        path = paths[node_id] if node_id in paths else self._path(node_id)
                         plan = self._plan(node_id, path, first, wanted)
-                    self._send(node_id, [first], plan)
+                    self._send(node_id, [first], plan, slot_wait=self._duplicate_after(node_id))
                 return
         if self._lookup is None and self.from_node is None and self._unfound_ago is None:
             ago = None if self.explicit else self.fetcher.unfound(self.root)
@@ -1726,7 +1813,8 @@ class Fetch:
                 return
             self._lookup = self.fetcher.make_lookup(self.root.key)
             self._lookups.append(self._lookup)
-            log(f"looking for providers of {self.root}", LOG_VERBOSE)
+            log(f"looking for providers of {self.root}"
+                + (" while the nodes asked first answer" if in_flight else ""), LOG_VERBOSE)
             self._start_lookup()
             # The records this node holds of the root's key are candidates at once, never a reason to skip the search
             # (its own /find answer, which it would give anyone): on a slow node a search takes a minute, and on an
@@ -1742,6 +1830,7 @@ class Fetch:
     def _start_lookup(self):
         """Run find_providers on a thread of its own; providers and its end arrive as events."""
         self._lookup_running = True
+        self._lookup_found = 0
         self._report_providers()
         lookup = self._lookup
 
@@ -1789,7 +1878,6 @@ class Fetch:
             # The first (whose budget the others share) and the latest: a fetch of days searches every 10 minutes,
             # and one finding the same providers again would otherwise be kept for its whole life
             del self._lookups[1]
-        self._lookup_found = 0
         self._start_lookup()
 
     def _search_late(self) -> bool | None:
@@ -1812,7 +1900,6 @@ class Fetch:
         self._late_searched = True
         self._lookup = self.fetcher.make_lookup(self.root.key)
         self._lookups.append(self._lookup)
-        self._lookup_found = 0
         self._start_lookup()
         return True
 
@@ -1820,11 +1907,12 @@ class Fetch:
         """Every provider failed: search again for a fresh random half, within lookup_timeout. False if not."""
         if self._lookup is None or self.closed:
             return False
-        # A run that found nothing new would most likely find nothing new again
+        # A run that found nothing new would most likely find nothing new again: counted by the providers the fetch
+        # took up, as identities can name made-up providers in every answer, which it skips (AUD-M2); the runs share
+        # the lookup's /find cap too (Lookup.max_queries)
         if self._lookup_found == 0 or self._lookup.remaining() <= 0:
             return False
         log(f"every provider of {self.root} failed; searching again", LOG_VERBOSE)
-        self._lookup_found = 0
         self._start_lookup()
         return True
 
@@ -1841,6 +1929,7 @@ class Fetch:
                 LOG_VERBOSE)
             return
         self._new_provider(node_id)
+        self._lookup_found += 1
         log(f"found provider {node_name(node_id)} for {self.root}{source}", LOG_VERBOSE)
 
     # Results
@@ -1886,20 +1975,21 @@ class Fetch:
 
     def _handle(self, node_id: bytes, cids: list[Cid], result, probe: bool, wanted: dict, children: dict,
                 outstanding: set[Cid], budget: _DagBudget, sent_at: float | None = None, rate: float | None = None,
-                counted: bool = True):
+                counted: bool = True, overdue: bool = False):
         """Store a response's blocks (counted against budget) and apply the provider failure and pacing rules.
         Raises InvalidDag.
 
         sent_at is when the request was sent and rate the link's rate estimate then (None: unknown). A request
         not counted (one whose link the fetch closed, as its duplicate won) has its blocks stored, but its outcome
-        applies none of the rules: closing the link isn't the provider's stall or failure.
+        applies none of the rules: closing the link isn't the provider's stall or failure. overdue: it ran past
+        _duplicate_after (a probe that did without sending anything isn't asked first again).
         """
         provider = self._providers.get(node_id)
         if result.bad:
             # Not a lossy link: the node sent something other than what was asked for (section 10)
             log(f"banning {node_name(node_id)}: it sent {plural(len(result.bad), 'block')} not matching "
                 "the CID requested", LOG_WARNING)
-            self.fetcher.routing.ban(node_id)
+            self.fetcher.routing.ban(node_id, "it sent a block not matching the CID requested")
             self.fetcher.scores.bad_block(node_id)
             if provider is None:
                 provider = self._new_provider(node_id)
@@ -1938,9 +2028,13 @@ class Fetch:
                 self._pace(provider, sent_at, rate)
             elif result.status == peer_client.UNSUPPORTED:
                 pass  # it left /range unanswered: asked again with /blocks at once (_handle_event)
-            elif not result.blocks and node_id in self._remembered_asked and result.status != peer_client.BUSY:
+            elif (not result.blocks and node_id in self._remembered_asked and result.reason != peer_client.NO_SLOT
+                  and (result.status != peer_client.BUSY or result.reason == "cancelled" or overdue)):
                 # A remembered provider that answered None (it no longer has it) or failed: not asked first again for
-                # this root. One that was busy may still have it
+                # this root. One that refused at once may still have it; not one that kept the probe going past
+                # deadline_slack only to send nothing, or whose answer stopped arriving: dripping its answer, it would
+                # hold every later fetch of the root up as long (AUD-H4). One whose link slot another request of this
+                # node held was never asked
                 self.fetcher.forget(self.root, node_id)
             return
         if provider is None or provider.failed or not counted:
@@ -2011,6 +2105,9 @@ class Fetch:
             self._progress_at = max(self._progress_at, provider.busy_until)  # waiting isn't hanging
             log(f"no path to {node_name(provider.node_id)}; asking it again in {UNREACHABLE_RETRY:.0f}s", LOG_VERBOSE)
         else:
+            if result.reneged:
+                # A malformed answer after ranges of the block: scored as an answer of [] after them is (AUD-L10)
+                self.fetcher.scores.bad_block(node_id)
             self._fail(provider, result.reason or "request failed")
 
     def _pace(self, provider: _Provider, sent_at: float | None, rate: float | None):

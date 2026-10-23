@@ -753,6 +753,7 @@ class NameManager:
         self._destinations: dict[str, object] = {}
         self._next_announce: dict[str, float] = {}  # alias -> monotonic time
         self._waiters: dict[bytes, list[threading.Event]] = {}
+        self._stopping = False  # set by stopping(): a resolve's refresh no longer waits on the network
         # A resolve's network refresh of each name (E1): when it last finished (monotonic) and whether a record was
         # held after it, least recent first, at most REFRESHED_SIZE; and the refreshes running, which other
         # resolves of the name wait for rather than refresh again
@@ -1022,7 +1023,9 @@ class NameManager:
             self._absorb_recalled(name)
             previous = self._published[alias]
             known = self._record(name, touch=False)
-            sequence = 1 + max(previous.sequence, known.sequence if known is not None else 0)
+            # The floor too, as known_sequence: a record resolved before may have left the table since
+            floor = self._floor[name][0] if name not in self._held and name in self._floor else 0
+            sequence = 1 + max(previous.sequence, known.sequence if known is not None else 0, floor)
             if sequence > MAX_SEQUENCE:
                 raise RnfsError(f"name {alias} has reached the highest sequence")
 
@@ -1080,6 +1083,16 @@ class NameManager:
                 if self._announce(alias):
                     self._next_announce[alias] = first
             self._save_announced()
+
+    def stopping(self):
+        """The node is stopping: wake the resolves waiting on the network, and let none wait from now on (each
+        goes on with what is held), so the threads resolving end within the node's stop budget. stop() does the
+        rest."""
+        with self._lock:
+            self._stopping = True
+            for events in self._waiters.values():
+                for event in events:
+                    event.set()
 
     def stop(self):
         """Deregister from RNS, wake waiting resolves and save state."""
@@ -1318,6 +1331,8 @@ class NameManager:
         """Request a path to name and wait, up to path_timeout, for an answer to reach RNS."""
         event = threading.Event()
         with self._lock:
+            if self._stopping:
+                return  # the resolve goes on with what is held
             self._waiters.setdefault(name, []).append(event)
         started = self._clock()
         try:

@@ -5,8 +5,10 @@ FILE_SHARE_DELETE, and virus scanners and search indexers briefly open new files
 remove() retry for about a second while the file is in use; elsewhere they are plain os.replace and os.remove.
 """
 import errno
+import filecmp
 import os
 import secrets
+import shutil
 import stat
 import sys
 import time
@@ -439,6 +441,31 @@ def remove(path: str) -> bool:
             return False
         raise
     return True
+
+
+def remove_tree(path: str):
+    """Delete path, a file or a directory tree (missing is fine); a symlink is removed, not followed. Raises
+    OSError."""
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        remove(path)
+
+
+def same_content(path: str, other: str) -> bool:
+    """True if path and other hold the same: byte-identical files, or directories whose entries do, recursively (a
+    symlink, or anything else, never matches)."""
+    try:
+        first, second = os.lstat(path), os.lstat(other)
+        if stat.S_ISREG(first.st_mode) and stat.S_ISREG(second.st_mode):
+            return filecmp.cmp(path, other, shallow=False)
+        if stat.S_ISDIR(first.st_mode) and stat.S_ISDIR(second.st_mode):
+            names = sorted(os.listdir(path))
+            return names == sorted(os.listdir(other)) and all(
+                same_content(os.path.join(path, name), os.path.join(other, name)) for name in names)
+    except OSError:
+        pass
+    return False
 
 
 def windows_name_reason(name: str) -> str | None:

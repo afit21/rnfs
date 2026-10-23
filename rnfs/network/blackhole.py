@@ -75,6 +75,10 @@ class Blackhole:
         self._failure_log = ThrottledLog()
         self.reads = 0  # reads of the list so far (tests count them)
 
+    def listed_count(self) -> int:
+        """The identities on the list as last read."""
+        return len(self._identities)
+
     def node_listed(self, node_id: bytes) -> bool:
         """True if node_id is the node ID of an identity on the list as last read."""
         return node_id in self._nodes

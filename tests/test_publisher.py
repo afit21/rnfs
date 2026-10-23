@@ -725,6 +725,49 @@ class PublisherTest(PublisherCase):
         self.assertEqual(self.records.providers(a.key), [OWN])
         self.assertEqual(self.records.providers(b.key), [OWN])  # recorded locally, nothing to cancel
 
+    def test_provided_again_before_a_save_keeps_its_row(self):
+        """A CID unpinned and pinned again before the unpin's save lands (that save failed, or waited behind a round's)
+        has its row deleted and written again in one save: the delete alone left it provided with no row, so no round
+        took it until a restart."""
+        cid = self.pinned(b"pinned again")
+        self.publisher.refresh()
+        self.assertEqual(len(state_rows(self.state, "SELECT item FROM publish_items")), 1)
+        self.storage.unpin(cid, USER)
+        with failing_commits(), self.assertRaises(OSError):
+            self.publisher.refresh()
+        self.storage.pin(cid, USER)
+        self.publisher.refresh()
+        self.assertEqual(self.publisher.provided(), {cid})
+        self.assertEqual(state_rows(self.state, "SELECT item FROM publish_items"), [(cid.binary,)])
+        self.assertEqual(self.publisher.next_due(), 0.0)
+        self.assertEqual(self.publisher.publish_due()["published"], [cid])
+
+    def test_withdrawals_waiting_for_a_partition_to_end_arent_due(self):
+        """In partition mode withdrawals for servers off the island stay queued: next_due doesn't count them, or the
+        loop ran a round every half second for as long as the partition lasted."""
+        class Partition:
+            """Partition mode, with every server off the island."""
+            active = True
+
+            def allows(self, node_id):
+                return False
+
+            def is_local(self, node_id):
+                return False
+
+        partition = Partition()
+        self.publisher.refresh()
+        self.publisher.set_islands(partition)
+        with self.publisher._lock:
+            self.publisher._withdrawals[N1] = {bytes([9]) * 16}
+        self.assertEqual(self.publisher.next_due(), MAX_WAIT)
+        self.publisher.publish_due()
+        self.assertEqual(self.client.calls, [])
+        self.assertIn(N1, self.publisher._withdrawals)  # still queued
+        partition.active = False
+        partition.allows = lambda node_id: True  # it ended
+        self.assertEqual(self.publisher.next_due(), 0.0)
+
     def test_served_blocks_are_the_provided_dags(self):
         cid = self.pinned(os.urandom(200_000))
         self.publisher.refresh()

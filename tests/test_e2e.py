@@ -492,3 +492,33 @@ class NetworkTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(os.environ.get("RNFS_E2E") == "1", "set RNFS_E2E=1 to run")
+@unittest.skipIf(WINDOWS, "a Windows daemon restarts only under the task wrapper")
+class RestartTest(unittest.TestCase):
+    """POST /api/restart (0.2.1) on a real daemon: it stops, starts again in place with its command line (the same
+    process ID), and a setting that needed a restart then runs."""
+
+    def test_restart(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        daemon = Daemon("solo", tmp.name, HUB_CONFIG, free_port())
+        self.addCleanup(daemon.stop)
+        with open(os.path.join(daemon.dir, "daemon.json"), encoding="utf-8") as f:
+            info = json.load(f)
+        self.assertEqual((info["pid"], info["can_restart"], info["started_by"]), (daemon.proc.pid, True, "unknown"))
+        with open(os.path.join(daemon.dir, "api_token"), encoding="ascii") as f:
+            token = f.read().strip()
+        daemon.out("config", "set", "dht_mode", "client")
+        self.assertEqual(daemon.status()["dht_mode"], "server")  # at the next start
+        self.assertIn("restarted", daemon.out("restart", "--wait", "60"))
+        self.assertIsNone(daemon.proc.poll())  # the same process, started again in place
+        status = wait_for(daemon.status, 60, "the restarted daemon to answer")
+        self.assertEqual((status["node_id"], status["dht_mode"]), (daemon.node_id, "client"))
+        with open(os.path.join(daemon.dir, "api_token"), encoding="ascii") as f:
+            self.assertNotEqual(f.read().strip(), token)  # a new run's token
+        with open(os.path.join(daemon.dir, "daemon.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["pid"], daemon.proc.pid)
+        with open(daemon.log_path, encoding="utf-8", errors="replace") as f:
+            self.assertIn("starting again", f.read())

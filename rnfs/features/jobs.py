@@ -22,6 +22,11 @@ or import job; `rnfs jobs` lists, shows, waits for, cancels and clears jobs.
   add_nomadnet, with name and identify among its options too (NOMADNET_OPTIONS). Its total_bytes is the answer's
   advertised size once a Resource brings it, done_bytes what has arrived, its rate bytes received; cancelling it, or
   the node stopping, closes its link at the fetch's next poll. A resumed one fetches a new snapshot.
+- Uploads (0.2.1): POST /api/add/stream and /api/import/stream run as a job while they read their body
+  (uploading), so the CLI and other apps see them: running from the start, kind add or import with "stream" (and
+  "stream_name", the add's origin or name), done_bytes the bytes read, total_bytes the Content-Length (None if
+  chunked), cancellable (the request is answered 409 cancelled at its next read). They take no job slot, are never
+  saved and never resumed (their data is the request's): a restart forgets them.
 - Every change of a job's state (queued, running, done, failed, cancelled, and forgotten: "removed") and, at
   most once a second (EVENT_INTERVAL), a running job's progress is published as a "job" event (rnfs.events) with
   the job's state and progress fields (Job.event; the job's kind as "job_kind", an event's "kind" being "job"),
@@ -38,11 +43,13 @@ or import job; `rnfs jobs` lists, shows, waits for, cancels and clears jobs.
   through eviction and gc, also across a restart (the sessions are opened when the jobs are loaded, before
   any eviction runs). Failed and cancelled jobs release theirs; starting the transfer again refetches
   whatever was evicted meanwhile.
-- A get job writes to <output's directory>/.rnfs-job-<id>.partial and renames that to its output once
-  complete, so an interrupted write-out never leaves a partial output behind, and a resumed run removes what
-  an earlier run left there. With sealed_name, a sealed file this node opens is renamed to its sealed name
-  (if fit, fsutil.safe_default_name) in the output's directory instead: for a sealed folder unpacked, the
-  name of the directory written. With no_extract, a sealed folder is written as its tar rather than unpacked
+- A get or export job writes to <output's directory>/.rnfs-job-<id>.partial and renames that to its output
+  once complete, so an interrupted write-out never leaves a partial output behind, and a resumed run removes
+  what an earlier run left there; an output already in place when a resumed run ends is accepted only if it
+  holds the same content (that run's, renamed before a crash kept its outcome from being saved). With
+  sealed_name, a sealed file this node opens is renamed to its sealed name (if fit,
+  fsutil.safe_default_name) in the output's directory instead: for a sealed folder unpacked, the name of the
+  directory written. With no_extract, a sealed folder is written as its tar rather than unpacked
   (node.get's no_extract). With fallback_dht, a get whose from node fails is retried with ordinary DHT
   discovery.
 - A get, pin or export job submitted with retry true (kept in its record) whose content no provider could supply
@@ -70,15 +77,18 @@ import sys
 import threading
 import time
 from collections import deque
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from typing import Callable
 
-from rnfs import ids
+from rnfs import fsutil, ids
 from rnfs.constants import PARTIAL_SUFFIX
 from rnfs.retry import counted_since, next_retry
 from rnfs.features import Feature, _common
 from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_WARNING
 from rnfs.fsutil import printable
+from rnfs.objects import ACTIVE, CANCELLED, DONE, FAILED, FINISHED, QUEUED, RUNNING
+from rnfs.objects import MAX_JOB_WAIT as MAX_WAIT
+from rnfs.units import human_size
 
 NAME = "jobs"
 KINDS = ("get", "pin", "export", "add", "import")
@@ -90,14 +100,10 @@ ADD_OPTIONS = {"wrap": bool, "only_hash": bool, "pin": bool, "to": list, "to_sel
                "chunker": str}
 NOMADNET_OPTIONS = {"name": str, "identify": bool}  # what an add job of a NomadNet link takes besides ADD_OPTIONS
 MAX_RECIPIENT_TEXT = 256  # characters of one of an add job's to= recipients (a key is 128 hex digits)
-QUEUED, RUNNING, DONE, FAILED, CANCELLED = "queued", "running", "done", "failed", "cancelled"
 STATES = (QUEUED, RUNNING, DONE, FAILED, CANCELLED)
-ACTIVE = frozenset({QUEUED, RUNNING})
-FINISHED = frozenset({DONE, FAILED, CANCELLED})
 MAX_ACTIVE = 1000  # queued and running jobs at most, so a script can't queue without bound
 RATE_WINDOW = 300.0  # seconds the rate is averaged over: LoRa responses can arrive minutes apart
 SAMPLE_INTERVAL = 1.0  # seconds between rate samples
-MAX_WAIT = 30  # longest wait= a GET /api/jobs/get may ask for, in seconds
 POLL_TTY = 1  # seconds between progress updates the CLI shows
 POLL_QUIET = 10  # seconds a CLI without a progress line waits per request (it returns early when the job ends)
 FINISHED_GRACE = 60.0  # seconds a finished job is kept whatever max_finished_jobs says
@@ -142,6 +148,10 @@ class Job:
         self.source = source  # what a pin, add or import job pins with: kept so a resumed job pins the same
         self.nomadnet = nomadnet  # an add job's NomadNet link, which it adds instead of a path
         self.retry = retry  # queued again when its content isn't found (rnfs.retry)
+        # An upload the API reads (0.2.1, JobsFeature.uploading): running from the start, never saved or resumed;
+        # stream_name names it (the add's origin or name), None for one unnamed
+        self.stream = False
+        self.stream_name: str | None = None
         self.state = QUEUED
         self.created = time.time() if created is None else created
         self.started: float | None = None  # when the latest run started
@@ -181,6 +191,8 @@ class Job:
         """What the job works on, for messages: its target, or an add's or import's path or NomadNet link."""
         if self.target is not None:
             return self.target
+        if self.stream:
+            return self.stream_name or "(upload)"
         return self.nomadnet if self.nomadnet is not None else str(self.path)
 
     # Observer (rnfs.fetcher.Observer), called on the job's thread
@@ -281,6 +293,23 @@ class Job:
             self._samples = deque([(time.monotonic(), 0)])
             self._last_event = time.monotonic()  # the "running" event has just been published
 
+    def undo_run(self):
+        """Take back begin_run for a run that never started (its thread couldn't): queued again, due when it was."""
+        with self._lock:
+            self.state = QUEUED
+            self.retry_at, self.retry_due = self.retry_due, None
+            self.runs -= 1
+        self.end_run()
+
+    def end_run(self):
+        """Let go of what this run kept to count its progress (each block met, partial blocks, rate samples): its
+        counts stay, and the next run (begin_run) starts them afresh. A finished job kept them until forgotten:
+        about 175 bytes a block met, 35 MB for a 12 GiB fetch."""
+        with self._lock:
+            self._seen = set()
+            self._partial = {}
+            self._samples = deque()
+
     def _prune(self, now: float):
         """Drop samples older than RATE_WINDOW, keeping one at or before the window's start as the base to
         measure from. Called with _lock held."""
@@ -335,10 +364,16 @@ class Job:
             record["source"] = self.source
         if self.nomadnet is not None:
             record["nomadnet"] = self.nomadnet
+        if self.stream:  # an upload (0.2.1): shown, never saved
+            record["stream"] = True
+            record["stream_name"] = self.stream_name
         if self.retry:
             record["retry"] = True
         if self.retry_since is not None:
-            record.update(retry_at=self.retry_at, retry_since=self.retry_since)
+            # A retry run in progress is saved as due when it was (begin_run moved retry_at to retry_due), so a run
+            # resuming it after a restart still knows how late it came (rnfs.retry.counted_since: REL-11)
+            record.update(retry_at=self.retry_at if self.retry_at is not None else self.retry_due,
+                          retry_since=self.retry_since)
         record.update({"state": self.state, "created": self.created, "started": self.started,
                        "finished": self.finished, "error": self.error, "result": self.result, "runs": self.runs,
                        "total_bytes": self.total_bytes, "done_bytes": self.done_bytes, "blocks": self.blocks,
@@ -414,7 +449,7 @@ def check_job_params(kind: str, target, output, from_node, sealed_name=False, fa
     (check_add_options) only for add; source "user", or for pin, add and import an app's (app:<name>[:<key>]); an add
     may have a NomadNet link (nomadnet, as written) instead of a path; retry is a boolean (any kind: it only
     changes a get's, pin's or export's)."""
-    from rnfs import nomadnet as nomadnet_links
+    from rnfs import nomadnet_links
     from rnfs.content import walker  # validates the root CID and every path name
     from rnfs.content.storage import app_of
     if kind not in KINDS:
@@ -463,7 +498,7 @@ def check_add_options(options, nomadnet: bool = False):
     of a NomadNet link), each of its type, to a list of at most MAX_RECIPIENTS recipient strings, chunker a known
     chunker's name, name a valid entry name. What the node checks only when the add runs (recipients it knows,
     only_hash with to) fails the job then, with the add's own message."""
-    from rnfs import nomadnet as nomadnet_links
+    from rnfs import nomadnet_links
     from rnfs.content import chunker, seal
     if not isinstance(options, dict):
         raise ValueError("an add job's options must be an object")
@@ -593,17 +628,18 @@ class JobsFeature(Feature):
         statedb.delete_rows(db, "jobs", ("id",), bad)
 
     def _row(self, job_id: str) -> tuple | None:
-        """job_id's jobs row, or None once it is forgotten (lock held)."""
+        """job_id's jobs row, or None once it is forgotten, or for an upload, which is never saved (lock held)."""
         from rnfs import statedb
         job = self._jobs.get(job_id)
-        return None if job is None else (job_id, job.position, statedb.dump(job.to_record()))
+        return None if job is None or job.stream else (job_id, job.position, statedb.dump(job.to_record()))
 
     def save(self):
         """Save the jobs changed since the last save, and forget those gone, durably (a queued job must survive a
         crash); running jobs whose progress changed too (the node calls this periodically, keeping saved progress
         recent). Each change is noted with _store.changed(job ID), under the lock."""
         with self._lock:
-            self._store.changed(*(job_id for job_id, job in self._jobs.items() if job.state == RUNNING))
+            self._store.changed(*(job_id for job_id, job in self._jobs.items()
+                                  if job.state == RUNNING and not job.stream))
         self._store.save()
 
     def _save_quietly(self):
@@ -680,20 +716,29 @@ class JobsFeature(Feature):
     def _retry_loop(self):
         """Start the queued jobs whose retry_at has come, every RETRY_POLL, until the node stops."""
         while not self._stop_event.wait(RETRY_POLL):
-            now = time.time()
-            with self._lock:
-                due = any(job.state == QUEUED and job.retry_at is not None and job.retry_at <= now
-                          for job in self._jobs.values())
-            if due:
-                self._schedule()
+            try:
+                now = time.time()
+                with self._lock:
+                    due = any(job.state == QUEUED and job.retry_at is not None and job.retry_at <= now
+                              for job in self._jobs.values())
+                if due:
+                    self._schedule()
+            except Exception as e:  # noqa: BLE001 - the loop must outlive one failed round, or no retry runs again
+                _log(f"starting the jobs due failed: {e!r}", LOG_ERROR)
 
-    def stop(self, deadline: float | None = None):
-        """Ask running jobs to stop (they are saved as queued, to resume), wait for them until deadline (as
-        Feature.stop), save."""
+    def stopping(self):
+        """Ask running jobs to stop (they are saved as queued, to resume) and start no more (as
+        Feature.stopping)."""
         with self._lock:
             self._started = False
-            threads = list(self._threads.values())
         self._stop_event.set()
+
+    def stop(self, deadline: float | None = None):
+        """Ask running jobs to stop (stopping), wait for them until deadline (as Feature.stop), save."""
+        self.stopping()
+        with self._lock:
+            # Not one _schedule has registered but not started yet (it can't be joined): it sees the stop at once
+            threads = [thread for thread in self._threads.values() if thread.ident is not None]
         self._join(deadline, threads)
         try:
             self.save()  # only if something changed: offline test nodes with no jobs write nothing
@@ -712,7 +757,8 @@ class JobsFeature(Feature):
         with self._lock:
             if not self._started or self._stop_event.is_set():
                 return False
-            running = sum(1 for job in self._jobs.values() if job.state == RUNNING)
+            # Uploads run on their request's thread, taking no job slot
+            running = sum(1 for job in self._jobs.values() if job.state == RUNNING and not job.stream)
             now = time.time()
             for job in self._jobs.values():
                 if running >= self.max_jobs:
@@ -727,11 +773,23 @@ class JobsFeature(Feature):
                 running += 1
         for job, _ in starting:
             self._publish(job)  # before its thread runs, so its first progress event comes after
-        for _, thread in starting:
-            thread.start()
+        started = False
+        for job, thread in starting:
+            try:
+                thread.start()
+                started = True
+            except RuntimeError as e:  # can't start new thread: out of threads or memory
+                # Queued again rather than left running with no thread, holding a job slot until a restart; the next
+                # schedule (a job submitted or ending, a retry due) tries again
+                with self._lock:
+                    self._threads.pop(job.id, None)
+                    job.undo_run()
+                    self._store.changed(job.id)
+                _log(f"job {job.id} ({job.kind} {job.subject}) couldn't start: {e}; queued again", LOG_ERROR)
+                self._publish(job)
         if starting:
             self._save_quietly()
-        return bool(starting)
+        return started
 
     def _run(self, job: Job):
         """Run a job to its end on this thread, then start the next."""
@@ -749,6 +807,10 @@ class JobsFeature(Feature):
             error = str(e) or type(e).__name__
             if self._retries(job, e):
                 state = QUEUED
+            elif self._stop_event.is_set() and not job.cancel_requested:
+                # Failed as the node stops (its links close before every fetch has seen the stop): resumed at the next
+                # start, as a run the stop cancelled is
+                state, error = QUEUED, None
         except Exception as e:  # noqa: BLE001 - a job's failure mustn't take its thread's bookkeeping with it
             error = str(e) or type(e).__name__
             _log(f"job {job.id} ({job.kind} {job.subject}) failed: {e!r}", LOG_ERROR)
@@ -801,7 +863,7 @@ class JobsFeature(Feature):
         elif job.kind == "pin":
             result = node.pin_add(job.target, **_source(job))
         elif job.kind == "export":
-            result = node.export(job.target, job.output)
+            result = self._export(job)
         elif job.kind == "add":
             result = self._add(job)
         else:
@@ -833,10 +895,9 @@ class JobsFeature(Feature):
 
     def _get(self, job: Job) -> dict:
         """A get job: write to its partial path, then rename that to the output (or the sealed name)."""
-        from rnfs import fsutil
         partial = partial_path(job)
-        remove_partial(partial)  # what an interrupted earlier run (or a crash) left
-        remove_partial(write_path(job))  # and what its write-out had under way (REL-10)
+        fsutil.remove_tree(partial)  # what an interrupted earlier run (or a crash) left
+        fsutil.remove_tree(write_path(job))  # and what its write-out had under way (REL-10)
         try:
             result = self._fetch_to(job, partial)
             output = job.output
@@ -846,16 +907,28 @@ class JobsFeature(Feature):
                 name = fsutil.safe_default_name(result.get("name"), None)
                 if name is not None:
                     output = os.path.join(os.path.dirname(job.output), name)
-            fsutil.rename_new(partial, output)
+            _rename_into_place(job, partial, output)
         except BaseException:
-            try:
-                remove_partial(partial)  # stored blocks stay, so a retry or resume writes it out again quickly
-            except OSError as e:  # the job's own error matters more; the next run tries again
-                _log(f"job {job.id}: removing {partial} failed: {e!r}", LOG_WARNING)
+            _remove_partial(job, partial)  # stored blocks stay, so a retry or resume writes it out again quickly
             raise
         with self._lock:
             job.output = output
         return {**result, "output": output}
+
+    def _export(self, job: Job) -> dict:
+        """An export job: node.export to its partial path (written under its write path first), then rename that to
+        the output, as a get job does (AUD-M8: written straight to the output, an export cut off by a crash left a
+        truncated archive there, which the resumed run then refused to overwrite)."""
+        partial = partial_path(job)
+        fsutil.remove_tree(partial)  # what an interrupted earlier run (or a crash) left
+        fsutil.remove_tree(write_path(job))  # and the archive it was writing
+        try:
+            result = self.node.export(job.target, partial, temporary=write_path(job))
+            _rename_into_place(job, partial, job.output)
+        except BaseException:
+            _remove_partial(job, partial)
+            raise
+        return result
 
     def _fetch_to(self, job: Job, path: str) -> dict:
         """node.get of the job's target to path: from its from node, then (fallback_dht) by DHT discovery."""
@@ -874,7 +947,7 @@ class JobsFeature(Feature):
                 raise
             _log(f"job {job.id}: getting {job.target} from {job.from_node} failed ({e}); trying the DHT",
                  LOG_NOTICE)
-        remove_partial(path)
+        fsutil.remove_tree(path)
         return self.node.get(job.target, path, **options)
 
     def _dag_block_count(self, result: dict) -> int | None:
@@ -900,6 +973,8 @@ class JobsFeature(Feature):
             if state in FINISHED:
                 job.finished = time.time()
                 job.retry_at = job.retry_since = None
+            if state != RUNNING:
+                job.end_run()
             self._threads.pop(job.id, None)
             self._store.changed(job.id)
             self._cap_finished()
@@ -972,6 +1047,53 @@ class JobsFeature(Feature):
         if not self._schedule():  # else saved as it started
             self._save_quietly()
         return job.to_dict()
+
+    @contextmanager
+    def uploading(self, kind: str, name: str | None, total: int | None, source: str = USER):
+        """A job for an upload the API reads as it adds (POST /api/add/stream, kind "add") or imports
+        (POST /api/import/stream, "import") it (0.2.1), so the CLI and other apps see it: listed and followed as any
+        job from the start (running, its progress the bytes read: total its Content-Length, None if chunked) and
+        cancellable, but never saved, and never resumed (its data is the request's), nor taking a job slot. Yields
+        the Job: the caller counts each read with job.read(n), which raises Cancelled once the job is cancelled (or
+        the node stops), and sets job.result. Leaving it marks the job done, cancelled (if it was) or failed, with
+        the error. Raises Busy when MAX_ACTIVE jobs are queued or running."""
+        from rnfs.errors import Busy
+        with self._lock:
+            if sum(1 for job in self._jobs.values() if job.state in ACTIVE) >= MAX_ACTIVE:
+                raise Busy(f"{MAX_ACTIVE} jobs are already queued or running")
+            job_id = secrets.token_hex(4)
+            while job_id in self._jobs:
+                job_id = secrets.token_hex(4)
+            job = Job(job_id, kind, None, source=source)
+            job.stream, job.stream_name = True, name
+            job.stop_event = self._stop_event
+            job.on_progress = self._publish
+            job.total_bytes = total
+            job.begin_run()
+            self._jobs[job_id] = job
+        self._publish(job)
+        state, error = FAILED, None
+        try:
+            yield job
+            state = DONE
+        except BaseException as e:
+            if job.cancelled():
+                state = CANCELLED
+            error = str(e) or type(e).__name__
+            raise
+        finally:
+            with self._lock:
+                job.state, job.error = state, None if state == DONE else error
+                job.result = _capped(job.result) if job.result is not None and state == DONE else None
+                job.finished = time.time()
+                if state == DONE and job.total_bytes is None:
+                    job.total_bytes = job.done_bytes
+                job.end_run()
+                self._cap_finished()
+            self._publish(job)
+            job.ended.set()
+            _log(f"job {job.id} ({job.kind} upload {job.subject}) {state}" + (f": {error}" if error and state != DONE
+                                                                                 else ""))
 
     def _job(self, job_id: str) -> Job:
         """The job with this ID. Raises NotFound."""
@@ -1088,23 +1210,35 @@ def _answer_progress(job: Job):
 
 
 def partial_path(job: Job) -> str:
-    """Where a get job writes before renaming to its output: hidden, beside it, named by the job's ID."""
+    """Where a get or export job writes before renaming to its output: hidden, beside it, named by the job's ID."""
     return os.path.join(os.path.dirname(job.output), f".rnfs-job-{job.id}{PARTIAL_SUFFIX}")
 
 
 def write_path(job: Job) -> str:
-    """Where node.get writes a get job's target before renaming it to the job's partial path: named by the job's ID
-    too, so a run resuming it after a crash finds and removes what the crashed one left."""
+    """Where node.get (node.export) writes a get (export) job's target before renaming it to the job's partial path:
+    named by the job's ID too, so a run resuming it after a crash finds and removes what the crashed one left."""
     return os.path.join(os.path.dirname(job.output), f".rnfs-job-{job.id}.write{PARTIAL_SUFFIX}")
 
 
-def remove_partial(path: str):
-    """Delete a get job's partial output, file or directory tree; a symlink there is removed, not followed."""
-    from rnfs import fsutil
-    if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path)
-    else:
-        fsutil.remove(path)
+def _rename_into_place(job: Job, partial: str, output: str):
+    """Rename what a get or export job wrote to partial to output. A run before a crash may have renamed its output
+    into place without its outcome being saved: the same content there is that run's, and partial is removed; anything
+    else there fails the job (FileExistsError), left as it is."""
+    try:
+        fsutil.rename_new(partial, output)
+    except FileExistsError:
+        if job.runs <= 1 or not fsutil.same_content(partial, output):
+            raise
+        fsutil.remove_tree(partial)
+
+
+def _remove_partial(job: Job, partial: str):
+    """Remove a failed run's partial output; a failure is logged (the job's own error matters more; the next run
+    tries again)."""
+    try:
+        fsutil.remove_tree(partial)
+    except OSError as e:
+        _log(f"job {job.id}: removing {partial} failed: {e!r}", LOG_WARNING)
 
 
 # API handlers: handler is the ApiHandler; every route requires the API token
@@ -1180,20 +1314,6 @@ def api_clear(handler):
 
 
 # Formatting (pure, for the CLI and its tests)
-
-
-def human_size(num_bytes: float | None) -> str:
-    """A size in decimal units: "512 B", "1.5 KB", "3.20 MB"."""
-    if num_bytes is None:
-        return "?"
-    value = float(num_bytes)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if value < 1000 or unit == "TB":
-            if unit == "B":
-                return f"{int(value)} B"
-            return f"{value:.2f} {unit}" if value < 10 else f"{value:.1f} {unit}" if value < 100 else f"{value:.0f} {unit}"
-        value /= 1000
-    return f"{value:.0f} TB"  # not reached
 
 
 def human_duration(seconds: float | None) -> str:

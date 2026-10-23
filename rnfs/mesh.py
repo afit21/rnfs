@@ -44,6 +44,7 @@ PATHFINDER_M = 128  # RNS.Transport.PATHFINDER_M: what hops_to returns for an un
 # IDX_PT_RVCD_IF), for RnsPaths.scan
 PATH_TABLE_HOPS = 2
 PATH_TABLE_INTERFACE = 5
+PATH_TABLE_TIMESTAMP = 0  # IDX_PT_TIMESTAMP: when the path was learned or last refreshed (Unix time), for path_since
 # Seconds a peer stays online after the last sign it was up (online()). Three link_idle_timeouts (300 s by
 # default): a peer just talked to doesn't turn offline the moment its idle link closes, nor between a fetch's
 # requests or a republish's. Far below announce_interval (6 h by default), so one announce doesn't keep a node
@@ -136,6 +137,19 @@ class RnsPaths:
         try:
             return _hops(RNS.Transport, node_id) if RNS.Transport.has_path(node_id) else None
         except Exception as e:  # noqa: BLE001 - RNS internals: no path known if they fail; logged
+            self._failure_log(f"couldn't read the path to {RNS.prettyhexrep(node_id)} from RNS: {e!r}", RNS.LOG_WARNING)
+            return None
+
+    def since(self, node_id: bytes) -> float | None:
+        """When RNS learned (or last refreshed) the path to node_id, Unix time, or None (no path; RNS fails). From this
+        process's own path table, as hops(): attached to a shared instance, when the instance passed the path on."""
+        import RNS
+        try:
+            entry = RNS.Transport.path_table.get(node_id) if RNS.Transport.has_path(node_id) else None
+            timestamp = entry[PATH_TABLE_TIMESTAMP] if entry else None
+            return float(timestamp) if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool) \
+                and math.isfinite(timestamp) else None
+        except Exception as e:  # noqa: BLE001 - RNS internals: unknown if they fail; logged
             self._failure_log(f"couldn't read the path to {RNS.prettyhexrep(node_id)} from RNS: {e!r}", RNS.LOG_WARNING)
             return None
 
@@ -263,6 +277,42 @@ class RnsPaths:
                                                       _bitrate(entry.get("bitrate")))
                 self._stats_at = self.clock()
             return self._stats.get(full_name, (full_name, None))
+
+
+# RNS's interface modes (RNS.Interfaces.Interface.Interface.MODE_*), by number, as rnsd's config names them
+INTERFACE_MODES = {0x01: "full", 0x02: "point_to_point", 0x03: "access_point", 0x04: "roaming", 0x05: "boundary",
+                   0x06: "gateway", 0x07: "internal"}
+
+
+def interface_states(reticulum) -> list[dict]:
+    """Reticulum's interfaces as GET /api/stats gives them (0.2.1), read-only: [{"name" (its configured name),
+    "full_name", "type", "online", "mode", "bitrate" (bits/s, None unknown), "rx_bytes", "tx_bytes", "rx_speed",
+    "tx_speed" (bits/s now, as rnstatus shows them), "clients"}], from Reticulum.get_interface_stats(): attached to a
+    shared instance, the instance's interfaces (one RPC), the ones that carry this node's traffic. [] without
+    Reticulum; raises what RNS or the RPC raises."""
+    if reticulum is None:
+        return []
+    found = []
+    for entry in (reticulum.get_interface_stats() or {}).get("interfaces", []) or []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            continue
+
+        def number(key):
+            """entry[key] if it is a finite number, else None."""
+            value = entry.get(key)
+            ok = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+            return value if ok else None
+
+        online = entry.get("status")
+        clients = entry.get("clients")
+        found.append({"name": str(entry.get("short_name") or entry["name"]), "full_name": entry["name"],
+                      "type": entry.get("type") if isinstance(entry.get("type"), str) else None,
+                      "online": online if isinstance(online, bool) else None,
+                      "mode": INTERFACE_MODES.get(entry.get("mode")), "bitrate": _bitrate(entry.get("bitrate")),
+                      "rx_bytes": number("rxb"), "tx_bytes": number("txb"), "rx_speed": number("rxs"),
+                      "tx_speed": number("txs"),
+                      "clients": clients if isinstance(clients, int) and not isinstance(clients, bool) else None})
+    return found
 
 
 def _hops(transport, node_id: bytes) -> int | None:
@@ -684,8 +734,11 @@ class Traffic:
             peer = self._peer(node_id)
             if peer.last_emitted is not None and emitted <= peer.last_emitted:
                 return False
-            peer.last_emitted = float(emitted)
-            age = max(0.0, self.clock() - emitted - EMISSION_SKEW)
+            now = self.clock()
+            # Kept no later than the skew allowed: one from a clock far ahead, kept as it is, would leave its sender's
+            # later announces (its clock put right) uncounted for the rest of the run
+            peer.last_emitted = min(float(emitted), now + EMISSION_SKEW)
+            age = max(0.0, now - emitted - EMISSION_SKEW)
             if age > ONLINE_WINDOW:
                 return False
             seen = self.monotonic() - age

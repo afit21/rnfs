@@ -2,6 +2,240 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## 0.2.1
+
+Fixes, and additions to the local API for apps. No wire-format or CID changes: these nodes, 0.2.0, 0.1.6, 0.1.5,
+0.1.4 and 0.1.3 nodes work together. Every API addition is additive: older clients see the answers they knew, with
+new fields beside them, and `GET /api/capabilities` lists `gc_dry_run`, `config_dry_run`, `add_origin`,
+`sealed_tar`, `ping_details`, `streamed_answers` and `restart`.
+
+Added (the local API, `rnfs.Client`/`rnfs.Node`, and the CLI where it helps):
+- **A peer's real last sign of life:** `GET /api/peers` (`Peer.last_seen`) gives when each peer last showed it was
+  up (an answer, a request of its own, a link, a fresh announce), as wall time; it is what `online` is decided
+  from. `last_heard` is no such sign: any node's path response refreshes it.
+- **Why a ping failed:** `GET /api/ping` (`ping_info()`, `Ping`) adds `reason` (`no_path`, `no_identity`,
+  `wrong_identity`, `not_member`, `link_refused`, `link_closed`, `link_timeout`) and the path's `hops`,
+  `interface` and `path_since`; `stream=1` answers in JSON lines, telling of each step (path, identity, link) as it
+  begins. `rnfs ping` says why.
+- **Providers as they are found:** `GET /api/providers?stream=1` sends each provider as the lookup finds it
+  (`providers(on_provider=)`); closing the connection ends the lookup. `rnfs providers` prints them as they come.
+- **A stream add's origin:** `POST /api/add/stream` takes `origin` (`add(..., origin=)`, `add_tar(..., origin=)`),
+  what `pin ls` says it was added from, so an app's adds aren't all `(stdin)` and the user's label stays free.
+- **Sealed folders from a tar upload:** `POST /api/add/stream?format=tar` with `to`/`to_self` seals the folder the
+  tar holds as `add --to <folder>` seals one (`name` is the folder's), re-packing its members as it streams: nothing
+  but the sealed bytes is stored.
+- **The shared folder's figures:** `GET /api/status` (`Status.shared_folder`) gives its path, entries and their
+  bytes, whether a scan runs, when the last ended, why the folder is refused or the last scan failed, and the
+  entries that failed to import; `rnfs status` sums it up.
+- **What `gc` would free:** `POST /api/gc` with `dry_run` (`gc(dry_run=True)`, `rnfs gc --dry-run`) changes nothing
+  and says what it would remove, and the stored bytes split by what keeps them: pins, cached fetches, operations in
+  progress, nothing, with what the state database takes. A client checks the `gc_dry_run` capability first: an
+  older daemon would ignore `dry_run` and collect.
+- **Settings checked without writing them:** `POST /api/config/set` with `dry_run` (`config_set(...,
+  dry_run=True)`) makes every check and says what would apply now and what at the next start (capability
+  `config_dry_run`, for the same reason).
+- **How the daemon runs:** `daemon.json` gains `started_by` (`systemd`, `launchd`, `windows_task`, `terminal`,
+  `unknown`, or what the program starting it set `RNFS_STARTED_BY` to), `service`, `sandbox` (`flatpak`) and
+  `can_restart`.
+- **Restart through the API:** `POST /api/restart` (`restart(wait=)`, `rnfs restart`) stops the daemon as SIGTERM
+  does and starts it again with the same command line, so settings that need a restart apply to a daemon started
+  in a terminal as much as one a service runs. On POSIX it starts again in place, keeping its process ID; on
+  Windows the task wrapper (`contrib/install-windows-task.ps1`, which now sets `RNFS_STARTED_BY`) restarts it.
+- **The routing table:** `GET /api/routing` (`routing()`, `Routing`) gives the buckets and each node's times and
+  failed queries, the nodes avoided as unreliable, and the bans with when they end and why.
+- **The daemon's log:** `GET /api/log` (`log()`) gives its recent lines, rnfs's and Reticulum's as its console shows
+  them (the last 2000, in memory), so an app shows the log of a daemon it didn't start.
+- **Uploads are jobs:** a stream add or import (`POST /api/add/stream`, `/api/import/stream`) is listed in
+  `GET /api/jobs` while it runs (`stream`, `stream_name`), with the bytes read, and cancelling it stops it (`409`,
+  code `cancelled`). Uploads are never saved or resumed, and take no job slot.
+- **More events:** `config` (a setting changed through the API, with what applied, what needs a restart and every
+  setting pending one), `name_sync` (a sync started, stopped or changed), `apps` (added, removed, requested,
+  denied) and `status` (the status fields that changed, checked every 30 s), so a status page needn't poll.
+- **Pairing:** an app with no token asks for one (`POST /api/apps/request`; `rnfs.Client.pair()`), shows its user
+  a 6-digit code, and the user approves it where that code shows too (`rnfs app requests`, `rnfs app approve`,
+  `deny`; an app told by the `requested` event). The app collects its token itself, once; the approver never sees
+  it.
+- **Reticulum's interfaces, read-only:** `GET /api/stats` (`Stats.reticulum_interfaces`, `rnfs stats`) gives each
+  interface's state, mode, bitrate, bytes and speeds (the shared instance's when attached to one). rnfs still never
+  edits Reticulum's config.
+- **The code checked at approval:** `POST /api/apps/approve` takes `code` (`ApiConnection.app_approve(id, code=)`,
+  `rnfs app approve <id> --code`), and `rnfs app approve` at a terminal asks for the code the app shows. Without it
+  the request is approved unchecked, as before.
+
+Changed:
+- **Sizes are written in decimal units everywhere** (KB, MB, as `rnfs jobs`, `rnfs peers` and the log already
+  wrote them): `rnfs status`'s record store line was in KiB and MiB. One function writes them all
+  (`rnfs.units.human_size`).
+- **The API and the gateway also listen on `[::1]`** (AUD-H2, below), on the same ports: a port another program
+  holds on `[::1]` stops the daemon, as one taken on `127.0.0.1` does. Only a host without IPv6 runs on
+  `127.0.0.1` alone. `[::1]` is still not an accepted `Host`.
+- **`pin add`, remote pins, following, `dir set` and `dir rm` stop at `max_output_entries` entries** (AUD-M6, below),
+  as `get` and `export` did: pinning a folder of more entries (100,000 by default) is refused; raise the setting to
+  pin it.
+- **Pairing:** a name may have several requests waiting, each with its own code; approving one denies the others,
+  and a name already taken is refused when approved, not when asked. A full table of 32 requests drops the oldest
+  instead of refusing new ones (AUD-M5, AUD-L1, below).
+- **The network size estimate is sampled by lookups the node chooses** (AUD-M1, below): up to 8 lookups of random
+  keys after joining, then one while the estimate is short of samples or an hour old (paced on slow nodes),
+  besides publishing's.
+
+Security (the 0.2.1 audit, AUD: each fix has a regression test in `tests/security`, listed in its README):
+- **Links waiting out upload pacing are bounded again** (AUD-H1, a 0.2.1 regression; specification section 3): an
+  answer that fits one packet took no response slot even while it waited for upload pacing, holding its link's
+  `/blocks` slot, and a link with one in progress is never closed to make room. So `max_incoming_links` links
+  looping on tiny paced answers (about 8 KB/s) had every new incoming link refused. An answer that must wait now
+  takes a pool slot, as in 0.2.0, and one outside the pools ends when its link closes.
+- **The gateway's sites and the API can't be taken over on `[::1]`** (AUD-H2, section 11): the daemon listened on
+  127.0.0.1 only, but browsers and curl try `*.localhost` and `localhost` on ::1 first, so another local user
+  listening on `[::1]:<port>` while the daemon ran could serve their own pages in every site's origin and relay
+  what clients sent. The API and the gateway now also listen on `[::1]:<port>`, sharing their connection cap.
+- **`add` can't be led into the rnfs dir by a path swapped while it runs** (AUD-H3, section 8): `add` checked the
+  path against the rnfs dir, then opened it again following a link, so a file or folder swapped for a link to
+  `api_token`, the identity or a name key between the two was added, pinned and provided. The check is made again
+  on what was opened (its own final path), for plain, sealed and only-hash adds.
+- **A node asked first can't hold off the provider search by dripping its answer** (AUD-H4, section 7): once a probe
+  runs past `deadline_slack` (longer over slow links) the search starts, and a provider it finds is asked for the
+  block as end-game duplication does; a probe waits for its link's `/blocks` slot no longer than that, so another
+  fetch's dripping response can't make later fetches fail without searching; and a remembered provider whose probe
+  was cancelled, or ran that long without sending anything, is forgotten.
+- **Searches no longer feed the network size estimate** (AUD-M1, section 6): anyone can make a node search keys of
+  their choosing, through the gateway for one, and 9 keys inside one tight cluster of identities inflated the
+  estimate up to a million times, which turned the density check off. Samples come from publish lookups and from
+  lookups for random keys; a key the density check flags loses its sample, and widened lookups take none.
+- **A fetch's searches share one `/find` cap again** (AUD-M2, section 6): runs of a lookup together send at most
+  8 × K `/find`, and a run counts as having found providers only if the fetch could use one. Sybils listing
+  made-up providers in every answer had one fetch send 66,426 `/find` in 15 s.
+- **Partition mode's probe doesn't go to the server that named the failing identities** (AUD-M3, section 6) while
+  another target exists, and prefers senior servers; a probe left unanswered doesn't enter partition mode if
+  another off-island server answered or announced itself while it was out.
+- **Links posing as slow can't hold the slow pool for good** (AUD-M4, section 3): two links on a fast path that kept
+  their MTU at 500 and asked again the moment each response ended held both slow-pool slots, and a LoRa requester
+  was refused for as long as they did. A slow-pool response's age counts from the start of its link's (or
+  identity's) back-to-back run, and a newcomer not on a known-fast interface may take a slot when every one is held
+  by links on one.
+- **Another program can't take an app's place in pairing** (AUD-M5, section 11): asking first under an app's name had
+  the real app refused, so the user could only approve the other program's request. Several requests may wait under
+  one name, each with its own code, which `rnfs app approve` asks for and checks.
+- **Directory trees declaring 0 bytes are bounded** (AUD-M6, section 8): `pin add`, remote pins, following, deny
+  lists, `dir set` and `dir rm` fetched a DAG with no entry cap, and directory nodes pay for themselves, so a tree
+  of empty files was unbounded. They stop at `max_output_entries`; a remote pin refused for it is dropped as
+  `too_large`.
+- **`get` counts what a folder's entries allocate** (AUD-M11, section 8): its free-space check counted the content's
+  bytes, so a DAG of many empty directories or tiny files (5,000 empty directories: checked as 0 bytes, 20 MB
+  written) could fill the disk past the reserve. It now counts allocation units, as the sealed unpack does (REV10).
+- **install.sh keeps a working install when an update fails** (AUD-M10): it repairs a venv a distro Python upgrade
+  broke (every update failed with "No module named pip"), and builds before touching the venv, moving a venv it
+  must re-create aside and putting it back if the install fails, where it used to delete it first.
+- **Pairing no longer tells which apps are installed** (AUD-L1, section 11): `POST /api/apps/request` answers every
+  valid name alike, as REV9 made the proof do.
+- **`rnfs name export -o` writes a private file on Windows** (AUD-L2): the user-and-SYSTEM access list, as
+  `rnfs app add -o` already did, instead of inheriting its folder's.
+- **One link can't spend the node's `/range` compression budget** (AUD-L4, section 7): each link may spend at most a
+  quarter of it.
+- **Early responses are kept only if they came as one packet** (AUD-L5, section 3): a responder answering with
+  Resources under made-up request IDs had up to 16 of about 1 MiB each kept per link until it closed; they also
+  expire on hand-over now.
+- **Path-request turns given up are given back** (AUD-L6, section 3): a waiter whose path arrived before its turn
+  left its turn reserved, so callers after it waited for nothing (about 28 s after 30 such waiters).
+- **Identify floods are dropped before RNS** (AUD-L7, section 3): on an incoming `rnfs.dht` link, identify packets are
+  dropped once the link has identified, and after 4 on one that hasn't; RNS checked each one's signature and asked
+  the shared instance whether it was blackholed before ignoring it.
+- **A `/range` of a few bytes at a time doesn't re-read the block for each answer** (AUD-L8, section 6): the last 8
+  blocks served are kept verified in memory, forgotten when deleted and read again if their files have changed (0.067 ms
+  to 0.001 ms an answer for a 128 KiB block).
+- **A replayed client-mode announce doesn't reset a server's seniority** (AUD-L9, section 6): the first-seen log
+  forgets a server only for a client announce emitted more than 5 minutes after its last server announce; an older
+  one only takes it out of the routing table until it announces server mode again.
+- **A provider that answers malformed after sending ranges of a block is scored as one that sent a bad block**
+  (AUD-L10), as REL-20 does for an answer of `[]`.
+- **A remote-pin release sent while the node starts is no longer lost** (AUD-L12, section 6): remote pins saved as
+  waiting are queued before the node accepts links, where a release arriving first was ignored and the pin then
+  resumed.
+- **An embedded node's event watch is bounded** (AUD-L13, section 11): `events.watch` holds at most 1024 events
+  waiting for a slow callback; past that the oldest are dropped and the callback gets a "lost" Event in their place,
+  as a Client's watch does. Remote announces drive some event kinds.
+- **Supply chain** (AUD-L14 to L18): certifi 2026.10.19 in `build-tools.lock` (GHSA-6q48-6c7w-9gw2), and a daily OSV
+  audit of every lock (`.github/workflows/audit.yml`), since Dependabot doesn't read them; install.sh refuses to
+  downgrade rnfs, or to replace a `--main`/`RNFS_SOURCE` install with a release of the same version, unless
+  `--force`; the Windows logon task is per user (`rnfs daemon (<SID>)`) and stops only your processes; an opt-in
+  `contrib/rnfs.service.d/strict.conf` (read-only home but `~/.rnfs`, `~/.reticulum` and `~/Downloads`), and the
+  unit's comments no longer overstate `hardening.conf`; a reproducible .deb (`SOURCE_DATE_EPOCH`, no
+  `direct_url.json`, built from the released wheel).
+- **Docs:** the Flatpak's `~/.reticulum` grant doesn't contain a compromised daemon (host RNS programs run what that
+  config names), and CONTRIBUTING lists the repository settings releases rely on (AUD-M10); the API reference no
+  longer says every route but status needs the token (AUD-L3).
+
+Fixed:
+- **Stopping leaves every part its time** (AUD-M7): stopping asks every feature, the node's threads and the waiting
+  name resolves to end, and closes the links, before it waits for any of them; follow and deny fetches and keeper
+  queries end when their feature stops. One busy feature (a follow fetch, a keeper query) no longer uses up the whole
+  5 s stop budget, leaving the jobs and the node's threads none with the state closed under them. No link opens
+  once the node's links are closed, and a job whose run fails while the node stops resumes at the next start.
+  Features get an optional `stopping()` hook.
+- **A crash during `export` leaves no truncated archive** (AUD-M8): `export` wrote straight to its output, so a crash
+  left a truncated archive there and the resumed export job failed "already exists". It writes beside the output,
+  syncs and renames once complete; an export job resumes as a get job does.
+- **A finished job lets go of what it met** (AUD-M9): it kept every CID its last run met (about 175 bytes a block,
+  35 MB for a 12 GiB fetch) until it was forgotten.
+- **A job whose thread can't start is queued again** (AUD-L11), instead of staying "running" with no thread and
+  holding a `max_jobs` slot until a restart; the jobs' retry loop survives a failing round.
+- **`install.sh --update --service` runs the version it installed:** with the service already running, the
+  installer's `systemctl --user enable --now` left the old daemon running, so an updated node kept the previous
+  version until someone restarted it. `--service` now restarts the unit (starting it if it was stopped).
+  Without `--service`, a running daemon is restarted as before.
+- **No traceback when a local client drops its connection:** a client that reset or closed its API or gateway
+  connection mid-request (an `rnfs status` while the daemon was starting, for one) left a `ConnectionResetError`
+  traceback on the daemon's output. The connection is now closed quietly; other failures are still reported.
+- **A name's first publish from an imported key goes past what this node resolved:** the publish counted the
+  sequence of the record it held, but not the floor of one it had resolved before, whose record had since left the
+  table. A key imported on a node that had resolved its name at sequence 10 published sequence 1, which every node
+  that had seen 10 refused, and lowered this node's own floor.
+- **Deny lists end lines only at `\n`, `\r` and `\r\n`:** a comment holding U+2028, NEL or another character Python
+  takes for a line end was cut there, its rest read as an entry: a list refused, or a commented-out CID denied.
+- **An unreadable block no longer stops eviction, collection and verify:** a block file that couldn't be read (a
+  disk error, or a file a run as root left) raised out of every walk that met it, so eviction and `gc` stopped
+  for good, providing failed and `rnfs verify`, the remedy, crashed. It is now treated as damaged, the error
+  logged, and kept until `rnfs verify` removes it. A delete that fails (a filesystem remounted read-only) no
+  longer leaves the index and its memos out of step with the disk: the block stays, and the next collection
+  tries again.
+- **A directory whose sizes sum past 2^64 − 1 is refused as too large** (413) in any of its groups, not a 500.
+- **A shared-folder scan saves again after a failed save,** even when nothing in the folder changed since.
+- **Items provided again before a save are published:** an item withdrawn and provided again before the
+  publisher's next save (an unpin then re-pin, or a save that failed) lost its row and wasn't published again
+  until a restart.
+- **Partition mode doesn't wake the publisher twice a second:** withdrawals queued for servers off the island,
+  which wait for the partition to end, counted as due, so a round ran every 0.5 s for as long as it lasted.
+- **A partial block whose block another provider brought is deleted** once the `/range` request holding it is
+  done, not left on disk until the next start.
+- **Withdrawing and storing the same provider records again costs a write:** a withdrawal undone before the next
+  save had its row rewritten all the same, for nothing from the publisher's write budget (REL-13), so a loop of
+  them rewrote every record of a publisher each save.
+- **Patience works on slow nodes searching few servers:** with alpha 1, a server that lagged past patience took
+  its place back at once while the search knew three servers or fewer, so the next wasn't asked until the link
+  timed out (up to 217 s). Now it is waited for only once there is nobody else to ask.
+- **Provider expiry no longer takes a store for a clock gone back:** a store during an expiry pass made it clamp
+  every record's times, scanning the whole table under the store's lock, on about a third of passes under load.
+- **Requests answered in one packet, refused for the requester's budget share, or for a `/range` past the block's
+  end take no response slot,** so they no longer displace and cancel another requester's download
+  (specification section 3). A response displaced while it waits for upload pacing no longer closes its
+  requester's link. A second request for a node whose link is being opened waits for it rather than give up after
+  a fixed time, which counted a slow but reachable node as unreachable.
+- **A peer whose clock was once far ahead is seen online again:** one announce from a clock ahead (say by a day)
+  kept every later, correctly dated announce from counting, so the peer showed offline for the rest of the run.
+- **An embedded node whose start fails early can start again:** a failure just after its `rnfs.dht` destination
+  was registered left it registered, so every later `rnfs.Node` in the process failed with RNS's `KeyError`.
+- **Name watches end 60 s after the last watch call** as documented, rather than at the next watch call (or never).
+- **`rnfs.Client(timeout=...)` checks its timeout:** 0, a negative number or a bool raised `ValueError` only on
+  the first call, or failed every call with a misleading "can't reach the daemon".
+- **A stop during the first join is prompt:** the deny feature waited for the join without looking for a stop, so
+  a stop before the node had joined took the whole stop budget, leaving the other features and the node's threads
+  none.
+- **Jobs:** a retry run cut off by a restart keeps its due time, rather than being given up after one more try; a
+  resumed get whose output a run before the crash had already put in place (the same content) finishes done,
+  not "already exists"; and a stop just as a job starts no longer raises and skips the save.
+- **Settings:** a duration rnfs.toml sets below its minimum (raised at start) is no longer listed as needing a
+  restart, and a live setting set to its current value isn't reported as applied.
+
 ## 0.2.0
 
 The feature-complete release: the local API and the library for companion apps; providing at scale (sweep

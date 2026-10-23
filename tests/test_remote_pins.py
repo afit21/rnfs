@@ -597,7 +597,7 @@ class ServedByTheNodeTest(NodeTest):
         hold = threading.Event()
         self.addCleanup(hold.set)
         with mock.patch.object(self.a, "_remote_pin_fetch", lambda cid, source: hold.wait(10)), \
-                mock.patch("rnfs.node.REMOTE_PIN_QUEUE", 1):
+                mock.patch("rnfs.node_pins.REMOTE_PIN_QUEUE", 1):
             self.assertTrue(self.a.backend.remote_pin(OTHER_IDENTITY, Cid.for_block(RAW, b"first"), True))
             self.assertFalse(self.a.backend.remote_pin(OTHER_IDENTITY, Cid.for_block(RAW, b"second"), True))
             served = self.served()

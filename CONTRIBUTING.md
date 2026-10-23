@@ -204,8 +204,10 @@ under the next version's `## X.Y.Z (unreleased)` heading.
 
 A release is published by pushing a tag `vX.Y.Z`: `.github/workflows/release.yml` runs the whole tests workflow,
 builds every package (wheel and sdist, `.deb` for amd64 and arm64, the x86_64 Flatpak, the Windows exe),
-smoke-tests them, and (through the `release` environment, which may require a reviewer) publishes a GitHub Release with
-`SHA256SUMS` and signed build provenance. The release notes are CHANGELOG.md's section for the version.
+smoke-tests them, and (through the `release` environment) publishes a GitHub Release with `SHA256SUMS` and signed
+build provenance. The release notes are CHANGELOG.md's section for the version. What stops anyone else from
+publishing, or from changing a release afterwards, is the repository's settings, not the workflow: see
+"Repository settings" below.
 
 The same builds run, without publishing, on pull requests that touch `packaging/**`, `pyproject.toml` or
 `.github/**`, weekly, and when the workflow is started by hand, so check that they pass before tagging.
@@ -219,14 +221,36 @@ Steps:
 3. Commit, let CI pass on `main`, then push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. The workflow
    refuses a tag that isn't `v` + `__version__`, and a CHANGELOG whose section for it is still marked
    unreleased.
-4. If the `release` environment requires a reviewer, approve its deployment once the builds pass.
+4. If the `release` environment requires a reviewer (see below), approve its deployment once the builds pass.
 5. Open the next version's section: `## X.Y.(Z+1) (unreleased)` at the top of CHANGELOG.md (`__version__` stays
    X.Y.Z until that release), and name that version in the note at the top of specification.md (checked too).
+
+### Repository settings
+
+The workflow can't enforce these; they are GitHub settings, which only an admin can see or change. Without them
+the release's checks protect less than they seem to: `install.sh` without the GitHub CLI checks only
+`SHA256SUMS`, a release file like the others, and `curl | sh` runs `install.sh` from `main`.
+
+- **Release immutability** (Settings > General > Releases): on, so a published release's files and tag can't
+  be replaced or deleted. The workflow never replaces a file (no `--clobber`), but that binds only the
+  workflow: without immutability anyone with write access can swap a file and its `SHA256SUMS` line.
+- **`main` protected** (a branch ruleset or protection rule): pull requests required, no force pushes or
+  deletion, required status checks (the tests workflow), and not bypassable by admins if possible.
+- **The `release` environment** (Settings > Environments > release): a required reviewer, self-review
+  prevented if there is a second maintainer, deployments only from tags `v*`, and admins not allowed to
+  bypass. With no reviewer, whoever can push a `v*` tag publishes.
+- **The `v*` tag ruleset**: creation, update and deletion of `v*` tags restricted.
+- **Actions** (Settings > Actions > General): allow only actions from GitHub and the ones the workflows pin
+  (`actions/*`, `flatpak/flatpak-github-actions`, `google/osv-scanner-action`), with SHA pinning required;
+  the workflow token read-only by default.
+- **Dependabot alerts and security updates** on. They see `pyproject.toml`'s ranges and the actions, not the
+  exact versions `packaging/*.lock` pins: those are checked against OSV by `.github/workflows/audit.yml`.
 
 ### Release checklist
 
 - [ ] Every decision the release's plan needed is answered, and the maintainer-only actions (GitHub settings,
       PyPI, benchmarks on real hardware) are done or deliberately left.
+- [ ] The repository settings above are as listed, and `.github/workflows/audit.yml`'s last run passed.
 - [ ] Wire: `tests/test_wire.py`'s 0.1.3 and 0.1.4 vectors pass byte for byte.
 - [ ] Interop: the new version against the previous releases' nodes (fixtures in `tests/fixtures/`,
       `tests/test_rns_compat.py`). Fetch, provide, names and keepers behave the same, and a previous release's

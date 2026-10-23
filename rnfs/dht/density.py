@@ -7,6 +7,10 @@ then looks further out. All local: nothing about it is sent, and nothing on the 
   and estimates N as (K − 1/3) × 2^128 over their median (the median of a Gamma(K) is about K − 1/3), leaving out the
   key being checked, so identities placed next to it can't shrink its own yardstick. Pooled over many keys it is 2 to
   4 times less noisy than a node's own neighbourhood (eclipse simulation: 4% false positives at T = 2 against 12%).
+  Only lookups for keys the node chose itself are sampled (rnfs.dht.lookups: its publish lookups and lookups for
+  random keys, never a search, whose key anyone may choose through the gateway), and a key the check flags loses its
+  sample (forget): searches for keys inside one tight cluster of identities used to collapse the median, inflating
+  the estimate a million times and turning the check off (AUD-M1).
   A lookup's sample counts only nodes it verified (verified_sample: the closest that answered or whose identity is
   known, up to the first that isn't, its d_j scaled to rank K), so made-up IDs in a reply can't inflate the estimate.
   It needs MIN_SIZE_SAMPLES lookups before the check runs, and is kept in the state database's meta table, written
@@ -56,10 +60,14 @@ def _never(node_id: bytes) -> int:
 class SizeEstimate:
     """The network's size, estimated from recent lookups. Thread-safe; a node.Store (save, close) given a state_dir."""
 
-    def __init__(self, state_dir: str | None = None, samples: int = SIZE_SAMPLES, minimum: int = MIN_SIZE_SAMPLES):
-        """An estimate saved in state_dir (only in memory without one), pooling samples lookups and needing minimum."""
+    def __init__(self, state_dir: str | None = None, samples: int = SIZE_SAMPLES, minimum: int = MIN_SIZE_SAMPLES,
+                 clock: Callable[[], float] = time.monotonic):
+        """An estimate saved in state_dir (only in memory without one), pooling samples lookups and needing minimum;
+        clock (monotonic seconds) times the latest sample."""
         self.samples = max(1, samples)
         self.minimum = max(1, min(minimum, self.samples))
+        self.clock = clock
+        self.updated = clock()  # when the latest sample came (or the estimate was made: a loaded one counts as fresh)
         self._lock = threading.Lock()
         self._distances: OrderedDict[bytes, int] = OrderedDict()  # key -> d_K, least recent first
         self._dirty = False
@@ -117,6 +125,13 @@ class SizeEstimate:
             while len(self._distances) > self.samples:
                 self._distances.popitem(last=False)
             self._dirty = True
+            self.updated = self.clock()
+
+    def forget(self, key: bytes):
+        """Drop key's sample, if any: the density check flagged key, so its d_K says nothing of the network's size."""
+        with self._lock:
+            if self._distances.pop(key, None) is not None:
+                self._dirty = True
 
     def estimate(self, key: bytes | None = None) -> float | None:
         """The estimated number of DHT servers, from the samples of keys other than key; None until there are

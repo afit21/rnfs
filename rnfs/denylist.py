@@ -82,7 +82,7 @@ def parse_list(data: bytes) -> tuple[frozenset[bytes], frozenset[bytes]]:
         raise ValueError("it isn't UTF-8 text") from None
     cids: set[bytes] = set()
     digests: set[bytes] = set()
-    for number, line in enumerate(text.splitlines(), 1):
+    for number, line in enumerate(re.split(r"\r\n|\r|\n", text), 1):  # not splitlines: \x0b, \x85, U+2028 ... aren't line ends
         line = line.split("#", 1)[0].strip()
         if not line:
             continue

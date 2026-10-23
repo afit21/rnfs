@@ -4,7 +4,7 @@ rnfs is content-addressed file sharing over [Reticulum](https://reticulum.networ
 features of IPFS: content IDs, chunked files, directories, a provider DHT, verified multi-source transfer,
 pinning, mutable names and a gateway — built on what RNS already provides.
 
-**Version.** This document describes rnfs 0.2.0. The wire format (request paths and messages, CIDs and DAG
+**Version.** This document describes rnfs 0.2.1. The wire format (request paths and messages, CIDs and DAG
 bytes, chunk boundaries, provider and name records, announce app_data and the LXMF field) is byte-identical
 since rnfs 0.1.3, so nodes of 0.1.3 and later work together. 0.2.0 adds one optional request, `/range` (section 7),
 which older nodes don't answer and newer ones send only to nodes that do; every other message, and every CID, is
@@ -136,7 +136,9 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   stores, fetches and keeper queries; a lookup's path check; name resolves; NomadNet adds): each takes a turn at least
   1 s after the last, and requests 1 s apart peak at an estimate of 1.5 a second. On a slow node the spacing grows
   while its radio measures the channel busy (up to 4 s; "Measured airtime", below). A request waiting for its turn
-  hasn't failed, and the wait isn't part of `path_timeout`, which starts once it is sent. A turn is also put off while
+  hasn't failed, and the wait isn't part of `path_timeout`, which starts once it is sent. A request no longer needed
+  before its turn (its path arrived meanwhile) gives the turn up, and turns given up at the end of the queue are free
+  again for the requests after them (rnfs 0.2.1). A turn is also put off while
   the busiest interface's outgoing estimate (RNS's `outgoing_pr_frequency` from `get_interface_stats`, through a
   shared instance too, which counts other applications' requests; a hub's server interface, which counts a copy for
   each client, left out) is above 1.5 a second, for at most 15 s. Not while an interface's own limit is active
@@ -221,7 +223,10 @@ section 7) SHOULD also have a hard deadline from when they were sent (rnfs: twic
 pass a `max_response_size` just above their largest honest answer. RNS (1.5.6) registers a request as pending only
 after `Link.request` has sent it, and drops a response that matches no pending request, so on a fast link a response
 can arrive first and be lost; a requester SHOULD keep such a response and hand it over once the request is
-registered (rnfs: `links.EarlyResponses`), or the request waits out RNS's timeout, 11 s at least.
+registered (rnfs: `links.EarlyResponses`), or the request waits out RNS's timeout, 11 s at least. Only a response
+sent as one packet can arrive that early (RNS accepts a response Resource only for a pending request), so a requester
+SHOULD keep only those, and for a short while (rnfs: at most 16 per link, for 30 s): what a responder sends under
+request IDs it made up costs it little more.
 
 | Path | Request | Response | Section |
 |---|---|---|---|
@@ -291,14 +296,28 @@ registered (rnfs: `links.EarlyResponses`), or the request waits out RNS's timeou
     connected requester.
   - A request for which nothing asked for is served is answered at once (each entry `None`; `[]` for `/range`)
     without taking a slot, so it displaces nothing (rnfs 0.2.0, REL-2: one ~100-byte request for a made-up CID
-    cancelled an honest LoRa download).
-  - When a pool is full, a new `/blocks` request displaces one of the pool's responses, never one on its own
+    cancelled an honest LoRa download). So is a `/range` whose `offset` is past the block's end (`False`), and
+    neither takes a slot an answer the node knows will fit one packet (from the stored sizes of what it serves):
+    sent as RNS gets it, it would hold the slot for nothing (rnfs 0.2.1; pacing and `upload_budget` apply to it
+    as to any response). Unless it must first wait for upload pacing: a request waiting holds its link's `/blocks`
+    slot, and with it keeps the link from being closed to make room for another (below), so it takes a pool slot
+    as any response does, which bounds how many links can be waiting at once. A response outside the pools ends
+    when its link closes, as a pooled one does.
+  - When a pool is full, a new `/blocks` request that takes a slot displaces one of the pool's responses, never one on its own
     link: the response making least progress among those that are unprotected (past their grace and below the
     floor); else, if the newcomer's receiving interface holds no slot in the pool, the oldest response with
     nothing sent from an interface that holds two or more, once it is past half its grace and at most one
-    within a grace from each interface; else, if neither the newcomer's link nor its identity holds a slot in
-    the pool, the response with the lowest throughput, if it is older than `deadline_slack` and past its
-    grace. Otherwise the request is refused.
+    within a grace from each interface; else, in the slow pool, if every response there arrived on an interface
+    whose bitrate is known and at least `slow_bitrate` and the newcomer's didn't (nor does its identity hold a
+    slot), the response there that has sent least (the newest on a tie); else, if neither the newcomer's link nor
+    its identity holds a slot in the pool, the response with the lowest throughput, if it is older than
+    `deadline_slack` and past its grace. Otherwise the request is refused. In the slow pool a response's age counts
+    from the start of its link's (or identity's) run: a response started within `deadline_slack` of the end of
+    the last one on that link or identity continues the run, and one continuing a run older than `deadline_slack`
+    may be displaced as the slowest within its own grace, as its run had one (rnfs 0.2.1, AUD-M4). The requester
+    decides whether its link is slow (its MTU, or a rate estimate it can keep low), so otherwise two links on a
+    fast path asking again the moment each response ends kept both slow-pool slots with young, moving responses,
+    and a LoRa requester was refused for as long as they did.
   - A response that makes **no progress** is cancelled and its budget charge refunded: one with nothing sent,
     once its grace plus `deadline_slack` has passed; any response with no progress for `stall_timeout`.
   - **Cooldown.** A link (and its identity, if it identified) whose response was displaced or cancelled for
@@ -373,7 +392,12 @@ registered (rnfs: `links.EarlyResponses`), or the request waits out RNS's timeou
   response fails its request as a malformed one does. A responder sends no requests, so a response packet on
   an incoming `rnfs.dht` link is dropped unread. Likewise a node serves requests only on incoming links, so it
   SHOULD drop, unread, a request packet on an `rnfs.dht` link it opened: the remote destination of such a link
-  has no request size limit or handlers, and RNS would decode the request and start a thread for it first.
+  has no request size limit or handlers, and RNS would decode the request and start a thread for it first. On an
+  incoming `rnfs.dht` link a node SHOULD drop, unread, an identify packet (RNS `LINKIDENTIFY`) once the link has a
+  remote identity, and after a few on a link that has none (rnfs: 4; an honest requester sends one, and again only
+  after a refusal): RNS keeps the first identity it accepts, but checks each packet's signature and asks whether
+  the identity is blackholed (through a shared instance, a call to it) before ignoring the rest, and one identify
+  packet can be sent again and again (rnfs 0.2.1).
 - `max_upload_rate` caps bytes sent for `/blocks` on a link. An explicit one applies to every `/blocks`
   response, including one sent as a single packet (which never gives a rate estimate: on a link with a large
   MTU every response may be one); the default, half the rate estimate on slow links, applies once the link has
@@ -586,7 +610,9 @@ identical bytes.
   `files/` is shared anyway. A walk (`add`, the shared folder, name sync, a sealed folder's packing) MUST also skip,
   with a warning, a directory whose device and inode are those of the rnfs dir or one of those subdirectories, taken
   when the walk starts: another way to them, such as a bind mount, which a path check can't see. A root that is one
-  is refused.
+  is refused. The path check MUST hold for what `add` opened, not only for the path before it was opened: a path
+  whose last component is swapped for a link into the rnfs dir between the check and the open MUST be refused too
+  (rnfs 0.2.1: the check is made again on the opened file or directory's own final path).
 
 ### Sealed files (a content convention)
 
@@ -919,7 +945,10 @@ and repeat.
   a `False` is. A `False` soon after the provider served a response (within 4 × that request's round trip, counted from
   when it was sent) is taken as upload pacing (section 3) and not counted; it is retried after an eighth of that round
   trip, or the usual delay if longer. Failed providers are removed and not retried during that fetch. When no providers
-  are left, `/find` runs again for a fresh random half, within the same `lookup_timeout`.
+  are left, `/find` runs again for a fresh random half, within the same `lookup_timeout` and the same 8 × `K`
+  `/find` (rnfs 0.2.1: each run sends what the earlier ones left), and only if the last run found a provider the
+  requester could use (not one it skipped, as an identity it may not spend a path request on): otherwise identities
+  listing made-up providers afresh in every answer kept a fetch searching again until `lookup_timeout`.
 
 **LoRa islands.** A LoRa mesh joined to the internet through a gateway (an *island*) is part of one DHT with the
 rest, so its own content's records sit on servers anywhere: while the gateway is down (a *partition*) a node there
@@ -979,7 +1008,11 @@ or protocol constant changes.
     A probe's outcome counts whatever the reason. A node dropped wrongly from the routing table regains its
     seniority within 2 × `announce_interval`. The probe goes at once, to a
     server that answered or announced itself recently (with none, nothing beyond the island having been heard since
-    the start, the failures enter partition mode without one); or
+    the start, the failures enter partition mode without one), but not, while there is another, to a server whose
+    answer named an identity that failed: it answered last, so it used to be probed first, and could drop the probe.
+    rnfs prefers a senior one (first heard at least `provider_seniority` ago) that hasn't failed since. A probe left
+    unanswered doesn't enter partition mode if an off-island server answered or announced itself while it was out;
+    or
   - after off-island silence (no off-island answer nor fresh announce) longer than 4 times the usual gap between the
     off-island announces it heard (their mean over the last 32 gaps, counted once it has 8, and none that spanned
     partition mode), and at least 10 minutes. Silence alone doesn't enter it: with servers announcing every 6 hours,
@@ -1034,7 +1067,9 @@ differently. A score can be earned quickly by serving popular blocks, so it neve
   by 0.5 for a `/find` answer that proved useful, once per fetch or lookup: it listed a provider that then
   served verified blocks, or named a server closer to the key than the answering node that then answered;
 - lowers it by 1 for a failed query or provider (a `/find` unanswered, a provider failing in a fetch) and by 32
-  for a block not matching its CID (besides the ban);
+  for a block not matching its CID (besides the ban), or for a `/range` provider that, after sending ranges of a
+  block, answers that it doesn't hold it or answers malformed (rnfs 0.2.1; not banned, as content unpinned and
+  collected while it was sent does the first);
 - halves every score each 7 days without new work, towards 0 from either side (silence lowers standing, and a bad
   score is forgiven in time), and keeps it within ±64;
 - starts bootstrap nodes (`bootstrap_nodes`, and the defaults unless `default_bootstrap` is off or in private
@@ -1052,7 +1087,11 @@ mode, whether or not the server enters its routing table, and keep the record ac
 in the future when loaded counts as now). Identities generated next to a key can't be old ones, so among the servers
 near a key, those first heard at least `provider_seniority` ago were there before any such identity was made for it;
 the log gives the `K` closest of them to a key, which publishers also store to and searchers ask (below). It is
-local state: nothing about it is sent. A server that announces client mode is forgotten. A full log SHOULD NOT let
+local state: nothing about it is sent. A server that announces client mode is forgotten, but only for an announce
+emitted after its last server announce the node heard (rnfs: RNS's newest emission time for its path, more than 5
+minutes, the clock difference allowed, after the log last heard it in server mode): anyone can replay an old,
+validly signed client announce of a server that once ran as a client, which made it new again for a day. Any client
+announce still takes it out of the routing table until it announces server mode again. A full log SHOULD NOT let
 new identities push out its senior servers: forgetting the least recently heard first would let about 3 fresh
 identities a second push out every server announcing every 6 hours between its announces, so that none ever became
 senior. rnfs keeps at most 65,536 servers (about 12 MB of memory when full) and, when full, forgets first a server
@@ -1083,6 +1122,13 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   in every lookup can still end the runs where they bias the estimate most, by about 1.3 times (1.6 for 1 estimate in
   20). rnfs keeps the samples in the state database (written with the periodic saves), so a restart has the
   estimate at once, and runs no density check until it has 8.
+  Samples SHOULD come only from lookups for keys the node chose itself: anyone can make a node search keys of their
+  choosing (a web page through the gateway, say), and searches for about 9 keys inside one tight cluster of
+  identities made the median collapse (in simulation the estimate went from 400 to 10^6–10^9 and the density check
+  stopped firing). rnfs samples its publish (region) lookups and lookups for random keys of its own, which it runs
+  while it has fewer than 16 samples or none came for an hour (up to 8 after joining, then one every 5 minutes at
+  most; paced on slow nodes as a search's fallback is), never a search; and a key of its own whose servers the check
+  flags loses its sample, and its widened lookup takes none, as their d_K is the anomaly.
 - **Density check** (T = 2). The servers known near a key are anomalously dense when some rank j ≥ `K` (1-based,
   by distance) lies closer than j × 2^128 / (T × N); the *dense core* ends at the last such rank. Ranks below `K`
   never fire: a few close servers happen by chance, and fewer than `K` identities can't take every place anyway.
@@ -1360,7 +1406,9 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   computes; an entry provided inside a pin, section 6, adds nothing, as its DAG is inside the pin's). With `pinned`, cached downloads answer `None`, so a node's download history can't be read by
   asking for it. With the default `roots`, complete cached downloads are provided and served, so they can.
 - **Before serving**, a node SHOULD re-check the block against its CID, so a damaged block on disk doesn't get
-  it banned.
+  it banned. It MAY keep a few blocks it checked in memory and serve those again unchecked (rnfs 0.2.1: the last 8
+  served, forgotten when deleted, and read and checked again if their files have changed since), so a `/range` of a few bytes at a time (section 7) doesn't cost a read and a hash
+  of the whole block per answer.
 - **Example.** Request `[60000, [c1, c2, c3]]`; the node holds `c1` (40 000 bytes) and `c3` (30 000 bytes), but
   not `c2`. Response `[b1, None]`: `c2` isn't held, and `c3` would take the total past 60 000, so it was left
   for a later request.
@@ -1388,14 +1436,15 @@ link in about a third of the airtime.
   nothing for a handler's `None`); `False` if it refuses under its limits, or `offset` is past `size`.
 - **Responder.** A `/range` response is a `/blocks` response for every rule of section 3 and this section: it serves
   only what `/blocks` would serve, re-checked against its CID; it takes the link's one `/blocks` slot (at most one
-  `/blocks` or `/range` in progress per link) and a slot in the same response pools, with the same deadline,
+  `/blocks` or `/range` in progress per link) and, as a `/blocks` response does, a slot in the same response pools
+  unless it fits one packet, with the same deadline,
   displacement, cooldowns and upload pacing; the same airtime controls refuse it and `upload_budget` charges it, by
   its packed size; a completed one gives the link a rate estimate. Its range is sent whole, as a `/blocks`
   response's first block is, so a `/range` response is never larger than the `/blocks` response for the same block
   could be. A responder compresses only when asked and only if the stream is smaller, and MAY send the bytes as they
   are anyway (rnfs: once its compression budget, 256 KiB of input a second node-wide in bursts of up to 1 MiB, is
-  spent: bz2 costs about a hundred times what re-checking the block's hash does, about 5 ms for 128 KiB on a
-  desktop, and only slow links ask for it).
+  spent, or the link's share of it, a quarter, so one requester can't spend it all (rnfs 0.2.1): bz2 costs about a hundred times what re-checking the block's hash does, about 5 ms for
+  128 KiB on a desktop, and only slow links ask for it).
 - **Requester.** Passes `max_response_size = min(max_bytes + 1 KiB, MAX_RESPONSE_SIZE)` to RNS, and checks every
   answer before keeping any of it: its shape; `size` at most `MAX_BLOCK_SIZE`, equal to a raw chunk's size if its
   parent declares one, and to the `size` of earlier ranges of the block from that provider; an encoding it asked
@@ -1457,15 +1506,23 @@ link in about a third of the airtime.
    radio this request is most often what brings a small file. An open link is asked with `/blocks` otherwise, as it is
    only a guess, and an older node's silence would hold the search up a request timeout. One that
    sends part of the block is a provider holding a partial block, and one that leaves the `/range` unanswered is
-   asked again at once with `/blocks` (section 7, `/range`), not taken as a miss.
+   asked again at once with `/blocks` (section 7, `/range`), not taken as a miss. A node asked in this step SHOULD NOT
+   hold the search off: one could drip its answer, never stalling, for the hours its deadline allows. rnfs (0.2.1)
+   gives each such request a patience of `deadline_slack`, or 1.5 times its block's transfer time at its link's rate
+   estimate (else at the next-hop interface's bitrate) if longer, so minutes over a radio: once one has run past it,
+   the search starts while the requests go on, and a provider it finds is asked for the block as end-game duplication
+   asks (item 7). The request waits for its link's `/blocks` slot (section 3; another fetch's response may hold it) no
+   longer than that, and is then a miss, not sent.
    - **Remembered providers** (rnfs 0.2.0). A node SHOULD remember, for a few hours, the providers that served
      verified blocks of a root, and ask them in this step, after a remote pin's asker and before the nodes with open
      links, so fetching a root again once its links have closed (a gateway reload, `pin add` after `cat`) doesn't
      repeat its lookup. Asking one is a probe like an open link's, under the same slow-link rule; a link need not be
-     open. One that answers `None`, or whose request fails, is forgotten for that root (one that is busy is kept), as
-     is one that fails during a fetch or is banned. rnfs remembers them for 3 hours after they last served, up to `K`
-     per root and 4,096 roots, the least recently used forgotten first, in memory only. It remembers only nodes that
-     served verified blocks, not the providers a lookup reports: a `/find` reply can't make it ask a node again.
+     open. One that answers `None`, or whose request fails, is forgotten for that root (one that is busy is kept;
+     rnfs 0.2.1 forgets one whose answer was cancelled partway, or that ran past the patience above without sending
+     anything), as is one that fails during a fetch or is banned. rnfs remembers them for 3 hours after they last
+     served, up to `K` per root and 4,096 roots, the least recently used forgotten first, in memory only. It remembers
+     only nodes that served verified blocks, not the providers a lookup reports: a `/find` reply can't make it ask a
+     node again.
    - **Searches that found none** (rnfs 0.2.0). A lookup that ran to its end, was answered by some node and found
      no provider, in a fetch whose other requests found none either, SHOULD NOT be repeated for the same root for
      10 minutes, except when the user asks again: a search for content nobody provides costs about 13.5 `/find`.
@@ -1481,7 +1538,10 @@ link in about a third of the airtime.
    total size (for a byte range, the range's size) is checked against it. Sizes are verified as blocks arrive
    (section 5), so a DAG can't hide its size.
 4. Writing out a DAG (`get`, `ls`, the gateway, `export`) stops with an error after `max_output_entries`
-   entries, counting every occurrence. This catches DAGs that repeat empty subtrees, which have size 0.
+   entries, counting every occurrence. This catches DAGs that repeat empty subtrees, which have size 0. Fetching
+   one whole (item 5) stops after as many distinct entries: for `pin add`, remote pins, `dir set` and `dir rm` too
+   (rnfs 0.2.1), as directory nodes pay for themselves under item 5's bound, so it doesn't limit a tree of empty
+   files.
 5. Fetching a target's whole DAG (`get`, `pin add`, `export`, `dir set` and `dir rm`, a followed name's new
    target, the gateway's archives and remote pins) is bounded by what its verified size can
    hold. The bytes of its distinct blocks, stored or downloaded, may not exceed the size, plus 64 bytes per
@@ -1623,8 +1683,11 @@ link in about a third of the airtime.
   max(256 MiB, 2% of the filesystem) free on the filesystem holding `<rnfs dir>/blocks/`.
 - `get` and `export` write their output only if it leaves the same reserve (of the output's filesystem) free.
   When that is the filesystem holding the blocks, what `get` still has to fetch counts too: its verified size
-  less the bytes of the target's DAG already stored. If the free space there can't be read (the directory is
-  missing, say), they fail without writing.
+  less the bytes of the target's DAG already stored. A directory's write-out counts what its entries allocate
+  on the output's filesystem rather than their bytes (rnfs 0.2.1), once its DAG is stored and before anything is
+  written: each file rounded up to the filesystem's allocation unit, each directory at least one unit, every
+  occurrence of a repeated subtree, so many empty directories or tiny files can't pass a check for a few bytes.
+  If the free space there can't be read (the directory is missing, say), they fail without writing.
 
 **Shared folder.** Every `scan_interval`, files and directories in `<rnfs dir>/files/` are imported as with
 `add` (copied into the block store) and pinned with source `folder`. A changed or removed file releases its
@@ -1648,7 +1711,9 @@ changed by other users, who could replace the folder with another.
 **Archives** move content without a network (the equivalent of IPFS CAR files).
 - `export` fetches the target if needed, then writes a msgpack stream: `["rnfs-archive", 1, [root CIDs]]`,
   then `[cid, block]` for every block of every root's DAG, depth-first from each root, each block once. For
-  `export <cid>/<path>`, the archive's root is the target.
+  `export <cid>/<path>`, the archive's root is the target. As `get`, it writes under a temporary name beside the
+  output and renames it once complete, so a failed or interrupted export leaves no truncated archive under the
+  output's name.
 - `import` verifies every block, including blocks already stored, pins with source `user` each root whose
   every block was in the archive, and reports the other roots. A root is never pinned on the strength of
   blocks already held locally, so an archive listing guessed CIDs can't turn cached downloads into provided
@@ -1667,7 +1732,8 @@ changed by other users, who could replace the folder with another.
 - The requester learns that a remote pin is complete when the node shows up as a provider (`providers`).
 - `/pin` is best effort: an accepted pin may still be dropped (quota, or the CID can't be found). rnfs saves the
   pins waiting (in its state database, about once a second and at stop) and resumes them after a restart,
-  unless their identity has left `remote_pin_identities`; a crash may lose those accepted in the last second.
+  unless their identity has left `remote_pin_identities`; a crash may lose those accepted in the last second. From
+  rnfs 0.2.1 they are queued again before the node accepts links, so a release sent as it starts is never lost.
 - The node asked to pin asks the node that asked first (rnfs 0.2.0): its identity, from the identified link, gives
   its node ID, and it serves what it provides even before its provider records are out. One that hasn't it isn't
   held against it, and the providers are looked up as usual.
@@ -1937,7 +2003,9 @@ fetch has the usual limits: `max_download_size`, the DAG byte bound of its new t
 the disk reserve (section 8). It also has `follow_quota` (section 12), since a pinned fetch never stops at
 `max_storage`: a new target whose verified size, or whose DAG's distinct blocks (stored or downloaded), would
 exceed it is refused (a failed fetch, so the old target stays pinned), and `follow_quota` = 0 fetches nothing.
-While one target replaces another both are held, so a followed name can use up to 2 × `follow_quota` for a
+From rnfs 0.2.1 a new target with more than `max_output_entries` directory entries (section 7) is refused too, as a
+`get` of it would be: a tree of empty files has size 0 and fits the quota whatever it holds. While one target replaces
+another both are held, so a followed name can use up to 2 × `follow_quota` for a
 time. A target pinned before the quota was lowered stays pinned. A
 followed name is checked when a newer record is heard and every `announce_interval`.
 - The periodic check uses the record held, unless nothing was heard for the name for
@@ -2175,23 +2243,24 @@ are local conveniences, not part of the protocol.
 | `pin add <cid>[/path] [--background]`, `pin rm <cid>`, `pin ls [<cid>] [--json]`, `pin label <cid> [<label>]` | Manage pins; `ls` shows their sources, whether each is a sealed file (`sealed`: true, false, or null when its stored blocks can't tell), and a local name: the pin's label if it has one, else where it was added from on this machine (recorded locally, never sent; for a sealed file too), the shared-folder entry, or what a stored directory holds. `--json` also gives each pin's `label`, `origin` (where it was added from, kept apart from the label), `size` (as its root block states it), `entries` (a directory's entry count) and `added` (when first pinned, by any source; null for pins made before rnfs 0.2.0). `label` sets a pin's label (local only, lasting while the CID is pinned); without a label it clears it |
 | `cache ls [--json]`, `cache rm <cid>…` | The cached fetches (downloads not pinned, section 8), most recently used first, with their size, completeness and whether the same content is pinned; `rm` evicts those leading to a CID now, deleting the blocks nothing else needs, as `gc` does for all of them |
 | `pin remote add\|rm <node ID> <cid>`, `pin remote ls [<node ID>] [<cid>] [--check] [--json]`, `pin remote ls --served [--json]` | Remote pinning; `ls` lists the remote pins this node asked for (rnfs 0.2.0: node, CID, state, when asked and last checked; section 8, Status), `--check` checking them first, and `--served` those other identities asked of it, with each identity's use of `remote_pin_quota` |
-| `gc`, `verify` | Evict all cached fetches; re-check every stored block against its CID |
-| `providers <cid>` | Find nodes providing a CID |
-| `ping <node ID>` | Open a link and report its round-trip time (`rnprobe` can't probe `rnfs.dht`, which doesn't send delivery proofs) |
+| `gc [--dry-run]`, `verify` | Evict all cached fetches; re-check every stored block against its CID. `--dry-run` (rnfs 0.2.1: `POST /api/gc {"dry_run": true}`) changes nothing and says what `gc` would free, and the stored bytes split by what keeps them: pins, cached fetches, operations in progress, nothing; and what the state database takes (provider records and node state) |
+| `providers <cid>` | Find nodes providing a CID, each printed as it is found (rnfs: `GET /api/providers?stream=1`, JSON lines; a client closing the connection ends the lookup) |
+| `ping <node ID>` | Open a link and report its round-trip time (`rnprobe` can't probe `rnfs.dht`, which doesn't send delivery proofs), or why none: no path, no identity, the wrong identity, not a member, the link refused, closed or not established in time (rnfs: `GET /api/ping` also gives `reason`, the path's `hops`, `interface` and `path_since`, when it was learned; `stream=1` tells of each step, path, identity and link, as it begins) |
 | `name create\|rm\|export\|import <alias>`, `name list` | Manage name keys; `rm` releases the name's pin. A name can't move to another key, so losing its key loses the name for good: `create` and `import` say so and give the `export` command, the node remembers which keys were exported (by `name export`) or imported, and `status` lists the others (`unexported_names`; keys made before rnfs 0.2.0 count as never exported) |
 | `name publish <alias> <cid>[/path]`, `name resolve <name>` | Mutable names. Every `<name>` argument is 32 hex digits or a name contact's nick. `publish` says on stderr when the name's announce is held because the clock is behind its last announce (`announce_held`, section 9) |
 | `name keep\|unkeep <name>`, `name kept` | Keep a name's signed record and serve it (section 9) |
 | `name follow\|unfollow <name>`, `name following` | Keep a name's latest target pinned (section 9) |
 | `name sync <alias> <folder>`, `name unsync <alias>`, `name syncs [--json]` | Keep a name pointing at a folder's current content, published at most once an hour once it has been unchanged a minute (section 9, Syncing a folder); `syncs` lists each sync's folder, state (`new`, `settling`, `waiting`, `synced`, `paused` and why), the root last imported and the one last published and when (rnfs: `POST /api/name/sync {"alias", "path"}`, `POST /api/name/unsync {"alias"}`, `GET /api/name/syncs`) |
 | `export <cid>[/path] -o file [--background]`, `import file [--background]` | Archives; `import --background` runs as an `import` job |
-| `jobs [list]`, `jobs show\|wait\|cancel <id>`, `jobs clear [<id>]` | Background jobs (below) |
+| `jobs [list]`, `jobs show\|wait\|cancel <id>`, `jobs clear [<id>]` | Background jobs (below); from rnfs 0.2.1 the uploads the API is reading (`add -`, an app's stream or tar add, an archive import from a stream) are listed too while they run, and cancelling one stops it (the upload is answered `409` `cancelled`); they are never saved or resumed |
 | `contacts add <nick> <hex> [--kind name\|node\|lxmf]`, `contacts rm <nick>`, `contacts ls` | Contacts (below) |
 | `deny add\|rm <entry>…`, `deny ls` | The local deny list (CIDs, `sha256:<hex>` file hashes); `ls` also shows each `deny_lists` source, the version in use and its state (section 8) |
-| `peers [--json]`, `stats [--json]` | Known nodes with hops, interface, traffic, the last link round-trip time and whether each is online (Peers, below); traffic since start, refusals by cause, per interface |
-| `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
-| `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
+| `peers [--json]`, `stats [--json]` | Known nodes with hops, interface, traffic, the last link round-trip time and whether each is online (Peers, below); traffic since start, refusals by cause, per interface, and (rnfs 0.2.1) Reticulum's interfaces as they stand: up or down, mode, bitrate, bytes and speeds (the shared instance's when attached to one). rnfs only reads them: they are configured in Reticulum's config |
+| `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart (rnfs 0.2.1: `POST /api/config/set` with `dry_run` makes every check and says what it would do, writing nothing, so an app can check settings as the user types them) |
+| `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>`, `app requests [--json]`, `app approve <id> [--code C]`, `app deny <id>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these. `requests` lists the apps asking for a token themselves (pairing, rnfs 0.2.1), each with the code it shows its user, and `approve` gives the one whose code matches its token (which only it collects; the approver never sees it) once the user gives the code the app shows (`--code`, or typed at a terminal; rnfs 0.2.1), `deny` refuses it |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), the hash of the identity `add --identify` identifies to NomadNet nodes with (`nomadnet_identity_hash`, the value a NomadNet node's operator lists; made then if there is none), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), the local servers it knows of (`local_servers`, section 6 "LoRa islands") and whether it is in partition mode and since when (`partition`, `partition_since`: Unix time, or null), the clock's estimated offset from the network's and the names whose announces are held (`clock_offset`, `announces_held`: section 9, "Announces and the clock"; `rnfs status` warns on stderr of an offset over 5 minutes and of held names), what it sees of the network (`network`, `record_store`: Network status, below), storage use, traffic, jobs, deny-list entries and sources (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
+| `restart [--wait S]` | Ask the daemon to stop as `stop` does and start again with the same command line, so settings that need a restart apply, and wait until it answers again (rnfs 0.2.1: 120 s; `POST /api/restart`). On POSIX it starts again in place, keeping its process ID, so a service manager sees no exit; on Windows only a daemon the task wrapper runs can (it exits for the wrapper to start it again). Refused where it can't (daemon.json's `can_restart`) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), the hash of the identity `add --identify` identifies to NomadNet nodes with (`nomadnet_identity_hash`, the value a NomadNet node's operator lists; made then if there is none), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), the local servers it knows of (`local_servers`, section 6 "LoRa islands") and whether it is in partition mode and since when (`partition`, `partition_since`: Unix time, or null), the clock's estimated offset from the network's and the names whose announces are held (`clock_offset`, `announces_held`: section 9, "Announces and the clock"; `rnfs status` warns on stderr of an offset over 5 minutes and of held names), what it sees of the network (`network`, `record_store`: Network status, below), the shared folder as its last scan left it (rnfs 0.2.1, `shared_folder`: its path, entries imported and their bytes, whether a scan runs, when the last ended, why the folder is refused or the last scan failed, and the entries that failed to import, the first 10 by name), storage use, traffic, jobs, deny-list entries and sources (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
 
 **Network status** (rnfs 0.2.0). `status` (`GET /api/status`, the library's `Status`) also reports what the node can
 see of the network from its own state, with nothing sent to learn it: the cheapest way to learn how big the network
@@ -2239,10 +2308,19 @@ renamed. A single file is created directly in the output's directory.
 
 **API** (`127.0.0.1:8788`) and **gateway** (`127.0.0.1:8789`) are separate ports, so pages served by the
 gateway can never reach the API.
+- Both listen on the loopback only: on `127.0.0.1:<port>` and, where the host has IPv6, on `[::1]:<port>` too
+  (rnfs 0.2.1). Browsers and most tools try `localhost` and `*.localhost` names (the gateway's sites, below) on `::1`
+  first, so a daemon listening on `127.0.0.1` alone would leave `[::1]:<port>` to any other local user, who could
+  serve pages in every site's origin and relay what a client dialing `localhost` sends. A port another program holds
+  on `::1` MUST stop the daemon as one held on `127.0.0.1` does; only where the host has no IPv6 (rnfs: binding
+  `::1` fails with "address not available" or "address family not supported") does it listen on `127.0.0.1` alone.
+  Both addresses share one cap on connections (below). API clients MUST dial `127.0.0.1` itself, not a name they
+  resolve (the CLI and `rnfs.apiclient` do), and tools SHOULD use `127.0.0.1` for the path gateway.
 - Both MUST reject requests whose `Host` header isn't `127.0.0.1:<port>` or `localhost:<port>`, which blocks
-  DNS rebinding. The gateway also accepts its site hosts (below), matched as exactly; the API accepts nothing
-  else.
-- Every API request except `GET /api/status` MUST carry `X-Rnfs-Api: <token>`, compared in constant time.
+  DNS rebinding, whichever address a request came to (`[::1]:<port>` is no accepted host). The gateway also accepts
+  its site hosts (below), matched as exactly; the API accepts nothing else.
+- Every API request except `GET /api/status` (and, from rnfs 0.2.1, an app asking for a token and collecting it:
+  pairing, below) MUST carry `X-Rnfs-Api: <token>`, compared in constant time.
   The token is random (at least 128 bits), made anew at each daemon start and written to
   `<rnfs dir>/api_token` with mode 0600 (on Windows, with a protected access list allowing only the user and
   SYSTEM); clients (the CLI, and apps through `rnfs.Client`, built on `rnfs.apiclient`) read it from there and
@@ -2325,7 +2403,10 @@ gateway can never reach the API.
 - **For apps** (rnfs 0.2.0). While it runs, the daemon describes itself in `<rnfs dir>/daemon.json` (written
   atomically after its API listens, mode 0600 like the token, removed when it stops): its process ID, API and
   gateway ports, version, start time, rnfs directory, Reticulum config directory, whether it attached to a shared
-  instance, and node ID. Clients read the port there first (refusing a symlink, a file other users could have
+  instance, and node ID; from 0.2.1 also what started it (`started_by`: `systemd`, `launchd`, `windows_task`,
+  `terminal`, `unknown`, or what the program starting it set `RNFS_STARTED_BY` to, such as `app:<name>`), the
+  service unit or launchd label (`service`), `sandbox` (`flatpak`) and whether `POST /api/restart` can restart it
+  (`can_restart`), so an app needn't ask the service managers. Clients read the port there first (refusing a symlink, a file other users could have
   written, or one whose process has ended), so a client finds the daemon even when it can't read a newer
   daemon's `rnfs.toml`; nothing else in it is trusted, and the proof above still comes first. Errors are
   `{"error": message, "code": code}`, the code machine-readable and never renamed once released, so a client
@@ -2334,9 +2415,31 @@ gateway can never reach the API.
   error codes and headers, checked against the code by the tests); `GET /api/capabilities` lists the daemon's
   routes, features, event kinds, error codes and
   capabilities. `POST /api/shutdown` stops the daemon as SIGTERM does,
-  after answering (Windows has no other clean way for a program to stop a daemon running in the background). `GET /api/events` is a long poll on the
+  after answering (Windows has no other clean way for a program to stop a daemon running in the background);
+  `POST /api/restart` (0.2.1) stops it so and starts it again, for a daemon started in a terminal as much as one a
+  service runs. **Pairing** (0.2.1): an app with no token asks for one (`POST /api/apps/request`, no token, naming
+  itself in the custom header `X-Rnfs-Pairing`, so no web page can ask: its request would need a CORS preflight,
+  which fails) and is given a request id, a secret and a 6-digit code to show its user. The user sees the request
+  with the same code where the CLI's token is (`rnfs app requests`, or an app told by an `apps` event) and approves
+  or denies it; the code tells their app's request from one another local process made under the same name. Any
+  local process can ask under any name, so asking first MUST NOT keep another from asking under the same name: a
+  name may have several requests waiting, each with its own code, and approving one denies the others under that
+  name. Approving takes the code the user reads off the app (`POST /api/apps/approve`'s `code`, optional for
+  compatibility; the CLI's `rnfs app approve <id> --code <code>`, or asked for at a terminal) and refuses another
+  code (`400`), the request still waiting. The answer to a request MUST NOT depend on the apps there are (rnfs 0.2.1,
+  as for the proof above): a name an app already has is refused when the user approves (`400`, a name clash), not
+  when an app asks. Once approved the app collects its token with the secret (`GET /api/apps/request`), once. A
+  node SHOULD bound the requests waiting (rnfs: 32, for 10 minutes, in memory only), and SHOULD NOT refuse a new one
+  for want of room, which would let one process shut pairing out by asking once in a while: rnfs forgets the oldest
+  waiting instead (its app is told the request is gone, as when it expires), so only a flood faster than the user
+  answers keeps an app out, and the user sees it. As with any client before it holds a token, an app
+  pairing can't tell the daemon from another program squatting its port while it is down: one that can read the
+  rnfs directory should use `rnfs app add` instead. `GET /api/log` (0.2.1) gives its recent log lines, its own and Reticulum's as its console shows them
+  (rnfs: the last 2000, kept in memory only), so an app shows the log of a daemon it didn't start. `GET /api/events` is a long poll on the
   node's events — jobs, pins, cached fetches, names it holds, peers and remote pins (those it asked
-  for and those it serves, section 8) — numbered within a run:
+  for and those it serves, section 8); from 0.2.1 settings changed through the API (with those a restart would
+  change), name syncs started, stopped or changed, apps added or removed, and status fields changed (checked at
+  most every 30 s, so a status page needn't poll) — numbered within a run:
   answered as soon as there is an event after the sequence the client gives, or after a wait (at most 30 s),
   level-triggered like the name watch below, so a client asking again with what it was given loses nothing. A
   node keeps a bounded number of events (rnfs: 1024) and says `lost` when the client asks for some it no longer
@@ -2498,14 +2601,16 @@ message that call would have reported.
   link takes a new snapshot). Their path MUST exist when queued (404 otherwise); they have no target or output, so
   the output rules don't apply.
 - Stopping the node MUST NOT wait for jobs beyond a short bound (rnfs: the node's stop budget, 5 s for every
-  thread it ends); a job interrupted by the shutdown is saved as queued and resumes at the next start.
+  thread it ends, all of them asked to end before any is waited for); a job interrupted by the shutdown (from rnfs
+  0.2.1 also one whose run fails as the node stops) is saved as queued and resumes at the next start.
 - At most `max_finished_jobs` (at least 1) finished jobs are kept, the oldest finished forgotten first, but
   a finished job is kept for at least 60 s whatever the cap, so a client following a fast job always finds
   its result. At most 1000 jobs may be queued or running (more are refused as busy). Two queued or running
   jobs MUST NOT share an output path, and a job's output path MUST NOT exist when it is queued.
-- A `get` job writes to a temporary hidden name beside its output (rnfs: `.rnfs-job-<id>.partial`) and renames
-  it when complete; if the output appeared meanwhile, the job fails. A failed, cancelled or interrupted job's
-  temporary output is removed (a resumed job removes one left by a crash).
+- A `get` or `export` job writes to a temporary hidden name beside its output (rnfs: `.rnfs-job-<id>.partial`)
+  and renames it when complete; if the output appeared meanwhile, the job fails, unless it is a resumed job and
+  the output holds the same content (a run's rename a crash kept from being recorded). A failed, cancelled or
+  interrupted job's temporary output is removed (a resumed job removes one left by a crash).
 - A `get` job MAY ask (`sealed_name`) that a sealed file this node opens be written under its sealed name, if
   that passes the `get` default-name rule, in the output's directory; the final path is then the job's output.
   For a sealed folder unpacked that name is its top directory's (the result's `name`). A `get` job MAY ask
@@ -2592,13 +2697,18 @@ in its requests and responses (rnfs: these routes):
   component, or whose names break the entry-name rules are skipped with a warning; directories a path implies
   are made; a later file replaces an earlier one of the same path, and a member conflicting with what is
   there as the other type is skipped with a warning. A file is executable if its mode has the owner's execute
-  bit. Sealing is refused (400): a sealed folder is added from a path (`POST /api/add` with `to`), where the node
-  packs the folder itself (section 5). The node MUST bound what a tar can make it hold: rnfs refuses (413) more than
+  bit. With `to`/`to_self` (rnfs 0.2.1) the tar is sealed as a folder instead (section 5), `name` (required) being
+  the folder's: its members are read under the same rules and written again as the node packs a folder from a path,
+  under `name/` after the sealed-folder marker, and only the sealed bytes are stored (`seal_name` is refused: the
+  sealed name is `<name>.tar`). The node MUST bound what a tar can make it hold: rnfs refuses (413) more than
   `max_output_entries` files and directories or nesting deeper than `MAX_DEPTH`, refuses (400) extended headers
   over 64 KiB, more than 8 in a row, global headers of more than 4 KiB in all, and sparse files, and keeps 100
   warnings (counting the rest), each naming at most 300 characters of the member. A malformed header anywhere,
   anything but zeros after the tar's end (as a zeroed header in its middle leaves), or a body ending inside the
   tar, is an error (400), never a shorter directory. The result is `/api/add`'s, the root pinned `user` (or cached with `pin=0`).
+  A stream add (with or without `format=tar`) takes `origin` (rnfs 0.2.1): what `pin ls` says the content was added
+  from (a URL, the app's own path for it), so an app's adds aren't all listed as `(stdin)` and the user's label stays
+  free.
 - `GET /api/get/stream?target=&format=tar`: the target as a tar, its DAG fetched first within
   `max_download_size` and `max_output_entries` (413) and checked against the deny list (451) like `get`, then
   sent with an exact Content-Length, so a client can tell a transfer cut short. A directory's entries are the
@@ -2619,12 +2729,21 @@ while after it (rnfs: 60 s); watching sends nothing to the network. A node SHOUL
 (rnfs: 64), the calls waiting at once (rnfs: 4, so watchers can't take the API's connections; more get `503`)
 and the names watched (rnfs: 1024). `GET /api/cat` takes `from`, a node to fetch from, as `GET /api/info` does.
 
+**Routing table** (rnfs 0.2.1). `GET /api/routing` gives the DHT routing table as the node holds it, read from
+memory: each bucket holding a node, with each node's first-seen and last-heard times, its queries unanswered since
+it was last heard and whether it is stale (the first to give up its place); how many nodes left with their seniority
+kept for a while; the nodes avoided as unreliable (in the table or not) and when each may be queried again; and the
+bans, with when each ends and why (a ban's reason is kept in memory only: one from before a restart has none), and
+how many identities Reticulum blackholes.
+
 **Peers.** `GET /api/peers` lists the nodes this one knows (in its routing table, with an open link, or met since
 it started) with what it already knows of each, gathered without network I/O. Besides the path and traffic fields,
 each has `first_heard` (when this node first heard of it, as far as it knows: rnfs keeps nothing of its peers
 across a restart, so it is since the start unless the routing table or Reticulum's own announce cache knows an
 earlier time; null if nothing does), `rtt` and `rtt_at` (the round trip measured on the last link this node
-established to it, a ping's included, in seconds, and when; null if none) and `online`, decided by the node so
+established to it, a ping's included, in seconds, and when; null if none), `last_seen` (the Unix time of that
+last sign it was up, below; null if none since the start; `last_heard`, which a path response refreshes, is no such
+sign) and `online`, decided by the node so
 every client applies the same rule: online while a link to it is open, or within a window (rnfs: 15 minutes) of
 the last sign it was up — an answer to a request (a refusal too), a request of its own served, a link established,
 or an announce of its own emitted within the window (by the emission time signed in it, allowing some clock
@@ -2730,7 +2849,7 @@ Reticulum, the DHT mode and private mode never apply before a restart.
 | `provide_entries_max` | 100,000 | Entry keys `provide_entries` provides at most: pins oldest first, each pin's entries all or none (section 6). 0: none |
 | `gateway_scripts` | on | |
 | `gateway_fetches` | 2 | Network fetches at a time for requests that aren't the user's own navigation |
-| `api_port`, `gateway_port` | 8788, 8789 | Local API and gateway ports, on 127.0.0.1 (section 11) |
+| `api_port`, `gateway_port` | 8788, 8789 | Local API and gateway ports, on 127.0.0.1 and ::1 (section 11) |
 | `bootstrap_nodes` | empty | Node IDs contacted first when joining (section 6) |
 | `default_bootstrap` | on | Also contact the default bootstrap nodes when joining; never in private mode (section 6) |
 | `reticulum_dir` | RNS's own | RNS config directory, the one `rnsd` uses by default |

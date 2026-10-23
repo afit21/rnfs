@@ -15,7 +15,9 @@ publisher) and searchers to ask (to come). It is local state: nothing about it i
   therefore pushes out only its own newest, and servers gone silent: forgetting the least recently heard first, as
   0.2.0's first version did, let about 3 fresh identities a second (65,536 in 6 hours) push out every honest server
   between its 6-hourly announces, so none ever became senior (REV7). A server that announces client mode is forgotten
-  (it is no longer a server; if it comes back, it is new again).
+  (it is no longer a server; if it comes back, it is new again), but only for an announce emitted after its last
+  server announce here: the node judges that (rnfs.node's _heard_client), as a replayed old client announce would
+  make an honest server new again (AUD-L9).
 - Each announce costs a dictionary update, and a sorted insert (a memory move) for a server not heard before; the
   rows changed are written together with the node's batched saves (every 30 s) and at stop, not durably, so a flood
   of announces costs one transaction per save, not one per announce. A row's last-heard time is the time of the
@@ -184,6 +186,12 @@ class FirstSeenLog:
         """When node_id's announce was first heard (Unix time), or None if it isn't in the log."""
         with self._lock:
             return self._first.get(node_id)
+
+    def last_heard(self, node_id: bytes) -> float | None:
+        """When node_id's announce was last heard (Unix time; as loaded, the save that wrote it), or None if it isn't in
+        the log."""
+        with self._lock:
+            return self._last.get(node_id)
 
     def __len__(self) -> int:
         """Servers in the log."""

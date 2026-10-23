@@ -13,10 +13,12 @@ updates:
       actions:
         patterns: ["*"]
 
-  # Report only: open-pull-requests-limit 0 turns off version-update pull requests for pyproject.toml's
-  # dependencies, while a vulnerable one is still reported (Dependabot alerts and security updates, once turned on
-  # in the repository's settings). rnfs relies on RNS internals, so a new version is taken deliberately:
-  # packaging/update-lock.py, packaging/flatpak/generate-sources.py and tests/test_rns_compat.py (CONTRIBUTING.md)
+  # open-pull-requests-limit 0 turns off version-update pull requests for pyproject.toml's dependencies. rnfs
+  # relies on RNS internals, so a new version is taken deliberately: packaging/update-lock.py,
+  # packaging/flatpak/generate-sources.py and tests/test_rns_compat.py (CONTRIBUTING.md). Dependabot alerts (a
+  # repository setting) see only pyproject.toml's version ranges: Dependabot doesn't read packaging/*.lock, so it
+  # doesn't report a vulnerable pinned version, runtime or build tool. .github/workflows/audit.yml checks those
+  # pins against OSV instead
   - package-ecosystem: pip
     directory: /
     schedule:

@@ -236,6 +236,15 @@ class BlockStore:
         except FileNotFoundError:
             return None
 
+    def signature(self, cid: Cid) -> tuple[int, int, int] | None:
+        """The stored block file's (inode, size, modification time in ns), which a rewrite or a replacement changes, or
+        None if it isn't stored."""
+        try:
+            info = os.stat(self.path(cid))
+        except FileNotFoundError:
+            return None
+        return info.st_ino, info.st_size, info.st_mtime_ns
+
     def size(self, cid: Cid) -> int | None:
         """Length of the stored block, or None if it isn't stored."""
         try:
@@ -320,8 +329,12 @@ class BlockStore:
         return freed
 
     def verify(self, cid: Cid) -> bool:
-        """True if the stored block exists and matches its CID."""
-        block = self.get(cid)
+        """True if the stored block exists, can be read and matches its CID (one that can't be read, a disk error or
+        a file this user can't open, is as bad as one that doesn't match)."""
+        try:
+            block = self.get(cid)
+        except OSError:
+            return False
         return block is not None and matches(cid, block)
 
     def scan(self, tidy: bool = False) -> Iterator[tuple[Cid, int]]:

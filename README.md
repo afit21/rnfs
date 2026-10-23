@@ -21,7 +21,7 @@ Access any file on RNFS by it's **'CID'**.
 
 No centralized servers
 
-<img width="700" alt="rnfs demo" src="https://raw.githubusercontent.com/afit21/rnfs/refs/heads/main/rnfsgifcompressed.gif" />
+<img width="700" alt="rnfs demo" src="https://raw.githubusercontent.com/afit21/rnfs/refs/heads/main/docs/rnfs-demo.gif" />
 
 ### Embed content on Nomadnet sites by linking to a CID
 
@@ -78,7 +78,7 @@ Different package options available at [latest release](https://github.com/afit2
 
 **Windows:**
 
-[`rnfs-0.2.0-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-windows-x64.exe), saved as `rnfs.exe`
+[`rnfs-0.2.1-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-windows-x64.exe), saved as `rnfs.exe`
   somewhere on your PATH ([how](#windows)).
 
 **Linux:**
@@ -95,7 +95,7 @@ Or installers for ([Debian & Ubuntu](#debian-and-ubuntu)).  [Flatpak](#other-lin
 
 **macOS:**
 
-`pipx install https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-py3-none-any.whl` ([details](#macos)).
+`pipx install https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-py3-none-any.whl` ([details](#macos)).
 
 ## 2 - Start rnfs and leave it running in its own terminal:
 
@@ -129,14 +129,14 @@ command. Your data in `~/.rnfs` is never touched by an update or uninstall.
 
 | System | Download |
 |---|---|
-| Windows (64-bit) | [`rnfs-0.2.0-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-windows-x64.exe) ([how](#windows)) |
-| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.2.0_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs_0.2.0_amd64.deb) or [`rnfs_0.2.0_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs_0.2.0_arm64.deb) ([how](#debian-and-ubuntu)) |
-| Other Linux (x86_64) | [`rnfs-0.2.0-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-x86_64.flatpak) ([how](#other-linux-flatpak)), or the [install script](#install-script) |
-| macOS, or any system with Python 3.11+ | [`rnfs-0.2.0-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-py3-none-any.whl) ([how](#macos)) |
+| Windows (64-bit) | [`rnfs-0.2.1-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-windows-x64.exe) ([how](#windows)) |
+| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.2.1_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs_0.2.1_amd64.deb) or [`rnfs_0.2.1_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs_0.2.1_arm64.deb) ([how](#debian-and-ubuntu)) |
+| Other Linux (x86_64) | [`rnfs-0.2.1-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-x86_64.flatpak) ([how](#other-linux-flatpak)), or the [install script](#install-script) |
+| macOS, or any system with Python 3.11+ | [`rnfs-0.2.1-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-py3-none-any.whl) ([how](#macos)) |
 
-These links are for 0.2.0; for a newer version, take the same files from the
+These links are for 0.2.1; for a newer version, take the same files from the
 [latest release](https://github.com/afit21/rnfs/releases/latest), which also has the source archive
-(`rnfs-0.2.0.tar.gz`) and `SHA256SUMS` ([checking a download](#checking-a-download)).
+(`rnfs-0.2.1.tar.gz`) and `SHA256SUMS` ([checking a download](#checking-a-download)).
 
 ## Windows
 
@@ -145,7 +145,7 @@ The exe is a single file with Python and Reticulum inside. In PowerShell, from y
 ```powershell
 $bin = "$env:USERPROFILE\.local\bin"
 New-Item -ItemType Directory -Force $bin | Out-Null
-Move-Item .\rnfs-0.2.0-windows-x64.exe "$bin\rnfs.exe" -Force
+Move-Item .\rnfs-0.2.1-windows-x64.exe "$bin\rnfs.exe" -Force
 Unblock-File "$bin\rnfs.exe"
 [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$bin", "User")
 # open a new terminal, then:
@@ -167,8 +167,8 @@ there, run `sudo apt install python3.11 python3.11-venv` and then the [install s
 `python3.11`.
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs_0.2.0_amd64.deb
-sudo apt install ./rnfs_0.2.0_amd64.deb
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs_0.2.1_amd64.deb
+sudo apt install ./rnfs_0.2.1_amd64.deb
 systemctl --user enable --now rnfs      # run it as a service; logs: journalctl --user -u rnfs -f
 loginctl enable-linger $USER            # keep it running while you're logged out
 ```
@@ -179,9 +179,9 @@ loginctl enable-linger $USER            # keep it running while you're logged ou
 ## Other Linux (Flatpak)
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-x86_64.flatpak
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-x86_64.flatpak
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak install --user rnfs-0.2.0-x86_64.flatpak
+flatpak install --user rnfs-0.2.1-x86_64.flatpak
 alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc
 rnfs daemon
 ```
@@ -189,15 +189,18 @@ rnfs daemon
 The app can use the network, `~/.rnfs` and `~/.reticulum`, and your Downloads folder: not the rest of your home
 folder, nor any device. Grant more with `flatpak override --user --device=all io.github.afit21.rnfs` (RNode and
 other serial interfaces) or `flatpak override --user --filesystem=<folder> io.github.afit21.rnfs` (another
-folder, or `~/.config/reticulum` if your Reticulum config is there); `--reset` takes them back. Until 0.1.6 the app had your whole home folder and every
-device: after updating, grant the ones you used again. Update by installing the newer `.flatpak`; uninstall
+folder, or `~/.config/reticulum` if your Reticulum config is there); `--reset` takes them back. This limits what
+the app can reach, but doesn't contain a compromised daemon: it can write `~/.reticulum`, whose config can name
+programs (a `PipeInterface`'s command, `interfaces/*.py`) that Reticulum programs you run outside the sandbox
+(`rnsd`, NomadNet, a pip-installed `rnfs`) then run, and `~/.rnfs`, whose `rnfs.toml` a host `rnfs` reads.
+Until 0.1.6 the app had your whole home folder and every device: after updating, grant the ones you used again. Update by installing the newer `.flatpak`; uninstall
 with `flatpak uninstall --user io.github.afit21.rnfs`.
 
 ## macOS
 
 ```sh
 brew install pipx && pipx ensurepath          # then open a new terminal
-pipx install https://github.com/afit21/rnfs/releases/download/v0.2.0/rnfs-0.2.0-py3-none-any.whl
+pipx install https://github.com/afit21/rnfs/releases/download/v0.2.1/rnfs-0.2.1-py3-none-any.whl
 rnfs daemon
 ```
 
@@ -228,15 +231,20 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
 curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --uninstall  # remove it (keeps ~/.rnfs)
 ```
 
-- Running it again updates rnfs and restarts the service if you installed it.
+- Running it again updates rnfs and restarts the service if you installed it. It won't install an older version
+  over a newer one, nor the latest release over a `--main` install of the same version number (which may be
+  newer), since a daemon that ran the newer one may refuse its upgraded state: `--force` does it anyway.
 - `--main` installs the main branch instead (no checksum to check; give it on every update).
 - `--system`, as root, installs for all users in `/opt/rnfs` and `/usr/local/bin/rnfs`.
 - `--python PATH` picks the Python; `--force` replaces another `rnfs` command (e.g. pipx's);
   `RNFS_SOURCE=<dir, archive, .whl or URL>` installs something other than the latest release (nothing checks
   it; a plain `http://` URL gets a warning).
-- With the service, `loginctl enable-linger $USER` keeps it running while you're logged out. More sandboxing
-  (`ProtectSystem`, `PrivateTmp`) needs unprivileged user namespaces, so it is an optional drop-in, for this
-  unit or the `.deb`'s: see [`contrib/rnfs.service.d/hardening.conf`](contrib/rnfs.service.d/hardening.conf).
+- With the service, `loginctl enable-linger $USER` keeps it running while you're logged out. The unit limits the
+  daemon's system calls, but not what it can write in your home folder. Sandboxing that does needs
+  unprivileged user namespaces, so it is an optional drop-in, for this unit or the `.deb`'s:
+  [`contrib/rnfs.service.d/strict.conf`](contrib/rnfs.service.d/strict.conf) makes your home read-only except
+  `~/.rnfs`, `~/.reticulum` and `~/Downloads` (so `rnfs get -o` writes only there), and
+  [`hardening.conf`](contrib/rnfs.service.d/hardening.conf) adds only `ProtectSystem` and `PrivateTmp`.
 
 ## Checking a download
 
@@ -244,12 +252,12 @@ Each release's `SHA256SUMS` lists every file's checksum. With it next to your do
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing                  # Linux; macOS: shasum -a 256 <file>
-gh attestation verify rnfs_0.2.0_amd64.deb --repo afit21/rnfs
+gh attestation verify rnfs_0.2.1_amd64.deb --repo afit21/rnfs
 ```
 
 A matching checksum shows the file is whole, not who made it. The signed build provenance, checked with the
 [GitHub CLI](https://cli.github.com/) (2.49 or newer, logged in), shows it was built by this repository's
-release workflow. On Windows, `Get-FileHash .\rnfs-0.2.0-windows-x64.exe` gives the checksum.
+release workflow. On Windows, `Get-FileHash .\rnfs-0.2.1-windows-x64.exe` gives the checksum.
 
 ## From source
 
@@ -466,7 +474,7 @@ quiet_hours = "22:00-06:00"
 | `deny_lists` | `[]` | [Deny lists](#keeping-content-off-your-node) to apply |
 | `keep_max_names` | `100` | Names you keep or follow for others |
 | `follow_quota` | 1 GiB | Storage each followed name's target may use; a larger one isn't fetched and the previous one stays pinned (up to twice this while it changes). `0` stops fetching followed names |
-| `api_port`, `gateway_port` | `8788`, `8789` | Local API and gateway ports (127.0.0.1 only) |
+| `api_port`, `gateway_port` | `8788`, `8789` | Local API and gateway ports (loopback only: 127.0.0.1 and ::1) |
 | `gateway_scripts` | `true` | Let gateway pages run scripts |
 | `debug_log` | `false` | Write `~/.rnfs/debug.log` (readable by you only) for diagnosing problems (`daemon --debug-log`) |
 | `verbosity` | `0` | Extra logging: 1 per-query detail, 2 RNS debug output (`daemon -v`, `-vv`) |

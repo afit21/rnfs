@@ -21,7 +21,7 @@ interface.py, objects.py, embedded.py, remote.py: the public API (rnfs.Node, rnf
 uris.py      rnfs: links (rnfs.Link, parse_uri, format_uri) and the LXMF link map (encode_field, decode_field)
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 API_STATUS = "provisional"  # the public API (rnfs.Node, rnfs.Client) and the local API may change until 1.0.0
 
 # Public name -> the module defining it, imported on first use (PEP 562)
@@ -30,9 +30,9 @@ _EXPORTS = {
     "Client": "rnfs.remote",
     **{name: "rnfs.objects" for name in ("Cid", "Added", "Written", "Entry", "Info", "Stat", "Pin", "Record",
                                          "Status", "Collected", "Verified", "Exported", "Imported", "DenyState",
-                                         "Peer", "Stats", "Contact", "Kept", "Followed", "Cached", "Uncached",
-                                         "Event", "EventBatch", "Capabilities", "Setting", "Settings",
-                                         "SettingsChange", "RemotePin", "ServedPin", "RemotePinUsage",
+                                         "Peer", "Ping", "Routing", "Stats", "Contact", "Kept", "Followed",
+                                         "Cached", "Uncached", "Event", "EventBatch", "Capabilities", "Setting",
+                                         "Settings", "SettingsChange", "RemotePin", "ServedPin", "RemotePinUsage",
                                          "ServedPins", "FolderSync")},
     **{name: "rnfs.interface" for name in ("Rnfs", "Name", "Names", "Job", "Jobs", "Deny", "Watch", "File",
                                            "Contacts", "Events")},

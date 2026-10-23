@@ -38,8 +38,8 @@ RNS_LEVEL = 4  # RNS.LOG_INFO: Reticulum's own messages this severe or more are 
 LEVEL_NAMES = {0: "Critical", 1: "Error", 2: "Warning", 3: "Notice", 4: "Info", 5: "Verbose", 6: "Debug",
                7: "Pathing", 8: "Extra"}
 # RNS's own log line: "[time] [Level] message" (its compact format has neither, and is copied as is)
-_RNS_LINE = re.compile(r"\[[^\]]*\] \[(\w+)\]\s*(.*)", re.DOTALL)
-_LEVEL_NUMBERS = {name: number for number, name in LEVEL_NAMES.items()}
+RNS_LINE = re.compile(r"\[[^\]]*\] \[(\w+)\]\s*(.*)", re.DOTALL)
+LEVEL_NUMBERS = {name: number for number, name in LEVEL_NAMES.items()}
 
 _active: "DebugLog | None" = None
 _previous_hook = None  # threading.excepthook before start()
@@ -167,9 +167,9 @@ def _rns_output(logstring: str):
     debug = _active
     if debug is None or rnfs_log.passing_through():
         return
-    match = _RNS_LINE.fullmatch(logstring)
-    if match and match.group(1) in _LEVEL_NUMBERS:
-        level = _LEVEL_NUMBERS[match.group(1)]
+    match = RNS_LINE.fullmatch(logstring)
+    if match and match.group(1) in LEVEL_NUMBERS:
+        level = LEVEL_NUMBERS[match.group(1)]
         if level <= RNS_LEVEL:
             debug.write(level, "RNS", match.group(2))
     else:

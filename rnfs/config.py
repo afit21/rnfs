@@ -76,8 +76,8 @@ LIVE_SETTINGS = frozenset({
 # One line per setting (specification section 12 has the full notes)
 DESCRIPTIONS = {
     "reticulum_dir": "Reticulum config directory; unset: RNS's own, the one rnsd uses",
-    "api_port": "Local API port, on 127.0.0.1",
-    "gateway_port": "Gateway port, on 127.0.0.1; 0: any free port",
+    "api_port": "Local API port, on 127.0.0.1 and ::1",
+    "gateway_port": "Gateway port, on 127.0.0.1 and ::1; 0: any free port",
     "bootstrap_nodes": "Node IDs (hex) contacted first when joining the DHT",
     "default_bootstrap": "Also contact the default bootstrap nodes when joining (never in private mode)",
     "verbosity": "Extra logging: 1 per-query detail, 2 RNS debug output",
@@ -366,7 +366,7 @@ class Config:
         for slow_node in (False, True):
             if self.effective_republish_interval(slow_node) >= PROVIDER_TTL / 2:
                 raise ValueError("republish_interval must be less than PROVIDER_TTL / 2")
-        # Both are bound on 127.0.0.1 at start, so one port for both stops the daemon then
+        # Both are bound on 127.0.0.1 and ::1 at start, so one port for both stops the daemon then
         if self.gateway_port != 0 and self.api_port == self.gateway_port:
             raise ValueError("api_port and gateway_port must differ")
 

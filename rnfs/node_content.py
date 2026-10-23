@@ -118,14 +118,15 @@ def add_sealed_path(path: str, put: builder.Put, wrap: bool, recipients: list[by
 
     A folder is packed as one tar (tarstream.folder_chunks: add's rules, everything under the folder's name, at
     most max_entries files and directories) and sealed as `<folder>.tar` (folder_sealed_name), which is also its
-    visible name with wrap. As builder.build_path, a path that is one of options.skip_dirs is refused (ValueError)
-    and a directory inside the folder that is one is skipped with a warning."""
+    visible name with wrap. As builder.build_path, a path that is one of options.skip_dirs, or that
+    options.root_check refuses as opened, is refused (ValueError), and a directory inside the folder that is one is
+    skipped with a warning."""
     from rnfs.content import tarstream
 
     handle, st = builder.open_path(path)
     try:
         skip_dirs = options.skip_dirs if options is not None else frozenset()
-        builder.check_root(st, path, skip_dirs)
+        builder.check_root(handle, st, path, options)
         name = os.path.basename(os.path.normpath(os.path.abspath(path)))
         progress = options.progress if options is not None else None
         warnings: list[str] = []
@@ -597,17 +598,17 @@ def add_nomadnet(node, link: str, wrap: bool = False, only_hash: bool = False, p
                  progress: Callable[[int, int | None], None] | None = None, source: str = USER) -> dict:
     """Fetch what a NomadNet node serves at link (rnfs/network/nomadnet.py: its own bounded link, anonymous unless
     identify) and add it as add_stream adds data: chunked, checked against the deny list, pinned with source (cache
-    if not pin) unless only_hash, sealed for to/to_self. It is a file named by nomadnet.snapshot_name (the node's name
+    if not pin) unless only_hash, sealed for to/to_self. It is a file named by nomadnet_links.snapshot_name (the node's name
     for a file, the path's last component for a page), wrapped under that name with wrap or under name if given (as
     `add - --name`; sealing seals that name inside instead, unless wrap), unless not seal_name; pin ls names the
     link as its origin. Each call takes a new
     snapshot. progress(received, total) as the fetch takes it. {"cid", "size", "warnings", "name", "link"}
     (+ "sealed")."""
-    from rnfs import nomadnet
+    from rnfs import nomadnet_links
     from rnfs.network import nomadnet as fetching
 
-    target = nomadnet.parse(link)
-    if name is not None and not nomadnet.is_valid_name(name):
+    target = nomadnet_links.parse(link)
+    if name is not None and not nomadnet_links.is_valid_name(name):
         raise ValueError(f"invalid entry name {name!r}")
     seal_recipients(node, to, to_self, only_hash)  # unknown recipients refused before anything is fetched
     builder.BuildOptions(chunker)  # an unknown chunker too
@@ -620,7 +621,7 @@ def add_nomadnet(node, link: str, wrap: bool = False, only_hash: bool = False, p
                               stop_event=getattr(node, "stop_event", None),
                               paths=getattr(getattr(node, "links", None), "paths", None))
     try:
-        entry = name or nomadnet.snapshot_name(target, snapshot.sent_name)
+        entry = name or nomadnet_links.snapshot_name(target, snapshot.sent_name)
         sealing = bool(to or to_self)
         # As `add - --name`: name wraps it, except that sealing seals the name inside instead, unless wrap
         wrapper = entry if wrap or (name and not sealing) else None

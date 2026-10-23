@@ -551,6 +551,22 @@ class PublishTest(NamesTestCase):
         self.manager.publish("moved", CID_C)
         self.assertEqual(self.network.path_requests, [name])
 
+    def test_first_publish_of_imported_key_goes_past_the_floor(self):
+        """A sequence this node resolved before, its record since gone from the table, is exceeded too: else the
+        publish goes out below what nodes that saw it accept, and this node's own floor drops."""
+        identity = RNS.Identity()
+        name = names.name_for_identity(identity)
+        self.network.store(name, encode_record(10, CID_A), self.clock())
+        self.assertEqual(self.manager.resolve(name, persist=False)["sequence"], 10)
+        self.manager.stop()
+        self.manager.close()
+        self.network.app_data.clear()
+        self.network.heard.clear()
+        restarted = self.make_manager()
+        restarted.import_key("moved", identity.get_private_key())
+        self.assertEqual(restarted.publish("moved", CID_B)["sequence"], 11)
+        self.assertEqual(restarted.known_sequence(name), 11)
+
     def test_first_publish_of_imported_key_asks_keepers(self):
         """Its old announces may have expired while keepers still hold its highest sequence (section 9)."""
         keepers = self.manager.keepers = FakeKeepers()

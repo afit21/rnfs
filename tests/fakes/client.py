@@ -77,8 +77,10 @@ class FakeClient:
         self.close(node_id)
         return True
 
-    def blocks(self, node_id: bytes, cids: list[Cid], on_progress=None) -> BlocksResult:
-        """Serve what node_id holds, BATCH CIDs per request (the calling thread counted among node_id's users)."""
+    def blocks(self, node_id: bytes, cids: list[Cid], on_progress=None,
+               slot_wait: float | None = None) -> BlocksResult:
+        """Serve what node_id holds, BATCH CIDs per request (the calling thread counted among node_id's users; no
+        link slots to wait for: tests/security/test_audh4_dripping_probe.py's SlotClient adds them)."""
         ident = threading.get_ident()
         with self.lock:
             users = self.users.setdefault(node_id, {})
@@ -112,7 +114,8 @@ class FakeClient:
         return result
 
     def block_range(self, node_id: bytes, cid: Cid, held: bytes = b"", max_bytes: int = 0, compress: bool = False,
-                    block_size: int | None = None, on_progress=None, answers: bool | None = None) -> RangeResult:
+                    block_size: int | None = None, on_progress=None, answers: bool | None = None,
+                    slot_wait: float | None = None) -> RangeResult:
         """Serve the next range of cid's block from what node_id holds, as a 0.2.0 node answers /range; recorded in
         ranges, and the first range of a block also in requests (as a request for [cid]: asked() counts each block
         asked for once, however many ranges it takes). A node in no_range leaves it unanswered, as one before 0.2.0

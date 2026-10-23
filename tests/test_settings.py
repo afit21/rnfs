@@ -333,6 +333,24 @@ class ApiTest(SettingsBase):
         body = self.set({"announce_interval": 10}, status=400)
         self.assertEqual(body["error"], "announce_interval must be at least 60 seconds")
 
+    def test_an_interval_raised_to_its_minimum_is_not_pending(self):
+        """An interval rnfs.toml sets below its least (taken before 0.2.0) is raised to it at every start, so a node
+        running that least has nothing pending: it was listed as changed, applying at the next start."""
+        self.write("announce_interval = 30\n")
+        self.b.config.announce_interval = 60.0  # what the start that read this file runs
+        entry = self.setting("announce_interval")
+        self.assertEqual((entry["value"], entry["file"], entry["pending"]), (60.0, 30, False))
+        self.assertNotIn("!", "".join(line[0] for line in feature_module.format_settings(
+            self.call("GET", "/api/config")[1]) if line))
+
+    def test_a_live_setting_set_to_its_value_is_not_said_applied(self):
+        """A live setting set to the value the node runs is saved but in neither "applied" nor "restart_required",
+        as a setting applying at the next start is: it was said applied."""
+        result = self.set({"max_finished_jobs": self.b.config.max_finished_jobs, "max_output_entries": 5000})
+        self.assertEqual((result["applied"], result["restart_required"]), (["max_output_entries"], []))
+        self.assertIn(f"max_finished_jobs = {self.b.config.max_finished_jobs}", self.read())
+        self.assertEqual(self.b.config.max_output_entries, 5000)
+
     def test_set_on_a_file_with_a_byte_order_mark(self):
         self.write("\ufeffmax_storage = 100\n")
         self.set({"max_storage": 5_000_000})
@@ -369,6 +387,33 @@ class ApiTest(SettingsBase):
         # What a restart loads
         loaded = Config.load(self.b.config.root)
         self.assertEqual((loaded.max_storage, loaded.dht_mode, loaded.members), (5_000_000, "client", []))
+
+    def test_dry_run_checks_and_changes_nothing(self):
+        """dry_run (0.2.1) answers what set would, with dry_run, writing and applying nothing; a refusal is the same
+        refusal."""
+        self.write("max_storage = 100  # mine\n")
+        before = self.read()
+        got, body = self.call("POST", "/api/config/set", {"settings": {"max_storage": 5_000_000, "dht_mode": "client"},
+                                                          "dry_run": True})
+        self.assertEqual(got, 200, body)
+        self.assertEqual(body, {"path": self.toml, "applied": ["max_storage"], "restart_required": ["dht_mode"],
+                                "overridden": [], "warnings": [], "dry_run": True})
+        self.assertEqual(self.read(), before)
+        self.assertNotEqual(self.b.config.max_storage, 5_000_000)
+        got, body = self.call("POST", "/api/config/set", {"settings": {"max_storage": "lots"}, "dry_run": True})
+        self.assertEqual(got, 400, body)
+        self.assertEqual(self.read(), before)
+
+    def test_config_events(self):
+        """A change publishes a "config" event (0.2.1) with what changed, applied and needs a restart, and every
+        setting pending a restart; a dry run publishes none."""
+        start = self.b.events.last
+        self.call("POST", "/api/config/set", {"settings": {"max_storage": 5_000_000}, "dry_run": True})
+        self.assertEqual(self.b.events.since(start, ["config"])["events"], [])
+        self.set({"max_storage": 5_000_000, "dht_mode": "client"})
+        [event] = self.b.events.since(start, ["config"])["events"]
+        self.assertEqual((event["changed"], event["applied"], event["restart_required"], event["pending"]),
+                         (["max_storage", "dht_mode"], ["max_storage"], ["dht_mode"], ["dht_mode"]))
 
     def test_null_removes(self):
         self.write("beta = 4\nban_time = 60\n")  # written after the start: the node runs with the defaults

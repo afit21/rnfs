@@ -129,6 +129,20 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn('wheel=$(find_wheel "$wheels")', install)
         self.assertLess(install.index('build_wheel "$wheels"'), install.index('wheel=$(find_wheel "$wheels")'))
 
+    @unittest.skipUnless(shutil.which("sh"), "needs a POSIX shell")
+    def test_service_runs_the_installed_version(self):
+        """--service restarts a daemon already running, so an update runs the new version: `enable --now` left the
+        old one running. Without --service a running daemon is restarted and a stopped one left stopped."""
+        def calls(service):
+            script = "\n".join(['systemctl() { printf "%s\\n" "$*"; }', 'say() { :; }',
+                                shell_function("start_user_service"), "start_user_service"])
+            return subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=True,
+                                  env={**os.environ, "SERVICE": service}).stdout.splitlines()
+        self.assertEqual(calls("yes"), ["--user daemon-reload", "--user enable rnfs.service",
+                                        "--user restart rnfs.service"])
+        self.assertEqual(calls("no"), ["--user daemon-reload", "--user try-restart rnfs.service"])
+        self.assertIn("start_user_service", shell_function("do_install"))
+
     def test_provenance_names_the_tag(self):
         """The provenance check asks for this tag's build on a GitHub-hosted runner, where gh can (SUP-2; the
         check itself is run in tests/security/test_l15_install_release_check.py)."""
@@ -284,7 +298,10 @@ class BuildScriptsTest(unittest.TestCase):
         self.assertIn("rnfs.egg-info", skipped)
 
     def test_flatpak_sandbox_is_narrow(self):
-        """The Flatpak reaches only rnfs's and Reticulum's directories and Downloads, and no device (SUP-5)."""
+        """The Flatpak reaches only rnfs's and Reticulum's directories and Downloads, and no device (SUP-5). This
+        narrows what a compromised daemon reaches but doesn't contain it (AUD-M10): the read-write ~/.reticulum holds
+        config (a PipeInterface's command, interfaces/*.py) that Reticulum programs outside the sandbox run, and
+        ~/.rnfs/rnfs.toml is read by a host rnfs. The manifest and README say so."""
         manifest = read(os.path.join(REPO, "packaging", "flatpak", "io.github.afit21.rnfs.yml"))
         block = re.search(r"(?m)^finish-args:\n((?: +.*\n)+)", manifest)
         self.assertTrue(block)
@@ -295,6 +312,8 @@ class BuildScriptsTest(unittest.TestCase):
         for text in (block.group(1), read(os.path.join(REPO, "README.md"))):
             for override in ("--device=all", "--filesystem="):
                 self.assertIn(f"flatpak override --user {override}", text)
+            # and so is what the ~/.reticulum grant leaves open
+            self.assertIn("interfaces/*.py", text)
 
     def test_release_waits_for_the_tests(self):
         """The release job needs the whole tests workflow, called from release.yml."""

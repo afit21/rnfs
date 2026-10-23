@@ -467,8 +467,8 @@ class AssembledSizeTest(_Transfers):
 
 def fetching_link():
     """The NomadNet link the fake transfers stand for."""
-    from rnfs import nomadnet
-    return nomadnet.parse("cd" * 16 + ":/file/song.mp3")
+    from rnfs import nomadnet_links
+    return nomadnet_links.parse("cd" * 16 + ":/file/song.mp3")
 
 
 class MetadataTest(_Transfers):

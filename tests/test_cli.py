@@ -324,12 +324,23 @@ class OtherCommandTest(CliTestCase):
     def test_maintenance_and_network(self):
         cid = self.node.put_file(b"abc")
         self.assertEqual(self.ok("gc"), "removed 3 blocks, freed 300 bytes\n")
+        preview = {"removed_blocks": 4, "freed_bytes": 2_000_000, "allocated_bytes": 2_100_000, "held_back": False,
+                   "cached_fetches": 1, "pinned_bytes": 5_000_000, "cached_bytes": 1_000_000,
+                   "protected_bytes": 0, "unreferenced_bytes": 1_000_000, "records_bytes": 300_000, "dry_run": True}
+        with mock.patch.object(self.node, "gc", return_value=preview) as gc:
+            self.assertEqual(self.ok("gc", "--dry-run").splitlines(), [
+                "would remove 4 blocks, freeing 2.00 MB (2.10 MB on disk) and evicting 1 cached fetch",
+                "stored: 5.00 MB pinned, 1.00 MB cached, 0 B held by operations in progress, 1.00 MB unreferenced",
+                "state database (provider records and node state): 300 KB"])
+        self.assertEqual(gc.call_args.kwargs, {"dry_run": True})
         self.assertIn("checked 1 blocks", self.ok("verify"))
         self.node.provider_map[cid] = [bytes.fromhex("cd" * 16)]
         self.assertEqual(self.ok("providers", cid), "cd" * 16 + "\n")
         self.assertEqual(self.run_cli("providers", self.node.put_file(b"other"))[0], 1)
         self.assertEqual(self.ok("ping", "cd" * 16), "round-trip time 250 ms\n")
-        self.assertEqual(self.run_cli("ping", "ff" * 16)[0], 1)
+        code, _, err = self.run_cli("ping", "ff" * 16)
+        self.assertEqual(code, 1)
+        self.assertIn(f"no path to {'ff' * 16}", err)
         self.assertIn(f"node_id: {bytes(range(16)).hex()}", self.ok("status"))
 
     def test_status_network(self):
@@ -356,7 +367,7 @@ class OtherCommandTest(CliTestCase):
             "network_size: about 1240 DHT servers (estimated from 16 lookups); 57 servers in the routing table",
             "density_check: fired on 2 of 48 checks in the last hour, 9 of 1104 in the last day",
             "partition_for: 2 h 5 min",
-            "record_store: 3.0 MiB of 1.0 GiB (room for 7000000 records), full; 7105 records (5 this node's) from 141 "
+            "record_store: 3.15 MB of 1.07 GB (room for 7000000 records), full; 7105 records (5 this node's) from 141 "
             "publishers",
             "record_tiers: known 100 (0.0%, floor 30%), earned 6000 (0.1%, floor 60%), newcomer 1000 (14.3%, floor "
             "10%)",
@@ -370,6 +381,23 @@ class OtherCommandTest(CliTestCase):
         older = {key: value for key, value in status.items() if key not in ("network", "record_store", "partition")}
         with mock.patch.object(self.node, "status", return_value=older):
             self.assertEqual(self.ok("status").splitlines(), [f"{key}: {value}" for key, value in older.items()])
+
+    def test_status_shared_folder(self):
+        """status sums the shared folder up in a line (0.2.1), with one per entry that failed to import."""
+        folder = {"path": "/home/u/.rnfs/files", "entries": 3, "bytes": 2_500_000, "scanning": False,
+                  "last_scan": time.time() - 600, "refused": None, "error": None, "failed": 12,
+                  "failures": [{"name": "big.iso", "reason": "too large"}]}
+        with mock.patch.object(self.node, "status", return_value={"node_id": "ab" * 16, "shared_folder": folder}):
+            out = self.ok("status").splitlines()
+        self.assertEqual(out, [f"node_id: {'ab' * 16}",
+                               "shared_folder: 3 entries, 2.50 MB in /home/u/.rnfs/files; last scanned 10 min ago",
+                               "shared_folder_failed: big.iso: too large",
+                               "shared_folder_failed: ... and 11 more"])
+        folder.update(refused="it leads into the rnfs dir", failed=0, failures=[], bytes=None)
+        with mock.patch.object(self.node, "status", return_value={"shared_folder": folder}):
+            self.assertEqual(self.ok("status").splitlines(),
+                             ["shared_folder: 3 entries, size unknown in /home/u/.rnfs/files; not scanned: it leads "
+                              "into the rnfs dir"])
 
     def test_status_clock(self):
         """status prints clock_offset and announces_held as fields, and warns on stderr of a clock estimated over 5

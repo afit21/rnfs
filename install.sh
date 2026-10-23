@@ -9,8 +9,9 @@
 # Per user (the default):   venv ~/.local/share/rnfs/venv, command ~/.local/bin/rnfs
 # --system (or as root):    venv /opt/rnfs/venv,           command /usr/local/bin/rnfs
 #
-#   --service     also install the systemd user unit and start it (system mode: install it for all users,
-#                 each then runs `systemctl --user enable --now rnfs`)
+#   --service     also install the systemd user unit and start it, or restart it on the new version if it was
+#                 running (system mode: install it for all users, each then runs
+#                 `systemctl --user enable --now rnfs`)
 #   --main        install the main branch, which may be newer than the latest release, instead of the release
 #                 (the branch archive has no checksum or provenance to check)
 #   --update      re-install from the latest release, or the main branch with --main (running the installer
@@ -18,7 +19,12 @@
 #   --uninstall   remove the venv, the command and the unit (keeps your data in ~/.rnfs)
 #   --python P    use this Python (3.11 or newer) for the venv
 #   --force       replace an existing rnfs command or systemd unit that this installer didn't make
-#                 (e.g. a pipx one)
+#                 (e.g. a pipx one); or install a version older than the installed one (which a daemon
+#                 that ran the newer one may refuse to start with: its state database can't be downgraded)
+#
+# It refuses, unless --force, to replace the installed rnfs with an older version, and to replace an install
+# of the main branch (or RNFS_SOURCE) with the latest release of the same version number, which may be older:
+# the main branch keeps the last release's number until the next release. Update those with --main again.
 #
 # Environment: RNFS_SOURCE  what to install instead of the latest release (overrides --main too): a local
 #                           source directory, a .zip/.tar.gz/.whl path or URL, or another pip requirement
@@ -56,6 +62,9 @@ RELEASE_TAG=""  # the release being installed (set by choose_source), whose file
 # rnfs-X.Y.Z.tar.gz and SHA256SUMS (with build provenance), and in the sdist packaging/requirements.lock and
 # packaging/build-backend.lock, which fetch_source looks for.
 SOURCE=${RNFS_SOURCE:-}  # empty: chosen by choose_source once Python is found
+ORIGIN=source  # what is installed: release, main (the branch) or source (RNFS_SOURCE)
+ORIGIN_FILE=rnfs-install-origin  # in the venv: the $ORIGIN of the rnfs installed there
+VENV_ASIDE=""  # the old venv while do_install re-creates it (put back if the install fails)
 MAIN=no
 PYTHON=${RNFS_PYTHON:-}
 PYTHON_GIVEN=no
@@ -194,8 +203,61 @@ pip_in() { py=$1; shift; "$py" -I -m pip $PIP_OPTS "$@"; }  # pip_in PYTHON ARGS
 vpip() { pip_in "$VENV/bin/python" "$@"; }
 
 venv_ok() {  # the venv exists, works, and uses the Python asked for with --python (if any)
+    # Working means its pip imports: after a distro Python upgrade bin/python is the new Python, which runs,
+    # but the venv's packages (pip among them) are under lib/python3.<old>, where it doesn't look
     [ -x "$VENV/bin/python" ] && python_ok "$VENV/bin/python" &&
+        "$VENV/bin/python" -I -c 'import pip' >/dev/null 2>&1 &&
         { [ "$PYTHON_GIVEN" = no ] || [ "$(python_version "$VENV/bin/python")" = "$(python_version "$PYTHON")" ]; }
+}
+
+installed_version() {  # the version of rnfs in the venv, or nothing; read from its dist-info directory's name, so
+    # a venv whose Python is gone or was upgraded still tells
+    for info in "$VENV"/lib/python3*/site-packages/rnfs-*.dist-info; do
+        if [ -d "$info" ]; then
+            info=${info##*/rnfs-}
+            printf '%s\n' "${info%.dist-info}"
+            return 0
+        fi
+    done
+}
+
+check_downgrade() {  # check_downgrade WHEEL: stop (unless --force) before replacing the installed rnfs with an older one
+    installed=$(installed_version)
+    [ -n "$installed" ] && [ "$FORCE" = no ] || return 0
+    new=${1##*/rnfs-}
+    new=${new%%-*}
+    origin=""
+    if [ -f "$VENV/$ORIGIN_FILE" ]; then origin=$(cat "$VENV/$ORIGIN_FILE"); fi
+    # Release numbers only (X.Y.Z, as rnfs's are): older, same or newer
+    order=$("$PYTHON" -I - "$installed" "$new" <<'EOF'
+import re, sys
+
+
+def release(version):
+    match = re.match(r"\d+(?:\.\d+)*", version)
+    parts = [int(p) for p in match.group(0).split(".")] if match else []
+    while parts and parts[-1] == 0:
+        parts.pop()
+    return parts
+
+
+installed, new = (release(v) for v in sys.argv[1:3])
+print("older" if new < installed else "same" if new == installed else "newer")
+EOF
+    ) || die "couldn't compare rnfs versions $installed and $new"
+    if [ "$order" = older ]; then
+        die "rnfs $installed is installed in $VENV, and this would replace it with $new, an older version. A daemon
+that has run $installed may have upgraded its state database (~/.rnfs/rnfs.db) to a schema $new can't open, and
+would then refuse to start. Keep $installed (for the main branch, update with --main), or install $new anyway with --force."
+    fi
+    if [ "$order" = same ] && [ -n "$RELEASE_TAG" ] && { [ "$origin" = main ] || [ "$origin" = source ]; }; then
+        what="the main branch"
+        if [ "$origin" = source ]; then what="RNFS_SOURCE"; fi
+        die "rnfs $installed in $VENV was installed from $what, which may be newer than release $RELEASE_TAG of
+the same version number (the main branch keeps the last release's number until the next release), and a daemon
+that ran it may have upgraded its state database beyond what the release can open. Update it with --main (or
+RNFS_SOURCE) instead, or install release $RELEASE_TAG anyway with --force."
+    fi
 }
 
 # The launcher and the systemd unit
@@ -277,8 +339,12 @@ RestrictSUIDSGID=yes
 # is left out: libffi closures, which cffi (under cryptography) can use, may need writable executable memory.
 SystemCallFilter=@system-service
 SystemCallArchitectures=native
-# ProtectSystem and PrivateTmp are left out: in a user unit they need unprivileged user namespaces, which some
-# systems turn off. Where that works, add them with the drop-in in contrib/rnfs.service.d/hardening.conf
+# These limit the system calls and sockets the daemon can use; they don't keep a compromised daemon from writing
+# your home folder (~/.bashrc, autostart entries, other user units) or from asking your systemd user manager to
+# start an unsandboxed process. The file system settings that would (ProtectHome, ReadWritePaths, ...) are left
+# out: in a user unit they need unprivileged user namespaces, which some systems turn off, and they limit where
+# rnfs get can write. Where that works, add them with the drop-in contrib/rnfs.service.d/strict.conf, or just
+# ProtectSystem and PrivateTmp with contrib/rnfs.service.d/hardening.conf
 # (https://github.com/afit21/rnfs/blob/main/contrib/rnfs.service.d/hardening.conf). UMask is left out too: what
 # rnfs get writes gets its permissions from your umask.
 
@@ -308,6 +374,7 @@ EOF
 choose_source() {  # without RNFS_SOURCE: the latest release's sdist (checked by fetch_release), or the main branch's archive with --main
     [ -z "$SOURCE" ] || return 0
     if [ "$MAIN" = yes ]; then
+        ORIGIN=main
         SOURCE=$REPO_URL/archive/refs/heads/main.zip
         say "Installing the main branch, which may be newer than the latest release (it has no checksums to check)"
     else
@@ -316,6 +383,7 @@ the main branch instead with --main."
         # The sdist the release workflow built, checksummed and attested, not GitHub's archive of the tag
         # (archive/refs/tags/...), which nothing covers and which a moved tag would change
         RELEASE_TAG=$tag
+        ORIGIN=release
         SOURCE=$REPO_URL/releases/download/$tag/rnfs-${tag#v}.tar.gz
         say "Installing rnfs $tag, the latest release"
     fi
@@ -426,7 +494,8 @@ fetch_release() {  # fetch_release WORKDIR: download the release's sdist and SHA
 # so its packaging/requirements.lock and packaging/build-backend.lock can be used. A wheel or other pip requirement goes to pip as it is.
 
 unpack() {  # unpack SOURCE DIR: download (if a URL) and unpack the .zip/.tar.* SOURCE in DIR; print its top directory
-    "$VENV/bin/python" -I - "$1" "$2" <<'EOF'
+    # With $PYTHON: this runs before rnfs's venv is made or changed
+    "$PYTHON" -I - "$1" "$2" <<'EOF'
 import os, shutil, sys, tarfile, urllib.request, zipfile
 
 source, work = sys.argv[1:3]
@@ -497,10 +566,11 @@ fetch_source() {  # fetch_source WORKDIR: set build_source (what pip builds), lo
 }
 
 build_wheel() {  # build_wheel WORKDIR: build (or fetch) the rnfs wheel from build_source into WORKDIR
+    # In a venv of its own, so the build stays out of rnfs's venv, which is left as it is until the wheel is built
+    "$PYTHON" -I -m venv "$1/build-venv" || die "couldn't create a build venv with $PYTHON"
     if [ -n "$backend_lock" ]; then
-        # With the pinned, hash-checked setuptools, in a venv of its own (so it stays out of rnfs's venv), and
-        # without build isolation, which would fetch the newest setuptools from PyPI
-        "$PYTHON" -I -m venv "$1/build-venv" || die "couldn't create a build venv with $PYTHON"
+        # With the pinned, hash-checked setuptools, and without build isolation, which would fetch the newest
+        # setuptools from PyPI
         pip_in "$1/build-venv/bin/python" install --quiet --require-hashes --only-binary=:all: -r "$backend_lock" ||
             die "pip couldn't install the build backend from $backend_lock"
         pip_in "$1/build-venv/bin/python" wheel --quiet --no-deps --no-build-isolation --wheel-dir "$1" \
@@ -510,7 +580,8 @@ build_wheel() {  # build_wheel WORKDIR: build (or fetch) the rnfs wheel from bui
             *.whl) ;;
             *) warn "$SOURCE has no packaging/build-backend.lock, so pip may build it with the newest setuptools (unpinned)" ;;
         esac
-        vpip wheel --quiet --no-deps --wheel-dir "$1" "$build_source" || die "couldn't build rnfs from $SOURCE"
+        pip_in "$1/build-venv/bin/python" wheel --quiet --no-deps --wheel-dir "$1" "$build_source" ||
+            die "couldn't build rnfs from $SOURCE"
     fi
 }
 
@@ -548,6 +619,40 @@ python3-dev libffi-dev), run this again with RNFS_ALLOW_SOURCE_BUILDS=1 set:
 
 have_user_systemd() { command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; }
 
+start_user_service() {  # after the user unit is written: with --service, run the version just installed; else restart a running one
+    systemctl --user daemon-reload
+    if [ "$SERVICE" = yes ]; then
+        # Not enable --now, which leaves a daemon already running as it is: the version before this update
+        systemctl --user enable rnfs.service
+        systemctl --user restart rnfs.service
+        say "Started the rnfs service (systemctl --user status rnfs; logs: journalctl --user -u rnfs -f)"
+    else
+        systemctl --user try-restart rnfs.service || true
+        say "Updated the systemd user unit (restarted rnfs if it was running)"
+    fi
+}
+
+install_cleanup() {  # do_install's EXIT trap: remove the work directory, and put a venv moved aside back
+    rm -rf "$wheels"
+    if [ -n "$VENV_ASIDE" ] && [ -d "$VENV_ASIDE" ]; then
+        rm -rf "$VENV"
+        if mv "$VENV_ASIDE" "$VENV"; then
+            warn "the install didn't finish, so the rnfs that was installed before was put back in $VENV"
+        fi
+    fi
+}
+
+recover_venv() {  # a venv an earlier run moved aside and was killed (SIGKILL, power loss) before putting back
+    if [ -d "$VENV.old" ] && ! [ -L "$VENV.old" ]; then
+        if [ -e "$VENV" ] || [ -L "$VENV" ]; then
+            rm -rf "$VENV.old"  # that run got as far as making the new venv
+        else
+            mv "$VENV.old" "$VENV"
+            say "Recovered the venv an interrupted install left in $VENV.old"
+        fi
+    fi
+}
+
 # Actions
 
 do_install() {
@@ -557,33 +662,40 @@ do_install() {
     choose_source
     warn_plain_http
     check_source
+    recover_venv
     updating=no
-    if venv_ok; then
-        say "Updating rnfs in $VENV"
-        updating=yes
-    else
-        check_venv
-        if [ -e "$VENV" ]; then
-            say "Re-creating the venv in $VENV"
-            rm -rf "$VENV"
-        fi
-        say "Creating a venv in $VENV with $("$PYTHON" -I -c 'import sys; print(sys.executable, sys.version.split()[0])')"
-        mkdir -p "$PREFIX"
-        "$PYTHON" -I -m venv "$VENV"
-    fi
-    # pip isn't upgraded from PyPI (that would be an unpinned download); the venv's own pip does --require-hashes
+    if venv_ok; then updating=yes; else check_venv; fi
 
-    # Build the wheel once, then install it: the dependencies at the versions the source's lock pins, and rnfs
-    # itself with a forced reinstall, since the main branch (or a local source) can change without its version
-    # number changing
+    # Fetch, check and build everything before the venv is changed, so a failure there leaves the installed
+    # rnfs as it was. Build the wheel once, then install it: the dependencies at the versions the source's lock
+    # pins, and rnfs itself with a forced reinstall, since the main branch (or a local source) can change
+    # without its version number changing
     wheels=$(mktemp -d "${TMPDIR:-/tmp}/rnfs-install.XXXXXX")
-    trap 'rm -rf "$wheels"' EXIT INT TERM
+    trap install_cleanup EXIT
+    trap 'exit 1' INT TERM HUP  # (runs install_cleanup too)
     say "Fetching and building rnfs from $SOURCE"
     if [ -n "$RELEASE_TAG" ]; then fetch_release "$wheels"; fi
     fetch_source "$wheels"
     build_wheel "$wheels"
     wheel=$(find_wheel "$wheels")
     [ -n "$wheel" ] || die "building $SOURCE didn't produce an rnfs wheel${RELEASE_TAG:+ of version ${RELEASE_TAG#v}}"
+    check_downgrade "$wheel"
+
+    if [ "$updating" = yes ]; then
+        say "Updating rnfs in $VENV"
+    else
+        if [ -e "$VENV" ] || [ -L "$VENV" ]; then
+            # Moved aside, not deleted, until the new one works: install_cleanup puts it back if this install
+            # fails. (The new venv can't be made elsewhere and renamed: its scripts hold its absolute path.)
+            say "Re-creating the venv in $VENV"
+            mv "$VENV" "$VENV.old"
+            VENV_ASIDE=$VENV.old
+        fi
+        say "Creating a venv in $VENV with $("$PYTHON" -I -c 'import sys; print(sys.executable, sys.version.split()[0])')"
+        mkdir -p "$PREFIX"
+        "$PYTHON" -I -m venv "$VENV" || die "couldn't create a venv in $VENV with $PYTHON"
+    fi
+    # pip isn't upgraded from PyPI (that would be an unpinned download); the venv's own pip does --require-hashes
     if [ -n "$lock" ]; then
         install_locked "$lock" "$wheels"
     else
@@ -594,8 +706,13 @@ do_install() {
     # rnfs went in with --no-deps: check the lock (or an older venv's leftovers) left nothing missing or conflicting
     check=$(vpip check 2>&1) || die "rnfs's dependencies in $VENV are incomplete or conflicting:
 $check"
+    printf '%s\n' "$ORIGIN" > "$VENV/$ORIGIN_FILE"
+    trap - EXIT INT TERM HUP
     rm -rf "$wheels"
-    trap - EXIT INT TERM
+    if [ -n "$VENV_ASIDE" ]; then
+        rm -rf "$VENV_ASIDE"
+        VENV_ASIDE=""
+    fi
 
     install_launcher
     version=$("$LAUNCHER" --version 2>/dev/null) || die "the installed rnfs doesn't run: $LAUNCHER --version failed"
@@ -610,14 +727,7 @@ $check"
                 say "  systemctl --user daemon-reload && systemctl --user restart rnfs)"
             fi
         elif have_user_systemd; then
-            systemctl --user daemon-reload
-            if [ "$SERVICE" = yes ]; then
-                systemctl --user enable --now rnfs.service
-                say "Started the rnfs service (systemctl --user status rnfs; logs: journalctl --user -u rnfs -f)"
-            else
-                systemctl --user try-restart rnfs.service || true
-                say "Updated the systemd user unit (restarted rnfs if it was running)"
-            fi
+            start_user_service
         else
             say "Installed $UNIT, but there's no systemd user session here; start it later with:"
             say "  systemctl --user daemon-reload && systemctl --user enable --now rnfs"
@@ -671,6 +781,7 @@ do_uninstall() {
     elif [ -e "$LAUNCHER" ]; then
         warn "left $LAUNCHER alone: this installer didn't make it"
     fi
+    rm -rf "$VENV.old"  # left by an interrupted install, if any
     if [ -d "$VENV" ]; then
         rm -rf "$VENV"
         rmdir "$PREFIX" 2>/dev/null || true

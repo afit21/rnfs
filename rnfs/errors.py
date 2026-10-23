@@ -83,7 +83,7 @@ STATUSES = ((ValueError, 400), (NotFound, 404), (TooLarge, 413), (Denied, 451), 
 STATUS_CODES = {400: "bad_request", 404: "not_found", 413: "too_large", 451: "denied", 422: "invalid_dag",
                 503: "busy", 507: "storage_full", 500: "internal"}
 API_CODES = ("bad_host", "unauthorized", "no_such_endpoint", "method_not_allowed", "timeout", "length_required",
-             "body_too_large", "unsupported", "too_many_connections", "forbidden")
+             "body_too_large", "unsupported", "too_many_connections", "forbidden", "cancelled")
 CODES = (*STATUS_CODES.values(), *API_CODES)
 
 

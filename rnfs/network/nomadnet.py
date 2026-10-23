@@ -1,5 +1,5 @@
 """Fetching a page or file from a NomadNet node, for `rnfs add <destination>:/page/<path>` and `:/file/<path>`
-(specification section 11, "Adding from NomadNet"; rnfs/nomadnet.py has the links' syntax).
+(specification section 11, "Adding from NomadNet"; rnfs/nomadnet_links.py has the links' syntax).
 
 The fetch opens a link of its own to the node's `nomadnetwork.node` destination (a path request and an identity
 recall first, as rnfs does for nodes, each within path_timeout), sends one request for the path and waits for the
@@ -53,7 +53,7 @@ from typing import Callable, NamedTuple
 
 import RNS
 
-from rnfs import nomadnet
+from rnfs import nomadnet_links
 from rnfs.errors import Cancelled, NotFound, TooLarge
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name, size
 from rnfs.network import guards, links, protocol
@@ -74,7 +74,7 @@ class Snapshot(NamedTuple):
 
     path: str
     size: int
-    sent_name: str | bytes | None  # the name a file's metadata gave, as sent: unchecked (nomadnet.snapshot_name)
+    sent_name: str | bytes | None  # the name a file's metadata gave, as sent: unchecked (nomadnet_links.snapshot_name)
     file: bool  # sent as a file (a Resource with metadata) rather than a page
 
 
@@ -320,7 +320,7 @@ def _recall(destination_hash: bytes, timeout: float, paths: PathRequests):
     return None
 
 
-def open_link(target: nomadnet.NomadnetLink, path_timeout: float, paths: PathRequests | None = None):
+def open_link(target: nomadnet_links.NomadnetLink, path_timeout: float, paths: PathRequests | None = None):
     """An established link to target's NomadNet node, marked for the guards; its path requests take their turns in
     paths (the node's budget; None: a budget of this fetch's own). Raises NotFound if there is no path, no identity,
     or the link can't be established in time."""
@@ -333,8 +333,8 @@ def open_link(target: nomadnet.NomadnetLink, path_timeout: float, paths: PathReq
     identity = _recall(destination_hash, path_timeout, paths)
     if identity is None:
         raise NotFound(f"have a path to NomadNet node {name} but not its identity (none after {path_timeout:g}s)")
-    destination = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, nomadnet.APP_NAME,
-                                  nomadnet.ASPECT)
+    destination = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, nomadnet_links.APP_NAME,
+                                  nomadnet_links.ASPECT)
     if destination.hash != destination_hash:
         # Another destination of that identity (an LXMF address, say): only its nomadnetwork.node serves pages
         raise NotFound(f"{name} isn't a NomadNet node (its identity's nomadnetwork.node is "
@@ -353,7 +353,7 @@ def open_link(target: nomadnet.NomadnetLink, path_timeout: float, paths: PathReq
     return link
 
 
-def fetch(target: nomadnet.NomadnetLink, config, directory: str, identity=None, max_size: int | None = None,
+def fetch(target: nomadnet_links.NomadnetLink, config, directory: str, identity=None, max_size: int | None = None,
           progress: Callable[[int, int | None], None] | None = None,
           stop_event: threading.Event | None = None, paths: PathRequests | None = None) -> Snapshot:
     """Fetch target from its NomadNet node into a file in directory (see the module): its Snapshot.
@@ -391,13 +391,13 @@ def fetch(target: nomadnet.NomadnetLink, config, directory: str, identity=None, 
 
 def _not_allowed(snapshot: Snapshot) -> bool:
     """True if snapshot is NomadNet's "Request Not Allowed" page."""
-    if snapshot.size > 4 * len(nomadnet.NOT_ALLOWED):
+    if snapshot.size > 4 * len(nomadnet_links.NOT_ALLOWED):
         return False
     with open(snapshot.path, "rb") as f:
-        return nomadnet.is_not_allowed(f.read())
+        return nomadnet_links.is_not_allowed(f.read())
 
 
-def _request(link, target: nomadnet.NomadnetLink, config, directory: str, max_size: int | None,
+def _request(link, target: nomadnet_links.NomadnetLink, config, directory: str, max_size: int | None,
              progress, stop_event, early: links.EarlyResponses | None = None) -> Snapshot:
     """Send target's request on link and wait for its answer (fetch). early holds the link's answers that came
     before RNS registered their request (None: a link without RNS's pending requests, a test's)."""
@@ -427,7 +427,7 @@ def _request(link, target: nomadnet.NomadnetLink, config, directory: str, max_si
             _remove_rns_files(transfer)
 
 
-def _wait(link, target: nomadnet.NomadnetLink, transfer: Transfer, config, progress, stop_event):
+def _wait(link, target: nomadnet_links.NomadnetLink, transfer: Transfer, config, progress, stop_event):
     """Wait for transfer's answer to target's request, within the timeouts (module docstring)."""
     what = f"NomadNet node {node_name(target.destination)}'s answer to {target.path}"
     clock = transfer.clock
@@ -454,7 +454,7 @@ def _wait(link, target: nomadnet.NomadnetLink, transfer: Transfer, config, progr
             raise NotFound(f"{what} took longer than {overall:.0f}s")
 
 
-def _outcome(target: nomadnet.NomadnetLink, transfer: Transfer, max_size: int | None) -> Snapshot:
+def _outcome(target: nomadnet_links.NomadnetLink, transfer: Transfer, max_size: int | None) -> Snapshot:
     """The Snapshot of a transfer that ended, or the error saying why there is none."""
     name, path = node_name(target.destination), target.path
     if transfer.too_large is not None and not transfer.answered:

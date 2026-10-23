@@ -10,7 +10,8 @@ first start, skipping malformed entries the same way, and malformed rows in the 
 
 The pinning node is an offline node; a provider joined to it by tests.test_node's NetClient holds the content.
 The file (or row) is written as a damaged or hand-edited one might be, and the node is started the way
-RnfsNode.__init__ starts it (_start_threads).
+RnfsNode.__init__ starts it (_resume_remote_pins, which _start_network runs before it accepts links since AUD-L12,
+then _start_threads).
 """
 import io
 import json
@@ -21,7 +22,7 @@ from unittest import mock
 
 import RNS
 
-from rnfs import node as node_module
+from rnfs import node as node_module, node_pins
 from rnfs.config import Config
 from rnfs.content.cid import Cid
 from rnfs.content.storage import remote_source
@@ -84,6 +85,7 @@ class RemotePinsBadEntryTest(unittest.TestCase):
         node = self.open("b", B_ID)
         node.routing.heard(A_ID)
         try:
+            node._resume_remote_pins()
             node._start_threads()
         except TypeError as error:
             # NEW-6: fails until each saved entry's types are checked inside the try, so a bad one is skipped
@@ -106,7 +108,7 @@ class RemotePinsBadEntryTest(unittest.TestCase):
         """Rows whose source isn't text or whose CID isn't a binary CID are skipped and logged; the good one is
         still fetched."""
         logged = []
-        with mock.patch.object(node_module, "log", side_effect=lambda message, *args: logged.append(message)):
+        with mock.patch.object(node_pins, "log", side_effect=lambda message, *args: logged.append(message)):
             node = self.start_with(rows=[(SOURCE, str(self.cid)), (SOURCE, self.cid.binary[:-1]),
                                          (SOURCE.encode(), self.cid.binary), (SOURCE, self.cid.binary)])
         self.assertTrue(wait_for(lambda: SOURCE in node.storage.pins().get(self.cid, set()), 15),

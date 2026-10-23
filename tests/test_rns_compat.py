@@ -160,9 +160,11 @@ INTERNALS = [
              "up on the link, so replaceable per link: EarlyResponses) with (request_id, response_data, "
              "response_size, response_transfer_size, metadata, update_sizes, check_size), which answers the "
              "link.pending_requests entry of that request_id; Link.request registering the RequestReceipt "
-             "(request_id its packet's truncated hash) only after sending the packet",
+             "(request_id its packet's truncated hash) only after sending the packet; a responder sending a "
+             "response as one packet only if it packs to at most Link.mdu (EarlyResponses keeps only those)",
              lambda: (_params(RNS.Link.handle_response, "request_id", "response_data", "response_size",
                               "response_transfer_size", "metadata", "update_sizes", "check_size"),
+                      _source(RNS.Link.handle_request, "if len(packed_response) <= self.mdu:"),
                       _source(RNS.Link._Link__receive,
                               "self.handle_response(request_id, response_data, transfer_size, transfer_size, "
                               "update_sizes=True, check_size=True)"),
@@ -360,6 +362,17 @@ INTERNALS = [
                               "self.teardown()"),
                       _source(RNS.Identity.validate_announce,
                               "if announced_identity.hash in RNS.Transport.blackholed_identities:"))),
+    Internal("network/guards.py", "Link.receive handling a DATA packet of context Packet.LINKIDENTIFY (0xFB) on an "
+             "incoming link by checking its signature and asking Reticulum.is_blackholed, then keeping only the first "
+             "identity (get_remote_identity), so one already identified ignores it (AUD-L7); Link.initiator",
+             lambda: (_true(RNS.Packet.LINKIDENTIFY == 0xFB, "LINKIDENTIFY renumbered"),
+                      _source(RNS.Link._Link__receive, "elif packet.context == RNS.Packet.LINKIDENTIFY:",
+                              "if not self.initiator and len(plaintext) == RNS.Identity.KEYSIZE // 8 + "
+                              "RNS.Identity.SIGLENGTH // 8:",
+                              "if identity.validate(signature, signed_data):",
+                              "if self.__remote_identity == None:"),
+                      _source(RNS.Link.get_remote_identity, "return self.__remote_identity"),
+                      _assigns(RNS.Link.__init__, "initiator"))),
 
     # Sealed files
     Internal("content/seal.py", "RNS.Cryptography.hkdf(length, derive_from, salt, context), "

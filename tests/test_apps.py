@@ -8,10 +8,11 @@ import unittest
 
 import RNS
 
-from rnfs import cli, statedb
+from rnfs import apps, cli, statedb
 from rnfs.api import ApiServer
-from rnfs.apiclient import PIN_KEY_HEADER, ApiConnection, BadRequest, api_proof, app_proof_key, app_verifier
-from rnfs.apps import AppRegistry
+from rnfs.apiclient import (PIN_KEY_HEADER, ApiConnection, AuthFailed, BadRequest, api_proof, app_proof_key,
+                            app_verifier)
+from rnfs.apps import AppRegistry, PairingRequests
 from rnfs.config import Config
 from rnfs.content.cid import Cid
 from rnfs.content.storage import USER, app_source
@@ -20,6 +21,7 @@ from rnfs.node import RnfsNode
 from tests.support import failing_commits, state_execute, state_rows
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
+from tests.test_api import raw_request
 
 NODE_ID = bytes(range(16))
 _saved_loglevel = RNS.loglevel
@@ -185,6 +187,17 @@ class NodeAppsTest(unittest.TestCase):
             self.node.app_rm("wiki")
         with self.assertRaises(ValueError):
             self.node.app_add("Wiki")
+
+    def test_events(self):
+        """An "apps" event (0.2.1) for each app added and removed; a refused add publishes none."""
+        start = self.node.events.last
+        self.node.app_add("wiki")
+        with self.assertRaises(ValueError):
+            self.node.app_add("wiki")
+        self.node.app_rm("wiki")
+        self.assertEqual([(event["change"], event["name"])
+                          for event in self.node.events.since(start, ["apps"])["events"]],
+                         [("added", "wiki"), ("removed", "wiki")])
 
     def test_remove_releases_every_pin_of_the_app(self):
         """app_rm releases app:<name> and every app:<name>:<key> pin, and no other source's (another app's, one
@@ -393,3 +406,107 @@ class AppPinsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PairingTest(unittest.TestCase):
+    """PairingRequests (0.2.1): an app asks for a token, the user approves or denies it, the app collects it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.registry = AppRegistry(os.path.join(self.tmp.name, "state"))
+        self.addCleanup(self.registry.close)
+        self.now = 1000.0
+        self.pairing = PairingRequests(self.registry, clock=lambda: self.now)
+
+    def test_approve_then_collect_once(self):
+        asked = self.pairing.request("notes", "Notes app")
+        self.assertRegex(asked["code"], r"^[0-9]{6}$")
+        self.assertEqual([(r["id"], r["name"], r["description"], r["code"]) for r in self.pairing.pending()],
+                         [(asked["id"], "notes", "Notes app", asked["code"])])
+        self.assertEqual(self.pairing.state(asked["id"], asked["secret"])["state"], "pending")
+        with self.assertRaises(NotFound):
+            self.pairing.state(asked["id"], "a wrong secret")
+        self.assertEqual(self.pairing.approve(asked["id"])["name"], "notes")
+        self.assertEqual(self.pairing.pending(), [])
+        answer = self.pairing.state(asked["id"], asked["secret"])
+        self.assertEqual(answer["state"], "approved")
+        self.assertTrue(self.registry.verify("notes", answer["token"]))
+        with self.assertRaises(NotFound):  # given once
+            self.pairing.state(asked["id"], asked["secret"])
+        with self.assertRaises(NotFound):
+            self.pairing.approve(asked["id"])
+
+    def test_deny_expiry_and_refusals(self):
+        asked = self.pairing.request("notes")
+        self.assertEqual(self.pairing.deny(asked["id"]), {"name": "notes"})
+        self.assertEqual(self.pairing.state(asked["id"], asked["secret"])["state"], "denied")
+        self.assertFalse("notes" in self.registry)
+        later = self.pairing.request("later")
+        self.now += apps.REQUEST_LIFE
+        with self.assertRaises(NotFound):
+            self.pairing.state(later["id"], later["secret"])
+        for name, description in (("Bad Name", None), ("ok", "x" * 201), ("ok", "line\nbreak")):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.pairing.request(name, description)
+        # A name an app has is refused when approved, not when asked (AUD-L1: the open route mustn't say which apps
+        # exist); a name may be asked for more than once (AUD-M5: tests/security/test_audm5_pairing_preempt.py)
+        self.registry.add("taken")
+        taken = self.pairing.request("taken")
+        with self.assertRaises(ValueError):
+            self.pairing.approve(taken["id"])
+        twice = [self.pairing.request("twice"), self.pairing.request("twice")]
+        self.assertEqual(self.pairing.approve(twice[1]["id"])["name"], "twice")
+        self.assertEqual(self.pairing.state(twice[0]["id"], twice[0]["secret"])["state"], "denied")
+        # Beyond MAX_PENDING waiting, the oldest makes way rather than the newest being refused
+        first = self.pairing.request("app0")
+        for n in range(1, apps.MAX_PENDING + 1):
+            self.pairing.request(f"app{n}")
+        self.assertEqual(len(self.pairing.pending()), apps.MAX_PENDING)
+        with self.assertRaises(NotFound):
+            self.pairing.state(first["id"], first["secret"])
+
+
+class PairingApiTest(unittest.TestCase):
+    """Pairing through the API (0.2.1): open routes for the app, the CLI's token for the user's answer."""
+
+    setUp = AppPinsTest.setUp
+    sources = AppPinsTest.sources
+
+    def test_pair_through_the_api(self):
+        import rnfs
+        start = self.node.events.last
+        seen = []
+
+        def approve(code):
+            """The user: sees the request with the app's code, and approves it."""
+            [request] = self.cli.app_requests()
+            seen.append((request["name"], request["code"] == code))
+            self.cli.app_approve(request["id"])
+
+        client, token = rnfs.Client.pair("gallery", self.tmp.name, description="Gallery", on_code=approve,
+                                         port=self.server.port, wait=10)
+        with client:
+            self.assertEqual(seen, [("gallery", True)])
+            cid = client.add(b"from the paired app").cid
+            self.assertEqual(self.sources(str(cid)), {"app:gallery"})
+        self.assertTrue(self.node.apps.verify("gallery", token))
+        self.assertEqual([(event["change"], event["name"])
+                          for event in self.node.events.since(start, ["apps"])["events"]],
+                         [("requested", "gallery"), ("added", "gallery")])
+        # The user's routes need the CLI's token; an app's (or none) is refused
+        asked = ApiConnection(self.tmp.name, port=self.server.port).app_request("other")
+        for api in (self.app, ApiConnection(self.tmp.name, port=self.server.port, app="gallery", token=token)):
+            with self.assertRaises(AuthFailed):
+                api.app_requests()
+        self.cli.app_deny(asked["id"])
+        with self.assertRaises(AuthFailed):
+            rnfs.Client.pair("third", self.tmp.name, on_code=lambda code: self.cli.app_deny(
+                self.cli.app_requests()[0]["id"]), port=self.server.port, wait=10)
+
+    def test_web_pages_cant_ask(self):
+        """Without the custom header (which a web page can't send without a failing preflight) it is refused."""
+        status, _, body = raw_request(self.server.port, "POST", "/api/apps/request", b"{}",
+                                      {"Content-Type": "text/plain"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(self.node.app_requests(), [])

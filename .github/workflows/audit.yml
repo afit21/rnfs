@@ -1,0 +1,40 @@
+name: audit
+
+# The exact versions packaging/*.lock pins, checked against the OSV vulnerability database (which includes the
+# GitHub advisories and PyPI's). Dependabot doesn't read these files (it sees pyproject.toml's ranges), so
+# nothing else reports a vulnerable pin. Runs daily, so a new advisory against a pin already committed is
+# found, and when a lock (or this workflow) changes. A finding fails the run: bump the pin with
+# packaging/update-lock.py (CONTRIBUTING.md), or, if it doesn't apply, say why in an osv-scanner.toml next to
+# the lock.
+on:
+  push:
+    branches: ["**"]
+    paths: ["packaging/*.lock", ".github/workflows/audit.yml"]
+  pull_request:
+    paths: ["packaging/*.lock", ".github/workflows/audit.yml"]
+  schedule:
+    - cron: "41 4 * * *"  # daily, 04:41 UTC
+  workflow_dispatch:
+
+# Read-only token: the scan only checks out the code and reads OSV
+permissions:
+  contents: read
+
+# Actions are pinned to commit SHAs (the comment says which tag); update both together.
+jobs:
+  locks:
+    name: locked dependencies (OSV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false  # no token left in .git/config
+      # Every lock, parsed as a requirements file (its name doesn't say so). tests/security/test_audl14_lock_audit.py
+      # checks that each packaging/*.lock is listed. The Flatpak's python3-deps.json holds the same wheels as
+      # requirements.lock (tests.yml's flatpak-sources job checks that)
+      - uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36  # v2.7.0
+        with:
+          scan-args: |-
+            --lockfile=requirements.txt:packaging/requirements.lock
+            --lockfile=requirements.txt:packaging/build-backend.lock
+            --lockfile=requirements.txt:packaging/build-tools.lock

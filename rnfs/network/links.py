@@ -14,7 +14,9 @@
   at most one of them /blocks. A request waits for a free slot.
 - RNS stops a request's timeout once a response Resource starts arriving, so a node could trickle an answer
   for hours while holding a slot. Requests other than /blocks therefore have a hard deadline from when they
-  were sent (and wait no longer than that for a slot); /blocks has the fetcher's stall detection instead.
+  were sent (and wait no longer than that for a slot); /blocks has the fetcher's stall detection instead. A /blocks or
+  /range request may bound its wait for the link's /blocks slot (slot_wait: the fetcher's probes, which a response
+  another fetch's node drips into the link would otherwise hold up for hours, AUD-H4); one that gives up isn't sent.
 - A request answered False on an identified link is retried once after identifying again, since
   Link.identify() is unacknowledged.
 - A shared link that has a path and identity but isn't established is remembered (LinkPool.unestablished): on a
@@ -61,10 +63,19 @@ MAX_NOT_ESTABLISHED = 1024  # nodes LinkPool remembers a link not established to
 # interval has passed (idle_limit): room for the sweep's own timing
 KEEPALIVE_MARGIN = 1.0
 MIN_SWEEP_WAIT = 0.25  # the idle sweep runs at most this often, however soon a link is due
-# Responses no pending request matched (EarlyResponses): kept this many seconds, at most this many per link. One
-# arriving early is handed over within moments; the rest are late answers to requests RNS already gave up on
+# Responses no pending request matched (EarlyResponses): kept this many seconds, at most this many per link, and only
+# if sent as one packet. One arriving early is handed over within moments; the rest are late answers to requests RNS
+# already gave up on
 EARLY_RESPONSE_LIFE = 30.0
 MAX_EARLY_RESPONSES = 16
+# The steps of opening a link (LinkPool._open's on_stage), and why one failed (PeerLink.failure): GET /api/ping's
+# stages and reasons
+STAGE_PATH, STAGE_IDENTITY, STAGE_LINK = "path", "identity", "link"
+OPEN_STAGES = (STAGE_PATH, STAGE_IDENTITY, STAGE_LINK)
+FAIL_NO_PATH, FAIL_NO_IDENTITY, FAIL_WRONG_IDENTITY = "no_path", "no_identity", "wrong_identity"
+FAIL_NOT_MEMBER, FAIL_REFUSED, FAIL_CLOSED, FAIL_TIMEOUT = "not_member", "link_refused", "link_closed", "link_timeout"
+OPEN_FAILURES = (FAIL_NO_PATH, FAIL_NO_IDENTITY, FAIL_WRONG_IDENTITY, FAIL_NOT_MEMBER, FAIL_REFUSED, FAIL_CLOSED,
+                 FAIL_TIMEOUT)
 
 
 def close_reason(link) -> str:
@@ -162,6 +173,7 @@ class Exchange:
         self.cancelled = False
         self.receipt = None  # the RNS RequestReceipt, once sent
         self.went_dead = False  # unanswered on a link that heard nothing meanwhile (Links._went_dead)
+        self.no_slot = False  # it gave up waiting for a free request slot on its link: never sent
 
     # RNS callbacks: they run on RNS threads, so they only record and never block
 
@@ -198,7 +210,9 @@ class Exchange:
 class EarlyResponses:
     """Responses to requests on one RNS link that arrived before RNS registered the request (see the module
     docstring): installed in place of the link's handle_response, which RNS looks up on the link for every response.
-    Thread-safe."""
+    Only a response sent as one packet can arrive that early (a Resource takes round trips, and RNS accepts one only
+    for a pending request), so only those are kept: a responder answering with Resources under made-up request IDs
+    can't have up to MAX_EARLY_RESPONSES of about 1 MiB each held per link (AUD-L5). Thread-safe."""
 
     def __init__(self, link, clock: Callable[[], float] = time.monotonic):
         """Take over link's handle_response."""
@@ -218,26 +232,43 @@ class EarlyResponses:
         return cls(link)
 
     def on_response(self, request_id, *args, **kwargs):
-        """Link.handle_response: handled by RNS if a pending request matches it, else kept for deliver()."""
+        """Link.handle_response: handled by RNS if a pending request matches it, else kept for deliver() if it came
+        as one packet (else dropped, as RNS drops it)."""
         with self.lock:
             # Under the lock: deliver() looks for a kept response only once its request is pending, so a response
             # is either seen pending here or kept before deliver() looks
             if not any(getattr(pending, "request_id", None) == request_id
                        for pending in list(self.link.pending_requests)):
                 now = self.clock()
-                self.kept[request_id] = (now, args, kwargs)
-                self.kept.move_to_end(request_id)
-                while self.kept and (len(self.kept) > MAX_EARLY_RESPONSES
-                                     or now - next(iter(self.kept.values()))[0] > EARLY_RESPONSE_LIFE):
-                    self.kept.popitem(last=False)
+                if self._one_packet(args):
+                    self.kept[request_id] = (now, args, kwargs)
+                    self.kept.move_to_end(request_id)
+                self._prune(now)
                 return None
         return self.handle(request_id, *args, **kwargs)
 
+    def _one_packet(self, args: tuple) -> bool:
+        """Whether a response handle_response was given args for (response, size, transfer size, ...: RNS 1.5.6)
+        came as one packet: its transfer size at most the link's MDU."""
+        transfer = args[2] if len(args) > 2 else None
+        mdu = getattr(self.link, "mdu", None)
+        if type(mdu) is not int:
+            mdu = protocol.DEFAULT_MDU
+        return type(transfer) is int and transfer <= mdu
+
+    def _prune(self, now: float):
+        """Drop kept responses older than EARLY_RESPONSE_LIFE, and the oldest beyond MAX_EARLY_RESPONSES. Lock
+        held."""
+        while self.kept and (len(self.kept) > MAX_EARLY_RESPONSES
+                             or now - next(iter(self.kept.values()))[0] > EARLY_RESPONSE_LIFE):
+            self.kept.popitem(last=False)
+
     def deliver(self, receipt) -> bool:
         """Hand RNS the response kept for receipt's request, which Link.request has just registered: True if there
-        was one (its callbacks then run on this thread)."""
+        was one (its callbacks then run on this thread). Responses kept past EARLY_RESPONSE_LIFE are dropped."""
         request_id = getattr(receipt, "request_id", None)
         with self.lock:
+            self._prune(self.clock())
             kept = self.kept.pop(request_id, None)
         if kept is None:
             return False
@@ -266,6 +297,7 @@ class PeerLink:
         # lost on the way (LinkPool._open), rather than the node being out of reach
         self.unestablished = False
         self.refused = False  # the node closed the link before it was established at this end (closed_by_other)
+        self.failure: str | None = None  # why _open failed (OPEN_FAILURES), for ping's answer
         self.handed_out: float | None = None  # when LinkPool.get() last returned it (the pool's clock)
         self.held_until: float | None = None  # LinkPool.hold: in use until then, as if handed out then
         self.cond = threading.Condition()
@@ -387,9 +419,14 @@ class LinkPool:
     def get(self, node_id: bytes) -> PeerLink | None:
         """The shared link to node_id, opened if needed; None if the node can't be reached.
 
-        Blocks for up to path_timeout plus RNS's link establishment timeout.
+        Blocks for up to path_timeout for the path and as long again for the identity, each after its path request's
+        turn in the node's budget, plus RNS's link establishment timeout. A caller finding another thread opening the
+        link waits for that thread's result, however long it takes, or until close_all. None at once after close_all
+        (the node stopping): a link opened then would outlive it.
         """
         with self.lock:
+            if self.stop_event.is_set():
+                return None
             peer = self.shared.get(node_id)
             if peer is not None and peer.is_active():
                 peer.handed_out = self.clock()  # under the lock, so sweep() sees it before closing the link
@@ -403,8 +440,16 @@ class LinkPool:
                 event = self.connecting[node_id] = threading.Event()
 
         if not opener:
-            # Another thread is opening this link: use its result rather than opening a second link
-            event.wait(self.config.path_timeout + 120)
+            # Another thread is opening this link: use its result rather than opening a second link. Not within a
+            # fixed time: its path requests wait for their turns in the node's budget, which no timeout counts (a slow
+            # node's busy channel spaces them up to 4 s apart), and giving up first failed a node that was reachable.
+            # The opener clears its entry whatever happens to it (below)
+            while not event.wait(POLL_INTERVAL):
+                if self.stop_event.is_set():
+                    return None
+                with self.lock:
+                    if self.connecting.get(node_id) is not event:
+                        break
             with self.lock:
                 peer = self.shared.get(node_id)
                 if peer is None or not peer.is_active():
@@ -412,24 +457,33 @@ class LinkPool:
                 peer.handed_out = self.clock()
                 return peer
 
-        peer = PeerLink(node_id, identified=self.config.private, shared=True)
-        opened = False
+        peer = None
+        opened = abandoned = False
         try:
+            peer = PeerLink(node_id, identified=self.config.private, shared=True)
             opened = self._open(peer)
         finally:
             with self.lock:
-                if opened and peer.is_active():
+                # Not once close_all has begun (it sets stop_event before listing the links under this lock): it
+                # wouldn't close this one
+                if opened and self.stop_event.is_set():
+                    opened, abandoned = False, True
+                elif opened and peer.is_active():
                     peer.handed_out = self.clock()
                     self.shared[node_id] = peer
-                for marked, flag in ((self.not_established, peer.unestablished), (self.closed_by, peer.refused)):
-                    if flag:
-                        if len(marked) >= MAX_NOT_ESTABLISHED:
-                            marked.clear()  # only the latest attempts matter; keeps it bounded
-                        marked.add(node_id)
-                    else:
-                        marked.discard(node_id)
+                if peer is not None:
+                    for marked, flag in ((self.not_established, peer.unestablished), (self.closed_by, peer.refused)):
+                        if flag:
+                            if len(marked) >= MAX_NOT_ESTABLISHED:
+                                marked.clear()  # only the latest attempts matter; keeps it bounded
+                            marked.add(node_id)
+                        else:
+                            marked.discard(node_id)
+                # Here whatever _open did, returned or raised: a thread waiting for this one's result then has it
                 self.connecting.pop(node_id, None)
             event.set()
+        if abandoned:
+            self.close_link(peer)
         if not (opened and peer.is_active()):
             return None
         self._start_sweeper()
@@ -470,30 +524,52 @@ class LinkPool:
 
     def open_oneshot(self, node_id: bytes, identify: bool) -> PeerLink | None:
         """A new link to node_id outside the shared pool (identifying if asked, or in private mode)."""
+        return self.try_oneshot(node_id, identify)[0]
+
+    def try_oneshot(self, node_id: bytes, identify: bool, on_stage: Callable[[str], None] | None = None
+                    ) -> tuple[PeerLink | None, str | None]:
+        """open_oneshot(): (the link, None), or (None, why it failed: OPEN_FAILURES). on_stage(stage) is told of each
+        step as it begins (OPEN_STAGES). Refused (FAIL_CLOSED) after close_all."""
         peer = PeerLink(node_id, identified=identify or self.config.private, shared=False)
         with self.lock:
+            if self.stop_event.is_set():
+                return None, FAIL_CLOSED
             self.oneshot.add(peer)
-        if not self._open(peer):
+        if not self._open(peer, on_stage):
             with self.lock:
                 self.oneshot.discard(peer)
-            return None
-        return peer
+            return None, peer.failure or FAIL_CLOSED
+        return peer, None
 
-    def _open(self, peer: PeerLink) -> bool:
-        """Find a path and the identity for peer's node, establish the link, and identify if peer should."""
+    def _open(self, peer: PeerLink, on_stage: Callable[[str], None] | None = None) -> bool:
+        """Find a path and the identity for peer's node, establish the link, and identify if peer should. On False,
+        peer.failure says why (OPEN_FAILURES); on_stage(stage) is told of each step as it begins (OPEN_STAGES)."""
         node_id = peer.node_id
         name = node_name(node_id)
+
+        def stage(step: str):
+            """Tell on_stage, which mustn't stop the link opening by failing."""
+            if on_stage is not None:
+                try:
+                    on_stage(step)
+                except Exception:  # noqa: BLE001 - a listener's failure isn't the link's
+                    pass
+
+        stage(STAGE_PATH)
         if not RNS.Transport.has_path(node_id):
             log(f"requesting a path to {name}", LOG_VERBOSE)
         if not self.paths.await_path(node_id, self.config.path_timeout, cancel=self.stop_event):
             log(f"no path to {name} after {self.config.path_timeout:g}s")
+            peer.failure = FAIL_NO_PATH
             return False
         if _debug_logged():  # RNS path lookups, only for a message that will be kept
             log(f"path to {name}: {path_description(node_id) or 'known'}", LOG_DEBUG)
 
+        stage(STAGE_IDENTITY)
         identity = self._recall(node_id)
         if identity is None:
             log(f"have a path to {name} but not its identity (none after {self.config.path_timeout:g}s)")
+            peer.failure = FAIL_NO_IDENTITY
             return False
 
         destination = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, DHT_ASPECT)
@@ -502,9 +578,11 @@ class LinkPool:
             # otherwise answer for many node IDs (ground near target keys) or dodge a ban on its real one
             log(f"the identity known for {name} isn't that node's (its rnfs.dht is "
                 f"{node_name(destination.hash)}); not connecting", LOG_VERBOSE)
+            peer.failure = FAIL_WRONG_IDENTITY
             return False
         if self.config.private and identity.hash.hex() not in self.members:
             log(f"{name} isn't a member; not connecting in private mode", LOG_VERBOSE)
+            peer.failure = FAIL_NOT_MEMBER
             return False
         # Set on close too, so a failed link doesn't wait out the full timeout
         settled = threading.Event()
@@ -515,6 +593,10 @@ class LinkPool:
             settled.set()
             log(f"link to {name} {close_reason(closed_link)}", LOG_VERBOSE)
 
+        if self.stop_event.is_set():  # close_all ran while the path or identity was awaited
+            peer.failure = FAIL_CLOSED
+            return False
+        stage(STAGE_LINK)
         log(f"connecting to {name}", LOG_VERBOSE)
         started = time.monotonic()
         link = RNS.Link(destination, established_callback=lambda _: settled.set(), closed_callback=on_closed)
@@ -528,12 +610,14 @@ class LinkPool:
             log(f"{name} closed the link as it was established", LOG_VERBOSE)
             peer.mark_closed()
             peer.refused = True
+            peer.failure = FAIL_REFUSED
             return False
         if link.status != RNS.Link.ACTIVE:
             route = path_description(node_id)
             why = (close_reason(link) if link.status == RNS.Link.CLOSED
                    else f"not established within {time.monotonic() - started:.0f}s")
             log(f"could not connect to {name}: {why}" + (f" ({route})" if route else ""))
+            peer.failure = FAIL_CLOSED if link.status == RNS.Link.CLOSED else FAIL_TIMEOUT
             link.teardown()
             peer.mark_closed()
             peer.unestablished = True
@@ -738,33 +822,40 @@ class LinkPool:
 
     def request(self, peer: PeerLink, path: str, data, blocks: bool = False, max_response_size: int | None = None,
                 watchdog: Callable[[Exchange, float], str | None] | None = None,
-                on_progress: Callable[[float], None] | None = None, silence_expected: bool = False) -> Exchange:
+                on_progress: Callable[[float], None] | None = None, silence_expected: bool = False,
+                slot_wait: float | None = None) -> Exchange:
         """Send one request on peer's link and wait for its outcome, within the per-link limits.
 
         watchdog(exchange, now) may return a reason to stop waiting (a stall). on_progress(fraction) is
         called from this thread, never an RNS one. A request other than /blocks gives up (.stalled set) once
-        request_deadline has passed since it was sent, or if it waited that long for a slot. A request larger
-        than the link's packet MDU isn't sent (the exchange is returned unanswered). A request left unanswered on a
-        link that heard nothing meanwhile closes it (_went_dead), unless silence_expected: a /range to a node not known
-        to answer it, which an older node leaves unanswered on a working link.
+        request_deadline has passed since it was sent, or if it waited that long for a slot (.no_slot set too); a
+        /blocks or /range one (blocks) waits for its slots as long as it takes, or slot_wait seconds at most (then
+        .no_slot is set, and it isn't sent). A request larger than the link's packet MDU isn't sent (the exchange is
+        returned unanswered). A request left unanswered on a link that heard nothing meanwhile closes it (_went_dead),
+        unless silence_expected: a /range to a node not known to answer it, which an older node leaves unanswered on a
+        working link.
         """
         peer.enter()
         try:
-            return self._request(peer, path, data, blocks, max_response_size, watchdog, on_progress, silence_expected)
+            return self._request(peer, path, data, blocks, max_response_size, watchdog, on_progress, silence_expected,
+                                 slot_wait)
         finally:
             peer.leave()
 
     def _request(self, peer: PeerLink, path: str, data, blocks: bool, max_response_size: int | None,
                  watchdog: Callable[[Exchange, float], str | None] | None,
-                 on_progress: Callable[[float], None] | None, silence_expected: bool = False) -> Exchange:
+                 on_progress: Callable[[float], None] | None, silence_expected: bool = False,
+                 slot_wait: float | None = None) -> Exchange:
         """request(), with the calling thread counted among the link's users."""
         exchange = Exchange(self.clock)
         deadline = None if blocks else self.request_deadline(peer)
-        if not peer.acquire(blocks, timeout=deadline):
-            if deadline is not None and peer.is_active():
-                exchange.stalled = "no free request slot"
-                log(f"no free request slot for {path} to {node_name(peer.node_id)} within {deadline:.0f}s",
-                    LOG_VERBOSE)
+        wait = slot_wait if blocks else deadline
+        if not peer.acquire(blocks, timeout=wait):
+            if wait is not None and peer.is_active():
+                exchange.no_slot = True
+                if deadline is not None:
+                    exchange.stalled = "no free request slot"
+                log(f"no free request slot for {path} to {node_name(peer.node_id)} within {wait:.1f}s", LOG_VERBOSE)
             exchange.done.set()
             return exchange
         try:

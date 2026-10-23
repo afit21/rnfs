@@ -9,9 +9,10 @@ answered, or once every known node has been queried without finding new ones; it
 holds the caller past the deadline.
 
 Nodes near the key can keep answering with ever closer IDs (made up, or ground for the key), so the beta closest
-never all answer. A run therefore also ends, incomplete, once it has sent `max_queries` queries and their answers
-are in, or after STALL_WINDOWS × max(alpha, beta) answers in a row that leave the bit length of the beta-th
-closest known distance unchanged. Over a simulated network of 2000 honest nodes, lookups complete within both.
+never all answer. A run therefore also ends, incomplete, once the lookup's runs have sent `max_queries` queries in
+all and their answers are in, or after STALL_WINDOWS × max(alpha, beta) answers in a row that leave the bit length
+of the beta-th closest known distance unchanged. Over a simulated network of 2000 honest nodes, lookups complete
+within both.
 
 Nodes whose recent queries all failed (the routing table's `unreliable`) rank after every other node, so a
 lookup asks and waits for them only when it has too few others. One whose retry is due (`may_retry`) is asked
@@ -68,7 +69,7 @@ FIRST = 0  # answered, or nothing against it
 SLOW_PATH = 1  # behind a slow path (slow_path) and not answered
 UNRELIABLE = 2  # unreliable (the routing table's) and not answered
 _POLL_INTERVAL = 0.5  # seconds between should_stop() checks while waiting for replies
-MAX_QUERIES = 8 * K  # queries a run sends at most (section 6)
+MAX_QUERIES = 8 * K  # queries a lookup's runs send at most, in all (section 6)
 STALL_WINDOWS = 3  # a run ends after this many query windows of answers in a row that bring the key no nearer
 # A search's query unanswered this long gives up its place among the alpha in flight, and ranks with the unreliable
 # until it answers (its answer still counts): a server RNS has a long path to holds a slot for its link's whole establishment
@@ -128,7 +129,9 @@ class Lookup:
       LOG_DEBUG, for the debug log); called from the running thread and the query threads.
     - `unreliable(id)`: nodes to avoid, checked when a run learns of them; `may_retry(id)`: True if an
       unreliable node is due to be asked again, claiming that retry (both the routing table's).
-    - `max_queries`: queries one run sends at most, retries included.
+    - `max_queries`: queries its runs send at most in all, retries included: a run sends what the earlier ones left.
+      (With a cap of its own each, a fetch's runs again after every provider failed, for providers that identities
+      made up afresh in each answer, sent tens of thousands of /find within lookup_timeout: AUD-M2.)
     - `on_useful(id)`: a node whose answer proved useful: it named a node closer to the key than itself that then
       answered (local scores, section 6). Called from the running thread, at most once per node per lookup.
     - `size`: the network size estimate (rnfs.dht.density), which turns the density check on; `seniors`: the
@@ -149,7 +152,8 @@ class Lookup:
     key, so one lookup serves the keys of a region (sweep providing, rnfs.publisher).
 
     A Lookup may be run again (find_providers after every provider failed): each run re-queries the nodes,
-    so /find replies give a fresh random half of providers, within the same deadline and unknown-ID budget.
+    so /find replies give a fresh random half of providers, within the same deadline, unknown-ID budget and
+    max_queries.
     Runs of one Lookup must not overlap.
     """
 
@@ -483,7 +487,8 @@ class Lookup:
         introduced: dict[bytes, bytes] = {}  # node -> the node whose answer first named it, in this run
         in_flight = 0
         retried = 0
-        sent = 0  # queries sent by this run, retries included: at most max_queries
+        sent = 0  # queries sent by this run, retries included: at most what the earlier runs left of max_queries
+        cap = max(0, self.max_queries - self.sent)
         window = max(self.alpha, self.beta)
         # Answers in a row that didn't bring the beta-th closest known node a bit nearer the key
         reach = self._reach(known)
@@ -543,7 +548,7 @@ class Lookup:
                 now = self.clock()
                 for node_id in [n for n, at in asked_at.items() if now - at >= patience]:
                     # Unanswered past patience: on top of alpha now, as a retry is, and ranked with the unreliable, so
-                    # it is waited for again (just below) only while the lookup knows no better nodes to ask
+                    # it is waited for again (waiting, below) only while the lookup knows no better nodes to ask
                     lagging[node_id] = asked_at.pop(node_id)
                     retrying.add(node_id)
                     doubtful.add(node_id)
@@ -552,7 +557,10 @@ class Lookup:
                 if lagged:
                     ranked = sorted(known, key=rank)
             for node_id in ranked[:window]:
-                if node_id in retrying:  # a retry the lookup now needs: waited for like any query
+                # A retry the lookup now needs: waited for like any query. Not one that lagged: counted in flight again,
+                # it took back its place among the alpha whenever the lookup knew no more than the window's nodes, and
+                # with alpha 1 (slow nodes) the next node wasn't asked until its link timed out
+                if node_id in retrying and node_id not in lagging:
                     retrying.discard(node_id)
                     in_flight += 1
 
@@ -560,7 +568,7 @@ class Lookup:
             # within the closest max(alpha, beta) known can affect completion, so farther ones aren't
             # queried while nearer queries are pending: on slow networks every query costs airtime.
             # The nodes the checks need are queried the same way, in rank order among the window's.
-            while in_flight < self.alpha and sent < self.max_queries:
+            while in_flight < self.alpha and sent < cap:
                 ranked = sorted(known, key=rank)[:window]
                 node_id = next((n for n in first if n in known and n not in queried), None)
                 if node_id is None:
@@ -590,7 +598,7 @@ class Lookup:
             # An unreliable node that distance alone would rank among them is asked again once its retry is
             # due: only an answer shows it is back. On top of alpha, since nothing waits for it
             for node_id in sorted(known, key=known.__getitem__)[:window]:
-                if node_id not in doubtful or node_id in queried or node_id in passed or sent >= self.max_queries:
+                if node_id not in doubtful or node_id in queried or node_id in passed or sent >= cap:
                     continue
                 if not self.is_known(node_id):
                     passed.add(node_id)
@@ -605,8 +613,11 @@ class Lookup:
                     self._send(node_id, results)
                 else:
                     passed.add(node_id)
-            if in_flight == 0 and not holding:
-                if sent >= self.max_queries:
+            # A query that lagged holds no place among the alpha, but while it ranks within the window the run still
+            # waits for it rather than end: it may be the only node left
+            waiting = bool(lagging) and any(node_id in lagging for node_id in sorted(known, key=rank)[:window])
+            if in_flight == 0 and not holding and not waiting:
+                if sent >= cap:
                     why = "query cap"
                     break  # sent all it may, and every answer waited for is in
                 why = "no node left to ask"
@@ -706,6 +717,13 @@ class Lookup:
         with self._lock:
             answered = set(self._answered)
         return lambda node_id: node_id in answered or self.is_known(node_id)
+
+    def introducers(self, node_id: bytes) -> set[bytes]:
+        """The nodes whose answers named node_id, in any run: the first to, and every reply listing it."""
+        with self._lock:
+            named = {other for other, nodes in self._replies.items() if node_id in nodes}
+            first = self._named_by.get(node_id)
+        return named if first is None else named | {first}
 
     def known_distances(self) -> dict[bytes, int]:
         """The nodes the last run knew of and hadn't seen fail, with their distances to the key."""

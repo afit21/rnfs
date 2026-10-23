@@ -21,7 +21,8 @@ delays every other callback of the instance; close() from one doesn't wait for t
 callback is logged and dropped. Watched jobs are polled by a thread of their own, which queues a call when a
 job changes (at most every job_poll seconds) and once more when it finishes. Both threads start on first use.
 events.watch's callbacks are the exception to coalescing: each event is one call, in order (an event says what
-changed, not a state), so a callback slower than the events lets them queue up.
+changed, not a state), so a callback slower than the events lets them queue up, MAX_WATCH_QUEUE per watch at most:
+past that the oldest give way to a "lost" Event, as a Client's watch gets when it falls behind the daemon's log.
 """
 import io
 import itertools
@@ -29,25 +30,28 @@ import os
 import threading
 import time
 import warnings
-from collections import OrderedDict
-from collections.abc import Mapping
+from collections import OrderedDict, deque
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 from rnfs import ids
 from rnfs.content.cid import Cid
 from rnfs.errors import Closed, NotFound, RnfsError
-from rnfs.events import EVENT_KINDS
+from rnfs.events import EVENT_KINDS, MAX_EVENTS
 # A job's final states, and the longest wait one request for a job asks for (the API's cap)
-from rnfs.features.jobs import FINISHED, MAX_WAIT as MAX_JOB_WAIT
-from rnfs.objects import (Added, Cached, Capabilities, Collected, Contact, DenyState, Entry, Event, EventBatch,
-                          Exported, Followed, FolderSync, Imported, Info, Kept, Peer, Pin, Record, RemotePin,
-                          ServedPins, Settings, SettingsChange, Stat, Stats, Status, Uncached, Verified, Written)
+from rnfs.objects import (FINISHED, MAX_JOB_WAIT, Added, Cached, Capabilities, Collected, Contact, DenyState, Entry,
+                          Event, EventBatch, Exported, Followed, FolderSync, Imported, Info, Kept, Peer, Pin, Ping,
+                          Record, RemotePin, Routing, ServedPins, Settings, SettingsChange, Stat, Stats, Status,
+                          Uncached, Verified, Written)
 
 FILE_BUFFER = 64 * 1024  # what a File reads at least per refill: one read() of the node, one GET /api/cat
 # The most one refill of a File read sequentially fetches: each sequential refill doubles from FILE_BUFFER up
 # to it, so the per-request cost is spread over more bytes; a seek starts again at FILE_BUFFER
 READ_AHEAD = 4 * 1024 * 1024
 STOP_WAIT = 5.0  # seconds close() waits for the event and job threads to end
+# Deliveries one event watch may have waiting for its callback, as many as a daemon's log keeps for a Client's: past
+# that the oldest give way to a "lost" marker (_Events.post)
+MAX_WATCH_QUEUE = MAX_EVENTS
 
 
 def node_hex(node_id) -> str | None:
@@ -140,6 +144,18 @@ class Watch:
         self.cancel()
 
 
+class _Backlog:
+    """An event watch's deliveries waiting on the event thread, guarded by _Events' condition: their keys, oldest
+    first, and the "lost" marker waiting first among them in place of those dropped, if any (an event dict whose seq
+    moves on as more are dropped)."""
+
+    def __init__(self, lost_call: Callable[[dict], Callable[[], None]]):
+        """None waiting; lost_call(marker) is the call delivering a marker to the watch."""
+        self.lost_call = lost_call
+        self.keys: deque = deque()
+        self.marker: dict | None = None
+
+
 class _Events:
     """The event thread: calls queued callbacks one at a time, in the order queued, the latest per key."""
 
@@ -148,6 +164,7 @@ class _Events:
         self._thread_name = thread_name
         self._report = report
         self._cond = threading.Condition()  # innermost: never held while calling out
+        # key -> (call, the event watch's _Backlog it counts in or None, (seq, epoch) of the event it delivers)
         self._pending: OrderedDict = OrderedDict()
         self._thread: threading.Thread | None = None
         self._stopped = False
@@ -160,14 +177,38 @@ class _Events:
             self._thread = threading.Thread(target=self._run, name=self._thread_name, daemon=True)
             self._thread.start()
 
-    def post(self, key, call):
+    def post(self, key, call, backlog: _Backlog | None = None, position: tuple[int, str] | None = None):
         """Queue call() under key, replacing one queued under key that hasn't run yet. Never blocks: safe to call
-        holding any lock."""
+        holding any lock.
+
+        backlog: an event watch's, for a call delivering the event at position (its seq, and the epoch of its run)
+        under a key never used before. Once more than MAX_WATCH_QUEUE of the watch's deliveries wait (its callback
+        is slower than the events), the oldest is dropped, and a "lost" marker waits in its place: its seq the last
+        dropped (the watch goes on after it), its fields the run's epoch, as a Client's watch gets on "lost"."""
         with self._cond:
             if self._stopped:
                 return
-            self._pending[key] = call
+            self._pending[key] = (call, backlog, position)
+            if backlog is not None:
+                backlog.keys.append(key)
+                if len(backlog.keys) > MAX_WATCH_QUEUE:
+                    self._drop_oldest(backlog)
             self._cond.notify()
+
+    def _drop_oldest(self, backlog: _Backlog):
+        """Drop backlog's oldest delivery, for the "lost" marker to stand for it (condition held). The marker is
+        always the watch's oldest, so it is delivered first."""
+        if backlog.marker is None:
+            # The oldest becomes the marker, in its place
+            first = backlog.keys[0]
+            _, _, (seq, epoch) = self._pending[first]
+            backlog.marker = {"seq": seq, "kind": "lost", "time": None, "epoch": epoch}
+            self._pending[first] = (backlog.lost_call(backlog.marker), backlog, None)
+        # The marker is the oldest: the next goes too, and the marker moves on past it
+        dropped = backlog.keys[1]
+        del backlog.keys[1]
+        _, _, (seq, epoch) = self._pending.pop(dropped)
+        backlog.marker.update(seq=seq, epoch=epoch)
 
     def _run(self):
         """Call what is queued until stopped."""
@@ -177,7 +218,10 @@ class _Events:
                     self._cond.wait()
                 if self._stopped:
                     return
-                _, call = self._pending.popitem(last=False)
+                _, (call, backlog, _) = self._pending.popitem(last=False)
+                if backlog is not None:
+                    backlog.keys.popleft()  # the watch's oldest: the marker, if one waits
+                    backlog.marker = None
             try:
                 call()
             except Exception as e:  # noqa: BLE001 - an app's callback mustn't end the thread
@@ -246,6 +290,7 @@ class _EventWatch:
         self.after = 0
         self.pending: list[tuple[str, dict]] = []
         self.handle: Watch | None = None
+        self.backlog: _Backlog | None = None  # its deliveries waiting on the event thread (Rnfs._watch_events)
 
     def begin(self, after: int, epoch: str, deliver) -> list[dict]:
         """Set the position the watch begins at and deliver(event) the events heard meanwhile that are after it,
@@ -499,11 +544,21 @@ class Rnfs:
         self._check()
         return self._backend.shutdown(wait)
 
+    def restart(self, wait: float | None = None) -> bool:
+        """Restart the daemon (a Client; rnfs 0.2.1): it stops as SIGTERM stops it and starts again with the same
+        command line, so settings that need a restart apply (SettingsChange.restart_required). With wait, True once
+        the new run answers within wait seconds (False: not yet); without, True once it agreed. Raises Unsupported:
+        from a Node (close() it), or a daemon that can't restart itself (daemon_info()'s can_restart);
+        NoSuchEndpoint (a NotFound) from a daemon before 0.2.1."""
+        self._check()
+        return self._backend.restart(wait)
+
     def daemon_info(self) -> dict | None:
         """What the running daemon wrote about itself in its rnfs dir (daemon.json: "pid", "api_port",
-        "gateway_port", "version", "started", "rnfs_dir", "reticulum_config", "shared_instance", "node_id"), or None:
-        none there (a daemon before 0.2.0), it can't be trusted or its process has ended; always None for a Node,
-        which is no daemon. Read from the file, not asked of the daemon."""
+        "gateway_port", "version", "started", "rnfs_dir", "reticulum_config", "shared_instance", "node_id", and from
+        0.2.1 "started_by", "service", "sandbox", "can_restart": rnfs.launch), or None: none there (a daemon before
+        0.2.0), it can't be trusted or its process has ended; always None for a Node, which is no daemon. Read from
+        the file, not asked of the daemon."""
         self._check()
         return self._backend.daemon_info()
 
@@ -514,16 +569,19 @@ class Rnfs:
         self._check()
         return Settings.from_dict(self._backend.config())
 
-    def config_set(self, settings: Mapping) -> SettingsChange:
+    def config_set(self, settings: Mapping, *, dry_run: bool = False) -> SettingsChange:
         """Set settings ({name: value, None: removed from rnfs.toml, so back to the default}) in the node's
         rnfs.toml, applying at once those that apply live and that the command line doesn't override. Nothing is
-        written unless the whole result is valid. Raises ValueError (unknown, refused or malformed settings), Busy
-        (rnfs.toml changed meanwhile: try again), NotFound without the settings feature; a Node OSError, a Client
-        ServerError, if rnfs.toml can't be written."""
+        written unless the whole result is valid. dry_run (rnfs 0.2.1): only check them, for settings checked as the
+        user types; the answer is what it would be (SettingsChange.dry_run), nothing written or applied (a Client:
+        Unsupported from an older daemon, which would write). Raises ValueError (unknown, refused or malformed
+        settings), Busy (rnfs.toml changed meanwhile: try again), NotFound without the settings feature; a Node
+        OSError, a Client ServerError, if rnfs.toml can't be written."""
         self._check()
         if not isinstance(settings, Mapping):
             raise ValueError("settings must be a dict of setting names and values (None: back to the default)")
-        return SettingsChange.from_dict(self._backend.config_set(dict(settings)))
+        return SettingsChange.from_dict(self._backend.config_set(dict(settings), dry_run=True) if dry_run
+                                        else self._backend.config_set(dict(settings)))
 
     # Targets
 
@@ -566,14 +624,16 @@ class Rnfs:
 
     def add(self, source, *, name: str | None = None, wrap: bool = False, pin: bool = True, only_hash: bool = False,
             to: list[str] | None = None, to_self: bool = False, seal_name: bool = True,
-            chunker: str | None = None) -> Added:
+            chunker: str | None = None, origin: str | None = None) -> Added:
         """Add a file or directory (a path), or data (bytes, or a binary file read to its end), pinned "user"
         unless pin is False (then evictable cache); only_hash stores nothing.
 
         Data is wrapped in a directory as the entry name, if given. to/to_self seal a file for those recipients
         (section 5, Sealed files): a path's name is sealed inside unless seal_name is False, and data's name is
-        sealed inside instead of wrapping it, unless wrap. chunker is "fixed" (default) or "fastcdc". Raises
-        ValueError, NotFound (no such path), Denied (a file's hash is denied), StorageFull, OSError.
+        sealed inside instead of wrapping it, unless wrap. chunker is "fixed" (default) or "fastcdc". origin, for
+        data, is what pins() says it was added from (Pin.origin: a URL, the app's own path for it; default its name,
+        or "(stdin)"); a path is its own origin. Raises ValueError, NotFound (no such path), Denied (a file's hash is
+        denied), StorageFull, OSError.
         """
         self._check()
         to, wrap, pin, only_hash, to_self, seal_name = (recipients(to), bool(wrap), bool(pin), bool(only_hash),
@@ -583,6 +643,8 @@ class Rnfs:
         if isinstance(source, (str, os.PathLike)):
             if name is not None:
                 raise ValueError("name is for adding data; a path is added under its own name")
+            if origin is not None:
+                raise ValueError("origin is for adding data; a path is its own origin")
             result = self._backend.add_path(_abspath(source), wrap=wrap, seal_name=seal_name, **options)
         else:
             if wrap and not name:
@@ -595,6 +657,8 @@ class Rnfs:
             else:
                 raise ValueError(f"add() takes a path, bytes or a binary file, not {type(source).__name__}")
             entry = name if wrap or not sealing else None
+            if origin is not None:
+                options["origin"] = origin
             result = self._backend.add_stream(data, length, entry, seal_name=name if sealing and seal_name else None,
                                               **options)
         return Added.from_dict(result)
@@ -728,10 +792,11 @@ class Rnfs:
         self._check()
         return ServedPins.from_dict(self._backend.pin_remote_served())
 
-    def gc(self) -> Collected:
-        """Evict every cached fetch and delete unreachable blocks."""
+    def gc(self, *, dry_run: bool = False) -> Collected:
+        """Evict every cached fetch and delete unreachable blocks. dry_run (rnfs 0.2.1): change nothing, and say what
+        that would free and what the stored blocks are kept for (Collected's dry-run fields)."""
         self._check()
-        return Collected.from_dict(self._backend.gc())
+        return Collected.from_dict(self._backend.gc(dry_run=True) if dry_run else self._backend.gc())
 
     def verify(self) -> Verified:
         """Re-check every stored block against its CID, deleting bad ones."""
@@ -752,15 +817,47 @@ class Rnfs:
 
     # Network
 
-    def providers(self, cid) -> list[bytes]:
-        """Node IDs providing cid: records held here, then what a provider lookup finds."""
+    def providers(self, cid, *, on_provider: Callable[[bytes], None] | None = None) -> list[bytes]:
+        """Node IDs providing cid: records held here, then what a provider lookup finds. on_provider(node_id) is
+        called with each as it is found, on this thread, before this returns (a Client streams the answer: a daemon
+        before 0.2.1 calls it only once its lookup ends)."""
         self._check()
-        return [bytes.fromhex(node_id) for node_id in self._backend.providers(str(cid))]
+        report = None if on_provider is None else lambda node_id: on_provider(bytes.fromhex(node_id))
+        found = (self._backend.providers(str(cid)) if report is None
+                 else self._backend.providers(str(cid), on_provider=report))
+        return [bytes.fromhex(node_id) for node_id in found]
+
+    def log(self, *, after: int | None = None, limit: int | None = None, level: str | int | None = None) -> dict:
+        """The node's recent log lines (rnfs 0.2.1): {"lines": [{"seq", "time", "level", "level_name", "source",
+        "text"}], "next" (pass it as after to get only newer ones), "dropped" (lines after after are no longer
+        kept)}: the last limit (default 200, at most 1000) after after, of level ("error", "warning", ..., or 0-8)
+        or more severe. A Client's are the daemon's, rnfs's and Reticulum's as its console shows them (the last
+        2000, in memory); a Node's are rnfs's own. Raises ValueError; a Client NoSuchEndpoint from an older
+        daemon."""
+        self._check()
+        return self._backend.log_lines(after, limit, level)
+
+    def routing(self) -> Routing:
+        """The DHT routing table (rnfs 0.2.1): its buckets and their nodes, the nodes avoided as unreliable, and the
+        bans with when they end and why. Raises NoSuchEndpoint (a NotFound) from an older daemon."""
+        self._check()
+        return Routing.from_dict(self._backend.routing())
 
     def ping(self, node_id) -> float | None:
         """Round-trip seconds of a new link to node_id, or None if it can't be reached."""
         self._check()
         return self._backend.ping(node_hex(node_id))
+
+    def ping_info(self, node_id, *, on_stage: Callable[[str], None] | None = None) -> Ping:
+        """ping() with why it failed (Ping.reason: "no_path", "no_identity", "wrong_identity", "not_member",
+        "link_refused", "link_closed", "link_timeout") and the path it took (hops, interface, path_since).
+        on_stage(stage) is called as each step of opening the link begins ("path", "identity", "link"), on this
+        thread, before this returns. A daemon before 0.2.1 gives only rtt, and no stages."""
+        self._check()
+        node = node_hex(node_id)
+        info = (self._backend.ping_info(node) if on_stage is None
+                else self._backend.ping_info(node, on_stage=on_stage))
+        return Ping.from_dict(info)
 
     def peers(self) -> list[Peer]:
         """Every node this one knows (in its routing table, with a link open, or counted in its traffic), nearest
@@ -793,13 +890,20 @@ class Rnfs:
     # in memory). A stream out is sent once iterated, as cat's, its target's whole DAG fetched first
 
     def add_tar(self, source, *, name: str | None = None, pin: bool = True, only_hash: bool = False,
-                chunker: str | None = None) -> Added:
+                chunker: str | None = None, to: list[str] | None = None, to_self: bool = False,
+                origin: str | None = None) -> Added:
         """Add the directory a tar holds (bytes, or a binary file read up to the tar's end): its regular files
         and directories, the rest skipped with a warning; wrapped as the entry name if given, pinned "user" unless
-        pin is False (evictable cache) or only_hash (nothing stored); chunker as add's. Raises ValueError (a
-        malformed tar, an unknown chunker), Denied (a file's hash), TooLarge (max_output_entries), StorageFull."""
+        pin is False (evictable cache) or only_hash (nothing stored); chunker as add's. to/to_self (rnfs 0.2.1) seal
+        it as add() seals a folder, named name (required: its top directory, sealed as <name>.tar; the sealed file
+        is the CID, not wrapped). origin is what pins() says it was added from (default name, or "(tar upload)").
+        Raises ValueError (a malformed tar, an unknown chunker, sealing without name), Denied (a file's hash),
+        TooLarge (max_output_entries), StorageFull."""
         self._check()
-        return Added.from_dict(self._backend.add_tar(_body(source, "add_tar"), name or None, pin, only_hash, chunker))
+        options = {key: value for key, value in (("to", recipients(to)), ("to_self", bool(to_self)),
+                                                 ("origin", origin)) if value}
+        return Added.from_dict(self._backend.add_tar(_body(source, "add_tar"), name or None, pin, only_hash, chunker,
+                                                     **options))
 
     def get_tar(self, target):
         """An iterator of target (a file or directory) as a tar, files as stored (a sealed file sealed); entries
@@ -896,6 +1000,7 @@ class Rnfs:
         key = next(self._event_keys)
         watch = _EventWatch(kinds, callback)
         watch.handle = Watch(lambda: self._end_event_watch(key))
+        watch.backlog = _Backlog(lambda marker: self._event_call(watch, marker))
         self._events.start()
         with self._watch_lock:
             self._event_watches[key] = watch
@@ -932,14 +1037,21 @@ class Rnfs:
         self._events_heard(epoch, [{"seq": next_seq, "kind": "lost", "time": None, "epoch": epoch}])
 
     def _deliver_event(self, watch: "_EventWatch", event: dict):
-        """Queue watch's callback with event, under a key of its own: events are never coalesced."""
-        value = Event.from_dict(event)
+        """Queue watch's callback with event, under a key of its own: events are never coalesced, but a watch has at
+        most MAX_WATCH_QUEUE waiting (_Events.post). Called with watch's lock held, its position now event's."""
+        self._events.post(("event", next(self._event_keys)), self._event_call(watch, event), watch.backlog,
+                          (event["seq"], watch.epoch))
+
+    @staticmethod
+    def _event_call(watch: "_EventWatch", event: dict) -> Callable[[], None]:
+        """The call delivering event to watch's callback, unless cancelled since: the Event is made when it runs, as
+        a "lost" marker's seq moves on until then."""
 
         def call():
             """The app's callback, unless cancelled since."""
             if watch.handle.active:
-                watch.callback(value)
-        self._events.post(("event", next(self._event_keys)), call)
+                watch.callback(Event.from_dict(event))
+        return call
 
     def _event_baseline(self) -> tuple[int, str]:
         """(the sequence of the last event published, the run's epoch) now, the event source started if needed
@@ -1268,7 +1380,9 @@ class Job:
     retry_at is when a get, pin or export job queued again because its content wasn't found is tried again (None
     otherwise; error says why), retry_since when it first wasn't found; retry True: it was submitted to be.
     While it runs (rnfs 0.2.0): providers, how many its fetch uses (None before it has any, and for an add or import),
-    and searching, True while the fetch looks for providers, which takes minutes on a radio before any byte comes."""
+    and searching, True while the fetch looks for providers, which takes minutes on a radio before any byte comes.
+    stream (rnfs 0.2.1): an upload the daemon's API is reading (a stream add or import), listed and cancellable while
+    it runs, never saved or resumed; stream_name its origin or name."""
 
     id: str
     kind: str
@@ -1301,12 +1415,15 @@ class Job:
     retry: bool = False
     providers: int | None = None
     searching: bool = False
+    stream: bool = False
+    stream_name: str | None = None
     _owner: Rnfs | None = field(default=None, repr=False, compare=False)
 
     FIELDS = ("id", "kind", "target", "output", "sealed_name", "fallback_dht", "path", "options", "no_extract",
               "source", "nomadnet", "state", "created", "started",
               "finished", "error", "result", "runs", "total_bytes", "done_bytes", "blocks", "blocks_total",
-              "downloaded_bytes", "rate", "eta", "retry_at", "retry_since", "retry", "providers", "searching")
+              "downloaded_bytes", "rate", "eta", "retry_at", "retry_since", "retry", "providers", "searching",
+              "stream", "stream_name")
 
     @classmethod
     def from_dict(cls, data: dict, owner: Rnfs | None = None) -> "Job":
@@ -1519,7 +1636,8 @@ def _whole(value, name: str, none: bool = False) -> int | None:
 
 class Events:
     """What changes on a node (Rnfs.events; rnfs/events.py; design.md, "Events"): jobs, pins, the cache, names,
-    peers and remote pins, each an Event, so an app follows them instead of polling every list. A Node hears its
+    peers and remote pins, and from rnfs 0.2.1 the settings, name syncs, apps and the status, each an Event, so an
+    app follows them instead of polling every list. A Node hears its
     own as they are published; a Client long-polls GET /api/events. A daemon before 0.2.0 has no events:
     NoSuchEndpoint (a NotFound)."""
 
@@ -1530,8 +1648,9 @@ class Events:
     def watch(self, callback, kinds=None) -> Watch:
         """Call callback(event) on the event thread for each event of kinds (a kind or several; None: all)
         published from now on, in order, one call each. If events were missed (a Client fell more than the node's
-        1024 kept events behind, or the daemon restarted), callback gets an Event of kind "lost" (event.lost) in
-        their place: read again what the app shows. A Client polls on a thread of its own
+        1024 kept events behind, or the daemon restarted; or the callback is so slow that 1024 of its calls wait,
+        when the oldest are dropped), callback gets an Event of kind "lost" (event.lost) in their place: read again
+        what the app shows. A Client polls on a thread of its own
         (rnfs-client-event-watch), within its timeout as the name poller does. Raises ValueError (an unknown
         kind); a Client NoSuchEndpoint from a daemon without events."""
         return self._owner._watch_events(frozenset(kinds) if (kinds := event_kinds(kinds)) else None, callback)

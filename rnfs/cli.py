@@ -22,10 +22,11 @@ import stat
 import sys
 import time
 
-from rnfs import __version__, apiclient, fsutil, nomadnet
+from rnfs import __version__, apiclient, fsutil, launch, nomadnet_links, recentlog
 from rnfs.apiclient import CHALLENGE_HEADER, PROOF_HEADER, TOKEN_FILE, api_proof, token_path  # noqa: F401
 from rnfs.apiclient import daemon_info_path
 from rnfs.config import DEFAULT_API_PORT, LOCK_FILE, Config
+from rnfs.units import human_size
 
 DEFAULT_DIR = apiclient.DEFAULT_DIR
 COPY_SIZE = apiclient.COPY_SIZE
@@ -289,6 +290,7 @@ def run_daemon(args):
             fsutil.unlock(lock)  # fail() raises SystemExit, which an in-process caller (a test) may catch
             fail(f"can't write the debug log: {e}")
         print(f"rnfs: writing the debug log {debug.path}", flush=True)
+    recentlog.capture()  # Reticulum's output kept for GET /api/log too, from its start (after the debug log's hook)
 
     try:
         node = RnfsNode(config)
@@ -303,6 +305,14 @@ def run_daemon(args):
     servers = []
     # Set by a signal (below) or POST /api/shutdown (Windows has no clean way to stop a background daemon otherwise)
     stopping = threading.Event()
+    # POST /api/restart (0.2.1): stop as above, then start again where this daemon can (rnfs.launch)
+    started = launch.how_started()
+    restarting = threading.Event()
+
+    def restart():
+        """Stop, then start again (after the stop below)."""
+        restarting.set()
+        stopping.set()
 
     def abort(message: str):
         """Shut down what has started and exit with status 1 and message."""
@@ -315,10 +325,11 @@ def run_daemon(args):
         RNS.exit(1)  # ends with os._exit, so the message is printed first
 
     try:
-        servers.append(ApiServer(node, config.api_port, shutdown=stopping.set))
+        servers.append(ApiServer(node, config.api_port, shutdown=stopping.set,
+                                 restart=restart if started["can_restart"] else None))
         servers.append(GatewayServer(node, config, config.gateway_port))
     except (OSError, OverflowError) as e:  # OverflowError: a port over 65535, which validate() should have refused
-        abort(f"can't listen on 127.0.0.1: {e}. Is another daemon running? (--api-port, --gateway-port)")
+        abort(f"can't listen on 127.0.0.1 and ::1: {e}. Is another daemon running? (--api-port, --gateway-port)")
     api, gateway = servers
     # A new token each start, so one copied while an old daemon ran is useless now
     token_file = token_path(config.root)
@@ -334,7 +345,8 @@ def run_daemon(args):
         write_daemon_info(info_file, {
             "pid": os.getpid(), "api_port": api.port, "gateway_port": gateway.port, "version": __version__,
             "started": time.time(), "rnfs_dir": config.root, "reticulum_config": RNS.Reticulum.configdir,
-            "shared_instance": bool(node.reticulum.is_connected_to_shared_instance), "node_id": node.node_id.hex()})
+            "shared_instance": bool(node.reticulum.is_connected_to_shared_instance), "node_id": node.node_id.hex(),
+            **started})
     except OSError as e:
         abort(f"can't write {info_file}: {e}")
     print(f"rnfs node {node.node_id.hex()}, API on http://127.0.0.1:{api.port}, "
@@ -369,12 +381,33 @@ def run_daemon(args):
     remove_token(token_file, api.token)
     node.stop()
     if debug is not None:
-        debug.note("stopped", LOG_NOTICE)
+        debug.note("stopped, to start again" if restarting.is_set() else "stopped", LOG_NOTICE)
         debuglog.stop()
     # RNS.exit() ends with os._exit, which would lose log lines still buffered when stdout is a file
     sys.stdout.flush()
     sys.stderr.flush()
+    if restarting.is_set():
+        restart_daemon(lock, started)
     RNS.exit()  # saves Reticulum's path table and known destinations
+
+
+def restart_daemon(lock, started: dict):
+    """Start the daemon again once it has stopped (POST /api/restart): Reticulum saved and its interfaces closed as
+    RNS.exit() would, the rnfs dir unlocked, then this process's own command line executed in its place (rnfs.launch;
+    the same process ID). The Windows task wrapper's daemon exits with launch.EXIT_RESTART instead, which the wrapper
+    restarts. An exec that fails exits with status 1, as a crash would, for a service manager to restart."""
+    import RNS
+    if started["started_by"] == launch.WINDOWS_TASK:
+        RNS.exit(launch.EXIT_RESTART)
+    print("rnfs: starting again", flush=True)
+    RNS.Reticulum.exit_handler()  # what RNS.exit() does before os._exit
+    fsutil.unlock(lock)
+    program, argv = launch.restart_argv()
+    try:
+        os.execv(program, argv)
+    except OSError as e:
+        print(f"rnfs: couldn't start again: {printable(str(e))}", file=sys.__stderr__, flush=True)
+        os._exit(1)
 
 
 # Content
@@ -468,7 +501,7 @@ def run_add(args):
     In the foreground an add stays one request, not a job: a job would wait behind max_jobs transfers (one on slow
     nodes), and a local add mustn't queue behind an hour-long LoRa download. A NomadNet link is a transfer, so it
     runs as a job like get (run_add_nomadnet)."""
-    if nomadnet.looks_like(args.path):
+    if nomadnet_links.looks_like(args.path):
         run_add_nomadnet(args)
         return
     if getattr(args, "identify", False):
@@ -516,10 +549,10 @@ def run_add_nomadnet(args):
     there, as a job followed with a progress line (the transfer can take long on LoRa), or one request on a daemon
     without jobs; --background prints the job's ID. A local file named like that is added as ./<name>."""
     try:
-        link = str(nomadnet.parse(args.path))
+        link = str(nomadnet_links.parse(args.path))
     except ValueError as e:
         fail(f"{e}; a local file of that name is added as ./{args.path}")
-    if args.name is not None and not nomadnet.is_valid_name(args.name):
+    if args.name is not None and not nomadnet_links.is_valid_name(args.name):
         fail(f"invalid entry name {args.name!r}")
     api = client(args)
     if not daemon_has(args, api, "add_nomadnet"):
@@ -802,9 +835,27 @@ def run_pin_remote_ls(args):
 
 
 def run_gc(args):
-    """Evict every cached fetch."""
-    result = client(args).post("/api/gc")
-    print(printable(f"removed {result['removed_blocks']} blocks, freed {result['freed_bytes']} bytes"))
+    """Evict every cached fetch; --dry-run: say what that would free, and what the stored blocks are kept for."""
+    if not args.dry_run:
+        result = client(args).post("/api/gc")
+        print(printable(f"removed {result['removed_blocks']} blocks, freed {result['freed_bytes']} bytes"))
+        return
+    api = client(args)
+    try:
+        result = api.gc(dry_run=True)
+    except apiclient.ApiError as e:  # Unsupported: an older daemon, which would have collected
+        fail(str(e))
+    if result["held_back"]:
+        print("would remove nothing: a damaged DAG node holds collection back (run rnfs verify)")
+    else:
+        print(f"would remove {result['removed_blocks']} blocks, freeing {human_size(result['freed_bytes'])} "
+              f"({human_size(result['allocated_bytes'])} on disk) and evicting "
+              f"{result['cached_fetches']} cached {'fetch' if result['cached_fetches'] == 1 else 'fetches'}")
+    print(f"stored: {human_size(result['pinned_bytes'])} pinned, {human_size(result['cached_bytes'])} cached, "
+          f"{human_size(result['protected_bytes'])} held by operations in progress, "
+          f"{human_size(result['unreferenced_bytes'])} unreferenced")
+    if isinstance(result.get("records_bytes"), int):
+        print(f"state database (provider records and node state): {human_size(result['records_bytes'])}")
 
 
 def run_verify(args):
@@ -821,21 +872,41 @@ def run_verify(args):
 
 
 def run_providers(args):
-    """Print the IDs of nodes providing a CID, one per line."""
-    providers = client(args).get("/api/providers", cid=args.cid)["providers"]
-    if not providers:
+    """Print the IDs of nodes providing a CID, one per line, each as it is found (a daemon before 0.2.1: all once its
+    lookup ends)."""
+    printed: set[str] = set()
+    try:
+        for line in client(args).providers_stream(args.cid):
+            for node_id in [line["provider"]] if "provider" in line else line.get("providers", []):
+                if node_id not in printed:
+                    printed.add(node_id)
+                    print(printable(node_id), flush=True)
+    except apiclient.ApiError as e:  # an error line, or the answer cut short
+        fail(str(e))
+    if not printed:
         fail("no providers found")
-    print("\n".join(printable(node_id) for node_id in providers))
+
+
+# Why a ping failed (GET /api/ping's reason, rnfs.network.links.OPEN_FAILURES), as `rnfs ping` says it
+PING_FAILURES = {
+    "no_path": "no path to {node} (it hasn't been heard, or is out of reach)",
+    "no_identity": "a path to {node}, but not its identity",
+    "wrong_identity": "the identity known for {node} isn't that node's",
+    "not_member": "{node} isn't a member (private mode)",
+    "link_refused": "{node} refused the link (it is up, but has no room for it)",
+    "link_closed": "the link to {node} closed before it was established",
+    "link_timeout": "the link to {node} wasn't established in time",
+}
 
 
 def run_ping(args):
-    """Print the round-trip time to a node."""
+    """Print the round-trip time to a node, or why there is none."""
     from rnfs.features.contacts import node_arg  # a node contact's nick works as a node ID
     args.node = node_arg(args, args.node)
-    rtt = client(args).get("/api/ping", node=args.node)["rtt"]
-    if rtt is None:
-        fail(f"no answer from {args.node}")
-    print(f"round-trip time {rtt * 1000:.0f} ms")
+    answer = client(args).get("/api/ping", node=args.node)
+    if answer["rtt"] is None:
+        fail(PING_FAILURES.get(answer.get("reason"), "no answer from {node}").format(node=args.node))
+    print(f"round-trip time {answer['rtt'] * 1000:.0f} ms")
 
 
 # Names
@@ -855,20 +926,21 @@ def run_name_rm(args):
 
 
 def run_name_export(args):
-    """Write a name's key to -o (created with mode 0600) or stdout."""
+    """Write a name's key to -o (a new file only this user can read: mode 0600, and on Windows, which ignores the
+    mode, a private access list, AUD-L2) or stdout."""
     if not args.output and sys.stdout.isatty():
         fail("refusing to write a private key to the terminal; use -o <file> or redirect stdout")
+    if args.output and os.path.lexists(args.output):
+        fail(f"{args.output} already exists")  # before the key is exported (and marked so), as app add does
     response = client(args).request("POST", "/api/name/export", json_body={"alias": args.alias})
     key = read_all(response)
     if args.output:
         try:
-            fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | fsutil.O_BINARY, 0o600)
+            fsutil.write_atomic(args.output, key, mode=0o600, private=True, exclusive=True)
         except FileExistsError:
             fail(f"{args.output} already exists")
         except OSError as e:
             fail(f"can't write {args.output}: {e}")
-        with os.fdopen(fd, "wb") as out:
-            out.write(key)
     else:
         sys.stdout.buffer.write(key)
         sys.stdout.buffer.flush()
@@ -984,6 +1056,24 @@ def run_stop(args):
     print("rnfs: the daemon stopped")
 
 
+def run_restart(args):
+    """Ask the daemon to restart (stop, then start again with its command line), and wait (up to --wait seconds)
+    until it answers again."""
+    found = client(args)
+    # The library's own connection: the CLI's would exit on the errors the daemon gives while it restarts
+    api = apiclient.ApiConnection(args.dir, port=found.port, token_file=found.token_file)
+    try:
+        restarted = api.restart(wait=args.wait)
+    except apiclient.NoSuchEndpoint:
+        fail(f"the daemon (rnfs {api.daemon_version or '?'}) can't restart through its API; stop it (rnfs stop) and "
+             f"start it again")
+    except apiclient.ApiError as e:
+        fail(str(e))
+    if not restarted:
+        fail(f"the daemon hasn't answered again after {args.wait:g} s; it may still be starting (rnfs status)")
+    print("rnfs: the daemon restarted")
+
+
 def run_app_add(args):
     """Issue a token to a new app: print it, or write it to -o (a new file, readable by this user only); say on
     stderr what it lets the app do."""
@@ -1027,12 +1117,47 @@ def run_app_rm(args):
                     f"{'' if result['released'] == 1 else 's'}"))
 
 
-def human_size(size: float) -> str:
-    """A size in bytes, KiB, MiB or GiB."""
-    for unit in ("B", "KiB", "MiB", "GiB"):
-        if size < 1024 or unit == "GiB":
-            return f"{size:.0f} B" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024
+def run_app_requests(args):
+    """List the apps waiting for an answer: request ID, name, code, and what each says of itself."""
+    requests = client(args).app_requests()
+    if args.json:
+        print(json.dumps(requests, indent=2))
+        return
+    for request in requests:
+        about = f"\t{request['description']}" if request.get("description") else ""
+        print(printable(f"{request['id']}\t{request['name']}\tcode {request['code']}{about}"))
+    if not requests:
+        print("no app is asking for a token", file=sys.stderr)
+
+
+def run_app_approve(args):
+    """Approve an app's request for a token: the app collects the token itself. The daemon checks the code the app
+    shows (--code, or asked for at a terminal), so a request another program made under the app's name, which shows
+    another code, isn't approved in its place (AUD-M5)."""
+    api = client(args)
+    code = args.code
+    if code is None and sys.stdin.isatty():
+        request = next((request for request in api.app_requests() if request["id"] == args.id), None)
+        if request is None:
+            fail(f"no app is waiting for an answer as request {args.id}")
+        about = f" ({request['description']})" if request.get("description") else ""
+        # Typed, not shown: the code is to come from the app, which another program asking under its name can't show
+        print(printable(f"app {request['name']}{about} asks for a token, which lets it do anything rnfs can"),
+              file=sys.stderr)
+        print("type the code the app shows (Enter to cancel): ", end="", file=sys.stderr, flush=True)
+        code = sys.stdin.readline().strip()
+        if not code:
+            fail("not approved")
+    added = api.app_approve(args.id, code)
+    if code is None:
+        warn("approved without checking the code the app shows (--code)")
+    print(printable(f"approved app {added['name']}: it can now do anything rnfs can (rnfs app rm "
+                    f"{added['name']} revokes it)"))
+
+
+def run_app_deny(args):
+    """Refuse an app's request for a token."""
+    print(printable(f"refused app {client(args).app_deny(args.id)['name']}"))
 
 
 def human_duration(seconds: float) -> str:
@@ -1085,6 +1210,31 @@ def network_lines(status: dict) -> list[str]:
     return lines
 
 
+def folder_lines(status: dict) -> list[str]:
+    """`rnfs status`'s line for the shared folder (0.2.1: entries, bytes, the last scan) and one per entry that
+    couldn't be imported; none from an older daemon."""
+    folder = status.get("shared_folder")
+    if not isinstance(folder, dict):
+        return []
+    if folder.get("refused"):
+        scanned = f"not scanned: {folder['refused']}"
+    elif folder.get("scanning"):
+        scanned = "scanning now"
+    elif isinstance(folder.get("last_scan"), (int, float)):
+        scanned = f"last scanned {human_duration(time.time() - folder['last_scan'])} ago"
+    else:
+        scanned = "not scanned yet"
+    size = human_size(folder["bytes"]) if isinstance(folder.get("bytes"), int) else "size unknown"
+    lines = [printable(f"shared_folder: {folder.get('entries')} entries, {size} in {folder.get('path')}; {scanned}"
+                       + (f"; the last scan failed: {folder['error']}" if folder.get("error") else ""))]
+    failures = folder.get("failures") or []
+    lines += [printable(f"shared_folder_failed: {failure.get('name')}: {failure.get('reason')}")
+              for failure in failures]
+    if (folder.get("failed") or 0) > len(failures):
+        lines.append(f"shared_folder_failed: ... and {folder['failed'] - len(failures)} more")
+    return lines
+
+
 def run_status(args):
     """Print the daemon's status, one "name: value" per line, what it sees of the network summed up in a few lines
     at the end. Without a readable API token (a health check by another user), only the version the daemon says
@@ -1095,8 +1245,9 @@ def run_status(args):
         warn(f"no readable API token at {api.token_file}: the daemon only says its version without it")
         return
     status = api.status()
-    print_fields({name: value for name, value in status.items() if name not in ("network", "record_store")})
-    for line in network_lines(status):
+    print_fields({name: value for name, value in status.items()
+                  if name not in ("network", "record_store", "shared_folder")})
+    for line in network_lines(status) + folder_lines(status):
         print(line)
     for warning in clock_warnings(status):
         warn(warning)
@@ -1246,7 +1397,9 @@ def build_parser() -> argparse.ArgumentParser:
                            help="the pins other identities asked of this node, and their use of remote_pin_quota")
     remote_ls.add_argument("--json", action="store_true", help="print the full listing as JSON")
 
-    command(commands, "gc", run_gc, "evict all cached fetches")
+    gc = command(commands, "gc", run_gc, "evict all cached fetches")
+    gc.add_argument("--dry-run", action="store_true", help="change nothing: say what gc would free, and what the "
+                                                           "stored blocks are kept for")
     cache = commands.add_parser("cache", help="cached fetches (downloads not pinned)").add_subparsers(
         dest="cache_command", required=True, metavar="command")
     cache_ls = command(cache, "ls", run_cache_ls, "list cached fetches, most recently used first")
@@ -1302,11 +1455,22 @@ def build_parser() -> argparse.ArgumentParser:
     app_ls = command(app_commands, "ls", run_app_ls, "list the apps")
     app_ls.add_argument("--json", action="store_true")
     command(app_commands, "rm", run_app_rm, "revoke an app's token and release its pins").add_argument("name")
+    app_requests = command(app_commands, "requests", run_app_requests,
+                           "list the apps asking for a token, with the code each shows")
+    app_requests.add_argument("--json", action="store_true")
+    app_approve = command(app_commands, "approve", run_app_approve,
+                          "give an app that asked a token, once you give the code it shows")
+    app_approve.add_argument("id")
+    app_approve.add_argument("--code", help="the code the app shows (asked for at a terminal)")
+    command(app_commands, "deny", run_app_deny, "refuse an app's request for a token").add_argument("id")
 
     command(commands, "status", run_status, "node ID, known nodes, records held, storage use")
     stop = command(commands, "stop", run_stop, "stop the daemon (as Ctrl+C or SIGTERM would) and wait until it has")
     stop.add_argument("--wait", type=positive_seconds, default=30.0, metavar="SECONDS",
                       help="how long to wait for it to stop (default 30)")
+    restart = command(commands, "restart", run_restart, "restart the daemon, so settings that need a restart apply")
+    restart.add_argument("--wait", type=positive_seconds, default=120.0, metavar="SECONDS",
+                         help="how long to wait for it to answer again (default 120)")
 
     from rnfs import features
     for feature in features.feature_classes():

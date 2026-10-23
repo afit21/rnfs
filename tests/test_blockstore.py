@@ -14,7 +14,7 @@ from rnfs.content import blockstore
 from rnfs.content.blockstore import PARTIAL_PREFIX, SHARD_DIGITS, BlockStore, is_shard_name, matches, shard_of
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.errors import RnfsError
-from tests.support import CAN_SYMLINK, POSIX_MODES
+from tests.support import CAN_SYMLINK, PERMISSION_CHECKS, POSIX_MODES
 
 HELLO_WORLD = "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e"
 HELLO_SHARD = "n5"  # HELLO_WORLD's third- and second-to-last characters
@@ -177,6 +177,22 @@ class BlockStoreTest(unittest.TestCase):
         self.store.put(cid, b"abc")
         with open(self.store.path(cid), "wb") as f:
             f.write(b"abd")
+        self.assertFalse(self.store.verify(cid))
+
+    def test_verify_counts_an_unreadable_block_as_bad(self):
+        # A disk error (EIO), or a file this user can't open, is as bad as damage: verify says so rather than raising
+        cid = Cid.for_block(RAW, b"abc")
+        self.store.put(cid, b"abc")
+        with mock.patch("builtins.open", side_effect=OSError(5, "Input/output error")):
+            self.assertFalse(self.store.verify(cid))
+        self.assertTrue(self.store.verify(cid))
+
+    @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks (POSIX, not root)")
+    def test_verify_counts_a_block_this_user_cant_open_as_bad(self):
+        cid = Cid.for_block(RAW, b"abc")
+        self.store.put(cid, b"abc")
+        os.chmod(self.store.path(cid), 0)  # as a block a run as root left would be
+        self.addCleanup(os.chmod, self.store.path(cid), 0o600)
         self.assertFalse(self.store.verify(cid))
 
     def test_ignores_foreign_files_and_deletes_partial_files(self):

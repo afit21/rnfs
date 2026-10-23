@@ -428,6 +428,41 @@ class BanTest(RoutingTestCase):
         self.assertFalse(self.table.is_banned(node_id(43)))
 
 
+class SnapshotTest(RoutingTestCase):
+    """snapshot() (GET /api/routing, 0.2.1): the buckets holding nodes, unreliable nodes and bans, as wall time."""
+
+    def test_snapshot(self):
+        self.table.wall_clock = lambda: self.clock.now + 1_000_000  # the wall clock, a fixed offset ahead
+        old, newer = bucket_ids(3, 2)
+        self.table.heard(old)
+        self.clock.now += 10
+        self.table.heard(newer)
+        self.table.failed(newer)
+        far = node_id(1 << 100)
+        self.table.heard(far)
+        for _ in range(3):
+            self.table.failed(node_id(7))  # never in the table: unreliable all the same
+        self.table.ban(node_id(99), "it sent a block not matching the CID requested")
+        self.table.ban(node_id(98))
+        snap = self.table.snapshot()
+        self.assertEqual((snap["k"], snap["nodes"], snap["dropped"]), (K, 3, 0))
+        self.assertEqual([bucket["index"] for bucket in snap["buckets"]], [3, 100])
+        first, second = snap["buckets"][0]["nodes"]
+        self.assertEqual((first["node_id"], first["failures"], first["stale"]), (old.hex(), 0, False))
+        self.assertEqual((second["node_id"], second["failures"], second["stale"]), (newer.hex(), 1, True))
+        self.assertEqual(first["first_seen"], self.clock.now - 10 + 1_000_000)
+        self.assertEqual([(entry["node_id"], entry["failures"]) for entry in snap["unreliable"]],
+                         [(node_id(7).hex(), 3)])
+        self.assertEqual([(ban["node_id"], ban["reason"]) for ban in snap["bans"]],
+                         [(node_id(99).hex(), "it sent a block not matching the CID requested"), (node_id(98).hex(), None)])
+        self.assertEqual(snap["bans"][0]["until"], self.clock.now + 3600 + 1_000_000)
+        self.assertEqual(self.table.snapshot(max_listed=1)["bans_total"], 2)
+        self.assertEqual(len(self.table.snapshot(max_listed=1)["bans"]), 1)
+        self.clock.now += 3601
+        self.assertEqual(self.table.snapshot()["bans"], [])  # ended, and their reasons forgotten
+        self.assertEqual(self.table._ban_reasons, {})
+
+
 
 class PruneTest(RoutingTestCase):
     """Expired bans and dropped nodes are forgotten from the front of their expiry order (S4), and the outcome is

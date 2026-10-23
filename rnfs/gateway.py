@@ -1,4 +1,4 @@
-"""HTTP gateway of a running node (specification section 11), bound to 127.0.0.1, separate from the API.
+"""HTTP gateway of a running node (specification section 11), bound to 127.0.0.1 and ::1, separate from the API.
 
 GET/HEAD /rnfs/<cid>[/path]   content by CID: immutable, ETag "<cid>" of the target
 GET/HEAD /name/<name>[/path]  content a name points at, resolved with for_gateway=True
@@ -388,7 +388,7 @@ class GatewayServer(LocalServer):
     response_timeout = 300.0
 
     def __init__(self, node, config, port: int):
-        """Bind to 127.0.0.1:port; requests are served once start() is called."""
+        """Bind to 127.0.0.1:port and [::1]:port (LocalServer); requests are served once start() is called."""
         super().__init__(GatewayHandler, port, node=node, config=config, limiter=FetchLimiter(config.gateway_fetches),
                          names=NameCache())
 

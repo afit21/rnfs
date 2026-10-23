@@ -1,7 +1,7 @@
 """Entry names (specification section 5): what a directory entry may be called. The one rule, which
 rnfs.content.dag re-exports for the DAG and its builders.
 
-Stdlib only: rnfs.uris and rnfs.nomadnet check names with it, and the CLI and rnfs.Client import those without RNS
+Stdlib only: rnfs.uris and rnfs.nomadnet_links check names with it, and the CLI and rnfs.Client import those without RNS
 (rnfs.content.dag loads RNS's bundled msgpack).
 """
 

@@ -1001,6 +1001,145 @@ class RequestServerTest(unittest.TestCase):
         self.backend.find = broken
         self.assertIs(self.ask(FIND_PATH, KEY, self.connect(b"a")), False)
 
+    # Requests refused, or answered in one packet, displace nothing; a response displaced before it was handed
+    # to RNS keeps its link
+
+    def on(self, link, interface, hops=1):
+        """link, arriving on interface (an RNS interface stand-in with a bitrate) over hops hops."""
+        link.attached_interface, link.expected_hops = interface, hops
+        return link
+
+    def lora_downloads(self, blocks, seconds=120):
+        """Two honest downloads of blocks[0] and blocks[1] filling the slow pool (default: 2 slots), moving steadily
+        over a LoRa interface for seconds: old enough for a newcomer to displace the slower. Their Resources."""
+        lora = types.SimpleNamespace(bitrate=1200)
+        resources = []
+        for i in (0, 1):
+            link = self.on(self.connect(b"honest%d" % i), lora)
+            request_id = bytes([i + 1]) * 16
+            self.assertIsNot(self.blocks(link, [blocks[i][0]], 64 * KIB, request_id), False)
+            resources.append(self.send(link, request_id))
+        for second in range(1, seconds + 1):
+            self.clock.now += 1
+            for resource in resources:
+                resource.progress = 0.00225 * second  # ~150 B/s of 64 KiB
+            self.server.check_responses()
+        self.assertEqual(self.server.pools.count(server.SLOW_POOL), 2)
+        return resources, lora
+
+    def sized_backend(self, blocks):
+        """Serve blocks, with their stored sizes known (as a node's backend knows them)."""
+        self.backend = FakeBackend(blocks=dict(blocks))
+        self.backend.served_block_size = lambda cid: len(self.backend.blocks[cid]) if cid in self.backend.blocks \
+            else None
+        self.make_server(Config())
+
+    def test_a_one_packet_answer_takes_no_slot_and_displaces_nothing(self):
+        """A valid 1-byte /range (or a /blocks of a tiny block) is answered in one packet: it took a pool slot, so
+        displaced the slowest LoRa download older than deadline_slack, and freed the slot at once, with no cooldown,
+        so one link could cancel download after download."""
+        blocks = [block_of(64 * KIB, i) for i in range(3)] + [block_of(100, 3)]
+        self.sized_backend(blocks)
+        honest, lora = self.lora_downloads(blocks)
+        newcomer = self.on(self.connect(b"newcomer"), lora)
+        cid, block = blocks[2]
+        self.assertEqual(self.ask(RANGE_PATH, protocol.encode_range(cid, len(block) - 1, 1), newcomer,
+                                  request_id=b"n" * 16), [len(block), 0, block[-1:]])
+        self.assertEqual(self.blocks(newcomer, [blocks[3][0]], request_id=b"m" * 16), [blocks[3][1]])
+        self.assertEqual([resource.cancelled for resource in honest], [False, False])
+        self.assertEqual(self.server.pools.count(server.SLOW_POOL), 2)
+        self.assertEqual(self.server.incoming.in_progress(newcomer.link_id), (0, 0))
+
+    def test_an_answer_larger_than_its_stored_size_said_takes_a_slot(self):
+        """fits_packet goes by the stored size; a block found larger when read is sent with a slot as any other."""
+        cid, block = block_of(100 * KIB, 1)
+        self.backend = FakeBackend(blocks={cid: block})
+        self.backend.served_block_size = lambda cid: 10  # out of date
+        self.make_server(Config())
+        link = self.connect(b"a")
+        self.assertEqual(self.ask(RANGE_PATH, protocol.encode_range(cid, 0, 64 * KIB), link, request_id=b"r" * 16),
+                         [len(block), 0, block[:64 * KIB]])
+        response = self.server.pools.responses()[0]
+        self.assertEqual((response.link_id, response.request_id), (link.link_id, b"r" * 16))
+        self.assertIsNotNone(response.size)
+        self.assertEqual(self.server.incoming.in_progress(link.link_id), (1, 1))
+
+    def test_a_range_past_the_stored_end_is_refused_unread_and_unslotted(self):
+        """A /range past the end of a served block is refused as before (False), from its stored size: it took a pool
+        slot (displacing a download, REL-2's harm) and read the block before finding the offset past its end."""
+        blocks = [block_of(64 * KIB, i) for i in range(3)]
+        self.sized_backend(blocks)
+        honest, lora = self.lora_downloads(blocks)
+        reads = []
+        served = self.backend.served_block
+        self.backend.served_block = lambda cid: reads.append(cid) or served(cid)
+        attacker = self.on(self.connect(b"attacker"), lora)
+        cid, block = blocks[2]
+        for attempt in range(3):
+            self.assertIs(self.ask(RANGE_PATH, protocol.encode_range(cid, len(block) + 1, 1), attacker,
+                                   request_id=bytes([attempt]) * 16), False)
+        self.assertEqual(reads, [])
+        self.assertEqual([resource.cancelled for resource in honest], [False, False])
+        self.assertEqual(self.server.incoming.in_progress(attacker.link_id), (0, 0))
+
+    def test_a_requester_at_its_budget_share_is_refused_before_it_takes_a_slot(self):
+        """upload_budget's per-requester share was checked after the slot was reserved: a requester then refused for
+        it had already displaced (and cancelled) another requester's download."""
+        blocks = [block_of(100 * KIB, 10), block_of(60 * KIB, 11), block_of(60 * KIB, 12)]
+        self.backend = FakeBackend(blocks=dict(blocks))
+        self.make_server(Config(max_blocks_responses=2, fast_blocks_responses=1, upload_budget=200 * KIB))
+        tcp = types.SimpleNamespace(bitrate=10_000_000)
+        x_identity = RNS.Identity()
+        # X has a 100 KiB response in flight on a slow link: half the budget
+        x1 = self.on(self.connect(b"x1"), tcp)
+        self.assertIsNot(self.ask(BLOCKS_PATH, protocol.encode_blocks(MAX_RESPONSE_SIZE, [blocks[0][0]]), x1,
+                                  x_identity, b"1" * 16), False)
+        x_resource = self.send(x1, b"1" * 16)
+        # Y downloads on a fast link, slowly but above its floor, for 40 s
+        y = self.on(self.connect(b"y", mtu=1000, mdu=931), tcp)
+        self.assertIsNot(self.blocks(y, [blocks[1][0]], request_id=b"2" * 16), False)
+        y_resource = self.send(y, b"2" * 16)
+        for second in range(1, 41):
+            self.clock.now += 1
+            y_resource.progress = 0.022 * second
+            x_resource.progress = 0.013 * second
+            self.server.check_responses()
+        # X asks again on a fast link of its own
+        x2 = self.on(self.connect(b"x2", mtu=1000, mdu=931), tcp)
+        self.assertIs(self.ask(BLOCKS_PATH, protocol.encode_blocks(MAX_RESPONSE_SIZE, [blocks[2][0]]), x2,
+                               x_identity, b"3" * 16), False)
+        self.assertFalse(y_resource.cancelled)
+        self.assertEqual(self.server.pools.count(server.FAST_POOL), 1)
+
+    def test_a_response_displaced_while_paced_keeps_its_link(self):
+        """A response displaced while it waits for upload pacing had no Resource, and would get none (its handler
+        refuses it): _cancel closed its requester's link anyway, and every request on it."""
+        blocks = [block_of(20 * KIB, i) for i in range(4)]
+        self.backend = FakeBackend(blocks=dict(blocks))
+        self.make_server(Config(max_blocks_responses=2, fast_blocks_responses=2, max_upload_rate=40_000))
+        first, second = types.SimpleNamespace(bitrate=10_000_000), types.SimpleNamespace(bitrate=10_000_000)
+        a, b = (self.on(self.connect(name, mtu=1000, mdu=900), first) for name in (b"a", b"b"))
+        c = self.on(self.connect(b"c", mtu=1000, mdu=900), second)
+        # A's first response completes: pacing holds its next one back a few seconds
+        self.assertIsNot(self.blocks(a, [blocks[0][0]], request_id=b"1" * 16), False)
+        self.send(a, b"1" * 16).complete()
+        self.assertGreater(self.server.pacer.wait_time(a.link_id), 0)
+        answers = []
+        paced = threading.Thread(target=lambda: answers.append(self.blocks(a, [blocks[1][0]], request_id=b"2" * 16)))
+        paced.start()
+        held = wait_for(lambda: [r for r in self.server.pools.responses() if r.link_id == a.link_id], timeout=5)
+        # B, on the same interface, takes the other slot and moves
+        self.assertIsNot(self.blocks(b, [blocks[2][0]], request_id=b"3" * 16), False)
+        self.send(b, b"3" * 16).progress = 0.5
+        # Past half of A's grace, still pacing, C from another interface takes A's slot (the fairness pick)
+        self.clock.now += held[0].grace / 2 + 0.1
+        self.server.check_responses()
+        self.assertIsNot(self.blocks(c, [blocks[3][0]], request_id=b"4" * 16), False)
+        paced.join(10)
+        self.assertEqual(answers, [False])
+        self.assertEqual(a.status, RNS.Link.ACTIVE)
+        self.assertEqual(self.server.incoming.in_progress(a.link_id), (0, 0))
+
 
 class ResourceGuardTest(unittest.TestCase):
     """The guard on incoming Resource advertisements (oversized-transfer bombs)."""

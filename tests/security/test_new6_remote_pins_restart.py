@@ -7,7 +7,8 @@ start; pins released before the stop, or from identities no longer on remote_pin
 
 The tests use two offline nodes joined by tests.test_node's NetClient. The provider's /blocks answers are held
 while the pinning node stops, so its pins are still waiting then; the node is then reopened over the same
-directory and started the way RnfsNode.__init__ starts it (_start_threads).
+directory and started the way RnfsNode.__init__ starts it (_resume_remote_pins, which _start_network runs before
+it accepts links since AUD-L12, then _start_threads).
 """
 import io
 import os
@@ -76,7 +77,7 @@ class RemotePinsRestartTest(unittest.TestCase):
         """Accept /pin for pins while the provider's answers are held, then stop the node with them waiting."""
         asked, go = threading.Event(), threading.Event()
 
-        def held(node_id, cids, on_progress=None):
+        def held(node_id, cids, on_progress=None, slot_wait=None):
             """Hold every /blocks until the test lets it go, then fail it."""
             asked.set()
             go.wait(10)
@@ -93,6 +94,7 @@ class RemotePinsRestartTest(unittest.TestCase):
     def restart(self, **settings) -> RnfsNode:
         """Reopen the pinning node over the same directory and start it as RnfsNode.__init__ does."""
         self.node = self.open("b", B_ID, **settings)
+        self.node._resume_remote_pins()
         self.node._start_threads()
         return self.node
 
@@ -112,7 +114,7 @@ class RemotePinsRestartTest(unittest.TestCase):
         """A pin released before the stop isn't fetched after the restart."""
         asked, go = threading.Event(), threading.Event()
 
-        def held(node_id, cids, on_progress=None):
+        def held(node_id, cids, on_progress=None, slot_wait=None):
             """Hold every /blocks until the test lets it go, then fail it."""
             asked.set()
             go.wait(10)

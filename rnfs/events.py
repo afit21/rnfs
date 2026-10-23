@@ -1,5 +1,6 @@
-"""The node's event log for local clients: what changed (jobs, pins, the cache, names, peers, remote pins), so an
-app learns of it through one long poll (GET /api/events, rnfs/api.py) instead of polling every list. No RNS.
+"""The node's event log for local clients: what changed (jobs, pins, the cache, names, peers, remote pins; from
+0.2.1 the settings, name syncs, apps and the status), so an app learns of it through one long poll (GET /api/events,
+rnfs/api.py) instead of polling every list. No RNS.
 
 Every event is a dict: "seq" (1, 2, ... for the node's run), "kind" (EVENT_KINDS), "time" (Unix time) and the
 kind's own fields (design.md, "Events"). The log keeps the last MAX_EVENTS; a client that asks for events after a
@@ -20,7 +21,7 @@ from collections import deque
 MAX_EVENTS = 1024  # events kept; a client further behind gets "lost"
 MAX_EVENT_CIDS = 100  # CIDs one event lists; "count" says how many changed (a gc may uncache thousands)
 # Every kind published, for GET /api/events?kinds= and the capability list
-EVENT_KINDS = ("job", "pin", "cache", "name", "peer", "remote_pin")
+EVENT_KINDS = ("job", "pin", "cache", "name", "peer", "remote_pin", "config", "name_sync", "apps", "status")
 RESERVED_FIELDS = frozenset({"seq", "kind", "time"})  # every event's own
 
 

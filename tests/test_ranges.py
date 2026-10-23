@@ -330,6 +330,33 @@ class RangesFetchTest(unittest.TestCase):
             result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
         self.assertEqual(result.status, peer_client.UNSUPPORTED)
 
+    def test_a_partial_whose_block_was_stored_meanwhile_goes_once_released(self):
+        """The block stored while a range of it arrives (another provider's copy, an end-game duplicate's): its
+        partial, which drop() can't take from the request holding it, goes when that request releases it, rather than
+        staying (on disk) until evicted. Other blocks' partials stay."""
+        self.ranges = ranges.Ranges(ranges.RangeSupport(None), ranges.Partials(self.tmp_dir()))
+        cid, block = raw(os.urandom(40 * KIB))
+        other, other_block = raw(os.urandom(40 * KIB))
+        self.client.holdings[P1] = {cid: block, other: other_block}
+        self.ranges.fetch(self.client, P1, other, 16 * KIB, 1.0, False, len(other_block))
+
+        def stored_meanwhile(c, offset, max_bytes, compress):
+            """Fetch._accept stores the block from elsewhere as this range arrives."""
+            self.ranges.partials.drop(cid)
+            return None
+        self.client.range_behaviour[P1] = stored_meanwhile
+        result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
+        self.assertEqual(result.partial, {cid: 16 * KIB})
+        self.assertEqual(self.ranges.partials.length(cid, P1), 0)
+        self.assertEqual(self.ranges.partials.length(other, P1), 16 * KIB)
+        self.assertEqual(len(os.listdir(self.ranges.partials.directory)), 1)
+
+    def tmp_dir(self) -> str:
+        """A partials directory removed when the test ends."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return os.path.join(tmp.name, ranges.PARTIAL_DIR)
+
     def test_a_partial_in_use_falls_back_to_blocks(self):
         cid, block = raw(os.urandom(20 * KIB))
         held = self.ranges.partials.acquire(cid, P1)

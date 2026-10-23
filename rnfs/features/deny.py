@@ -112,11 +112,15 @@ class DenyFeature(Feature):
                 self._due[source] = first
         self._spawn(self._loop, "rnfs-deny")
 
-    def stop(self, deadline: float | None = None):
-        """Stop the background thread and wait for it until deadline (a fetch in progress stops at its next network
-        wait), so the node doesn't close the state database under it."""
+    def stopping(self):
+        """Ask the background thread to end: a fetch in progress ends at its next step (as Feature.stopping)."""
         self._stop.set()
         self._wake.set()
+
+    def stop(self, deadline: float | None = None):
+        """Stop the background thread and wait for it until deadline, so the node doesn't close the state database
+        under it."""
+        self.stopping()
         self._join(deadline)
 
     def status(self) -> dict:
@@ -135,7 +139,7 @@ class DenyFeature(Feature):
 
     def check(self, source: str) -> bool:
         """Bring source's list up to date: True if it is current (or a CID source already accepted)."""
-        from rnfs import denylist
+        from rnfs import denylist, fetcher
         from rnfs.content import walker
         from rnfs.content.storage import DENY
         root, name, names = parse_source(source)
@@ -155,7 +159,8 @@ class DenyFeature(Feature):
             self._set_state(source, "in use")
             return True
         try:
-            with self.node.pinned_fetch(root, names, explicit=False) as fetch:
+            # Ends at its next step once the feature is asked to stop, so the node's stop needn't wait it out
+            with fetcher.cancel_when(self._stop.is_set), self.node.pinned_fetch(root, names, explicit=False) as fetch:
                 expect = fetch.resolve()
                 if previous == expect.cid and self.deny.in_use(source):
                     self._set_state(source, "in use")
@@ -165,7 +170,7 @@ class DenyFeature(Feature):
                 if fetch.size_of(expect) > denylist.MAX_LIST_BYTES:
                     raise ValueError(f"it is over {denylist.MAX_LIST_BYTES // 1024} KiB")
                 self._set_state(source, f"fetching {expect.cid}")
-                fetch.fetch_dag(expect)
+                fetch.fetch_dag(expect, self.node.config.max_output_entries)  # as every fetch of a whole DAG
                 entries = denylist.parse_list(b"".join(walker.read_range(expect, fetch.get)))
                 # Pinned inside the fetch's protection, so the new version is never unprotected
                 self.node.storage.pin(expect.cid, DENY)
@@ -219,7 +224,11 @@ class DenyFeature(Feature):
 
     def _loop(self):
         """The background thread: checks and fetches, one at a time, once the node has joined."""
-        self.node.joined.wait()
+        # In steps, so a stop during the join (minutes on a radio) ends this at once rather than at the node's stop
+        # deadline, which would leave the other features' threads and the node's no time
+        while not self.node.joined.wait(0.5):
+            if self._stop.is_set():
+                return
         while not self._stop.is_set():
             try:
                 delay = self.run_due()

@@ -355,21 +355,33 @@ class FakeNode:
         self.cached.discard(cid)
         return {"removed_records": 1, "removed_blocks": 1, "freed_bytes": 1}
 
-    def gc(self):
-        self.record("gc")
-        return {"removed_blocks": 3, "freed_bytes": 300}
+    def gc(self, dry_run=False):
+        self.record("gc", **({"dry_run": True} if dry_run else {}))
+        return {"removed_blocks": 3, "freed_bytes": 300, **({"dry_run": True} if dry_run else {})}
 
     def verify(self):
         self.record("verify")
         return {"checked": len(self.objects), "bad": []}
 
-    def providers(self, cid):
+    def providers(self, cid, on_provider=None, should_stop=None):
         self.record("providers", cid)
-        return self.provider_map.get(cid, [])
+        found = self.provider_map.get(cid, [])
+        for node_id in found:
+            if on_provider is not None:
+                on_provider(node_id)
+        return found
 
     def ping(self, node_id):
         self.record("ping", node_id)
         return None if node_id == b"\xff" * 16 else 0.25
+
+    def ping_info(self, node_id, on_stage=None):
+        for stage in ("path", "identity", "link") if node_id != b"\xff" * 16 else ("path",):
+            if on_stage is not None:
+                on_stage(stage)
+        rtt = self.ping(node_id)
+        return {"rtt": rtt, "reason": None if rtt is not None else "no_path", "hops": 1 if rtt else None,
+                "interface": "TCP" if rtt else None, "path_since": 1000.0 if rtt else None}
 
     def _name_of(self, key: bytes) -> str:
         return hashlib.sha256(key).digest()[:16].hex()
@@ -444,7 +456,7 @@ class FakeNode:
             raise NotFound(f"name {name} not resolved")
         return {"name": name, **self.records[name], "age": 5.0}
 
-    def export(self, target, output):
+    def export(self, target, output, temporary=None):
         self.record("export", target, output)
         cid = self._resolve(target)
         with open(output, "wb") as f:
@@ -556,7 +568,8 @@ class SecurityTest(ApiTestCase):
         self.assertEqual(self.node.called("gc"), [])
 
     def test_token_required(self):
-        # Every route but status, with valid parameters, so only the token can be what refuses them
+        # Every route but the open ones (status, and pairing's: AppSupportTest), with valid parameters, so only the
+        # token can be what refuses them
         file_cid = self.node.put_file(b"x")
         with tempfile.TemporaryDirectory() as tmp:
             secret = os.path.join(tmp, "secret")
@@ -567,8 +580,10 @@ class SecurityTest(ApiTestCase):
                           "path": secret, "output": os.path.join(tmp, "out"), "alias": "k", "pin": True}
             query = "&".join(f"{name}={value}" for name, value in parameters.items() if name != "pin")
             wrong = ["1", "0", "", self.server.token[:-1], self.server.token + "x", "é" + self.server.token[1:]]
+            self.assertEqual(ApiHandler.OPEN_ROUTES, {("GET", "/api/status"), ("POST", "/api/apps/request"),
+                                                      ("GET", "/api/apps/request")})
             for (method, path) in ApiHandler.ROUTES:
-                if path == "/api/status":
+                if (method, path) in ApiHandler.OPEN_ROUTES:
                     continue
                 body = parameters if method == "POST" else None
                 status, _, data = self.call(method, f"{path}?{query}", body, api=False)
@@ -814,10 +829,48 @@ class EndpointTest(ApiTestCase):
         self.assertEqual(self.ok("GET", f"/api/stat?target={directory}/%3Cb%3E")["size"], 3)
         self.node.provider_map[file_cid] = [bytes.fromhex("ab" * 16)]
         self.assertEqual(self.ok("GET", f"/api/providers?cid={file_cid}"), {"providers": ["ab" * 16]})
-        self.assertEqual(self.ok("GET", f"/api/ping?node={'cd' * 16}"), {"rtt": 0.25})
+        self.assertEqual(self.ok("GET", f"/api/ping?node={'cd' * 16}"),
+                         {"rtt": 0.25, "reason": None, "hops": 1, "interface": "TCP", "path_since": 1000.0})
         self.assertEqual(self.node.called("ping")[0][0], (bytes.fromhex("cd" * 16),))
-        self.assertEqual(self.ok("GET", f"/api/ping?node={'ff' * 16}"), {"rtt": None})
+        self.assertEqual(self.ok("GET", f"/api/ping?node={'ff' * 16}"),
+                         {"rtt": None, "reason": "no_path", "hops": None, "interface": None, "path_since": None})
         self.assertEqual(self.ok("GET", "/api/status")["node_id"], bytes(range(16)).hex())
+
+    def lines(self, path) -> list:
+        """The JSON lines of a streamed answer (send_lines), checked to be one."""
+        status, headers, data = self.call("GET", path)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(headers["Content-Type"], "application/x-ndjson")
+        self.assertIsNone(headers["Content-Length"])
+        self.assertTrue(data.endswith(b"\n"))
+        return [json.loads(line) for line in data.splitlines()]
+
+    def test_streamed_ping_and_providers(self):
+        """stream=1: each step or provider as it comes, then the answer the plain request gives, with done."""
+        self.assertEqual(self.lines(f"/api/ping?node={'cd' * 16}&stream=1"),
+                         [{"stage": "path"}, {"stage": "identity"}, {"stage": "link"},
+                          {"rtt": 0.25, "reason": None, "hops": 1, "interface": "TCP", "path_since": 1000.0,
+                           "done": True}])
+        self.assertEqual(self.lines(f"/api/ping?node={'ff' * 16}&stream=1")[-1]["reason"], "no_path")
+        file_cid = self.node.put_file(b"abc")
+        self.node.provider_map[file_cid] = [bytes.fromhex("ab" * 16), bytes.fromhex("cd" * 16)]
+        self.assertEqual(self.lines(f"/api/providers?cid={file_cid}&stream=1"),
+                         [{"provider": "ab" * 16}, {"provider": "cd" * 16},
+                          {"providers": ["ab" * 16, "cd" * 16], "done": True}])
+        # Errors before the first line are answered as without stream=
+        self.assertEqual(self.call("GET", "/api/providers?cid=nope&stream=1")[0], 400)
+
+    def test_streamed_error_after_the_first_line(self):
+        """An error once lines were sent ends the answer with an error line carrying its status and code."""
+        from rnfs.errors import NotFound
+
+        def ping_info(node_id, on_stage=None):
+            on_stage("path")
+            raise NotFound("gone")
+
+        self.node.ping_info = ping_info
+        self.assertEqual(self.lines(f"/api/ping?node={'cd' * 16}&stream=1"),
+                         [{"stage": "path"}, {"error": "gone", "code": "not_found", "status": 404, "done": True}])
 
     def test_validation(self):
         file_cid = self.node.put_file(b"abc")
@@ -1043,6 +1096,23 @@ class ConnectionTest(ConnectionTestCase):
             read_until_closed(sock)
         self.assertTrue(wait_for(lambda: free_slots(self.server) == self.LIMITS["max_connections"]))
         self.assertEqual(self.call("GET", "/api/status")[0], 200)
+
+    def test_a_client_reset_is_not_reported(self):
+        """A client that resets its connection mid-request is closed quietly, its slot freed: no traceback on the
+        daemon's output, which a status check during startup used to leave. Any other failure is still reported."""
+        server = self.server.server
+        for error, reported in ((ConnectionResetError, False), (BrokenPipeError, False),
+                                (ConnectionAbortedError, False), (RuntimeError, True)):
+            with self.subTest(error=error.__name__):
+                ours, theirs = socket.socketpair()
+                theirs.close()  # so the lingering close finds the client gone at once
+                server.slots.acquire()
+                with mock.patch.object(server, "finish_request", side_effect=error()), \
+                        mock.patch.object(server, "handle_error") as handle_error:
+                    server.process_request_thread(ours, ("127.0.0.1", 1))
+                self.assertEqual(handle_error.called, reported)
+                self.assertEqual(ours.fileno(), -1)  # closed
+        self.assertEqual(free_slots(self.server), self.LIMITS["max_connections"])
 
     def test_log_escapes_the_target(self):
         def failing(*args, **kwargs):
@@ -1302,6 +1372,19 @@ class AppSupportTest(ApiTestCase):
         self.assertEqual(self.ok("POST", "/api/shutdown"), {"stopping": True})
         self.assertTrue(stopped.wait(5))
 
+    def test_restart(self):
+        """POST /api/restart (0.2.1) answers, then calls the server's restart; a server without one (a daemon that
+        can't restart itself) answers 404 unsupported."""
+        status, body = self.error("POST", "/api/restart")
+        self.assertEqual((status, body["code"]), (404, "unsupported"))
+        restarting = threading.Event()
+        server = ApiServer(self.node, 0, restart=restarting.set)
+        server.start()
+        self.addCleanup(server.stop)
+        self.server, self.port = server, server.port
+        self.assertEqual(self.ok("POST", "/api/restart"), {"restarting": True})
+        self.assertTrue(restarting.wait(5))
+
     def test_pin_label_and_cache_routes(self):
         """POST /api/pin/label, GET /api/cache/ls and POST /api/cache/rm reach the facade, CIDs checked first."""
         cid = self.node.put_file(b"label me")
@@ -1427,6 +1510,70 @@ class BindTest(unittest.TestCase):
             self.assertTrue(server.server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE))
         with self.assertRaises(OSError):
             ApiServer(FakeNode(), server.port)  # a second daemon can't share the port
+
+
+class WatchedNames:
+    """NameManager's watch counts, as NameWatches uses them."""
+
+    def __init__(self):
+        self.watched: dict[bytes, int] = {}
+
+    def watch(self, name):
+        self.watched[name] = self.watched.get(name, 0) + 1
+
+    def unwatch(self, name):
+        self.watched[name] -= 1
+        if not self.watched[name]:
+            del self.watched[name]
+
+    def record(self, name):
+        return None
+
+    def add_record_listener(self, listener):
+        pass
+
+
+class NameWatchExpiryTest(unittest.TestCase):
+    """A name watched for an API client stops being watched WATCH_GRACE after its last call, with no later call to
+    notice, and when the server stops."""
+
+    def setUp(self):
+        self.node = FakeNode()
+        self.node.names = WatchedNames()
+        patcher = mock.patch.object(api, "WATCH_GRACE", 0.2)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def timing(watches) -> bool:
+        """Whether watches' timer is running (only its own: other tests' may still be)."""
+        timer = watches.timer
+        return timer is not None and timer.is_alive()
+
+    def test_a_watch_ends_after_its_grace_without_another_call(self):
+        watches = api.NameWatches(self.node)
+        self.addCleanup(watches.close)
+        name, other = bytes(16), bytes([1] * 16)
+        watches.wait([name], [None], 0)
+        time.sleep(0.1)
+        watches.wait([other], [None], 0)  # ends later: the timer, armed for name, re-arms for it
+        self.assertEqual(set(self.node.names.watched), {name, other})
+        self.assertTrue(wait_for(lambda: name not in self.node.names.watched, 2))
+        self.assertIn(other, self.node.names.watched)
+        self.assertTrue(wait_for(lambda: not self.node.names.watched, 2))
+        self.assertEqual(watches.until, {})
+        self.assertTrue(wait_for(lambda: not self.timing(watches), 2), "the timer ends once nothing is watched")
+
+    def test_stopping_the_server_ends_the_watches_and_the_timer(self):
+        server = ApiServer(self.node, 0)
+        server.start()
+        server.watches.wait([bytes(16)], [None], 0)
+        self.assertTrue(self.timing(server.watches))
+        server.stop()
+        self.assertEqual(self.node.names.watched, {})
+        self.assertTrue(wait_for(lambda: not self.timing(server.watches), 2))
+        server.watches.wait([bytes(16)], [None], 0)  # a call answered after the stop watches nothing
+        self.assertEqual(self.node.names.watched, {})
 
 
 class BodyReaderTest(unittest.TestCase):

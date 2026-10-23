@@ -70,6 +70,9 @@ APP_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 PIN_KEY = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 MAX_CACHE_RECORDS = 10_000  # cached fetches remembered; past this the least recently used record is dropped
 MISSING_MEMO = 10_000  # incomplete DAGs whose missing block dag_blocks remembers; past this the oldest is forgotten
+# Blocks get(remember=True) checked against their CIDs, kept in memory (at most 1 MiB of them): the node serves one
+# again, a /range answer of a few bytes at a time, without reading and hashing the whole block each time (AUD-L8)
+VERIFIED_MEMORY = 8
 EVICT_MARGIN = 32  # eviction frees max_storage / EVICT_MARGIN more than it must, so it runs rarely
 DISK_RESERVE_MIN = 256 * MIB  # free disk space fetches always leave on the blocks' filesystem...
 DISK_RESERVE_FRACTION = 0.02  # ...or this fraction of the filesystem, if larger
@@ -80,6 +83,7 @@ WRITE_QUEUE = 32  # blocks a writer holds waiting to be written, at most (2 MiB 
 
 DAMAGED = object()  # Storage._node's answer for a stored DAG node that is unreadable or no longer matches its CID
 MISSING = object()  # Storage._read_node's answer for a block that isn't stored (or was deleted meanwhile)
+UNREADABLE = "can't be read"  # how _block_problem starts its answer for a block whose read raised an OSError
 _NO_MEMO = object()  # a memo's answer for a key it has no entry for (None is a memoised answer)
 _NO_ENTRIES: frozenset = frozenset()  # dag_entries of a file, shared by every one memoised
 
@@ -396,6 +400,9 @@ class Storage:
         # so eviction over max_storage with nothing to evict needn't walk everything again
         self._maybe_garbage = True
         self._reported_damaged: set[Cid] = set()  # damaged DAG nodes already logged as stopping collection
+        # The last VERIFIED_MEMORY blocks get(remember=True) verified, with their files' signatures, least recently used
+        # first; forgotten as each is deleted (_delete), under the lock get checks a block is stored with
+        self._verified: OrderedDict[Cid, tuple[bytes, tuple[int, int, int]]] = OrderedDict()
         self.deny = denylist.NONE  # what put() refuses; the node sets its DenyList
         try:
             self._load()
@@ -613,19 +620,67 @@ class Storage:
         with self._lock:
             return cid in self._sizes
 
-    def get(self, cid: Cid, verify: bool = False) -> bytes | None:
-        """The stored block, or None. With verify, a block that no longer matches its CID is deleted, giving None."""
+    def get(self, cid: Cid, verify: bool = False, remember: bool = False) -> bytes | None:
+        """The stored block, or None. With verify, a block that no longer matches its CID is deleted, giving None.
+
+        With remember too, the block is kept in memory once verified, among the last VERIFIED_MEMORY, with its file's
+        signature (BlockStore.signature), and given from there, unread and unhashed, while it stays stored and its
+        file keeps that signature: a file rewritten or replaced since is read and checked again.
+        """
+        signature = None
         with self._lock:
             if cid not in self._sizes:
                 return None
-        block = self.blocks.get(cid)
+            remembered = self._verified.get(cid) if verify and remember else None
+        if remembered is not None:
+            block, kept = remembered
+            try:
+                signature = self.blocks.signature(cid)
+            except OSError:
+                signature = None
+            if signature is not None and signature == kept:
+                with self._lock:
+                    if cid in self._verified:
+                        self._verified.move_to_end(cid)
+                return block
+        if verify and remember and signature is None:
+            try:
+                signature = self.blocks.signature(cid)  # before the read: a change after it is seen at the next one
+            except OSError:
+                signature = None
+        try:
+            block = self.blocks.get(cid)
+        except OSError as e:
+            # Unreadable (a disk error, a file this user can't open): damaged, as _read_node takes it, but kept until
+            # verify() removes it, as a damaged node is: a file a run as root left is whole, and may be the only copy
+            log(f"storage: block {cid} {UNREADABLE} ({e}); `rnfs verify` removes it", LOG_ERROR)
+            return None
         if block is None or (verify and not blockstore.matches(cid, block)):
             with self._lock:
-                if cid in self._sizes and not self.blocks.verify(cid):
-                    log(f"storage: block {cid} is damaged or missing; removing it", LOG_ERROR)
+                problem = self._block_problem(cid) if cid in self._sizes else None
+                if problem is not None:
+                    log(f"storage: block {cid} {problem}; removing it", LOG_ERROR)
                     self._delete({cid})  # if Windows defers it, verify() or the next read tries again
             return None
+        if verify and remember and signature is not None:
+            with self._lock:
+                if cid in self._sizes:  # not deleted while it was read: _delete forgets it under this lock
+                    self._verified[cid] = (block, signature)
+                    self._verified.move_to_end(cid)
+                    while len(self._verified) > VERIFIED_MEMORY:
+                        self._verified.popitem(last=False)
         return block
+
+    def _block_problem(self, cid: Cid) -> str | None:
+        """Why the stored block cid is bad, for the log, or None if it can be read and matches its CID. An unreadable
+        one says why (the OSError: a disk error, or a file this user can't open, such as one a run as root left)."""
+        try:
+            block = self.blocks.get(cid)
+        except OSError as e:
+            return f"{UNREADABLE} ({e})"
+        if block is None:
+            return "is missing"
+        return None if blockstore.matches(cid, block) else "is damaged (it doesn't match its CID)"
 
     def block_size(self, cid: Cid) -> int | None:
         """Length of a stored block, or None."""
@@ -1121,20 +1176,31 @@ class Storage:
         """Delete stored blocks; returns (deleted, bytes freed) (lock held). Invalidates completeness memos.
 
         A block Windows keeps in use (a reader has it open) stays stored and indexed, so the index always
-        matches the disk; it is left out of deleted, and the next collection tries again.
+        matches the disk; it is left out of deleted, and the next collection tries again. So does one whose delete
+        fails (an OSError: a disk error, a filesystem remounted read-only), which is logged; the blocks deleted
+        around it are accounted for all the same, and their DAGs' completeness memos forgotten.
         """
         deleted: set[Cid] = set()
         freed = released = 0  # bytes, and what they took on disk
         deferred = False
+        failed, error = 0, None  # deletes that raised, and the first error
         if self._closed:
             return deleted, freed  # the sizes are saved: the blocks stay, and are collected after the next start
         for cid in cids:
             if cid in self._sizes:
-                if self.blocks.delete(cid) is None:
+                try:
+                    removed = self.blocks.delete(cid)
+                except OSError as e:
+                    failed += 1
+                    error = error or e  # one line for them all: a read-only filesystem fails every one
+                    deferred = True
+                    continue
+                if removed is None:
                     log(f"storage: block {cid} is in use; deleting it later", LOG_VERBOSE)
                     deferred = True
                     continue
                 deleted.add(cid)
+                self._verified.pop(cid, None)
                 length = self._sizes.pop(cid)
                 freed += length
                 released += self._allocation(length)
@@ -1150,6 +1216,8 @@ class Storage:
             self._complete_entries = {root: entries for root, entries in self._complete_entries.items()
                                       if root in self._complete}
             self._complete_bytes = {root: n for root, n in self._complete_bytes.items() if root in self._complete}
+        if failed:
+            log(f"storage: couldn't delete {plural(failed, 'block')} ({error}); trying again later", LOG_ERROR)
         if deleted or deferred:
             # A deleted DAG node no longer reaches its children; a deferred block is still garbage
             self._maybe_garbage = True
@@ -1509,6 +1577,36 @@ class Storage:
         return {"removed_blocks": stats["removed_blocks"], "freed_bytes": stats["freed_bytes"],
                 "incomplete": incomplete, "uncached": stats["uncached"]}
 
+    def gc_preview(self) -> dict:
+        """What gc() would delete now, deleting nothing, and what the stored blocks are kept for (0.2.1: POST /api/gc
+        with dry_run): {"removed_blocks", "freed_bytes" (block bytes, as gc() counts them), "allocated_bytes" (what
+        those take on disk), "held_back" (a damaged DAG node something reaches: gc would delete nothing),
+        "cached_fetches" (the records gc would evict), "pinned_bytes" (blocks a pin reaches), "cached_bytes" (blocks
+        only a cached fetch reaches), "protected_bytes" (blocks only an operation in progress holds: a fetch, an
+        add, a job) and "unreferenced_bytes" (blocks nothing reaches)}. Walks every pin's DAG, as gc does: the nodes
+        are read without the lock first (_warm)."""
+        with self._lock:
+            roots = self._roots() | set(self._cache.values())
+        self._warm(roots, [])
+        with self._lock:
+            damaged: set[Cid] = set()
+            pinned = self._reach(self._pins, damaged=damaged)
+            held = pinned | self._reach(self._roots(), known=pinned, damaged=damaged)
+            live = self._live(damaged)
+            dead = self._sizes.keys() - held
+            held_back = bool(damaged)
+            removed = set() if held_back else dead
+
+            def total(cids) -> int:
+                """The block bytes of cids."""
+                return sum(self._sizes[cid] for cid in cids if cid in self._sizes)
+
+            return {"removed_blocks": len(removed), "freed_bytes": total(removed),
+                    "allocated_bytes": sum(self._allocation(self._sizes[cid]) for cid in removed),
+                    "held_back": held_back, "cached_fetches": len(self._cache),
+                    "pinned_bytes": total(pinned), "cached_bytes": total(live - held),
+                    "protected_bytes": total(held - pinned), "unreferenced_bytes": total(self._sizes.keys() - live)}
+
     def verify(self) -> dict:
         """Re-check every stored block against its CID, deleting bad ones.
 
@@ -1526,7 +1624,10 @@ class Storage:
                     continue
                 with self._lock:
                     # Checked again under the lock: it may have been deleted (or rewritten) meanwhile
-                    if cid in self._sizes and not self.blocks.verify(cid):
+                    problem = self._block_problem(cid) if cid in self._sizes else None
+                    if problem is not None:
+                        if problem.startswith(UNREADABLE):  # why, so a disk error or a file's owner can be told
+                            log(f"storage: block {cid} {problem}", LOG_ERROR)
                         self._delete({cid})  # reported either way; one Windows defers stays until a later try
                         bad.append(cid)
             return set(bad)

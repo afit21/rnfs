@@ -439,13 +439,16 @@ def run_host(configdir: str, rnfs_dir: str, peer_echo_hex: str, peer_dht_hex: st
     guards.refusal = recording_refusal
     # The DHT mode is left to rnfs.Node's default: client
     settings = {"default_bootstrap": False, "startup_announce_delay": 2, "path_timeout": WAIT}
-    # A start failing late leaves nothing behind (its rnfs.dht destination above all), so the next one works
-    from rnfs.node import RnfsNode
-    with mock.patch.object(RnfsNode, "_start_network", side_effect=RuntimeError("failing on purpose")):
-        try:
-            rnfs.Node(rnfs_dir, reticulum=reticulum, settings=settings)
-        except RuntimeError:
-            pass
+    # A start failing, early or late, leaves nothing behind (its rnfs.dht destination above all), so the next one works
+    from rnfs import node as node_module
+    for failing in (mock.patch.object(node_module, "LinkPool", side_effect=RuntimeError("failing on purpose")),
+                    mock.patch.object(node_module.RnfsNode, "_start_network",
+                                      side_effect=RuntimeError("failing on purpose"))):
+        with failing:
+            try:
+                rnfs.Node(rnfs_dir, reticulum=reticulum, settings=settings)
+            except RuntimeError:
+                pass
     node = rnfs.Node(rnfs_dir, reticulum=reticulum, settings=settings)
     own.announce()
     print("HOST", own.hash.hex(), node.node_id.hex(), flush=True)

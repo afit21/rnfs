@@ -112,7 +112,10 @@ def _check_depth(height: int):
 
 
 def _put_node(node: dag.Node, put: Put) -> Cid:
-    """Encode node, hand it to put and return its CID."""
+    """Encode node, hand it to put and return its CID. Raises TooLarge if its sizes add up past 2^64 - 1 (the DAG would
+    be invalid, and an index node above it couldn't even be encoded)."""
+    if node.size > dag.MAX_SIZE:
+        raise TooLarge("content exceeds 2^64 - 1 bytes")
     block = dag.encode(node)
     if len(block) > constants.MAX_BLOCK_SIZE:
         # Can't happen with the protocol constants (256 maximal entries are ~80 KiB), but never write one
@@ -135,6 +138,9 @@ class BuildOptions:
     skip_dirs: the directories, by DirId, a walk skips with a warning and build_path refuses as its root: the rnfs dir
     and its private subdirectories (shared_folder.private_dirs), so that another way to them, such as a bind mount,
     isn't added (audit REV1). Empty skips nothing.
+    root_check: called with the root of a build as opened (its Handle, its stat and the path it was opened by), before
+    anything is read; it may raise to refuse it (add_path: the rnfs dir check made again on what was opened, so a
+    path swapped for a link after an earlier check is refused, audit AUD-H3). None checks nothing.
     Raises ValueError for an unknown chunker.
     """
 
@@ -142,6 +148,7 @@ class BuildOptions:
     check: Callable[[bytes], None] | None = None
     progress: Callable[[int], None] | None = None
     skip_dirs: frozenset[DirId] = frozenset()
+    root_check: "Callable[[Handle, os.stat_result, str], None] | None" = None
 
     def __post_init__(self):
         """Check the chunker's name (None is the default)."""
@@ -495,21 +502,25 @@ def build_path(path: str, put: Put, warnings: list[str], options: BuildOptions |
     The path itself is followed if it is a symlink (the user named it); inside a directory, hidden files
     are included and symlinks, devices, sockets, FIFOs, invalid names and the directories of options.skip_dirs are
     skipped with a warning. Raises TooLarge for a tree deeper than MAX_DEPTH, ValueError if path is neither file nor
-    directory, or is one of options.skip_dirs.
+    directory, or is one of options.skip_dirs, and what options.root_check raises for it as opened (check_root).
     """
     options = _resolve(options)
     handle, st = open_path(path)
     try:
-        check_root(st, path, options.skip_dirs)
+        check_root(handle, st, path, options)
         return build_open(handle, st, path, put, warnings, options=options)
     finally:
         close(handle)
 
 
-def check_root(st: os.stat_result, path: str, skip_dirs: frozenset[DirId]):
-    """Raise ValueError if the root of a build, at path and opened with the stat st, is one of skip_dirs."""
-    if is_skipped_dir(st, skip_dirs):
+def check_root(handle: Handle, st: os.stat_result, path: str, options: BuildOptions | None):
+    """Raise ValueError if the root of a build, at path and open as handle with the stat st, is one of
+    options.skip_dirs; and whatever options.root_check raises for it."""
+    options = options if options is not None else BuildOptions()
+    if is_skipped_dir(st, options.skip_dirs):
         raise ValueError(f"refusing to add {display_path(path)}: {PRIVATE_DIR}")
+    if options.root_check is not None:
+        options.root_check(handle, st, path)
 
 
 FileState = tuple[int, int, int, int, bool]
