@@ -2,6 +2,8 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## 0.2.2 (unreleased)
+
 ## 0.2.1
 
 Fixes, and additions to the local API for apps. No wire-format or CID changes: these nodes, 0.2.0, 0.1.6, 0.1.5,

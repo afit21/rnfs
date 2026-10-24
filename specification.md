@@ -4,7 +4,7 @@ rnfs is content-addressed file sharing over [Reticulum](https://reticulum.networ
 features of IPFS: content IDs, chunked files, directories, a provider DHT, verified multi-source transfer,
 pinning, mutable names and a gateway — built on what RNS already provides.
 
-**Version.** This document describes rnfs 0.2.1. The wire format (request paths and messages, CIDs and DAG
+**Version.** This document describes rnfs 0.2.2. The wire format (request paths and messages, CIDs and DAG
 bytes, chunk boundaries, provider and name records, announce app_data and the LXMF field) is byte-identical
 since rnfs 0.1.3, so nodes of 0.1.3 and later work together. 0.2.0 adds one optional request, `/range` (section 7),
 which older nodes don't answer and newer ones send only to nodes that do; every other message, and every CID, is
