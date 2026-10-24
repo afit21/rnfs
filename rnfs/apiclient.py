@@ -56,6 +56,7 @@ import math
 import os
 import re
 import secrets
+import select
 import stat
 import threading
 import time
@@ -680,6 +681,22 @@ class ApiConnection:
         return PROOF_TIMEOUT if timeout is None else min(timeout, PROOF_TIMEOUT)
 
     @staticmethod
+    def _until_answered(connection: http.client.HTTPConnection, body):
+        """A binary file's bytes, in the connection's blocks, until the daemon answers: an upload's route answers only
+        once the body is read, unless it stops reading (a refusal, or the upload's job cancelled: 409 cancelled), so
+        anything to read before then is that answer, and the rest isn't sent. Where the daemon then closes the
+        connection while bytes still come, Windows discards the answer unread (WSAECONNABORTED), as other systems
+        don't (_early_answer)."""
+        while True:
+            sock = connection.sock
+            if sock is not None and select.select([sock], [], [], 0)[0]:
+                return
+            data = body.read(connection.blocksize)
+            if not data:
+                return
+            yield data
+
+    @staticmethod
     def _early_answer(connection: http.client.HTTPConnection, method: str,
                       error: Exception) -> http.client.HTTPResponse | None:
         """The answer the daemon sent before it stopped reading an upload (a refusal, or the upload's job cancelled:
@@ -701,6 +718,8 @@ class ApiConnection:
         """Send one request on connection and return its response, whatever its status; a connection that fails
         raises DaemonNotRunning (DaemonStarting while a process holds the rnfs dir) or ConnectionFailed (also when
         the answer doesn't come within its timeout)."""
+        if hasattr(body, "read"):
+            body = self._until_answered(connection, body)
         try:
             connection.request(method, url, body=body, headers=headers)
             return connection.getresponse()

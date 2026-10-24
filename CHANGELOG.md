@@ -179,8 +179,9 @@ Fixed:
 - **A finished job lets go of what it met** (AUD-M9): it kept every CID its last run met (about 175 bytes a block,
   35 MB for a 12 GiB fetch) until it was forgotten.
 - **Windows: an upload the daemon refuses or cancels reports why:** `rnfs.Client` read the daemon's answer to an
-  upload it stopped reading (409 cancelled, a refusal) only after a broken pipe or a reset; Windows reports that
-  send as aborted, so the client said the daemon dropped the connection.
+  upload it stopped reading (409 cancelled, a refusal) only once sending the rest failed, but Windows discards that
+  answer unread when the daemon closes the connection, so the client said the daemon dropped the connection. It
+  now stops sending as soon as the daemon has answered, and reads the answer.
 - **A job whose thread can't start is queued again** (AUD-L11), instead of staying "running" with no thread and
   holding a `max_jobs` slot until a restart; the jobs' retry loop survives a failing round.
 - **`install.sh --update --service` runs the version it installed:** with the service already running, the
