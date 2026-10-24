@@ -154,7 +154,8 @@ Security (the 0.2.1 audit, AUD: each fix has a regression test in `tests/securit
 - **An embedded node's event watch is bounded** (AUD-L13, section 11): `events.watch` holds at most 1024 events
   waiting for a slow callback; past that the oldest are dropped and the callback gets a "lost" Event in their place,
   as a Client's watch does. Remote announces drive some event kinds.
-- **Supply chain** (AUD-L14 to L18): certifi 2026.10.19 in `build-tools.lock` (GHSA-6q48-6c7w-9gw2), and a daily OSV
+- **Supply chain** (AUD-L14 to L18): certifi 2026.10.19 in `build-tools.lock` (GHSA-6q48-6c7w-9gw2) and setuptools
+  84.1.0 in both build locks (GHSA-xmj3-9gf7-h52w, which the new audit found), and a daily OSV
   audit of every lock (`.github/workflows/audit.yml`), since Dependabot doesn't read them; install.sh refuses to
   downgrade rnfs, or to replace a `--main`/`RNFS_SOURCE` install with a release of the same version, unless
   `--force`; the Windows logon task is per user (`rnfs daemon (<SID>)`) and stops only your processes; an opt-in
@@ -177,6 +178,10 @@ Fixed:
   syncs and renames once complete; an export job resumes as a get job does.
 - **A finished job lets go of what it met** (AUD-M9): it kept every CID its last run met (about 175 bytes a block,
   35 MB for a 12 GiB fetch) until it was forgotten.
+- **Windows: an upload the daemon refuses or cancels reports why:** `rnfs.Client` read the daemon's answer to an
+  upload it stopped reading (409 cancelled, a refusal) only once sending the rest failed, but Windows discards that
+  answer unread when the daemon closes the connection, so the client said the daemon dropped the connection. It
+  now stops sending as soon as the daemon has answered, and reads the answer.
 - **A job whose thread can't start is queued again** (AUD-L11), instead of staying "running" with no thread and
   holding a `max_jobs` slot until a restart; the jobs' retry loop survives a failing round.
 - **`install.sh --update --service` runs the version it installed:** with the service already running, the

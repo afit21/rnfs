@@ -1,4 +1,5 @@
 """Tests for the client library of the local API (rnfs/apiclient.py), against a live ApiServer with a FakeNode."""
+import http.client
 import http.server
 import inspect
 import io
@@ -280,6 +281,76 @@ class DaemonFileTest(unittest.TestCase):
         self.write({"pid": os.getpid(), "api_port": 9555})
         cli.remove_daemon_info(self.path, os.getpid())
         self.assertFalse(os.path.exists(self.path))
+
+
+class EarlyAnswerTest(unittest.TestCase):
+    """The answer a daemon sent before it stopped reading an upload is read, whichever error sending the rest
+    raised: a broken pipe or a reset, or on Windows an abort (WSAECONNABORTED), which test_tar_stream's cancelled
+    upload got there."""
+
+    def test_each_dropped_send_reads_the_answer(self):
+        for error in (BrokenPipeError(), ConnectionResetError(), ConnectionAbortedError()):
+            with self.subTest(error=type(error).__name__):
+                ours, daemons = socket.socketpair()
+                self.addCleanup(ours.close)
+                with daemons:
+                    daemons.sendall(b"HTTP/1.1 409 Conflict\r\nContent-Length: 2\r\n\r\n{}")
+                connection = mock.Mock(sock=ours)
+                response = ApiConnection._early_answer(connection, "POST", error)
+                self.assertIsNotNone(response)
+                self.assertEqual((response.status, response.read()), (409, b"{}"))
+
+    def test_an_upload_stops_once_the_daemon_has_answered(self):
+        # A daemon that answers 409 mid-upload and keeps reading: the client sees the answer, sends no more of a
+        # body that never ends, and reads it (on Windows the daemon's close would have discarded it unread)
+        listener = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(listener.close)
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def daemon():
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(0.2)
+                received = b""
+                while b"\r\n\r\n" not in received:
+                    received += connection.recv(65536)
+                connection.sendall(b"HTTP/1.1 409 Conflict\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                while not stop.is_set():  # drains whatever still comes
+                    try:
+                        if not connection.recv(65536):
+                            return
+                    except TimeoutError:
+                        pass
+        threading.Thread(target=daemon, daemon=True).start()
+
+        class Endless(io.RawIOBase):
+            def readable(self):
+                return True
+
+            def readinto(self, buffer):
+                buffer[:len(buffer)] = b"x" * len(buffer)
+                return len(buffer)
+        connection = http.client.HTTPConnection("127.0.0.1", listener.getsockname()[1], timeout=10)
+        self.addCleanup(connection.close)
+        connection.connect()
+        done = {}
+
+        def upload():
+            body = ApiConnection._until_answered(connection, io.BufferedReader(Endless()))
+            connection.request("POST", "/api/add/stream", body=body)
+            done["response"] = connection.getresponse()
+        thread = threading.Thread(target=upload, daemon=True)
+        thread.start()
+        thread.join(10)
+        self.assertFalse(thread.is_alive(), "the client kept sending after the daemon answered")
+        self.assertEqual((done["response"].status, done["response"].read()), (409, b"{}"))
+
+    def test_other_errors_read_nothing(self):
+        ours, daemons = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(daemons.close)
+        self.assertIsNone(ApiConnection._early_answer(mock.Mock(sock=ours), "POST", TimeoutError()))
 
 
 class AppSupportTest(ClientTestCase):

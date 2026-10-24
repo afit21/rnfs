@@ -22,7 +22,9 @@ FIXTURE = re.compile(r"^(?:setUpClass|tearDownClass|setUpModule|tearDownModule) 
 
 
 def rerun_name(test) -> str | None:
-    """The name to run test again by, or None if running it again can't help (it didn't import)."""
+    """The name to run test again by, or None if running it again can't help (it didn't import). A failed subtest
+    is run again by its test's name: its own id carries its parameters, which no loader takes."""
+    test = getattr(test, "test_case", test)  # a unittest.case._SubTest's test
     name = test.id()
     if name.startswith("unittest.loader."):
         return None

@@ -178,6 +178,7 @@ import queue
 import re
 import secrets
 import socket
+import socketserver
 import threading
 import time
 from contextlib import contextmanager
@@ -579,7 +580,9 @@ class BoundedHTTPServer(ThreadingHTTPServer):
         super().__init__(address, handler_class)
 
     def server_bind(self):
-        """Bind the listening socket, exclusively on Windows; an IPv6 one to IPv6 only."""
+        """Bind the listening socket, exclusively on Windows; an IPv6 one to IPv6 only. The server's name is its
+        address as it is: HTTPServer's own server_bind looks the address up (socket.getfqdn), which for ::1 can
+        wait on the system's resolver (mDNS on macOS) before the daemon answers anything, and nothing reads it."""
         if fsutil.IS_WINDOWS:
             # There SO_REUSEADDR (HTTPServer's default) lets another socket bind a port already listening, so a
             # second daemon, or another local program listening in on API tokens, could share it
@@ -589,7 +592,8 @@ class BoundedHTTPServer(ThreadingHTTPServer):
         if self.address_family == socket.AF_INET6:
             # ::1 and nothing else: 127.0.0.1 is the sibling's
             self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-        super().server_bind()
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def process_request(self, request, client_address):
         """Serve the connection on a new thread if a slot is free, else refuse it at once."""

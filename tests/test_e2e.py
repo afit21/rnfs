@@ -89,6 +89,13 @@ def same_tree(a: str, b: str) -> bool:
     return all(same_tree(os.path.join(a, name), os.path.join(b, name)) for name in comparison.common_dirs)
 
 
+def daemon_environment() -> dict:
+    """The environment a daemon is started with: this one, less what would say a service manager started it (a CI
+    runner's jobs run inside its systemd service, with INVOCATION_ID set), so each daemon is started by hand."""
+    environment = {key: value for key, value in os.environ.items() if key not in ("INVOCATION_ID", "RNFS_STARTED_BY")}
+    return {**environment, "PYTHONUNBUFFERED": "1"}
+
+
 class Daemon:
     """One running daemon: its directory, ports, node ID and log."""
 
@@ -108,7 +115,7 @@ class Daemon:
             self.proc = subprocess.Popen(
                 [sys.executable, MAIN, "--dir", self.dir, "--api-port", str(self.api_port), "daemon",
                  "--rnsconfig", self.dir, "--gateway-port", str(self.gateway_port), *extra],
-                stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "PYTHONUNBUFFERED": "1"}, **POPEN_OPTIONS)
+                stdout=log, stderr=subprocess.STDOUT, env=daemon_environment(), **POPEN_OPTIONS)
         self.node_id = wait_for(self.status, 60, f"{name} daemon to start")["node_id"]
 
     def status(self) -> dict | None:

@@ -1533,6 +1533,18 @@ class WatchedNames:
         pass
 
 
+class NameLookupTest(unittest.TestCase):
+    """The API and the gateway listen without looking their addresses up: HTTPServer's server_bind calls
+    socket.getfqdn, which for ::1 can wait on the resolver (mDNS on macOS) while a starting daemon answers nothing."""
+
+    def test_no_name_lookup(self):
+        from rnfs.config import Config
+        from rnfs.gateway import GatewayServer
+        with mock.patch.object(socket, "getfqdn", side_effect=AssertionError("a name lookup")):
+            for server in (ApiServer(FakeNode(), 0), GatewayServer(FakeNode(), Config(), 0)):
+                self.addCleanup(server.stop)
+
+
 class NameWatchExpiryTest(unittest.TestCase):
     """A name watched for an API client stops being watched WATCH_GRACE after its last call, with no later call to
     notice, and when the server stops."""
@@ -1540,7 +1552,7 @@ class NameWatchExpiryTest(unittest.TestCase):
     def setUp(self):
         self.node = FakeNode()
         self.node.names = WatchedNames()
-        patcher = mock.patch.object(api, "WATCH_GRACE", 0.2)
+        patcher = mock.patch.object(api, "WATCH_GRACE", 2.0)  # well past the sleep below, even on a slow runner
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -1555,14 +1567,14 @@ class NameWatchExpiryTest(unittest.TestCase):
         self.addCleanup(watches.close)
         name, other = bytes(16), bytes([1] * 16)
         watches.wait([name], [None], 0)
-        time.sleep(0.1)
+        time.sleep(0.5)  # other's watch ends this much later than name's
         watches.wait([other], [None], 0)  # ends later: the timer, armed for name, re-arms for it
         self.assertEqual(set(self.node.names.watched), {name, other})
-        self.assertTrue(wait_for(lambda: name not in self.node.names.watched, 2))
+        self.assertTrue(wait_for(lambda: name not in self.node.names.watched, 5))
         self.assertIn(other, self.node.names.watched)
-        self.assertTrue(wait_for(lambda: not self.node.names.watched, 2))
+        self.assertTrue(wait_for(lambda: not self.node.names.watched, 5))
         self.assertEqual(watches.until, {})
-        self.assertTrue(wait_for(lambda: not self.timing(watches), 2), "the timer ends once nothing is watched")
+        self.assertTrue(wait_for(lambda: not self.timing(watches), 5), "the timer ends once nothing is watched")
 
     def test_stopping_the_server_ends_the_watches_and_the_timer(self):
         server = ApiServer(self.node, 0)

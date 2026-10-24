@@ -140,7 +140,11 @@ class DaemonSignalTest(unittest.TestCase):
                          "--rnsconfig", rnfs_dir, "--gateway-port", str(free_port())],
                         cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "PYTHONUNBUFFERED": "1"})
                 try:
-                    wait_for(lambda: self.status(rnfs_dir, api_port, proc), 60, "the daemon to start")
+                    try:
+                        wait_for(lambda: self.status(rnfs_dir, api_port, proc), 60, "the daemon to start")
+                    except AssertionError as e:
+                        with open(log_path, "rb") as f:
+                            raise AssertionError(f"{e}; its output:\n{f.read().decode('utf-8', 'replace')}") from None
                     time.sleep(1.5)  # past the first waits of every loop
                     start = time.monotonic()
                     proc.send_signal(signum)
